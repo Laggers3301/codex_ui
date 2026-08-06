@@ -1,6 +1,15 @@
 import type {
   ApprovalPolicy,
+  CodexLeaderboard,
+  CodexQuota,
+  CodexSkillsResponse,
   DirectoryListResponse,
+  ModelProfile,
+  LocalSendResult,
+  LocalSendSettings,
+  LocalSendTestResult,
+  ThreadExportFormat,
+  ThreadExportResult,
   Project,
   ProjectFile,
   ProjectFilePreview,
@@ -32,10 +41,16 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     headers.set("Content-Type", "application/json");
   }
 
-  const response = await fetch(path, {
-    ...options,
-    headers
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...options,
+      headers
+    });
+  } catch (caught) {
+    const detail = caught instanceof Error ? caught.message : String(caught);
+    throw new Error(`网络请求失败 ${path}: ${detail}`);
+  }
 
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -45,8 +60,34 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return body as T;
 }
 
-export function listUsers(): Promise<{ data: UserProfile[]; defaultUserId: string }> {
+export function listUsers(): Promise<{ data: UserProfile[]; defaultUserId: string; lockedToLoginUser?: boolean }> {
   return request("/api/users");
+}
+
+export function listModels(): Promise<{ data: ModelProfile[]; defaultModel: string; defaultReasoningEffort: ReasoningEffort }> {
+  return request("/api/models");
+}
+
+export function readCodexQuota(refresh = false): Promise<{ data: CodexQuota }> {
+  const suffix = refresh ? "?refresh=true" : "";
+  return request(`/api/codex/quota${suffix}`, { cache: "no-store" });
+}
+
+export function readCodexLeaderboard(refresh = false): Promise<{ data: CodexLeaderboard }> {
+  const suffix = refresh ? "?refresh=true" : "";
+  return request(`/api/codex/leaderboard${suffix}`, { cache: "no-store" });
+}
+
+export function listCodexSkills(projectId?: string, reload = false): Promise<CodexSkillsResponse> {
+  const params = new URLSearchParams();
+  if (projectId) {
+    params.set("projectId", projectId);
+  }
+  if (reload) {
+    params.set("reload", "true");
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request(`/api/codex/skills${suffix}`);
 }
 
 export function createUser(input: { name: string }): Promise<{ data: UserProfile }> {
@@ -58,6 +99,41 @@ export function createUser(input: { name: string }): Promise<{ data: UserProfile
 
 export function deleteUser(id: string): Promise<{ ok: boolean }> {
   return request(`/api/users/${id}`, { method: "DELETE" });
+}
+
+export function readLocalSendSettings(): Promise<{ data: LocalSendSettings; detectedClientHost: string }> {
+  return request("/api/settings/local-send");
+}
+
+export function updateLocalSendSettings(input: Partial<LocalSendSettings>): Promise<{ data: LocalSendSettings }> {
+  return request("/api/settings/local-send", {
+    method: "PATCH",
+    body: JSON.stringify(input)
+  });
+}
+
+export function testLocalSendSettings(): Promise<{ data: LocalSendTestResult }> {
+  return request("/api/settings/local-send/test", {
+    method: "POST"
+  });
+}
+
+export function sendProjectFileToLocal(projectId: string, filePath: string, destinationPath?: string): Promise<{ data: LocalSendResult }> {
+  return request(`/api/projects/${projectId}/files/send-local`, {
+    method: "POST",
+    body: JSON.stringify({ path: filePath, destinationPath })
+  });
+}
+
+export function exportThreadRecord(
+  projectId: string,
+  threadId: string,
+  input: { format?: ThreadExportFormat; sendLocal?: boolean; outputPath?: string; destinationPath?: string }
+): Promise<{ data: ThreadExportResult }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/export`, {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
 }
 
 export function listProjects(): Promise<{
@@ -108,12 +184,31 @@ export function deleteProject(id: string): Promise<{ ok: boolean }> {
   return request(`/api/projects/${id}`, { method: "DELETE" });
 }
 
-export function listThreads(projectId: string): Promise<ThreadListResponse> {
-  return request(`/api/projects/${projectId}/threads`);
+export function listThreads(projectId: string, search?: string): Promise<ThreadListResponse> {
+  const params = new URLSearchParams();
+  if (search?.trim()) {
+    params.set("search", search.trim());
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request(`/api/projects/${projectId}/threads${suffix}`);
 }
 
-export function readThread(threadId: string, projectId?: string): Promise<ThreadReadResponse> {
-  const suffix = projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
+export function deleteThread(projectId: string, threadId: string): Promise<{ ok: boolean }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}`, { method: "DELETE" });
+}
+
+export function readThread(threadId: string, projectId?: string, options?: { before?: number; limit?: number }): Promise<ThreadReadResponse> {
+  const params = new URLSearchParams();
+  if (projectId) {
+    params.set("projectId", projectId);
+  }
+  if (typeof options?.before === "number") {
+    params.set("before", String(Math.max(0, Math.floor(options.before))));
+  }
+  if (typeof options?.limit === "number") {
+    params.set("limit", String(Math.max(1, Math.floor(options.limit))));
+  }
+  const suffix = params.toString() ? `?${params.toString()}` : "";
   return request(`/api/threads/${threadId}${suffix}`);
 }
 

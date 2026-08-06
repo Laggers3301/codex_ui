@@ -15,6 +15,20 @@
 - 用户视图：内置 `admin` 用户，可创建其他用户来分别记忆项目列表。用户切换只影响本工具里的项目可见性，不隔离 Codex 登录态或系统权限。
 - LAN 访问：服务端默认监听 `0.0.0.0:4573`，可以通过环境变量调整监听地址和端口。
 
+## 本分支新增功能
+
+- 会话操作：会话右键菜单支持重命名和复制真实 Codex 会话 ID，便于跨会话继续任务。
+- 对话检索：在对话左侧显示当前会话的 prompt 导航与预览，点击可跳转到对应消息；历史分页内容也会按需加载。
+- 输入体验：普通 Enter 发送、Shift+Enter 换行；输入法组合输入期间不会误发。焦点不在文本输入控件时，Enter 可发送当前 prompt。
+- 消息定位：新发 prompt 会先在底部保留 5 秒，再回到时间线位置；设置保存提示也会随会话推进，不会永久占据底部。
+- 多用户隔离：服务端依据经过签名的登录 Cookie 确定用户，忽略伪造的用户 ID，并按用户隔离项目、会话归属、实时消息与 SSH 发送设置。认证默认关闭，部署者可显式启用。
+- 远程交付：设置页默认从浏览器来源识别 ZeroTier/SSH 地址，并可将当前用户会话生成的图片、PDF、PPT、Word、表格等文件通过 SSH 发送到其 `~/Downloads`。此功能需要用户保存设置并测试连接后才会启用。
+- 界面可用性：排行榜支持独立滚动浏览完整列表；折叠左栏后内容区仍保持可操作。
+
+## 隐私与部署
+
+本分支不包含任何实际会话、上传文件、数据库、部署专用网络地址、私钥、密码或组织信息。认证和跨实例能力均默认关闭或留空，必须由部署者通过环境变量配置；请将这些环境变量和 `.codex-web/` 数据目录保留在部署环境中，不要提交到 Git。
+
 ## 技术栈
 
 - 前端：React 19、Vite、lucide-react、react-markdown
@@ -105,6 +119,10 @@ npm run generate:codex-schema
 | `CODEX_WEB_DATA_DIR` | `.codex-web` | SQLite 数据库和运行数据目录 |
 | `CODEX_WEB_CODEX_BIN` | `codex` | Codex CLI 可执行文件 |
 | `CODEX_WEB_ALLOW_OUTSIDE_PROJECT_ROOT` | 未开启 | 设为 `1`、`true`、`yes` 或 `on` 后允许连接默认根目录之外的项目 |
+| `CODEX_WEB_AUTH_MODE` | `off` | `off` 关闭认证；`member` 只允许已配置用户；`bootstrap` 允许使用下方引导密码创建账号 |
+| `CODEX_WEB_AUTH_USER` / `CODEX_WEB_AUTH_PASSWORD` | 未设置 | 可选的初始管理员凭据，仅通过部署环境提供 |
+| `CODEX_WEB_DEFAULT_PASSWORD` | 未设置 | `bootstrap` 模式所需的引导密码；请勿写入仓库 |
+| `CODEX_WEB_USER_WORKSPACE_ROOT` | `<项目根目录>/users` | 每位登录用户的默认工作区根目录 |
 
 示例：
 

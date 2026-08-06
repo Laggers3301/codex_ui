@@ -1,8 +1,18 @@
 import fs from "node:fs/promises";
+import { createReadStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createInterface } from "node:readline";
 
 type JsonObject = Record<string, unknown>;
+
+export interface ThreadHistoryPage {
+  totalItems: number;
+  returnedItems: number;
+  before: number;
+  nextBefore: number;
+  hasOlder: boolean;
+}
 
 interface JsonlRecord {
   timestamp?: string;
@@ -21,7 +31,14 @@ interface FallbackTurn {
   durationMs: number | null;
 }
 
+function recordFromUnknown(value: unknown): JsonObject {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
+}
+
 const codexSessionsRoot = path.join(os.homedir(), ".codex", "sessions");
+const sessionPathIndexTtlMs = 15_000;
+let cachedSessionPathIndex: { root: string; expiresAt: number; paths: Map<string, string> } | null = null;
+let buildingSessionPathIndex: Promise<Map<string, string>> | null = null;
 
 function secondsFromIso(value: unknown): number | null {
   if (typeof value !== "string") {
@@ -73,6 +90,51 @@ function commandTextFromArguments(argumentsJson: unknown): string {
   return JSON.stringify(args, null, 2);
 }
 
+function normalizedSearchTerms(query: string): string[] {
+  return query
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function textMatchesSearch(text: string, query: string): boolean {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) {
+    return true;
+  }
+  const normalizedText = text.toLowerCase();
+  return normalizedText.includes(normalizedQuery) || normalizedSearchTerms(normalizedQuery).every((term) => normalizedText.includes(term));
+}
+
+function searchTextFromPayload(record: JsonlRecord): string {
+  const payload = record.payload ?? {};
+  if (record.type === "response_item") {
+    if (payload.type === "message") {
+      return shouldSkipMessage(payload) ? "" : textFromContent(payload.content);
+    }
+    if (payload.type === "function_call") {
+      return `${String(payload.name ?? "")}\n${commandTextFromArguments(payload.arguments)}`;
+    }
+    if (payload.type === "function_call_output") {
+      return typeof payload.output === "string" ? payload.output : JSON.stringify(payload.output ?? "");
+    }
+    if (payload.type === "reasoning" && Array.isArray(payload.summary)) {
+      return payload.summary.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join("\n");
+    }
+  }
+  if (record.type === "event_msg") {
+    if (payload.type === "user_message" && typeof payload.message === "string") {
+      const message = payload.message.trim();
+      return message.startsWith("<environment_context>") || message.startsWith("<app-context>") ? "" : message;
+    }
+    if (payload.type === "image_generation_end") {
+      return `${typeof payload.revised_prompt === "string" ? payload.revised_prompt : ""}\n${typeof payload.saved_path === "string" ? payload.saved_path : ""}`;
+    }
+  }
+  return "";
+}
+
 function getTurnId(payload: JsonObject, currentTurnId: string | null): string | null {
   const metadata = payload.internal_chat_message_metadata_passthrough;
   if (metadata && typeof metadata === "object" && "turn_id" in metadata) {
@@ -88,8 +150,16 @@ function shouldSkipMessage(payload: JsonObject): boolean {
   if (payload.role === "developer") {
     return true;
   }
-  const text = textFromContent(payload.content);
-  return payload.role === "user" && text.trim().startsWith("<environment_context>");
+  const text = textFromContent(payload.content).trim();
+  if (payload.role !== "user") {
+    return false;
+  }
+  return (
+    text.startsWith("<environment_context>") ||
+    text.startsWith("<recommended_plugins>") ||
+    text.startsWith("<permissions instructions>") ||
+    text.startsWith("<app-context>")
+  );
 }
 
 function appendResponseItem(turn: FallbackTurn, payload: JsonObject, nextId: () => string): void {
@@ -164,6 +234,113 @@ function isSafeCodexSessionPath(filePath: string, sessionsRoot = codexSessionsRo
   return resolved.startsWith(`${root}${path.sep}`) && resolved.endsWith(".jsonl");
 }
 
+function sessionIdFromJsonlFilename(name: string): string | null {
+  const match = name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+  return match?.[1] ?? null;
+}
+
+async function buildSessionPathIndex(sessionsRoot: string): Promise<Map<string, string>> {
+  const paths = new Map<string, string>();
+  async function walk(directory: string): Promise<void> {
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true }) as unknown as Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    } catch {
+      return;
+    }
+    await Promise.all(entries.map(async (entry) => {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await walk(target);
+      } else if (entry.isFile() && entry.name.endsWith(".jsonl") && isSafeCodexSessionPath(target, sessionsRoot)) {
+        const sessionId = sessionIdFromJsonlFilename(entry.name);
+        if (sessionId) {
+          paths.set(sessionId, target);
+        }
+      }
+    }));
+  }
+  await walk(sessionsRoot);
+  return paths;
+}
+
+async function getSessionPathIndex(sessionsRoot: string): Promise<Map<string, string>> {
+  const root = path.resolve(sessionsRoot);
+  if (cachedSessionPathIndex?.root === root && cachedSessionPathIndex.expiresAt > Date.now()) {
+    return cachedSessionPathIndex.paths;
+  }
+  if (!buildingSessionPathIndex) {
+    buildingSessionPathIndex = buildSessionPathIndex(root).finally(() => {
+      buildingSessionPathIndex = null;
+    });
+  }
+  const paths = await buildingSessionPathIndex;
+  cachedSessionPathIndex = { root, paths, expiresAt: Date.now() + sessionPathIndexTtlMs };
+  return paths;
+}
+
+/**
+ * Keep the browser payload bounded for long-running Codex sessions.  The cursor
+ * counts already-loaded items from the end of the conversation: `before = 0`
+ * returns the newest page, then `nextBefore` fetches the preceding page.
+ */
+export function paginateThreadPayload(
+  value: unknown,
+  before = 0,
+  limit = 120
+): { thread: JsonObject; history: ThreadHistoryPage } {
+  const root = recordFromUnknown(value);
+  const wrappedThread = recordFromUnknown(root.thread);
+  const thread = Object.keys(wrappedThread).length ? wrappedThread : root;
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  const normalizedBefore = Math.max(0, Math.floor(before));
+  const normalizedLimit = Math.max(1, Math.floor(limit));
+  const itemAddresses: Array<{ turnIndex: number; itemIndex: number }> = [];
+
+  turns.forEach((turnValue, turnIndex) => {
+    const items = Array.isArray(recordFromUnknown(turnValue).items) ? recordFromUnknown(turnValue).items as unknown[] : [];
+    items.forEach((_item, itemIndex) => itemAddresses.push({ turnIndex, itemIndex }));
+  });
+
+  const totalItems = itemAddresses.length;
+  const end = Math.max(0, totalItems - normalizedBefore);
+  const start = Math.max(0, end - normalizedLimit);
+  const selectedItemsByTurn = new Map<number, Set<number>>();
+  for (const address of itemAddresses.slice(start, end)) {
+    const selected = selectedItemsByTurn.get(address.turnIndex) ?? new Set<number>();
+    selected.add(address.itemIndex);
+    selectedItemsByTurn.set(address.turnIndex, selected);
+  }
+
+  const pageTurns: JsonObject[] = [];
+  turns.forEach((turnValue, turnIndex) => {
+    const selected = selectedItemsByTurn.get(turnIndex);
+    if (!selected?.size) {
+      return;
+    }
+    const turn = recordFromUnknown(turnValue);
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    pageTurns.push({
+      ...turn,
+      items: items.filter((_item, itemIndex) => selected.has(itemIndex))
+    });
+  });
+
+  return {
+    thread: {
+      ...thread,
+      turns: pageTurns
+    },
+    history: {
+      totalItems,
+      returnedItems: end - start,
+      before: normalizedBefore,
+      nextBefore: totalItems - start,
+      hasOlder: start > 0
+    }
+  };
+}
+
 export function threadJsonlPathFromError(error: unknown, sessionsRoot = codexSessionsRoot): string | null {
   const message = error instanceof Error ? error.message : String(error);
   const match = message.match(/failed to read thread ([^:]+\.jsonl):/);
@@ -172,6 +349,152 @@ export function threadJsonlPathFromError(error: unknown, sessionsRoot = codexSes
   }
   const filePath = match[1];
   return isSafeCodexSessionPath(filePath, sessionsRoot) ? filePath : null;
+}
+
+export async function findThreadJsonlPathById(threadId: string, sessionsRoot = codexSessionsRoot): Promise<string | null> {
+  const cleanThreadId = threadId.trim();
+  if (!cleanThreadId || !/^[a-zA-Z0-9_-]+$/.test(cleanThreadId)) {
+    return null;
+  }
+
+  const indexedPath = (await getSessionPathIndex(sessionsRoot)).get(cleanThreadId);
+  if (indexedPath && isSafeCodexSessionPath(indexedPath, sessionsRoot)) {
+    return indexedPath;
+  }
+
+  async function walk(directory: string): Promise<string | null> {
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true }) as unknown as Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    } catch {
+      return null;
+    }
+    entries.sort((left, right) => right.name.localeCompare(left.name));
+    for (const entry of entries) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        const found = await walk(target);
+        if (found) {
+          return found;
+        }
+      } else if (entry.isFile() && entry.name.endsWith(`${cleanThreadId}.jsonl`) && isSafeCodexSessionPath(target, sessionsRoot)) {
+        return target;
+      }
+    }
+    return null;
+  }
+
+  return walk(sessionsRoot);
+}
+
+/**
+ * Search an owned Codex session without constructing its full browser payload.
+ * This keeps large histories searchable while avoiding a full front-end render
+ * or an app-server thread/read request for every keystroke.
+ */
+export async function threadJsonlMatchesSearch(filePath: string, query: string, sessionsRoot = codexSessionsRoot): Promise<boolean> {
+  if (!isSafeCodexSessionPath(filePath, sessionsRoot)) {
+    return false;
+  }
+  if (!query.trim()) {
+    return true;
+  }
+
+  const input = createReadStream(filePath, { encoding: "utf8" });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        const record = JSON.parse(line) as JsonlRecord;
+        if (textMatchesSearch(searchTextFromPayload(record), query)) {
+          lines.close();
+          input.destroy();
+          return true;
+        }
+      } catch {
+        // A malformed historical line should not make the user's whole search fail.
+      }
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+  return false;
+}
+
+/** Read just enough metadata for a search result row; do not construct a full
+ * turns/items payload for a large historical conversation. */
+export async function readThreadSummaryFromJsonl(
+  filePath: string,
+  threadId: string,
+  sessionsRoot = codexSessionsRoot
+): Promise<JsonObject> {
+  if (!isSafeCodexSessionPath(filePath, sessionsRoot)) {
+    throw new Error("Refusing to read a thread outside the Codex sessions directory.");
+  }
+  const stat = await fs.stat(filePath);
+  const input = createReadStream(filePath, { encoding: "utf8" });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  let metadata: JsonObject | null = null;
+  let preview = "";
+
+  try {
+    for await (const line of lines) {
+      if (!line.trim()) {
+        continue;
+      }
+      try {
+        const record = JSON.parse(line) as JsonlRecord;
+        const payload = record.payload ?? {};
+        if (record.type === "session_meta") {
+          metadata = payload;
+          continue;
+        }
+        if (!preview && record.type === "event_msg" && payload.type === "user_message" && typeof payload.message === "string") {
+          const message = payload.message.trim();
+          if (!message.startsWith("<environment_context>") && !message.startsWith("<app-context>")) {
+            preview = message;
+          }
+        }
+        if (!preview && record.type === "response_item" && payload.type === "message" && payload.role === "user" && !shouldSkipMessage(payload)) {
+          preview = textFromContent(payload.content).trim();
+        }
+        if (metadata && preview) {
+          lines.close();
+          input.destroy();
+          break;
+        }
+      } catch {
+        // Ignore a malformed historical record and retain a usable search row.
+      }
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+
+  if (!metadata) {
+    throw new Error("Codex JSONL thread is missing session metadata.");
+  }
+  const createdAt = secondsFromIso(metadata.timestamp) ?? Math.floor(stat.birthtimeMs / 1000) ?? Math.floor(stat.mtimeMs / 1000);
+  const updatedAt = Math.floor(stat.mtimeMs / 1000);
+  const name = preview ? preview.split(/\r?\n/)[0].slice(0, 80) : null;
+  return {
+    id: typeof metadata.id === "string" ? metadata.id : threadId,
+    sessionId: typeof metadata.session_id === "string" ? metadata.session_id : typeof metadata.id === "string" ? metadata.id : threadId,
+    preview,
+    name,
+    ephemeral: false,
+    modelProvider: metadata.model_provider ?? null,
+    createdAt,
+    updatedAt,
+    status: { type: "recoveredFromJsonl" },
+    cwd: metadata.cwd,
+    turns: []
+  };
 }
 
 export async function readThreadFromJsonl(
@@ -247,6 +570,20 @@ export async function readThreadFromJsonl(
       }
       if (payload.type === "user_message" && typeof payload.message === "string" && !preview) {
         preview = payload.message.trim();
+      }
+      if (payload.type === "image_generation_end" && currentTurnId) {
+        const turn = ensureTurn(currentTurnId);
+        const savedPath = typeof payload.saved_path === "string" ? payload.saved_path : "";
+        const status = typeof payload.status === "string" ? payload.status : "completed";
+        turn.items.push({
+          type: "imageGeneration",
+          id: nextId(),
+          text: "已生成图片。",
+          savedPath: savedPath || undefined,
+          imagePath: savedPath || undefined,
+          status,
+          revisedPrompt: typeof payload.revised_prompt === "string" ? payload.revised_prompt : undefined
+        });
       }
       continue;
     }

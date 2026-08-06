@@ -1,6 +1,6 @@
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type ApprovalPolicy = "untrusted" | "on-request" | "never";
-export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export interface UserProfile {
   id: string;
@@ -39,6 +39,25 @@ export interface UpdateProjectInput {
   defaultReasoningEffort?: ReasoningEffort;
   defaultSandbox?: SandboxMode;
   defaultApprovalPolicy?: ApprovalPolicy;
+}
+
+export interface LocalSendSettings {
+  sshHost: string;
+  sshPort: number;
+  sshUser: string;
+  destinationPath: string;
+  identityFile: string;
+  outputPath: string;
+  updatedAt: string | null;
+}
+
+export interface UpdateLocalSendSettingsInput {
+  sshHost?: string;
+  sshPort?: number;
+  sshUser?: string;
+  destinationPath?: string;
+  identityFile?: string;
+  outputPath?: string;
 }
 
 export interface RpcEnvelope {

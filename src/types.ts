@@ -1,6 +1,149 @@
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type ApprovalPolicy = "untrusted" | "on-request" | "never";
-export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+
+export interface ModelProfile {
+  id: string;
+  label: string;
+  model: string;
+  effort: ReasoningEffort;
+  displayName?: string;
+  priority?: number;
+}
+
+export interface CodexRateLimitWindow {
+  usedPercent: number | null;
+  windowDurationMins: number | null;
+  resetsAt: number | null;
+}
+
+export interface CodexRateLimitSnapshot {
+  limitId: string | null;
+  limitName: string | null;
+  primary: CodexRateLimitWindow | null;
+  secondary: CodexRateLimitWindow | null;
+  credits: { hasCredits: boolean | null; unlimited: boolean | null; balance: string | null } | null;
+  individualLimit: { limit: string | null; used: string | null; remainingPercent: number | null; resetsAt: number | null } | null;
+  planType: string | null;
+  rateLimitReachedType: string | null;
+}
+
+export interface CodexQuota {
+  account: { type: string | null; planType: string | null } | null;
+  rateLimits: CodexRateLimitSnapshot | null;
+  rateLimitsByLimitId: Record<string, CodexRateLimitSnapshot>;
+  resetCredits: { availableCount: number | null } | null;
+  usage: {
+    summary: {
+      lifetimeTokens: number | null;
+      peakDailyTokens: number | null;
+      longestRunningTurnSec: number | null;
+      currentStreakDays: number | null;
+      longestStreakDays: number | null;
+    } | null;
+    dailyUsageBuckets: Array<{ startDate: string; tokens: number | null }>;
+  } | null;
+  errors: string[];
+  updatedAt: string;
+}
+
+export interface CodexTokenBreakdown {
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+}
+
+export interface CodexLeaderboardModelUsage extends CodexTokenBreakdown {
+  model: string;
+  effort: string | null;
+  sessionCount: number;
+}
+
+export interface CodexLeaderboardUserUsage extends CodexTokenBreakdown {
+  userId: string;
+  sharePercent: number;
+  quotaPercent: number | null;
+  sessionCount: number;
+  models: CodexLeaderboardModelUsage[];
+}
+
+export interface CodexLeaderboardScope {
+  totalTokens: number;
+  resetAt: number | null;
+  quotaUsedPercent: number | null;
+  users: CodexLeaderboardUserUsage[];
+}
+
+export interface CodexLeaderboard {
+  currentCycle: CodexLeaderboardScope;
+  lifetime: CodexLeaderboardScope;
+  updatedAt: string;
+  errors: string[];
+}
+
+export interface CodexSkill {
+  name: string;
+  displayName: string;
+  shortDescription: string | null;
+  description: string;
+  scope: string | null;
+  enabled: boolean;
+  defaultPrompt: string | null;
+}
+
+export interface CodexSkillsResponse {
+  data: CodexSkill[];
+  errors: Array<{ cwd: string; path: string; message: string }>;
+}
+
+
+export interface LocalSendSettings {
+  sshHost: string;
+  sshPort: number;
+  sshUser: string;
+  destinationPath: string;
+  identityFile: string;
+  outputPath: string;
+  updatedAt: string | null;
+}
+
+export interface LocalSendTestResult {
+  sshHost: string;
+  sshUser: string;
+  sshPort: number;
+  destinationPath: string;
+}
+
+export interface LocalSendResult {
+  sourcePath: string;
+  relativePath: string;
+  name: string;
+  size: number;
+  sshHost: string;
+  sshUser: string;
+  sshPort: number;
+  destinationPath: string;
+  remoteFile: string;
+  stdout?: string;
+  stderr?: string;
+}
+
+export type ThreadExportFormat = "markdown" | "json";
+
+export interface ThreadExportResult {
+  name: string;
+  path: string;
+  relativePath: string;
+  size: number;
+  mime: string;
+  rawUrl: string;
+  format: ThreadExportFormat;
+  outputPath: string;
+  sentLocal?: LocalSendResult;
+}
 
 export interface UserProfile {
   id: string;
@@ -88,6 +231,15 @@ export type ThreadItem = {
 
 export interface ThreadReadResponse {
   thread: ThreadSummary;
+  history?: ThreadHistoryPage;
+}
+
+export interface ThreadHistoryPage {
+  totalItems: number;
+  returnedItems: number;
+  before: number;
+  nextBefore: number;
+  hasOlder: boolean;
 }
 
 export interface ThreadListResponse {
@@ -127,7 +279,6 @@ export interface LiveTurnState {
 }
 
 export interface LiveStateSnapshot {
-  threadId: string | null;
   agentMessages: LiveAgentMessage[];
   activeTurns: LiveTurnState[];
   updatedAt: string | null;
@@ -140,6 +291,7 @@ export interface ProjectFile {
   size: number;
   mime: string;
   rawUrl: string;
+  uploadDir?: string;
 }
 
 export interface ProjectFilePreview extends ProjectFile {

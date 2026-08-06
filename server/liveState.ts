@@ -20,7 +20,6 @@ export interface LiveTurnState {
 }
 
 export interface LiveStateSnapshot {
-  threadId: string | null;
   agentMessages: LiveAgentMessage[];
   activeTurns: LiveTurnState[];
   updatedAt: string | null;
@@ -74,15 +73,14 @@ export class LiveStateStore {
   }
 
   snapshot(threadId?: string | null): LiveStateSnapshot {
-    const messages = Array.from(this.agentMessages.values());
-    const turns = Array.from(this.activeTurns.values());
+    const matchesRequestedThread = <T extends { threadId: string | null }>(entry: T): boolean =>
+      threadId === undefined || entry.threadId === threadId;
     return {
-      threadId: threadId ?? null,
-      agentMessages: messages
-        .filter((message) => threadId === undefined || (threadId !== null && message.threadId === threadId))
+      agentMessages: Array.from(this.agentMessages.values())
+        .filter(matchesRequestedThread)
         .map((message) => ({ ...message })),
-      activeTurns: turns
-        .filter((turn) => threadId === undefined || (threadId !== null && turn.threadId === threadId))
+      activeTurns: Array.from(this.activeTurns.values())
+        .filter(matchesRequestedThread)
         .map((turn) => ({ ...turn })),
       updatedAt: this.updatedAt
     };

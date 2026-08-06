@@ -122,7 +122,8 @@ export function resolveProjectFilePath(
   }
 
   const filePath = fs.existsSync(candidate) ? fs.realpathSync(candidate) : candidate;
-  if (!isInsideRoot(filePath, rootPath)) {
+  const insideRoot = isInsideRoot(filePath, rootPath);
+  if (!insideRoot) {
     throw new PathPolicyError("File path must stay inside the selected project.");
   }
 

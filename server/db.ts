@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { defaults, serverConfig } from "./config.js";
-import type { CreateProjectInput, Project, UpdateProjectInput, UserProfile } from "./types.js";
+import type { CreateProjectInput, LocalSendSettings, Project, UpdateLocalSendSettingsInput, UpdateProjectInput, UserProfile } from "./types.js";
 
 export const ADMIN_USER_ID = "admin";
 export const DEFAULT_USER_ID = ADMIN_USER_ID;
@@ -28,6 +28,52 @@ type UserRow = {
   updated_at: string;
 };
 
+type UserSettingsRow = {
+  user_id: string;
+  local_ssh_host: string;
+  local_ssh_port: number;
+  local_ssh_user: string;
+  local_send_path: string;
+  local_ssh_identity_file: string;
+  local_output_path: string;
+  created_at?: string;
+  updated_at: string;
+};
+
+type ThreadOwnerRow = {
+  thread_id: string;
+  user_id: string;
+  project_id: string;
+  root_path: string;
+  created_at: string;
+  updated_at: string;
+};
+
+type UnusedThreadRow = {
+  thread_id: string;
+  user_id: string;
+  project_id: string;
+  root_path: string;
+  deleted_at: string;
+};
+
+export interface ThreadOwner {
+  threadId: string;
+  userId: string;
+  projectId: string;
+  rootPath: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UnusedThread {
+  threadId: string;
+  userId: string;
+  projectId: string;
+  rootPath: string;
+  deletedAt: string;
+}
+
 function toProject(row: ProjectRow): Project {
   return {
     id: row.id,
@@ -49,6 +95,54 @@ function toUser(row: UserRow): UserProfile {
     name: row.name,
     createdAt: row.created_at,
     updatedAt: row.updated_at
+  };
+}
+
+function emptyLocalSendSettings(): LocalSendSettings {
+  return {
+    sshHost: "",
+    sshPort: 22,
+    sshUser: "",
+    destinationPath: "",
+    identityFile: "",
+    outputPath: "/tmp/codex_remote_exports",
+    updatedAt: null
+  };
+}
+
+function toLocalSendSettings(row: UserSettingsRow | undefined): LocalSendSettings {
+  if (!row) {
+    return emptyLocalSendSettings();
+  }
+  return {
+    sshHost: row.local_ssh_host ?? "",
+    sshPort: Number(row.local_ssh_port) || 22,
+    sshUser: row.local_ssh_user ?? "",
+    destinationPath: row.local_send_path ?? "",
+    identityFile: row.local_ssh_identity_file ?? "",
+    outputPath: row.local_output_path ?? "/tmp/codex_remote_exports",
+    updatedAt: row.updated_at ?? null
+  };
+}
+
+function toThreadOwner(row: ThreadOwnerRow): ThreadOwner {
+  return {
+    threadId: row.thread_id,
+    userId: row.user_id,
+    projectId: row.project_id,
+    rootPath: row.root_path,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function toUnusedThread(row: UnusedThreadRow): UnusedThread {
+  return {
+    threadId: row.thread_id,
+    userId: row.user_id,
+    projectId: row.project_id,
+    rootPath: row.root_path,
+    deletedAt: row.deleted_at
   };
 }
 
@@ -75,6 +169,40 @@ export class ProjectStore {
     return row ? toUser(row) : null;
   }
 
+  ensureUser(id: string, name = id): UserProfile {
+    const cleanId = id.trim();
+    const cleanName = (name.trim() || cleanId).trim();
+    if (!cleanId) {
+      throw new Error("User id is required.");
+    }
+
+    const now = new Date().toISOString();
+    const existing = this.getUser(cleanId);
+    if (!existing) {
+      this.db
+        .prepare("INSERT INTO users (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)")
+        .run(cleanId, cleanName, now, now);
+    } else if (existing.name !== cleanName) {
+      this.db.prepare("UPDATE users SET name = ?, updated_at = ? WHERE id = ?").run(cleanName, now, cleanId);
+    }
+
+    const duplicateRows = this.db
+      .prepare("SELECT * FROM users WHERE name = ? AND id <> ?")
+      .all(cleanName, cleanId) as UserRow[];
+    for (const duplicate of duplicateRows) {
+      // Preserve projects and thread ownerships that were created before login names became locked to user ids.
+      this.db.prepare("UPDATE OR IGNORE projects SET user_id = ? WHERE user_id = ?").run(cleanId, duplicate.id);
+      this.db.prepare("UPDATE OR IGNORE thread_owners SET user_id = ? WHERE user_id = ?").run(cleanId, duplicate.id);
+      this.db.prepare("UPDATE OR IGNORE unuse SET user_id = ? WHERE user_id = ?").run(cleanId, duplicate.id);
+      this.db.prepare("DELETE FROM unuse WHERE user_id = ?").run(duplicate.id);
+      this.db.prepare("DELETE FROM thread_owners WHERE user_id = ?").run(duplicate.id);
+      this.db.prepare("DELETE FROM projects WHERE user_id = ?").run(duplicate.id);
+      this.db.prepare("DELETE FROM users WHERE id = ?").run(duplicate.id);
+    }
+
+    return this.getUser(cleanId) ?? { id: cleanId, name: cleanName, createdAt: now, updatedAt: now };
+  }
+
   createUser(name: string): UserProfile {
     const now = new Date().toISOString();
     const user: UserProfile = {
@@ -98,9 +226,50 @@ export class ProjectStore {
       return false;
     }
 
+    this.db.prepare("DELETE FROM unuse WHERE user_id = ?").run(id);
+    this.db.prepare("DELETE FROM thread_owners WHERE user_id = ?").run(id);
     this.db.prepare("DELETE FROM projects WHERE user_id = ?").run(id);
     const result = this.db.prepare("DELETE FROM users WHERE id = ?").run(id);
     return result.changes > 0;
+  }
+
+  getLocalSendSettings(userId = DEFAULT_USER_ID): LocalSendSettings {
+    const row = this.db.prepare("SELECT * FROM user_settings WHERE user_id = ?").get(userId) as UserSettingsRow | undefined;
+    return toLocalSendSettings(row);
+  }
+
+  updateLocalSendSettings(userId = DEFAULT_USER_ID, input: UpdateLocalSendSettingsInput): LocalSendSettings {
+    this.ensureUser(userId, userId);
+    const current = this.getLocalSendSettings(userId);
+    const now = new Date().toISOString();
+    const existingSettingsRow = this.db.prepare("SELECT created_at FROM user_settings WHERE user_id = ?").get(userId) as { created_at?: string } | undefined;
+    const createdAt = existingSettingsRow?.created_at || now;
+    const next: LocalSendSettings = {
+      sshHost: input.sshHost?.trim() ?? current.sshHost,
+      sshPort: input.sshPort && Number.isFinite(input.sshPort) ? Math.trunc(input.sshPort) : current.sshPort || 22,
+      sshUser: input.sshUser?.trim() ?? current.sshUser,
+      destinationPath: input.destinationPath?.trim() ?? current.destinationPath,
+      identityFile: input.identityFile?.trim() ?? current.identityFile,
+      outputPath: input.outputPath?.trim() ?? current.outputPath,
+      updatedAt: now
+    };
+    this.db
+      .prepare(
+        `INSERT INTO user_settings (
+          user_id, local_ssh_host, local_ssh_port, local_ssh_user,
+          local_send_path, local_ssh_identity_file, local_output_path, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          local_ssh_host = excluded.local_ssh_host,
+          local_ssh_port = excluded.local_ssh_port,
+          local_ssh_user = excluded.local_ssh_user,
+          local_send_path = excluded.local_send_path,
+          local_ssh_identity_file = excluded.local_ssh_identity_file,
+          local_output_path = excluded.local_output_path,
+          updated_at = excluded.updated_at`
+      )
+      .run(userId, next.sshHost, next.sshPort, next.sshUser, next.destinationPath, next.identityFile, next.outputPath, createdAt, now);
+    return this.getLocalSendSettings(userId);
   }
 
   listProjects(userId = DEFAULT_USER_ID): Project[] {
@@ -200,8 +369,124 @@ export class ProjectStore {
   }
 
   deleteProject(id: string, userId = DEFAULT_USER_ID): boolean {
+    this.db.prepare("DELETE FROM unuse WHERE project_id = ? AND user_id = ?").run(id, userId);
+    this.db.prepare("DELETE FROM thread_owners WHERE project_id = ? AND user_id = ?").run(id, userId);
     const result = this.db.prepare("DELETE FROM projects WHERE id = ? AND user_id = ?").run(id, userId);
     return result.changes > 0;
+  }
+
+  registerThreadOwner(input: { threadId: string; userId: string; projectId: string; rootPath: string }): ThreadOwner {
+    const threadId = input.threadId.trim();
+    const userId = input.userId.trim();
+    const projectId = input.projectId.trim();
+    const rootPath = input.rootPath;
+    if (!threadId || !userId || !projectId || !rootPath) {
+      throw new Error("Thread ownership requires threadId, userId, projectId, and rootPath.");
+    }
+    const existing = this.getThreadOwner(threadId);
+    if (existing && (existing.userId !== userId || existing.projectId !== projectId)) {
+      throw new Error("Thread is already owned by another user or project.");
+    }
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO thread_owners (thread_id, user_id, project_id, root_path, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET updated_at = excluded.updated_at`
+      )
+      .run(threadId, userId, projectId, rootPath, now, now);
+    return this.getThreadOwner(threadId) ?? { threadId, userId, projectId, rootPath, createdAt: now, updatedAt: now };
+  }
+
+  touchThreadOwner(threadId: string): void {
+    const cleanThreadId = threadId.trim();
+    if (cleanThreadId) {
+      this.db.prepare("UPDATE thread_owners SET updated_at = ? WHERE thread_id = ?").run(new Date().toISOString(), cleanThreadId);
+    }
+  }
+
+  getThreadOwner(threadId: string): ThreadOwner | null {
+    const cleanThreadId = threadId.trim();
+    if (!cleanThreadId) {
+      return null;
+    }
+    const row = this.db.prepare("SELECT * FROM thread_owners WHERE thread_id = ?").get(cleanThreadId) as ThreadOwnerRow | undefined;
+    return row ? toThreadOwner(row) : null;
+  }
+
+  userCanAccessThread(threadId: string, userId: string, projectId?: string): boolean {
+    const owner = this.getThreadOwner(threadId);
+    if (!owner || owner.userId !== userId) {
+      return false;
+    }
+    if (projectId && owner.projectId !== projectId) {
+      return false;
+    }
+    return !this.isThreadUnused(threadId, userId);
+  }
+
+  softDeleteThread(threadId: string, userId: string, projectId: string, allowAnyOwnedProject = false): UnusedThread | null {
+    const cleanThreadId = threadId.trim();
+    const owner = this.getThreadOwner(cleanThreadId);
+    if (!owner || owner.userId !== userId || (!allowAnyOwnedProject && owner.projectId !== projectId)) {
+      return null;
+    }
+    const deletedAt = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO unuse (thread_id, user_id, project_id, root_path, deleted_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(thread_id, user_id) DO UPDATE SET
+           project_id = excluded.project_id,
+           root_path = excluded.root_path,
+           deleted_at = excluded.deleted_at`
+      )
+      .run(cleanThreadId, userId, owner.projectId, owner.rootPath, deletedAt);
+    return this.getUnusedThread(cleanThreadId, userId);
+  }
+
+  restoreThreadFromUnused(threadId: string, userId: string): void {
+    const cleanThreadId = threadId.trim();
+    if (!cleanThreadId) {
+      return;
+    }
+    this.db.prepare("DELETE FROM unuse WHERE thread_id = ? AND user_id = ?").run(cleanThreadId, userId);
+  }
+
+  getUnusedThread(threadId: string, userId: string): UnusedThread | null {
+    const row = this.db
+      .prepare("SELECT * FROM unuse WHERE thread_id = ? AND user_id = ?")
+      .get(threadId.trim(), userId) as UnusedThreadRow | undefined;
+    return row ? toUnusedThread(row) : null;
+  }
+
+  isThreadUnused(threadId: string, userId: string): boolean {
+    return this.getUnusedThread(threadId, userId) !== null;
+  }
+
+  ownedThreadIds(userId: string, projectId?: string): Set<string> {
+    const rows = projectId
+      ? (this.db
+          .prepare(
+            `SELECT thread_id FROM thread_owners
+             WHERE user_id = ? AND project_id = ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM unuse
+                 WHERE unuse.thread_id = thread_owners.thread_id AND unuse.user_id = thread_owners.user_id
+               )`
+          )
+          .all(userId, projectId) as Array<{ thread_id: string }>)
+      : (this.db
+          .prepare(
+            `SELECT thread_id FROM thread_owners
+             WHERE user_id = ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM unuse
+                 WHERE unuse.thread_id = thread_owners.thread_id AND unuse.user_id = thread_owners.user_id
+               )`
+          )
+          .all(userId) as Array<{ thread_id: string }>);
+    return new Set(rows.map((row) => row.thread_id));
   }
 
   private migrate(): void {
@@ -214,7 +499,10 @@ export class ProjectStore {
       );
     `);
     this.ensureAdminUser();
+    this.createUserSettingsTable();
     this.migrateProjectsTable();
+    this.createThreadOwnersTable();
+    this.createUnuseTable();
   }
 
   private ensureAdminUser(): void {
@@ -286,6 +574,84 @@ export class ProjectStore {
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_projects_user_updated_at ON projects(user_id, updated_at);
+    `);
+  }
+
+  private createUserSettingsTable(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS user_settings (
+        user_id TEXT PRIMARY KEY,
+        local_ssh_host TEXT NOT NULL DEFAULT '',
+        local_ssh_port INTEGER NOT NULL DEFAULT 22,
+        local_ssh_user TEXT NOT NULL DEFAULT '',
+        local_send_path TEXT NOT NULL DEFAULT '',
+        local_ssh_identity_file TEXT NOT NULL DEFAULT '',
+        local_output_path TEXT NOT NULL DEFAULT '/tmp/codex_remote_exports',
+        created_at TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+    `);
+    let columns = this.db.prepare("PRAGMA table_info(user_settings)").all() as Array<{ name: string }>;
+    const hasColumn = (name: string) => columns.some((column) => column.name === name);
+    const addColumn = (name: string, sql: string) => {
+      if (!hasColumn(name)) {
+        this.db.prepare(sql).run();
+        columns = this.db.prepare("PRAGMA table_info(user_settings)").all() as Array<{ name: string }>;
+      }
+    };
+    addColumn("local_ssh_host", "ALTER TABLE user_settings ADD COLUMN local_ssh_host TEXT NOT NULL DEFAULT ''");
+    addColumn("local_ssh_port", "ALTER TABLE user_settings ADD COLUMN local_ssh_port INTEGER NOT NULL DEFAULT 22");
+    addColumn("local_ssh_user", "ALTER TABLE user_settings ADD COLUMN local_ssh_user TEXT NOT NULL DEFAULT ''");
+    addColumn("local_send_path", "ALTER TABLE user_settings ADD COLUMN local_send_path TEXT NOT NULL DEFAULT ''");
+    addColumn("local_ssh_identity_file", "ALTER TABLE user_settings ADD COLUMN local_ssh_identity_file TEXT NOT NULL DEFAULT ''");
+    addColumn("local_output_path", "ALTER TABLE user_settings ADD COLUMN local_output_path TEXT NOT NULL DEFAULT '/tmp/codex_remote_exports'");
+    addColumn("created_at", "ALTER TABLE user_settings ADD COLUMN created_at TEXT NOT NULL DEFAULT ''");
+
+    const finalColumns = this.db.prepare("PRAGMA table_info(user_settings)").all() as Array<{ name: string }>;
+    const finalHas = (name: string) => finalColumns.some((column) => column.name === name);
+    if (finalHas("ssh_port")) {
+      this.db.prepare("UPDATE user_settings SET local_ssh_port = ssh_port WHERE local_ssh_port = 22 AND ssh_port IS NOT NULL").run();
+    }
+    if (finalHas("ssh_destination_path")) {
+      this.db.prepare("UPDATE user_settings SET local_send_path = ssh_destination_path WHERE local_send_path = '' AND ssh_destination_path IS NOT NULL AND ssh_destination_path <> ''").run();
+    }
+    if (finalHas("ssh_target")) {
+      this.db.prepare("UPDATE user_settings SET local_ssh_host = ssh_target WHERE local_ssh_host = '' AND ssh_target IS NOT NULL AND ssh_target <> '' AND instr(ssh_target, '@') = 0").run();
+      this.db.prepare("UPDATE user_settings SET local_ssh_user = substr(ssh_target, 1, instr(ssh_target, '@') - 1), local_ssh_host = substr(ssh_target, instr(ssh_target, '@') + 1) WHERE local_ssh_host = '' AND ssh_target IS NOT NULL AND instr(ssh_target, '@') > 1").run();
+    }
+  }
+
+  private createThreadOwnersTable(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS thread_owners (
+        thread_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        root_path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_thread_owners_user_project_updated_at ON thread_owners(user_id, project_id, updated_at);
+    `);
+  }
+
+  private createUnuseTable(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS unuse (
+        thread_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        root_path TEXT NOT NULL,
+        deleted_at TEXT NOT NULL,
+        PRIMARY KEY(thread_id, user_id),
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(thread_id) REFERENCES thread_owners(thread_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_unuse_user_project_deleted_at ON unuse(user_id, project_id, deleted_at);
     `);
   }
 
