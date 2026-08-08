@@ -9,7 +9,7 @@ import { z } from "zod";
 import type { CodexBridge } from "./codexBridge.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
 import { defaults, serverConfig } from "./config.js";
-import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
+import { DEFAULT_USER_ID, type ProjectStore, type ThreadPresentation } from "./db.js";
 import { listBrowsableDirectories } from "./directoryBrowser.js";
 import { ensureProjectDirectory, PathPolicyError, resolveProjectFilePath, resolveProjectPath } from "./pathPolicy.js";
 import { findThreadJsonlPathById, paginateThreadPayload, readThreadFromJsonl, readThreadSummaryFromJsonl, threadJsonlMatchesSearch, threadJsonlPathFromError } from "./threadFallback.js";
@@ -125,7 +125,6 @@ const sendLocalFileSchema = z.object({
 const threadExportSchema = z.object({
   format: z.enum(["markdown", "json"]).optional().default("markdown"),
   sendLocal: z.boolean().optional().default(false),
-  outputPath: z.string().max(2048).optional(),
   destinationPath: z.string().max(2048).optional()
 });
 
@@ -133,6 +132,23 @@ const threadReadQuerySchema = z.object({
   projectId: z.string().optional(),
   before: z.coerce.number().int().min(0).optional().default(0),
   limit: z.coerce.number().int().min(1).max(maxThreadHistoryPageSize).optional().default(defaultThreadHistoryPageSize)
+});
+
+const threadPresentationSchema = z.object({
+  pinned: z.boolean()
+});
+
+const threadModelProfileSchema = z.object({
+  model: z.string().trim().min(1).max(128),
+  reasoningEffort: effortSchema
+}).strict();
+
+const threadOrderSchema = z.object({
+  threadIds: z.array(z.string().trim().min(1).max(256)).min(1).max(500)
+}).superRefine((value, context) => {
+  if (new Set(value.threadIds).size !== value.threadIds.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "threadIds must not contain duplicates" });
+  }
 });
 
 const fallbackCodexModels: Array<{
@@ -945,8 +961,28 @@ function timestampSegment(date = new Date()): string {
   ].join("_");
 }
 
-function uploadBatchDirectory(username: string): string {
-  return path.join(uploadRoot, safeFolderSegment(username, "anonymous"), timestampSegment());
+function ensureProjectArtifactRoot(projectRoot: string): string {
+  const artifactRoot = path.join(projectRoot, ".codex-web");
+  fs.mkdirSync(artifactRoot, { recursive: true, mode: 0o700 });
+  const ignorePath = path.join(artifactRoot, ".gitignore");
+  try {
+    // Protect uploaded files and exported conversation records from a normal
+    // `git add .` in the selected project without modifying user files that
+    // already provide their own nested ignore rules.
+    fs.writeFileSync(ignorePath, "uploads/\nexports/\n", { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) {
+      throw error;
+    }
+  }
+  return artifactRoot;
+}
+
+function uploadBatchDirectory(projectRoot: string, username: string): string {
+  // Keep user uploads under the selected project. This lets the normal file
+  // policy protect previews, raw downloads and SSH delivery without allowing
+  // arbitrary reads from a shared temporary directory.
+  return path.join(ensureProjectArtifactRoot(projectRoot), "uploads", safeFolderSegment(username, "anonymous"), timestampSegment());
 }
 
 function uniqueUploadTarget(projectRoot: string, batchDirectory: string, filename: string): { filePath: string; relativePath: string } {
@@ -959,10 +995,7 @@ function uniqueUploadTarget(projectRoot: string, batchDirectory: string, filenam
     if (!candidate.startsWith(`${root}${path.sep}`)) {
       throw new Error("Invalid upload filename.");
     }
-    const target = resolveProjectFilePath(projectRoot, candidate, {
-      mustExist: false,
-      allowOutsideRoot: true
-    });
+    const target = resolveProjectFilePath(projectRoot, candidate, { mustExist: false });
     if (!fs.existsSync(target.filePath)) {
       return target;
     }
@@ -1014,20 +1047,28 @@ function cleanSshScalar(value: string, label: string): string {
   return cleaned;
 }
 
+function defaultSshUserForWebUser(userId: string): string {
+  const candidate = userId.trim();
+  return candidate && !candidate.startsWith("-") && !/[\s@]/.test(candidate) ? candidate : "";
+}
+
 function settingsForCurrentAccessDevice(
   settings: ReturnType<ProjectStore["getLocalSendSettings"]>,
-  request: { headers: Record<string, unknown>; ip?: string }
+  request: { headers: Record<string, unknown>; ip?: string },
+  userId: string
 ): ReturnType<ProjectStore["getLocalSendSettings"]> {
   const savedHost = cleanSshScalar(settings.sshHost, "当前访问设备 SSH 地址");
-  // A user-provided SSH address is deliberate (often a ZeroTier address or a
-  // hostname).  It must win over the browser source IP so saved settings are
-  // actually used for every transfer.  The source IP remains a convenience
-  // fallback only when the user intentionally leaves the setting blank.
-  if (savedHost) {
-    return settings;
-  }
-  const detected = cleanSshScalar(requestClientHost(request), "当前访问设备 IP");
-  return detected ? { ...settings, sshHost: detected } : settings;
+  const savedUser = cleanSshScalar(settings.sshUser, "SSH 用户");
+  const savedDestinationPath = cleanSshScalar(settings.destinationPath, "访问设备保存目录");
+  // A user-provided SSH address or hostname is deliberate. It wins over the
+  // browser source IP, which is only a convenience fallback for an empty host.
+  const detected = savedHost ? "" : cleanSshScalar(requestClientHost(request), "当前访问设备 IP");
+  return {
+    ...settings,
+    sshHost: savedHost || detected,
+    sshUser: savedUser || defaultSshUserForWebUser(userId),
+    destinationPath: savedDestinationPath || "Downloads"
+  };
 }
 
 function validateLocalSendSettings(settings: ReturnType<ProjectStore["getLocalSendSettings"]>, destinationPathOverride?: string) {
@@ -1036,8 +1077,13 @@ function validateLocalSendSettings(settings: ReturnType<ProjectStore["getLocalSe
   const destinationPath = cleanSshScalar(destinationPathOverride ?? settings.destinationPath, "访问设备保存目录");
   const identityFile = cleanSshScalar(settings.identityFile, "私钥路径");
   const sshPort = Math.trunc(settings.sshPort || 22);
-  if (!sshHost || !sshUser || !destinationPath) {
-    throw new Error("请先在设置里填写 SSH 用户名和访问设备保存目录；SSH 地址留空时才使用当前浏览器来源 IP。");
+  const missing = [
+    !sshHost ? "当前访问设备 SSH 地址（或浏览器来源 IP）" : "",
+    !sshUser ? "SSH 用户名" : "",
+    !destinationPath ? "访问设备保存目录" : ""
+  ].filter(Boolean);
+  if (missing.length) {
+    throw new Error(`请先在设置中填写：${missing.join("、")}。`);
   }
   if (sshHost.startsWith("-") || /\s/.test(sshHost)) {
     throw new Error("当前访问设备 SSH 地址格式不正确。");
@@ -1128,12 +1174,10 @@ async function sendFileToLocalViaSsh(settings: ReturnType<ProjectStore["getLocal
   };
 }
 
-function validateServerOutputPath(value: string | undefined, settings: ReturnType<ProjectStore["getLocalSendSettings"]>): string {
-  const outputPath = cleanSshScalar(value?.trim() || settings.outputPath || "/tmp/codex_remote_exports", "服务端临时中转目录");
-  if (!outputPath) {
-    throw new Error("请先在设置里填写服务端临时中转目录。");
-  }
-  return resolveProjectPath(expandHomePath(outputPath), serverConfig.projectRoot, { allowOutsideRoot: true });
+function projectExportOutputPath(projectRoot: string): string {
+  // Keep transcript exports in the same ignored, project-contained artifact
+  // area as uploads. This preserves preview and SSH delivery boundaries.
+  return path.join(ensureProjectArtifactRoot(projectRoot), "exports");
 }
 
 function exportFileName(thread: Record<string, unknown>, threadId: string, format: "markdown" | "json"): string {
@@ -1331,6 +1375,64 @@ function itemMatchesSearch(item: unknown, query: string): boolean {
 function listItemUpdatedAt(item: unknown): number {
   const record = asRecord(item);
   return numberOrNull(record.updatedAt) ?? numberOrNull(record.updated_at) ?? numberOrNull(record.recencyAt) ?? 0;
+}
+
+function resolvedThreadModelPresentation(
+  store: ProjectStore,
+  userId: string,
+  threadId: string,
+  presentation: ThreadPresentation | undefined
+): { model: string; reasoningEffort: ReasoningEffort } {
+  const owner = store.getThreadOwner(threadId);
+  const ownerProject = owner?.userId === userId ? store.getProject(owner.projectId, userId) : null;
+  return {
+    model: presentation?.model ?? ownerProject?.defaultModel ?? defaults.model,
+    reasoningEffort: presentation?.reasoningEffort ?? ownerProject?.defaultReasoningEffort ?? defaults.reasoningEffort
+  };
+}
+
+function sortThreadsForUser(store: ProjectStore, userId: string, items: unknown[]): unknown[] {
+  const preferences = store.getThreadPresentation(
+    userId,
+    items.map(threadIdFromListItem).filter((threadId): threadId is string => Boolean(threadId))
+  );
+  return items
+    .map((item, index) => {
+      const threadId = threadIdFromListItem(item);
+      const presentation = threadId ? preferences.get(threadId) : undefined;
+      const modelPresentation = threadId ? resolvedThreadModelPresentation(store, userId, threadId, presentation) : null;
+      const record = asRecord(item);
+      return {
+        item: threadId
+          ? {
+              ...record,
+              pinned: presentation?.pinned === true,
+              configuredModel: modelPresentation?.model ?? null,
+              configuredReasoningEffort: modelPresentation?.reasoningEffort ?? null
+            }
+          : item,
+        pinned: presentation?.pinned === true,
+        manualOrder: presentation?.manualOrder ?? null,
+        originalIndex: index
+      };
+    })
+    .sort((left, right) => {
+      if (left.pinned !== right.pinned) {
+        return left.pinned ? -1 : 1;
+      }
+      if (left.manualOrder !== null && right.manualOrder !== null && left.manualOrder !== right.manualOrder) {
+        return left.manualOrder - right.manualOrder;
+      }
+      if (left.manualOrder !== null) {
+        return -1;
+      }
+      if (right.manualOrder !== null) {
+        return 1;
+      }
+      const byUpdatedAt = listItemUpdatedAt(right.item) - listItemUpdatedAt(left.item);
+      return byUpdatedAt || left.originalIndex - right.originalIndex;
+    })
+    .map((entry) => entry.item);
 }
 
 function listItemSummaryFromThread(thread: unknown): unknown {
@@ -1601,7 +1703,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
   app.get("/api/settings/local-send", async (request) => {
     const userId = userIdFromRequest(request, store);
     return {
-      data: store.getLocalSendSettings(userId),
+      data: settingsForCurrentAccessDevice(store.getLocalSendSettings(userId), request, userId),
       detectedClientHost: requestClientHost(request)
     };
   });
@@ -1621,7 +1723,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const userId = userIdFromRequest(request, store);
       // Saved host takes precedence; the browser source IP is used only for an
       // intentionally blank host setting.
-      const data = await testLocalSendSettingsViaSsh(settingsForCurrentAccessDevice(store.getLocalSendSettings(userId), request));
+      const data = await testLocalSendSettingsViaSsh(settingsForCurrentAccessDevice(store.getLocalSendSettings(userId), request, userId));
       return { data };
     } catch (error) {
       return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
@@ -1812,7 +1914,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       if (!stat.isFile()) {
         return reply.code(400).send({ error: "Path is not a file." });
       }
-      const result = await sendFileToLocalViaSsh(settingsForCurrentAccessDevice(store.getLocalSendSettings(userId), request), target.filePath, input.destinationPath);
+      const result = await sendFileToLocalViaSsh(settingsForCurrentAccessDevice(store.getLocalSendSettings(userId), request, userId), target.filePath, input.destinationPath);
       return {
         data: {
           sourcePath: target.filePath,
@@ -1836,7 +1938,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
     try {
       const saved = [];
-      const batchDirectory = uploadBatchDirectory(userId);
+      const batchDirectory = uploadBatchDirectory(project.rootPath, userId);
       for await (const part of request.files({ limits: { fileSize: 64 * 1024 * 1024, files: 12 } })) {
         const file = await saveMultipartFile(project.rootPath, batchDirectory, part);
         saved.push({
@@ -1872,8 +1974,9 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         );
         const searchTerm = normalizeSearchTerm(request.query.search);
         if (searchTerm) {
+          const data = await searchOwnedThreadList(bridge, ownedThreadIds, searchTerm);
           return {
-            data: await searchOwnedThreadList(bridge, ownedThreadIds, searchTerm),
+            data: sortThreadsForUser(store, userId, data),
             nextCursor: null,
             backwardsCursor: null
           };
@@ -1890,9 +1993,10 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           searchTerm: "",
           useStateDbOnly: false
         });
+        const data = await filterOwnedThreadList(bridge, result.data, ownedThreadIds, "");
         return {
           ...result,
-          data: await filterOwnedThreadList(bridge, result.data, ownedThreadIds, ""),
+          data: sortThreadsForUser(store, userId, data),
           nextCursor: null,
           backwardsCursor: null
         };
@@ -1901,6 +2005,77 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       }
     }
   );
+
+  app.patch<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/presentation", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) {
+        return reply.code(404).send({ error: "Project not found." });
+      }
+      const projectId = isUserWorkspaceProject(project, userId) ? undefined : project.id;
+      if (!store.userCanAccessThread(request.params.threadId, userId, projectId)) {
+        return reply.code(404).send({ error: "Thread not found." });
+      }
+      const input = threadPresentationSchema.parse(request.body);
+      const data = store.setThreadPinned(request.params.threadId, userId, input.pinned);
+      if (!data) {
+        return reply.code(404).send({ error: "Thread not found." });
+      }
+      return { data };
+    } catch (error) {
+      return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.patch<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/model-profile", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) {
+        return reply.code(404).send({ error: "Project not found." });
+      }
+      const projectId = isUserWorkspaceProject(project, userId) ? undefined : project.id;
+      if (!store.userCanAccessThread(request.params.threadId, userId, projectId)) {
+        return reply.code(404).send({ error: "Thread not found." });
+      }
+      const input = threadModelProfileSchema.parse(request.body);
+      const supported = listModelProfiles().some((profile) => profile.model === input.model && profile.effort === input.reasoningEffort);
+      if (!supported) {
+        return reply.code(400).send({ error: "Selected model profile is not available." });
+      }
+      const data = store.setThreadModelConfig(request.params.threadId, userId, input.model, input.reasoningEffort);
+      if (!data) {
+        return reply.code(404).send({ error: "Thread not found." });
+      }
+      return { data };
+    } catch (error) {
+      return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.put<{ Params: { id: string } }>("/api/projects/:id/threads/order", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) {
+        return reply.code(404).send({ error: "Project not found." });
+      }
+      const input = threadOrderSchema.parse(request.body);
+      const ownedThreadIds = store.ownedThreadIds(
+        userId,
+        isUserWorkspaceProject(project, userId) ? undefined : project.id
+      );
+      if (input.threadIds.some((threadId) => !ownedThreadIds.has(threadId))) {
+        return reply.code(404).send({ error: "Thread not found." });
+      }
+      store.setThreadOrder(userId, input.threadIds);
+      const presentation = store.getThreadPresentation(userId, input.threadIds);
+      return { data: input.threadIds.map((threadId) => presentation.get(threadId)).filter(Boolean) };
+    } catch (error) {
+      return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
 
   app.delete<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId", async (request, reply) => {
     const userId = userIdFromRequest(request, store);
@@ -1955,7 +2130,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
       const thread = asRecord(asRecord(result).thread);
       const settings = store.getLocalSendSettings(userId);
-      const outputRoot = validateServerOutputPath(input.outputPath, settings);
+      const outputRoot = projectExportOutputPath(project.rootPath);
       const outputDir = path.join(outputRoot, safeFolderSegment(userId, "user"));
       fs.mkdirSync(outputDir, { recursive: true, mode: 0o700 });
 
@@ -1964,11 +2139,9 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const rendered = renderThreadExport(thread, { name: project.name, rootPath: project.rootPath }, request.params.threadId, input.format);
       fs.writeFileSync(filePath, rendered.content, { mode: 0o600 });
       const stat = fs.statSync(filePath);
-      const target = resolveProjectFilePath(project.rootPath, filePath, {
-        allowOutsideRoot: serverConfig.allowOutsideProjectRoot
-      });
+      const target = resolveProjectFilePath(project.rootPath, filePath);
       const sentLocal = input.sendLocal
-        ? await sendFileToLocalViaSsh(settingsForCurrentAccessDevice(settings, request), target.filePath, input.destinationPath)
+        ? await sendFileToLocalViaSsh(settingsForCurrentAccessDevice(settings, request, userId), target.filePath, input.destinationPath)
         : undefined;
 
       return {
@@ -2028,7 +2201,17 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       }
       result = sanitizeThreadPayloadForClient(result);
       const page = paginateThreadPayload(result, input.before, input.limit);
-      return page;
+      const presentation = store.getThreadPresentation(userId, [request.params.threadId]).get(request.params.threadId);
+      const modelPresentation = resolvedThreadModelPresentation(store, userId, request.params.threadId, presentation);
+      return {
+        ...page,
+        thread: {
+          ...page.thread,
+          pinned: presentation?.pinned === true,
+          configuredModel: modelPresentation.model,
+          configuredReasoningEffort: modelPresentation.reasoningEffort
+        }
+      };
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
     }

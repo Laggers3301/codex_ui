@@ -15,6 +15,7 @@ import type {
   ProjectFilePreview,
   ReasoningEffort,
   SandboxMode,
+  ThreadPresentation,
   ThreadListResponse,
   ThreadReadResponse,
   UserProfile
@@ -128,7 +129,7 @@ export function sendProjectFileToLocal(projectId: string, filePath: string, dest
 export function exportThreadRecord(
   projectId: string,
   threadId: string,
-  input: { format?: ThreadExportFormat; sendLocal?: boolean; outputPath?: string; destinationPath?: string }
+  input: { format?: ThreadExportFormat; sendLocal?: boolean; destinationPath?: string }
 ): Promise<{ data: ThreadExportResult }> {
   return request(`/api/projects/${projectId}/threads/${threadId}/export`, {
     method: "POST",
@@ -195,6 +196,31 @@ export function listThreads(projectId: string, search?: string): Promise<ThreadL
 
 export function deleteThread(projectId: string, threadId: string): Promise<{ ok: boolean }> {
   return request(`/api/projects/${projectId}/threads/${threadId}`, { method: "DELETE" });
+}
+
+export function updateThreadPresentation(projectId: string, threadId: string, input: { pinned: boolean }): Promise<{ data: ThreadPresentation }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/presentation`, {
+    method: "PATCH",
+    body: JSON.stringify(input)
+  });
+}
+
+export function updateThreadModelProfile(
+  projectId: string,
+  threadId: string,
+  input: { model: string; reasoningEffort: ReasoningEffort }
+): Promise<{ data: ThreadPresentation }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/model-profile`, {
+    method: "PATCH",
+    body: JSON.stringify(input)
+  });
+}
+
+export function updateThreadOrder(projectId: string, threadIds: string[]): Promise<{ data: ThreadPresentation[] }> {
+  return request(`/api/projects/${projectId}/threads/order`, {
+    method: "PUT",
+    body: JSON.stringify({ threadIds })
+  });
 }
 
 export function readThread(threadId: string, projectId?: string, options?: { before?: number; limit?: number }): Promise<ThreadReadResponse> {

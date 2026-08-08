@@ -183,11 +183,22 @@ export interface ThreadSummary {
   sessionId: string;
   preview: string;
   name: string | null;
+  pinned?: boolean;
+  configuredModel?: string | null;
+  configuredReasoningEffort?: ReasoningEffort | null;
   cwd: string;
   updatedAt: number;
   createdAt: number;
   status: unknown;
   turns: Turn[];
+}
+
+export interface ThreadPresentation {
+  threadId: string;
+  pinned: boolean;
+  manualOrder: number | null;
+  model: string | null;
+  reasoningEffort: ReasoningEffort | null;
 }
 
 export interface Turn {

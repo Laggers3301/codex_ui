@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent } from "react";
+import "katex/dist/katex.min.css";
 import {
   Archive,
   Bot,
@@ -8,6 +9,7 @@ import {
   GitBranch,
   MessageSquare,
   PencilLine,
+  Pin,
   RefreshCcw,
   Send,
   Settings2,
@@ -18,8 +20,11 @@ import {
   X
 } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import type { PluggableList } from "unified";
 import {
   createProject,
   deleteProject,
@@ -43,7 +48,9 @@ import {
   setApiUserId,
   testLocalSendSettings,
   updateLocalSendSettings,
-  updateProject,
+  updateThreadModelProfile,
+  updateThreadOrder,
+  updateThreadPresentation,
   uploadProjectFiles
 } from "./api";
 import { codexSocket } from "./codexSocket";
@@ -100,12 +107,20 @@ interface PendingUserMessage {
   viewToken: number;
   text: string;
   keepAtBottomUntil: number;
+  attachments?: ComposerUpload[];
+}
+
+interface ComposerUpload extends ProjectFile {
+  sourceFile: File | null;
+  isImage: boolean;
 }
 
 interface PromptRequestContext {
   viewToken: number;
   projectId: string;
   threadId: string | null;
+  model: string;
+  reasoningEffort: ReasoningEffort;
   sentPromptText: string;
   visibleText: string;
 }
@@ -191,7 +206,7 @@ async function copyTextToClipboard(value: string): Promise<void> {
       await navigator.clipboard.writeText(value);
       return;
     } catch {
-      // Some browsers deny Clipboard API access on an HTTP ZeroTier address.
+      // Some browsers deny Clipboard API access on an HTTP network address.
       // Keep a selection-based fallback so the user can still copy a session ID.
     }
   }
@@ -555,10 +570,78 @@ const defaultLocalSendSettings: LocalSendSettings = {
   // This keeps the default correct for both macOS and Linux clients.
   destinationPath: "Downloads",
   identityFile: "",
-  outputPath: "/tmp/codex_remote_exports",
+  outputPath: ".codex-web/exports",
   updatedAt: null
 };
-const markdownRemarkPlugins = [remarkGfm, remarkBreaks];
+const markdownRemarkPlugins: PluggableList = [remarkGfm, remarkBreaks];
+const mathMarkdownRemarkPlugins: PluggableList = [remarkGfm, remarkBreaks, [remarkMath, { singleDollarTextMath: true }]];
+const markdownRehypePlugins: PluggableList = [[rehypeKatex, { throwOnError: false, trust: false }]];
+
+function normalizeMathInText(text: string): string {
+  return text
+    .replace(/(?<!\\)\\\[([\s\S]*?)(?<!\\)\\\]/g, (whole, equation: string) => {
+      const content = equation.trim();
+      return content ? `$$\n${content}\n$$` : whole;
+    })
+    .replace(/(?<!\\)\\\(([\s\S]*?)(?<!\\)\\\)/g, (whole, equation: string) => {
+      const content = equation.trim();
+      return content ? `$${content}$` : whole;
+    });
+}
+
+function normalizeMathInProse(text: string): string {
+  const codeSpanPattern = /(`+)([\s\S]*?)\1/g;
+  let result = "";
+  let cursor = 0;
+
+  for (const match of text.matchAll(codeSpanPattern)) {
+    const start = match.index ?? cursor;
+    result += normalizeMathInText(text.slice(cursor, start));
+    result += match[0];
+    cursor = start + match[0].length;
+  }
+
+  return result + normalizeMathInText(text.slice(cursor));
+}
+
+function normalizeMathMarkdown(text: string): string {
+  const lines = text.match(/[^\n]*\n|[^\n]+/g) ?? [];
+  const output: string[] = [];
+  let prose = "";
+  let fence: { character: "`" | "~"; length: number } | null = null;
+
+  const flushProse = () => {
+    if (prose) {
+      output.push(normalizeMathInProse(prose));
+      prose = "";
+    }
+  };
+
+  for (const line of lines) {
+    if (fence) {
+      output.push(line);
+      const closingFence = new RegExp(`^\\s*${fence.character}{${fence.length},}`);
+      if (closingFence.test(line)) {
+        fence = null;
+      }
+      continue;
+    }
+
+    const openingFence = line.match(/^\s*(`{3,}|~{3,})/);
+    if (openingFence) {
+      flushProse();
+      const marker = openingFence[1];
+      fence = { character: marker[0] as "`" | "~", length: marker.length };
+      output.push(line);
+      continue;
+    }
+
+    prose += line;
+  }
+
+  flushProse();
+  return output.join("");
+}
 
 function safeDecodeURIComponent(value: string): string {
   try {
@@ -603,13 +686,12 @@ function fileTargetFromHref(href?: string): string | null {
 }
 
 const inlineImageExtensionPattern = /\.(png|jpe?g|gif|webp|svg)(?:[#?].*)?$/i;
-const autoSendImageExtensionPattern = /\.(avif|bmp|gif|jpe?g|png|svg|tiff?|webp)(?:[#?].*)?$/i;
 const autoSendFileExtensionPattern = /\.(avif|bmp|gif|jpe?g|png|svg|tiff?|webp|pdf|docx?|pptx?|xlsx?|csv)(?:[#?].*)?$/i;
 const autoSendFilePathPattern = /(?:file:\/\/\S+|\/\S+?\.(?:avif|bmp|gif|jpe?g|png|svg|tiff?|webp|pdf|docx?|pptx?|xlsx?|csv)(?:[?#]\S+)?|(?:\.{1,2}\/)?[\w][\w .()\-\/]*\.(?:avif|bmp|gif|jpe?g|png|svg|tiff?|webp|pdf|docx?|pptx?|xlsx?|csv))/gi;
 
 interface GeneratedFileCandidate {
   target: string;
-  allowOutsideProject: boolean;
+  turnId: string | null;
 }
 
 function autoSendPreferenceStorageKey(userId: string): string {
@@ -624,11 +706,17 @@ function storedBooleanWithDefault(key: string, fallback: boolean): boolean {
   return value === null ? fallback : value === "true";
 }
 
-function suggestLocalSendSettings(settings: LocalSendSettings, detectedClientHost: string): LocalSendSettings {
+function suggestLocalSendSettings(settings: LocalSendSettings, detectedClientHost: string, defaultSshUser = ""): LocalSendSettings {
+  const outputPath = settings.outputPath.trim();
+  const safeOutputPath = outputPath && !outputPath.startsWith("/") && !outputPath.startsWith("~") && !outputPath.split(/[\\/]/).includes("..")
+    ? outputPath
+    : ".codex-web/exports";
   return {
     ...settings,
     sshHost: settings.sshHost.trim() || detectedClientHost.trim(),
-    destinationPath: settings.destinationPath.trim() || "Downloads"
+    sshUser: settings.sshUser.trim() || defaultSshUser.trim(),
+    destinationPath: settings.destinationPath.trim() || "Downloads",
+    outputPath: safeOutputPath
   };
 }
 
@@ -649,15 +737,15 @@ function projectPathForComparison(target: string): string {
   return safeDecodeURIComponent(withoutSuffix).replace(/\\/g, "/");
 }
 
-function isSafeGeneratedFileTarget(target: string, projectRoot: string, allowOutsideProject: boolean): boolean {
+function isSafeGeneratedFileTarget(target: string, projectRoot: string): boolean {
   const pathValue = projectPathForComparison(target);
   if (!pathValue || /^https?:\/\//i.test(pathValue)) {
     return false;
   }
   if (pathValue.startsWith("/")) {
-    if (allowOutsideProject && autoSendImageExtensionPattern.test(pathValue)) {
-      return true;
-    }
+    // Automatic delivery intentionally remains within the selected project,
+    // including tool-reported image paths, so it cannot disclose unrelated
+    // server files through the SSH delivery setting.
     const root = projectRoot.replace(/\\/g, "/").replace(/\/+$/, "");
     return pathValue === root || pathValue.startsWith(`${root}/`);
   }
@@ -669,19 +757,19 @@ function addGeneratedFileCandidate(
   seen: Set<string>,
   rawValue: string,
   projectRoot: string,
-  allowOutsideProject: boolean
+  turnId: string | null
 ): void {
   if (candidates.length >= 12) {
     return;
   }
   const target = normalizedGeneratedFileTarget(rawValue);
-  if (!target || !isSafeGeneratedFileTarget(target, projectRoot, allowOutsideProject)) {
+  if (!target || !isSafeGeneratedFileTarget(target, projectRoot)) {
     return;
   }
-  const key = `${allowOutsideProject ? "external" : "project"}:${target}`;
+  const key = target;
   if (!seen.has(key)) {
     seen.add(key);
-    candidates.push({ target, allowOutsideProject });
+    candidates.push({ target, turnId });
   }
 }
 
@@ -690,23 +778,23 @@ function collectGeneratedFileCandidates(
   projectRoot: string,
   candidates: GeneratedFileCandidate[],
   seen: Set<string>,
+  turnId: string | null,
   fieldName = "",
   depth = 0
 ): void {
   if (depth > 5 || candidates.length >= 12 || value === null || value === undefined) {
     return;
   }
-  const allowOutsideProject = /(?:saved|image)[_-]?(?:path|file)?/i.test(fieldName);
   if (typeof value === "string") {
-    addGeneratedFileCandidate(candidates, seen, value, projectRoot, allowOutsideProject);
+    addGeneratedFileCandidate(candidates, seen, value, projectRoot, turnId);
     for (const match of value.matchAll(autoSendFilePathPattern)) {
-      addGeneratedFileCandidate(candidates, seen, match[0], projectRoot, allowOutsideProject);
+      addGeneratedFileCandidate(candidates, seen, match[0], projectRoot, turnId);
     }
     return;
   }
   if (Array.isArray(value)) {
     for (const entry of value.slice(0, 80)) {
-      collectGeneratedFileCandidates(entry, projectRoot, candidates, seen, fieldName, depth + 1);
+      collectGeneratedFileCandidates(entry, projectRoot, candidates, seen, turnId, fieldName, depth + 1);
     }
     return;
   }
@@ -717,7 +805,7 @@ function collectGeneratedFileCandidates(
     if (/(?:token|secret|authorization|cookie|api[_-]?key)/i.test(key)) {
       continue;
     }
-    collectGeneratedFileCandidates(entry, projectRoot, candidates, seen, key, depth + 1);
+    collectGeneratedFileCandidates(entry, projectRoot, candidates, seen, turnId, key, depth + 1);
   }
 }
 
@@ -731,7 +819,7 @@ function generatedFileCandidatesFromThread(thread: ThreadSummary, projectRoot: s
       if (itemKind(item) === "user") {
         continue;
       }
-      collectGeneratedFileCandidates(item, projectRoot, candidates, seen);
+      collectGeneratedFileCandidates(item, projectRoot, candidates, seen, turn.id);
       if (candidates.length >= 12) {
         return candidates;
       }
@@ -776,13 +864,16 @@ function imageTargetsFromText(text: string): string[] {
 const MarkdownMessage = memo(function MarkdownMessage({
   text,
   projectId,
-  onOpenFileLink
+  onOpenFileLink,
+  renderMath = false
 }: {
   text: string;
   projectId?: string;
   onOpenFileLink?: (target: string) => void;
+  renderMath?: boolean;
 }) {
   const inlineImageTargets = useMemo(() => (projectId ? imageTargetsFromText(text) : []), [projectId, text]);
+  const markdownText = useMemo(() => (renderMath ? normalizeMathMarkdown(text || " ") : text || " "), [renderMath, text]);
   const markdownComponents = useMemo<Components>(
     () => ({
       a({ children, href, ...props }) {
@@ -829,8 +920,12 @@ const MarkdownMessage = memo(function MarkdownMessage({
 
   return (
     <div className="messageMarkdown">
-      <ReactMarkdown components={markdownComponents} remarkPlugins={markdownRemarkPlugins}>
-        {text || " "}
+      <ReactMarkdown
+        components={markdownComponents}
+        remarkPlugins={renderMath ? mathMarkdownRemarkPlugins : markdownRemarkPlugins}
+        rehypePlugins={renderMath ? markdownRehypePlugins : []}
+      >
+        {markdownText}
       </ReactMarkdown>
       {projectId && inlineImageTargets.length > 0 ? (
         <div className="inlineImagePreviewGrid" aria-label="图片预览">
@@ -1094,6 +1189,63 @@ function formatBytes(bytes: number): string {
   }
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
+
+function isImageComposerUpload(file: ProjectFile, sourceFile: File | null): boolean {
+  return Boolean(
+    sourceFile?.type.startsWith("image/") ||
+    file.mime.toLowerCase().startsWith("image/") ||
+    isInlineImageTarget(file.name) ||
+    isInlineImageTarget(file.relativePath)
+  );
+}
+
+const ComposerImageThumbnail = memo(function ComposerImageThumbnail({ upload }: { upload: ComposerUpload }) {
+  const [source, setSource] = useState("");
+
+  useEffect(() => {
+    if (!upload.sourceFile) {
+      setSource("");
+      return;
+    }
+    const objectUrl = URL.createObjectURL(upload.sourceFile);
+    setSource(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [upload.sourceFile]);
+
+  if (!source) {
+    return <span className="uploadedImageThumbnail uploadedImageThumbnailFallback"><FileText size={16} /></span>;
+  }
+  return <img className="uploadedImageThumbnail" src={source} alt={`${upload.name} 预览`} />;
+});
+
+const PendingUserImagePreviews = memo(function PendingUserImagePreviews({
+  uploads,
+  onOpenFileLink
+}: {
+  uploads?: ComposerUpload[];
+  onOpenFileLink: (target: string) => void;
+}) {
+  const images = uploads?.filter((upload) => upload.isImage) ?? [];
+  if (!images.length) {
+    return null;
+  }
+  return (
+    <div className="pendingUserImagePreviews" aria-label="本条消息附带的图片">
+      {images.map((upload) => (
+        <button
+          className="pendingUserImagePreview"
+          type="button"
+          key={upload.relativePath}
+          onClick={() => onOpenFileLink(upload.relativePath)}
+          title="打开图片预览"
+        >
+          <ComposerImageThumbnail upload={upload} />
+          <span>{upload.name}</span>
+        </button>
+      ))}
+    </div>
+  );
+});
 
 function modelProfileById(id: string, profiles: ModelProfile[]): ModelProfile {
   return profiles.find((profile) => profile.id === id) ?? profiles[0] ?? fallbackModelProfiles[0];
@@ -1488,6 +1640,9 @@ export function App() {
   const [threadSearch, setThreadSearch] = useState("");
   const [threadSearchLoading, setThreadSearchLoading] = useState(false);
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [draggingThreadId, setDraggingThreadId] = useState<string | null>(null);
+  const [dragOverThreadId, setDragOverThreadId] = useState<string | null>(null);
+  const [savingThreadOrder, setSavingThreadOrder] = useState(false);
   const [selectedThread, setSelectedThread] = useState<ThreadSummary | null>(null);
   const [threadHistory, setThreadHistory] = useState<ThreadHistoryPage | null>(null);
   const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
@@ -1505,14 +1660,15 @@ export function App() {
   const [threadRenameDraft, setThreadRenameDraft] = useState("");
   const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>(fallbackModelProfiles);
-  const [modelProfileId, setModelProfileId] = useState(defaultModelProfileId);
+  const [newThreadModelProfileId, setNewThreadModelProfileId] = useState(defaultModelProfileId);
+  const [savingThreadModel, setSavingThreadModel] = useState(false);
   const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("never");
   const [socketStatus, setSocketStatus] = useState<"connecting" | "open" | "closed">("closed");
   const [liveDeltas, setLiveDeltas] = useState<Record<string, LiveDeltaEntry>>({});
   const [pendingUserMessages, setPendingUserMessages] = useState<PendingUserMessage[]>([]);
   const [promptBottomHoldNow, setPromptBottomHoldNow] = useState(() => Date.now());
-  const [uploadedFiles, setUploadedFiles] = useState<ProjectFile[]>([]);
+  const [uploadedFiles, setUploadedFiles] = useState<ComposerUpload[]>([]);
   const [uploadingFiles, setUploadingFiles] = useState(false);
   const [draggingUpload, setDraggingUpload] = useState(false);
   const [filePreview, setFilePreview] = useState<ProjectFilePreview | null>(null);
@@ -1555,7 +1711,24 @@ export function App() {
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
     [projects, selectedProjectId]
   );
-  const selectedModelProfile = useMemo(() => modelProfileById(modelProfileId, modelProfiles), [modelProfileId, modelProfiles]);
+  const draftModelProfile = useMemo(
+    () => modelProfileById(newThreadModelProfileId, modelProfiles),
+    [newThreadModelProfileId, modelProfiles]
+  );
+  const activeModelProfileId = useMemo(() => {
+    if (!selectedThread) {
+      return draftModelProfile.id;
+    }
+    return modelProfileIdFor(
+      selectedThread.configuredModel ?? selectedProject?.defaultModel ?? "gpt-5.5",
+      selectedThread.configuredReasoningEffort ?? selectedProject?.defaultReasoningEffort ?? "xhigh",
+      modelProfiles
+    );
+  }, [draftModelProfile.id, modelProfiles, selectedProject, selectedThread]);
+  const selectedModelProfile = useMemo(
+    () => modelProfileById(activeModelProfileId, modelProfiles),
+    [activeModelProfileId, modelProfiles]
+  );
   const selectedUser = useMemo(
     () => users.find((user) => user.id === selectedUserId) ?? users[0] ?? null,
     [users, selectedUserId]
@@ -1684,6 +1857,13 @@ export function App() {
     setUploadedFiles([]);
     setDraggingUpload(false);
     setError("");
+    if (selectedProject) {
+      setNewThreadModelProfileId(modelProfileIdFor(
+        selectedProject.defaultModel || "gpt-5.5",
+        selectedProject.defaultReasoningEffort || "xhigh",
+        modelProfiles
+      ));
+    }
     if (clearPrompt) {
       setPrompt("");
     }
@@ -1782,6 +1962,98 @@ export function App() {
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }
+  }
+
+  async function toggleThreadPin(thread: ThreadSummary) {
+    const projectId = selectedProjectIdRef.current;
+    if (!projectId) {
+      return;
+    }
+    setThreadContextMenu(null);
+    try {
+      setError("");
+      await updateThreadPresentation(projectId, thread.id, { pinned: !thread.pinned });
+      await refreshThreads(projectId, threadSearch);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
+
+  function clearThreadDragState() {
+    setDraggingThreadId(null);
+    setDragOverThreadId(null);
+  }
+
+  function moveThreadBefore(orderedThreads: ThreadSummary[], sourceId: string, targetId: string): ThreadSummary[] {
+    const sourceIndex = orderedThreads.findIndex((thread) => thread.id === sourceId);
+    const targetIndex = orderedThreads.findIndex((thread) => thread.id === targetId);
+    if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) {
+      return orderedThreads;
+    }
+    const next = [...orderedThreads];
+    const [source] = next.splice(sourceIndex, 1);
+    const nextTargetIndex = next.findIndex((thread) => thread.id === targetId);
+    next.splice(nextTargetIndex < 0 ? next.length : nextTargetIndex, 0, source);
+    return next;
+  }
+
+  async function persistThreadOrder(nextThreads: ThreadSummary[]) {
+    const projectId = selectedProjectIdRef.current;
+    if (!projectId) {
+      return;
+    }
+    setSavingThreadOrder(true);
+    try {
+      await updateThreadOrder(projectId, nextThreads.map((thread) => thread.id));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      void refreshThreads(projectId, threadSearch);
+    } finally {
+      setSavingThreadOrder(false);
+    }
+  }
+
+  function startThreadDrag(event: ReactDragEvent<HTMLDivElement>, thread: ThreadSummary) {
+    if (threadSearch || savingThreadOrder) {
+      event.preventDefault();
+      return;
+    }
+    setPendingDeleteThreadId(null);
+    setDraggingThreadId(thread.id);
+    setDragOverThreadId(null);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", thread.id);
+  }
+
+  function dragOverThread(event: ReactDragEvent<HTMLDivElement>, thread: ThreadSummary) {
+    const sourceId = draggingThreadId || event.dataTransfer.getData("text/plain");
+    if (!sourceId || sourceId === thread.id || savingThreadOrder) {
+      return;
+    }
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    setDragOverThreadId((current) => current === thread.id ? current : thread.id);
+  }
+
+  function dropThread(event: ReactDragEvent<HTMLDivElement>, target: ThreadSummary) {
+    event.preventDefault();
+    const sourceId = draggingThreadId || event.dataTransfer.getData("text/plain");
+    const source = threadsRef.current.find((thread) => thread.id === sourceId);
+    clearThreadDragState();
+    if (!sourceId || !source || sourceId === target.id || savingThreadOrder) {
+      return;
+    }
+    if (Boolean(source.pinned) !== Boolean(target.pinned)) {
+      setError("置顶会话与普通会话分别排序；如需跨分组，请先取消或设置置顶。");
+      return;
+    }
+    const next = moveThreadBefore(threadsRef.current, sourceId, target.id);
+    if (next === threadsRef.current) {
+      return;
+    }
+    threadsRef.current = next;
+    setThreads(next);
+    void persistThreadOrder(next);
   }
 
   function closeThreadRename() {
@@ -2059,7 +2331,11 @@ export function App() {
     setFilePreview(null);
     setFilePreviewObjectUrl("");
     setPendingDeleteThreadId(null);
-    setModelProfileId(modelProfileIdFor(selectedProject.defaultModel || "gpt-5.5", selectedProject.defaultReasoningEffort || "xhigh", modelProfiles));
+    setNewThreadModelProfileId(modelProfileIdFor(
+      selectedProject.defaultModel || "gpt-5.5",
+      selectedProject.defaultReasoningEffort || "xhigh",
+      modelProfiles
+    ));
     setSandbox(selectedProject.defaultSandbox || "danger-full-access");
     setApprovalPolicy(selectedProject.defaultApprovalPolicy || "never");
     setLocalMessages([]);
@@ -2090,7 +2366,11 @@ export function App() {
       const response = await listModels();
       const nextProfiles = response.data.length ? response.data : fallbackModelProfiles;
       setModelProfiles(nextProfiles);
-      setModelProfileId((current) => (nextProfiles.some((profile) => profile.id === current) ? current : modelProfileIdFor(response.defaultModel, response.defaultReasoningEffort, nextProfiles)));
+      setNewThreadModelProfileId((current) => (
+        nextProfiles.some((profile) => profile.id === current)
+          ? current
+          : modelProfileIdFor(response.defaultModel, response.defaultReasoningEffort, nextProfiles)
+      ));
     } catch (caught) {
       setModelProfiles(fallbackModelProfiles);
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -2351,20 +2631,54 @@ export function App() {
     }
   }
 
-  async function changeModelProfile(nextProfileId: string) {
+  function applyThreadModelProfile(threadId: string, model: string, reasoningEffort: ReasoningEffort) {
+    setThreads((current) => {
+      const next = current.map((thread) => (
+        thread.id === threadId
+          ? { ...thread, configuredModel: model, configuredReasoningEffort: reasoningEffort }
+          : thread
+      ));
+      threadsRef.current = next;
+      return next;
+    });
+    if (selectedThreadRef.current?.id === threadId) {
+      const nextThread = {
+        ...selectedThreadRef.current,
+        configuredModel: model,
+        configuredReasoningEffort: reasoningEffort
+      };
+      selectedThreadRef.current = nextThread;
+      setSelectedThread(nextThread);
+    }
+  }
+
+  async function changeConversationModelProfile(nextProfileId: string) {
     const profile = modelProfileById(nextProfileId, modelProfiles);
-    setModelProfileId(profile.id);
-    if (!selectedProject) {
+    const thread = selectedThreadRef.current;
+    if (!thread?.id) {
+      setNewThreadModelProfileId(profile.id);
       return;
     }
+    const projectId = selectedProjectIdRef.current;
+    if (!projectId || savingThreadModel) {
+      return;
+    }
+    const previousModel = thread.configuredModel ?? selectedProject?.defaultModel ?? profile.model;
+    const previousEffort = thread.configuredReasoningEffort ?? selectedProject?.defaultReasoningEffort ?? profile.effort;
+    setError("");
+    setSavingThreadModel(true);
+    applyThreadModelProfile(thread.id, profile.model, profile.effort);
     try {
-      const response = await updateProject(selectedProject.id, {
-        defaultModel: profile.model,
-        defaultReasoningEffort: profile.effort
+      const response = await updateThreadModelProfile(projectId, thread.id, {
+        model: profile.model,
+        reasoningEffort: profile.effort
       });
-      setProjects((current) => current.map((project) => (project.id === response.data.id ? response.data : project)));
+      applyThreadModelProfile(thread.id, response.data.model ?? profile.model, response.data.reasoningEffort ?? profile.effort);
     } catch (caught) {
+      applyThreadModelProfile(thread.id, previousModel, previousEffort);
       setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setSavingThreadModel(false);
     }
   }
 
@@ -2382,8 +2696,8 @@ export function App() {
       const response = await createProject({
         name: projectNameFromPath(rootPath),
         rootPath,
-        defaultModel: selectedModelProfile.model,
-        defaultReasoningEffort: selectedModelProfile.effort,
+        defaultModel: draftModelProfile.model,
+        defaultReasoningEffort: draftModelProfile.effort,
         defaultSandbox: sandbox,
         defaultApprovalPolicy: approvalPolicy
       });
@@ -2476,11 +2790,24 @@ export function App() {
       setError("请先选择一个项目，再上传文件。");
       return;
     }
+    const projectId = selectedProject.id;
+    const sourceFiles = Array.from(files);
     setUploadingFiles(true);
     setError("");
     try {
-      const response = await uploadProjectFiles(selectedProject.id, Array.from(files));
-      setUploadedFiles((current) => [...response.data, ...current]);
+      const response = await uploadProjectFiles(projectId, sourceFiles);
+      if (selectedProjectIdRef.current !== projectId) {
+        return;
+      }
+      const uploads = response.data.map((file, index): ComposerUpload => {
+        const sourceFile = sourceFiles[index] ?? null;
+        return {
+          ...file,
+          sourceFile,
+          isImage: isImageComposerUpload(file, sourceFile)
+        };
+      });
+      setUploadedFiles((current) => [...uploads, ...current]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -2490,6 +2817,10 @@ export function App() {
         fileInputRef.current.value = "";
       }
     }
+  }
+
+  function removeUploadedFile(relativePath: string) {
+    setUploadedFiles((current) => current.filter((file) => file.relativePath !== relativePath));
   }
 
   function handleUploadDragOver(event: ReactDragEvent<HTMLElement>) {
@@ -2569,7 +2900,7 @@ export function App() {
     try {
       const response = await readLocalSendSettings();
       const detectedHost = response.detectedClientHost ?? "";
-      const next = suggestLocalSendSettings(response.data, detectedHost);
+      const next = suggestLocalSendSettings(response.data, detectedHost, selectedUserId);
       localSendSettingsRef.current = next;
       setLocalSendSettings(next);
       setDetectedClientHost(detectedHost);
@@ -2609,22 +2940,49 @@ export function App() {
     }
   }
 
-  function localSendSettingsInput() {
+  function localSendSettingsInput(settings = localSendSettings) {
     return {
-      sshHost: localSendSettings.sshHost,
-      sshPort: Number(localSendSettings.sshPort) || 22,
-      sshUser: localSendSettings.sshUser,
-      destinationPath: localSendSettings.destinationPath,
-      identityFile: localSendSettings.identityFile,
-      outputPath: localSendSettings.outputPath
+      sshHost: settings.sshHost,
+      sshPort: Number(settings.sshPort) || 22,
+      sshUser: settings.sshUser,
+      destinationPath: settings.destinationPath,
+      identityFile: settings.identityFile,
+      outputPath: settings.outputPath
     };
   }
 
-  async function persistLocalSendSettings() {
-    const response = await updateLocalSendSettings(localSendSettingsInput());
+  async function persistLocalSendSettings(settings = localSendSettings) {
+    const response = await updateLocalSendSettings(localSendSettingsInput(settings));
     localSendSettingsRef.current = response.data;
     setLocalSendSettings(response.data);
     return response.data;
+  }
+
+  async function applySuggestedLocalSendSettings() {
+    const suggested = suggestLocalSendSettings(localSendSettingsRef.current, detectedClientHost, selectedUserId);
+    localSendSettingsRef.current = suggested;
+    setLocalSendSettings(suggested);
+    setSettingsTesting(true);
+    setError("");
+    setSettingsTestStatus(null);
+    let persisted = false;
+    try {
+      await persistLocalSendSettings(suggested);
+      persisted = true;
+      const response = await testLocalSendSettings();
+      const target = response.data;
+      setSettingsTestStatus({
+        kind: "success",
+        message: `本机发送已配置且 SSH 可写入：${target.sshUser}@${target.sshHost}:${target.destinationPath}`
+      });
+    } catch (caught) {
+      setSettingsTestStatus({
+        kind: "error",
+        message: `${persisted ? "一键设置已保存，但 SSH 测试失败" : "一键设置失败"}：${caught instanceof Error ? caught.message : String(caught)}${persisted ? "。请确认 SSH 用户名与设备上的系统用户名一致。" : ""}`
+      });
+    } finally {
+      setSettingsTesting(false);
+    }
   }
 
   async function saveLocalSendSettings() {
@@ -2634,17 +2992,19 @@ export function App() {
     try {
       const saved = await persistLocalSendSettings();
       const currentThread = selectedThreadRef.current;
-      addLocalMessage(
-        `访问设备发送设置已保存：${saved.sshUser}@${saved.sshHost || detectedClientHost || "当前访问 IP"}:${saved.destinationPath}`,
-        "Codex Web · settings",
-        "system",
-        undefined,
-        {
-          placement: "conversation",
-          threadId: currentThread?.id ?? null,
-          afterTurnId: currentThread?.turns.at(-1)?.id ?? null
-        }
-      );
+      if (currentThread?.id) {
+        addLocalMessage(
+          `访问设备发送设置已保存：${saved.sshUser}@${saved.sshHost || detectedClientHost || "当前访问 IP"}:${saved.destinationPath}`,
+          "Codex Web · settings",
+          "system",
+          undefined,
+          {
+            placement: "conversation",
+            threadId: currentThread.id,
+            afterTurnId: currentThread.turns.at(-1)?.id ?? null
+          }
+        );
+      }
       setSettingsOpen(false);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -2679,6 +3039,7 @@ export function App() {
     if (!selectedProject || !filePreview) {
       return;
     }
+    const sourceThread = selectedThreadRef.current;
     setSendingLocalFile(true);
     setError("");
     try {
@@ -2688,7 +3049,13 @@ export function App() {
 - 源文件：${response.data.sourcePath}
 - 访问设备：${response.data.sshUser}@${response.data.sshHost}:${response.data.remoteFile}`,
         "Codex Web · file transfer",
-        "tool"
+        "tool",
+        undefined,
+        {
+          placement: "conversation",
+          threadId: sourceThread?.id ?? null,
+          afterTurnId: sourceThread?.turns.at(-1)?.id ?? null
+        }
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -2697,7 +3064,7 @@ export function App() {
     }
   }
 
-  async function autoSendGeneratedFilesForThread(threadId: string, projectId: string) {
+  async function autoSendGeneratedFilesForThread(threadId: string, projectId: string, afterTurnId: string | null = null) {
     const settings = localSendSettingsRef.current;
     if (
       !autoSendEnabledRef.current ||
@@ -2722,6 +3089,13 @@ export function App() {
       return;
     }
 
+    // The completed notification can arrive before the first UI refresh sees
+    // the newly persisted turn. Refresh the open view so the delivery status
+    // can be displayed beside the source turn.
+    if (selectedThreadRef.current?.id === threadId) {
+      void openThread(threadId, projectId, threadViewTokenRef.current);
+    }
+
     const candidates = generatedFileCandidatesFromThread(response.thread, project.rootPath);
     let nextIndex = 0;
     const transferOne = async () => {
@@ -2738,21 +3112,29 @@ export function App() {
         try {
           const sent = await sendProjectFileToLocal(project.id, candidate.target);
           autoSentGeneratedFileKeysRef.current.add(key);
-          if (selectedThreadRef.current?.id === threadId) {
-            addLocalMessage(
-              `已自动通过 SSH 发送生成文件：\n- ${sent.data.name}\n- 访问设备：${sent.data.sshUser}@${sent.data.sshHost}:${sent.data.remoteFile}`,
-              "Codex Web · 自动发送",
-              "tool"
-            );
-          }
+          addLocalMessage(
+            `已自动通过 SSH 发送生成文件：\n- ${sent.data.name}\n- 访问设备：${sent.data.sshUser}@${sent.data.sshHost}:${sent.data.remoteFile}`,
+            "Codex Web · 自动发送",
+            "tool",
+            undefined,
+            {
+              placement: "conversation",
+              threadId,
+              afterTurnId: candidate.turnId ?? afterTurnId ?? response.thread.turns.at(-1)?.id ?? null
+            }
+          );
         } catch (caught) {
-          if (selectedThreadRef.current?.id === threadId) {
-            addLocalMessage(
-              `自动发送 ${compactFileLabel(candidate.target)} 失败：${caught instanceof Error ? caught.message : String(caught)}`,
-              "Codex Web · 自动发送",
-              "tool"
-            );
-          }
+          addLocalMessage(
+            `自动发送 ${compactFileLabel(candidate.target)} 失败：${caught instanceof Error ? caught.message : String(caught)}`,
+            "Codex Web · 自动发送",
+            "tool",
+            undefined,
+            {
+              placement: "conversation",
+              threadId,
+              afterTurnId: candidate.turnId ?? afterTurnId ?? response.thread.turns.at(-1)?.id ?? null
+            }
+          );
         } finally {
           autoSendInFlightFileKeysRef.current.delete(key);
         }
@@ -2764,12 +3146,12 @@ export function App() {
     await Promise.all([transferOne(), transferOne()]);
   }
 
-  function scheduleAutoSendGeneratedFiles(threadId: string, projectId: string) {
+  function scheduleAutoSendGeneratedFiles(threadId: string, projectId: string, afterTurnId: string | null = null) {
     if (!threadId || !projectId || !autoSendEnabledRef.current) {
       return;
     }
-    window.setTimeout(() => void autoSendGeneratedFilesForThread(threadId, projectId), 900);
-    window.setTimeout(() => void autoSendGeneratedFilesForThread(threadId, projectId), 2_800);
+    window.setTimeout(() => void autoSendGeneratedFilesForThread(threadId, projectId, afterTurnId), 900);
+    window.setTimeout(() => void autoSendGeneratedFilesForThread(threadId, projectId, afterTurnId), 2_800);
   }
 
 
@@ -2778,13 +3160,13 @@ export function App() {
       setError("请先选择一个会话再导出记录。");
       return;
     }
+    const sourceThread = selectedThread;
     setExportingThread(true);
     setError("");
     try {
-      const response = await exportThreadRecord(selectedProject.id, selectedThread.id, {
+      const response = await exportThreadRecord(selectedProject.id, sourceThread.id, {
         format: exportFormat,
         sendLocal,
-        outputPath: localSendSettings.outputPath || undefined,
         destinationPath: localSendSettings.destinationPath || undefined
       });
       const exported = response.data;
@@ -2794,10 +3176,15 @@ export function App() {
         : "";
       addLocalMessage(
         `对话记录已导出：
-- [${exported.name}](${exported.relativePath})
-- 服务端临时中转路径：${exported.path}${localLine}`,
+- [${exported.name}](${exported.relativePath})${localLine}`,
         "Codex Web · export",
-        "tool"
+        "tool",
+        undefined,
+        {
+          placement: "conversation",
+          threadId: sourceThread.id,
+          afterTurnId: sourceThread.turns.at(-1)?.id ?? null
+        }
       );
       void openFilePreview(exported.relativePath);
     } catch (caught) {
@@ -2877,10 +3264,17 @@ export function App() {
       }
       try {
         const response = await sendProjectFileToLocal(selectedProject.id, argument);
+        const sourceThread = selectedThreadRef.current;
         addLocalMessage(
           `已通过 SSH 发送到当前设备：\n- 源文件：${response.data.sourcePath}\n- 访问设备：${response.data.sshUser}@${response.data.sshHost}:${response.data.remoteFile}`,
           "Codex Web · file transfer",
-          "tool"
+          "tool",
+          undefined,
+          {
+            placement: "conversation",
+            threadId: sourceThread?.id ?? null,
+            afterTurnId: sourceThread?.turns.at(-1)?.id ?? null
+          }
         );
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : String(caught));
@@ -2966,14 +3360,15 @@ export function App() {
 
   async function sendPrompt() {
     const promptText = prompt.trim();
-    if (!selectedProject || (!promptText && !uploadedFiles.length)) {
+    if (uploadingFiles || !selectedProject || (!promptText && !uploadedFiles.length)) {
       return;
     }
     if (await handleSlashCommand(promptText)) {
       return;
     }
-    const sentPromptText = promptWithUploadedFiles(promptText, uploadedFiles);
-    const visibleText = visiblePromptText(promptText, uploadedFiles);
+    const promptUploads = [...uploadedFiles];
+    const sentPromptText = promptWithUploadedFiles(promptText, promptUploads);
+    const visibleText = visiblePromptText(promptText, promptUploads);
     const requestId = `thread-${requestToken()}`;
     const requestViewToken = threadViewTokenRef.current;
     const keepAtBottomUntil = Date.now() + sentPromptBottomHoldMs;
@@ -2982,6 +3377,8 @@ export function App() {
       viewToken: requestViewToken,
       projectId: selectedProject.id,
       threadId: selectedThread?.id ?? null,
+      model: selectedModelProfile.model,
+      reasoningEffort: selectedModelProfile.effort,
       sentPromptText,
       visibleText
     });
@@ -3022,7 +3419,8 @@ export function App() {
           threadId: selectedThread?.id ?? null,
           viewToken: requestViewToken,
           text: visibleText,
-          keepAtBottomUntil
+          keepAtBottomUntil,
+          attachments: promptUploads
         }
       ]);
       releasePendingPromptBottomHold(requestId, keepAtBottomUntil);
@@ -3053,6 +3451,8 @@ export function App() {
       viewToken: requestViewToken,
       projectId: project.id,
       threadId: null,
+      model: selectedModelProfile.model,
+      reasoningEffort: selectedModelProfile.effort,
       sentPromptText: continuation.sentPromptText,
       visibleText: continuation.visibleText
     });
@@ -3154,6 +3554,21 @@ export function App() {
       delete next[promptRequestId];
       return next;
     });
+  }
+
+  function requestInterruptSelectedConversation(): boolean {
+    if (composerStopBusy) {
+      return false;
+    }
+    if (selectedActiveTurnId && selectedProject && selectedThread?.id) {
+      interruptCurrentTurn(selectedThread.id, selectedActiveTurnId, selectedProject.id);
+      return true;
+    }
+    if (currentPendingTurnStart) {
+      queueInterruptAfterTurnStarts(currentPendingTurnStart.requestId);
+      return true;
+    }
+    return false;
   }
 
   function hydrateLiveState(snapshot: LiveStateSnapshot | undefined) {
@@ -3307,9 +3722,18 @@ export function App() {
         }
       }
       if (newThread?.id) {
-        const normalizedThread = { ...newThread, turns: newThread.turns ?? [] };
+        const existingThread = threadsRef.current.find((thread) => thread.id === newThread.id);
+        const normalizedThread = {
+          ...newThread,
+          pinned: newThread.pinned ?? existingThread?.pinned ?? false,
+          configuredModel: requestContext?.model ?? newThread.configuredModel ?? existingThread?.configuredModel ?? null,
+          configuredReasoningEffort: requestContext?.reasoningEffort ?? newThread.configuredReasoningEffort ?? existingThread?.configuredReasoningEffort ?? null,
+          turns: newThread.turns ?? []
+        };
         setThreads((current) => {
-          const next = [normalizedThread, ...current.filter((thread) => thread.id !== normalizedThread.id)];
+          const next = current.filter((thread) => thread.id !== normalizedThread.id);
+          const firstUnpinnedIndex = next.findIndex((thread) => !thread.pinned);
+          next.splice(firstUnpinnedIndex === -1 ? next.length : firstUnpinnedIndex, 0, normalizedThread);
           threadsRef.current = next;
           return next;
         });
@@ -3438,7 +3862,7 @@ export function App() {
         }
         const threadProjectId = threadProjectIdsRef.current.get(threadId) ?? selectedProjectIdRef.current;
         if (!wasInterrupted && threadProjectId) {
-          scheduleAutoSendGeneratedFiles(threadId, threadProjectId);
+          scheduleAutoSendGeneratedFiles(threadId, threadProjectId, turnId);
         }
         const currentThread = selectedThreadRef.current;
         if (currentThread?.id === threadId) {
@@ -3529,10 +3953,16 @@ export function App() {
         tail.push(entry);
         continue;
       }
-      if (entry.threadId && entry.threadId !== currentThreadId) {
+      if (entry.threadId !== currentThreadId) {
         continue;
       }
-      if (entry.afterTurnId && currentTurnIds.has(entry.afterTurnId)) {
+      if (entry.afterTurnId) {
+        if (!currentTurnIds.has(entry.afterTurnId)) {
+          // An anchored status must never be detached and shown at the bottom
+          // of another page of the same long conversation. It appears when its
+          // source turn is loaded instead.
+          continue;
+        }
         const entries = byTurn.get(entry.afterTurnId) ?? [];
         entries.push(entry);
         byTurn.set(entry.afterTurnId, entries);
@@ -3604,6 +4034,7 @@ export function App() {
         event.metaKey ||
         globalEnterSendBlocked ||
         composerIsStopMode ||
+        uploadingFiles ||
         !selectedProject ||
         (!prompt.trim() && !uploadedFiles.length) ||
         blocksGlobalEnterSend(event.target)
@@ -3616,7 +4047,43 @@ export function App() {
 
     window.addEventListener("keydown", handleGlobalEnter);
     return () => window.removeEventListener("keydown", handleGlobalEnter);
-  }, [composerIsStopMode, globalEnterSendBlocked, prompt, selectedProject, sendPrompt, uploadedFiles.length]);
+  }, [composerIsStopMode, globalEnterSendBlocked, prompt, selectedProject, sendPrompt, uploadedFiles.length, uploadingFiles]);
+
+  useEffect(() => {
+    const handleGlobalEscape = (event: KeyboardEvent) => {
+      if (
+        event.key !== "Escape" ||
+        event.defaultPrevented ||
+        event.isComposing ||
+        event.keyCode === 229 ||
+        event.repeat ||
+        event.altKey ||
+        event.ctrlKey ||
+        event.metaKey ||
+        globalEnterSendBlocked ||
+        threadContextMenu ||
+        composerStopBusy
+      ) {
+        return;
+      }
+      if (!selectedActiveTurnId && !currentPendingTurnStart) {
+        return;
+      }
+      event.preventDefault();
+      requestInterruptSelectedConversation();
+    };
+
+    window.addEventListener("keydown", handleGlobalEscape);
+    return () => window.removeEventListener("keydown", handleGlobalEscape);
+  }, [
+    composerStopBusy,
+    currentPendingTurnStart,
+    globalEnterSendBlocked,
+    selectedActiveTurnId,
+    selectedProject,
+    selectedThread,
+    threadContextMenu
+  ]);
 
   return (
     <main className="appShell" style={{ gridTemplateColumns: sidebarCollapsed ? "0px 0px minmax(620px, 1fr)" : `${sidebarWidth}px 8px minmax(620px, 1fr)` }}>
@@ -3765,6 +4232,10 @@ export function App() {
           <button type="button" role="menuitem" onClick={() => beginThreadRename(threadContextMenu.thread)}>
             <PencilLine size={15} />
             重命名会话
+          </button>
+          <button type="button" role="menuitem" onClick={() => void toggleThreadPin(threadContextMenu.thread)}>
+            <Pin size={15} />
+            {threadContextMenu.thread.pinned ? "取消置顶" : "置顶会话"}
           </button>
         </div>
       ) : null}
@@ -3942,11 +4413,11 @@ export function App() {
             <div className="settingsBody">
               <div className="settingsGrid">
                 <label>
-                  <span>访问设备 ZeroTier IP / SSH 地址</span>
+                  <span>访问设备 IP / SSH 地址</span>
                   <input
                     value={localSendSettings.sshHost}
                     onChange={(event) => updateLocalSendSetting("sshHost", event.target.value)}
-                    placeholder={detectedClientHost || "自动识别本机 ZeroTier IP"}
+                    placeholder={detectedClientHost || "自动识别当前访问设备 IP"}
                   />
                 </label>
                 <label>
@@ -3983,18 +4454,10 @@ export function App() {
                     placeholder="例如 ~/.ssh/id_ed25519；不填则使用默认 SSH 配置"
                   />
                 </label>
-                <label className="settingsWide">
-                  <span>服务端临时中转目录</span>
-                  <input
-                    value={localSendSettings.outputPath}
-                    onChange={(event) => updateLocalSendSetting("outputPath", event.target.value)}
-                    placeholder="例如 /tmp/codex_remote_exports，只作导出中转"
-                  />
-                </label>
               </div>
               <p className="settingsHint">
-                ZeroTier IP 会在首次打开时自动填入；下载目录默认是远端 SSH 用户的 Downloads。保存并测试 SSH 成功后，生成文件即可自动发送。设备需开启 SSH/远程登录并允许服务端免密登录；服务端目录只作临时中转，不是最终保存位置。
-                {detectedClientHost ? ` 当前浏览器来源 ZeroTier IP：${detectedClientHost}` : ""}
+                当前访问设备 IP、登录用户名和下载目录会自动填入；下载目录默认是远端 SSH 用户的 Downloads。SSH 用户名可修改，需与设备上的系统用户名一致。保存并测试 SSH 成功后，生成文件即可自动发送。设备需开启 SSH/远程登录并允许服务端免密登录；导出文件保存在当前项目内，不会开放任意服务器路径。
+                {detectedClientHost ? ` 当前浏览器来源 IP：${detectedClientHost}` : ""}
               </p>
               {settingsTestStatus ? <p className={`settingsTestStatus ${settingsTestStatus.kind}`}>{settingsTestStatus.message}</p> : null}
               <div className="settingsExportBox">
@@ -4023,9 +4486,9 @@ export function App() {
                 </div>
               </div>
               <div className="dialogActions">
-                {detectedClientHost ? (
-                  <button className="iconTextButton" type="button" onClick={() => updateLocalSendSetting("sshHost", detectedClientHost)}>
-                    使用当前访问设备 IP
+                {detectedClientHost || localSendSettings.sshHost ? (
+                  <button className="iconTextButton" type="button" onClick={() => void applySuggestedLocalSendSettings()} disabled={settingsSaving || settingsTesting}>
+                    {settingsTesting ? "测试中" : "一键填入并测试"}
                   </button>
                 ) : null}
                 <button className="iconTextButton" type="button" onClick={() => setSettingsOpen(false)}>
@@ -4074,17 +4537,6 @@ export function App() {
               <Trophy size={14} />
               {leaderboardLoading ? "排行榜..." : "排行榜"}
             </button>
-            <select
-              value={modelProfileId}
-              onChange={(event) => void changeModelProfile(event.target.value)}
-              title={`当前模型：${selectedModelProfile.model} / ${selectedModelProfile.effort}`}
-            >
-              {modelProfiles.map((profile) => (
-                <option key={profile.id} value={profile.id}>
-                  {profile.label}
-                </option>
-              ))}
-            </select>
             <select value={sandbox} onChange={(event) => setSandbox(event.target.value as SandboxMode)}>
               <option value="danger-full-access">完全访问</option>
               <option value="workspace-write">项目可写</option>
@@ -4152,17 +4604,24 @@ export function App() {
                 const threadRunning = isRunningStatus(thread.status) || Boolean(activeTurnsByThread[thread.id]);
                 const hasNewResult = Boolean(unreadResultThreads[thread.id]);
                 const deletePending = pendingDeleteThreadId === thread.id;
+                const dragEnabled = !threadSearch && !savingThreadOrder;
                 return (
                   <div
                     key={thread.id}
-                    className={`threadRow ${selectedThread?.id === thread.id ? "selected" : ""} ${threadRunning ? "running" : ""}`}
+                    className={`threadRow ${selectedThread?.id === thread.id ? "selected" : ""} ${threadRunning ? "running" : ""} ${thread.pinned ? "pinned" : ""} ${draggingThreadId === thread.id ? "dragging" : ""} ${dragOverThreadId === thread.id ? "dragOver" : ""}`}
+                    draggable={dragEnabled}
                     onContextMenu={(event) => openThreadContextMenu(event, thread)}
+                    onDragStart={(event) => startThreadDrag(event, thread)}
+                    onDragOver={(event) => dragOverThread(event, thread)}
+                    onDrop={(event) => dropThread(event, thread)}
+                    onDragEnd={clearThreadDragState}
+                    title={threadSearch ? "清空搜索后可拖动排序" : thread.pinned ? "已置顶；可在同组内拖动排序" : "可拖动调整会话顺序"}
                   >
                     <button className="threadSelectButton" type="button" title="右键打开会话操作" onClick={() => {
                       setPendingDeleteThreadId(null);
                       selectThread(thread.id);
                     }}>
-                      <Archive size={14} />
+                      {thread.pinned ? <Pin className="threadPinnedIcon" size={14} /> : <Archive size={14} />}
                       <span>
                         <strong>{thread.name || thread.preview || "Untitled"}</strong>
                         <small>{formatTime(thread.updatedAt)}</small>
@@ -4224,6 +4683,23 @@ export function App() {
                   <span className="runLamp" />
                 </div>
               </div>
+              <label className="conversationModelSelect">
+                <span>{selectedThread ? "会话模型" : "新会话模型"}</span>
+                <select
+                  value={activeModelProfileId}
+                  onChange={(event) => void changeConversationModelProfile(event.target.value)}
+                  disabled={savingThreadModel || conversationRunState === "running"}
+                  title={conversationRunState === "running"
+                    ? "当前会话运行中；完成后可切换下一轮模型"
+                    : `仅影响${selectedThread ? "当前会话后续轮次" : "这次新会话"}：${selectedModelProfile.model} / ${selectedModelProfile.effort}`}
+                >
+                  {modelProfiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
             <div className="conversationContent">
               {showPromptNavigator ? (
@@ -4312,7 +4788,12 @@ export function App() {
                         ) : isUserMessage ? (
                             <CollapsibleUserMessage text={itemText(item)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
                           ) : (
-                            <MarkdownMessage text={itemText(item) || toolItemDetails(item)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+                            <MarkdownMessage
+                              text={itemText(item) || toolItemDetails(item)}
+                              projectId={selectedProject?.id}
+                              onOpenFileLink={openFilePreview}
+                              renderMath={itemKind(item) === "agent"}
+                            />
                           )}
                         {item.aggregatedOutput ? <pre className="outputBlock">{displayOutputText(item.aggregatedOutput)}</pre> : null}
                         <MessageImagePreviews item={item} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
@@ -4338,13 +4819,14 @@ export function App() {
                     >
                       <div className="messageMeta">用户 · sending</div>
                       <CollapsibleUserMessage text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+                      <PendingUserImagePreviews uploads={entry.attachments} onOpenFileLink={openFilePreview} />
                     </article>
                   );
                 })}
                 {allLiveMessages.map((entry) => (
                   <article className="messageItem kind-agent type-agentMessage live" key={entry.id}>
                     <div className="messageMeta">Codex · agentMessage</div>
-                    <MarkdownMessage text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+                    <MarkdownMessage text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} renderMath />
                   </article>
                 ))}
                 {conversationLocalMessageLayout.tail.map(renderLocalMessage)}
@@ -4364,6 +4846,7 @@ export function App() {
                     >
                       <div className="messageMeta">用户 · sending</div>
                       <CollapsibleUserMessage text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+                      <PendingUserImagePreviews uploads={entry.attachments} onOpenFileLink={openFilePreview} />
                     </article>
                   );
                 })}
@@ -4461,18 +4944,28 @@ export function App() {
                 </div>
                 {uploadedFiles.length ? (
                   <div className="uploadedFileList">
-                    {uploadedFiles.slice(0, 6).map((file) => (
-                      <button
-                        className="uploadedFileChip"
-                        key={file.relativePath}
-                        type="button"
-                        onClick={() => void openFilePreview(file.relativePath)}
-                        title={file.relativePath}
-                      >
-                        <FileText size={14} />
-                        <span>{file.name}</span>
-                        <small>{file.relativePath}</small>
-                      </button>
+                    {uploadedFiles.map((file) => (
+                      <div className={`uploadedFileChip${file.isImage ? " uploadedImageChip" : ""}`} key={file.relativePath} title={file.relativePath}>
+                        <button
+                          className="uploadedFilePreviewButton"
+                          type="button"
+                          onClick={() => void openFilePreview(file.relativePath)}
+                          title={file.isImage ? "查看图片预览" : "查看文件预览"}
+                        >
+                          {file.isImage ? <ComposerImageThumbnail upload={file} /> : <FileText className="uploadedFileIcon" size={14} />}
+                          <span>{file.name}</span>
+                          <small>{file.isImage ? `图片 · ${formatBytes(file.size)}` : file.relativePath}</small>
+                        </button>
+                        <button
+                          className="removeUploadedFileButton"
+                          type="button"
+                          onClick={() => removeUploadedFile(file.relativePath)}
+                          aria-label={`取消 ${file.name} 作为本轮输入`}
+                          title="取消作为本轮会话输入"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
                     ))}
                   </div>
                 ) : null}
@@ -4509,19 +5002,14 @@ export function App() {
                 className={`iconButton sendButton ${composerIsStopMode ? "stopMode" : "primary"}`}
                 type="button"
                 onClick={() => {
-                  if (selectedActiveTurnId && selectedProject && selectedThread?.id) {
-                    interruptCurrentTurn(selectedThread.id, selectedActiveTurnId, selectedProject.id);
-                    return;
-                  }
-                  if (currentPendingTurnStart) {
-                    queueInterruptAfterTurnStarts(currentPendingTurnStart.requestId);
+                  if (requestInterruptSelectedConversation()) {
                     return;
                   }
                   void sendPrompt();
                 }}
-                disabled={composerIsStopMode ? composerStopBusy : !selectedProject || (!prompt.trim() && !uploadedFiles.length)}
+                disabled={composerIsStopMode ? composerStopBusy : uploadingFiles || !selectedProject || (!prompt.trim() && !uploadedFiles.length)}
                 aria-label={composerIsStopMode ? "终止当前对话" : "发送"}
-                title={composerIsStopMode ? (composerStopBusy ? "正在终止当前对话" : "终止当前对话") : "发送"}
+                title={composerIsStopMode ? (composerStopBusy ? "正在终止当前对话" : "终止当前对话（Esc）") : "发送"}
               >
                 {composerIsStopMode ? <Square size={16} fill="currentColor" /> : <Send size={18} />}
               </button>

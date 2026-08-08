@@ -134,4 +134,53 @@ describe("ProjectStore", () => {
     expect(store.listProjects(bob.id).map((project) => project.id)).toEqual([bobProject.id]);
     expect(store.getProject(bobProject.id, alice.id)).toBeNull();
   });
+
+  it("stores pin, order and model presentation per owned thread", () => {
+    const store = createStore();
+    const alice = store.createUser("Alice");
+    const bob = store.createUser("Bob");
+    const aliceProject = store.createProject({ userId: alice.id, name: "Alice", rootPath: "/workspace/alice" });
+    const bobProject = store.createProject({ userId: bob.id, name: "Bob", rootPath: "/workspace/bob" });
+
+    store.registerThreadOwner({
+      threadId: "alice-first",
+      userId: alice.id,
+      projectId: aliceProject.id,
+      rootPath: aliceProject.rootPath,
+      model: "gpt-5.6-sol",
+      reasoningEffort: "xhigh"
+    });
+    store.registerThreadOwner({
+      threadId: "alice-second",
+      userId: alice.id,
+      projectId: aliceProject.id,
+      rootPath: aliceProject.rootPath
+    });
+    store.registerThreadOwner({
+      threadId: "bob-thread",
+      userId: bob.id,
+      projectId: bobProject.id,
+      rootPath: bobProject.rootPath
+    });
+
+    expect(store.setThreadPinned("alice-second", alice.id, true)).toMatchObject({
+      threadId: "alice-second",
+      pinned: true
+    });
+    expect(store.setThreadModelConfig("alice-second", alice.id, "gpt-5.6-terra", "high")).toMatchObject({
+      model: "gpt-5.6-terra",
+      reasoningEffort: "high"
+    });
+    store.setThreadOrder(alice.id, ["alice-first", "alice-second"]);
+
+    const alicePresentation = store.getThreadPresentation(alice.id, ["alice-first", "alice-second", "bob-thread"]);
+    expect(alicePresentation.get("alice-first")?.manualOrder).toBe(0);
+    expect(alicePresentation.get("alice-second")).toMatchObject({
+      pinned: true,
+      manualOrder: 1,
+      model: "gpt-5.6-terra",
+      reasoningEffort: "high"
+    });
+    expect(alicePresentation.has("bob-thread")).toBe(false);
+  });
 });

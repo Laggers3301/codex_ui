@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { defaults, serverConfig } from "./config.js";
-import type { CreateProjectInput, LocalSendSettings, Project, UpdateLocalSendSettingsInput, UpdateProjectInput, UserProfile } from "./types.js";
+import type { CreateProjectInput, LocalSendSettings, Project, ReasoningEffort, UpdateLocalSendSettingsInput, UpdateProjectInput, UserProfile } from "./types.js";
 
 export const ADMIN_USER_ID = "admin";
 export const DEFAULT_USER_ID = ADMIN_USER_ID;
@@ -45,6 +45,10 @@ type ThreadOwnerRow = {
   user_id: string;
   project_id: string;
   root_path: string;
+  is_pinned: number;
+  manual_order: number | null;
+  model_override: string | null;
+  reasoning_effort_override: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -62,8 +66,20 @@ export interface ThreadOwner {
   userId: string;
   projectId: string;
   rootPath: string;
+  pinned: boolean;
+  manualOrder: number | null;
+  modelOverride: string | null;
+  reasoningEffortOverride: ReasoningEffort | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ThreadPresentation {
+  threadId: string;
+  pinned: boolean;
+  manualOrder: number | null;
+  model: string | null;
+  reasoningEffort: ReasoningEffort | null;
 }
 
 export interface UnusedThread {
@@ -98,6 +114,15 @@ function toUser(row: UserRow): UserProfile {
   };
 }
 
+const defaultProjectExportPath = ".codex-web/exports";
+
+function projectRelativeExportPath(value: string | null | undefined): string {
+  const candidate = value?.trim() || defaultProjectExportPath;
+  return path.isAbsolute(candidate) || candidate.startsWith("~") || candidate.split(/[\\/]/).includes("..")
+    ? defaultProjectExportPath
+    : candidate;
+}
+
 function emptyLocalSendSettings(): LocalSendSettings {
   return {
     sshHost: "",
@@ -105,7 +130,7 @@ function emptyLocalSendSettings(): LocalSendSettings {
     sshUser: "",
     destinationPath: "",
     identityFile: "",
-    outputPath: "/tmp/codex_remote_exports",
+    outputPath: defaultProjectExportPath,
     updatedAt: null
   };
 }
@@ -120,7 +145,7 @@ function toLocalSendSettings(row: UserSettingsRow | undefined): LocalSendSetting
     sshUser: row.local_ssh_user ?? "",
     destinationPath: row.local_send_path ?? "",
     identityFile: row.local_ssh_identity_file ?? "",
-    outputPath: row.local_output_path ?? "/tmp/codex_remote_exports",
+    outputPath: projectRelativeExportPath(row.local_output_path),
     updatedAt: row.updated_at ?? null
   };
 }
@@ -131,9 +156,19 @@ function toThreadOwner(row: ThreadOwnerRow): ThreadOwner {
     userId: row.user_id,
     projectId: row.project_id,
     rootPath: row.root_path,
+    pinned: Boolean(row.is_pinned),
+    manualOrder: typeof row.manual_order === "number" ? row.manual_order : null,
+    modelOverride: row.model_override?.trim() || null,
+    reasoningEffortOverride: toReasoningEffort(row.reasoning_effort_override),
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+function toReasoningEffort(value: unknown): ReasoningEffort | null {
+  return value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max" || value === "ultra"
+    ? value
+    : null;
 }
 
 function toUnusedThread(row: UnusedThreadRow): UnusedThread {
@@ -375,7 +410,14 @@ export class ProjectStore {
     return result.changes > 0;
   }
 
-  registerThreadOwner(input: { threadId: string; userId: string; projectId: string; rootPath: string }): ThreadOwner {
+  registerThreadOwner(input: {
+    threadId: string;
+    userId: string;
+    projectId: string;
+    rootPath: string;
+    model?: string | null;
+    reasoningEffort?: ReasoningEffort | null;
+  }): ThreadOwner {
     const threadId = input.threadId.trim();
     const userId = input.userId.trim();
     const projectId = input.projectId.trim();
@@ -388,14 +430,31 @@ export class ProjectStore {
       throw new Error("Thread is already owned by another user or project.");
     }
     const now = new Date().toISOString();
+    const manualOrder = this.nextThreadOrder(userId, false);
+    const modelOverride = input.model?.trim() || null;
+    const reasoningEffortOverride = input.reasoningEffort ?? null;
     this.db
       .prepare(
-        `INSERT INTO thread_owners (thread_id, user_id, project_id, root_path, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO thread_owners (
+          thread_id, user_id, project_id, root_path, is_pinned, manual_order,
+          model_override, reasoning_effort_override, created_at, updated_at
+        )
+         VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
          ON CONFLICT(thread_id) DO UPDATE SET updated_at = excluded.updated_at`
       )
-      .run(threadId, userId, projectId, rootPath, now, now);
-    return this.getThreadOwner(threadId) ?? { threadId, userId, projectId, rootPath, createdAt: now, updatedAt: now };
+      .run(threadId, userId, projectId, rootPath, manualOrder, modelOverride, reasoningEffortOverride, now, now);
+    return this.getThreadOwner(threadId) ?? {
+      threadId,
+      userId,
+      projectId,
+      rootPath,
+      pinned: false,
+      manualOrder,
+      modelOverride,
+      reasoningEffortOverride,
+      createdAt: now,
+      updatedAt: now
+    };
   }
 
   touchThreadOwner(threadId: string): void {
@@ -412,6 +471,90 @@ export class ProjectStore {
     }
     const row = this.db.prepare("SELECT * FROM thread_owners WHERE thread_id = ?").get(cleanThreadId) as ThreadOwnerRow | undefined;
     return row ? toThreadOwner(row) : null;
+  }
+
+  getThreadPresentation(userId: string, threadIds: Iterable<string>): Map<string, ThreadPresentation> {
+    const cleanUserId = userId.trim();
+    const ids = [...new Set([...threadIds].map((threadId) => threadId.trim()).filter(Boolean))];
+    if (!cleanUserId || !ids.length) {
+      return new Map();
+    }
+    const placeholders = ids.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT thread_id, is_pinned, manual_order, model_override, reasoning_effort_override
+         FROM thread_owners
+         WHERE user_id = ? AND thread_id IN (${placeholders})`
+      )
+      .all(cleanUserId, ...ids) as Array<{
+        thread_id: string;
+        is_pinned: number;
+        manual_order: number | null;
+        model_override: string | null;
+        reasoning_effort_override: string | null;
+      }>;
+    return new Map(rows.map((row) => [row.thread_id, {
+      threadId: row.thread_id,
+      pinned: Boolean(row.is_pinned),
+      manualOrder: typeof row.manual_order === "number" ? row.manual_order : null,
+      model: row.model_override?.trim() || null,
+      reasoningEffort: toReasoningEffort(row.reasoning_effort_override)
+    }]));
+  }
+
+  setThreadPinned(threadId: string, userId: string, pinned: boolean): ThreadPresentation | null {
+    const cleanThreadId = threadId.trim();
+    const cleanUserId = userId.trim();
+    if (!cleanThreadId || !cleanUserId) {
+      return null;
+    }
+    const manualOrder = this.nextThreadOrder(cleanUserId, pinned, cleanThreadId);
+    const result = this.db
+      .prepare(
+        `UPDATE thread_owners
+         SET is_pinned = ?, manual_order = ?
+         WHERE thread_id = ? AND user_id = ?`
+      )
+      .run(pinned ? 1 : 0, manualOrder, cleanThreadId, cleanUserId);
+    return result.changes > 0 ? this.getThreadPresentation(cleanUserId, [cleanThreadId]).get(cleanThreadId) ?? null : null;
+  }
+
+  setThreadModelConfig(threadId: string, userId: string, model: string, reasoningEffort: ReasoningEffort): ThreadPresentation | null {
+    const cleanThreadId = threadId.trim();
+    const cleanUserId = userId.trim();
+    const cleanModel = model.trim();
+    if (!cleanThreadId || !cleanUserId || !cleanModel) {
+      return null;
+    }
+    const result = this.db
+      .prepare(
+        `UPDATE thread_owners
+         SET model_override = ?, reasoning_effort_override = ?
+         WHERE thread_id = ? AND user_id = ?`
+      )
+      .run(cleanModel, reasoningEffort, cleanThreadId, cleanUserId);
+    return result.changes > 0 ? this.getThreadPresentation(cleanUserId, [cleanThreadId]).get(cleanThreadId) ?? null : null;
+  }
+
+  setThreadOrder(userId: string, threadIds: Iterable<string>): void {
+    const cleanUserId = userId.trim();
+    const ids = [...threadIds].map((threadId) => threadId.trim()).filter(Boolean);
+    if (!cleanUserId || !ids.length || new Set(ids).size !== ids.length) {
+      throw new Error("Thread order requires unique owned thread ids.");
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const update = this.db.prepare(
+        `UPDATE thread_owners
+         SET manual_order = ?
+         WHERE thread_id = ? AND user_id = ?`
+      );
+      ids.forEach((threadId, index) => update.run(index, threadId, cleanUserId));
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   userCanAccessThread(threadId: string, userId: string, projectId?: string): boolean {
@@ -586,7 +729,7 @@ export class ProjectStore {
         local_ssh_user TEXT NOT NULL DEFAULT '',
         local_send_path TEXT NOT NULL DEFAULT '',
         local_ssh_identity_file TEXT NOT NULL DEFAULT '',
-        local_output_path TEXT NOT NULL DEFAULT '/tmp/codex_remote_exports',
+        local_output_path TEXT NOT NULL DEFAULT '.codex-web/exports',
         created_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -605,7 +748,7 @@ export class ProjectStore {
     addColumn("local_ssh_user", "ALTER TABLE user_settings ADD COLUMN local_ssh_user TEXT NOT NULL DEFAULT ''");
     addColumn("local_send_path", "ALTER TABLE user_settings ADD COLUMN local_send_path TEXT NOT NULL DEFAULT ''");
     addColumn("local_ssh_identity_file", "ALTER TABLE user_settings ADD COLUMN local_ssh_identity_file TEXT NOT NULL DEFAULT ''");
-    addColumn("local_output_path", "ALTER TABLE user_settings ADD COLUMN local_output_path TEXT NOT NULL DEFAULT '/tmp/codex_remote_exports'");
+    addColumn("local_output_path", "ALTER TABLE user_settings ADD COLUMN local_output_path TEXT NOT NULL DEFAULT '.codex-web/exports'");
     addColumn("created_at", "ALTER TABLE user_settings ADD COLUMN created_at TEXT NOT NULL DEFAULT ''");
 
     const finalColumns = this.db.prepare("PRAGMA table_info(user_settings)").all() as Array<{ name: string }>;
@@ -629,6 +772,10 @@ export class ProjectStore {
         user_id TEXT NOT NULL,
         project_id TEXT NOT NULL,
         root_path TEXT NOT NULL,
+        is_pinned INTEGER NOT NULL DEFAULT 0,
+        manual_order INTEGER,
+        model_override TEXT,
+        reasoning_effort_override TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -636,6 +783,40 @@ export class ProjectStore {
       );
       CREATE INDEX IF NOT EXISTS idx_thread_owners_user_project_updated_at ON thread_owners(user_id, project_id, updated_at);
     `);
+    const columns = this.db.prepare("PRAGMA table_info(thread_owners)").all() as Array<{ name: string }>;
+    const hasColumn = (name: string) => columns.some((column) => column.name === name);
+    if (!hasColumn("is_pinned")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!hasColumn("manual_order")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN manual_order INTEGER");
+    }
+    if (!hasColumn("model_override")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN model_override TEXT");
+    }
+    if (!hasColumn("reasoning_effort_override")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN reasoning_effort_override TEXT");
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_thread_owners_user_pinned_order ON thread_owners(user_id, is_pinned, manual_order)");
+  }
+
+  private nextThreadOrder(userId: string, pinned: boolean, excludeThreadId?: string): number {
+    const row = excludeThreadId
+      ? this.db
+          .prepare(
+            `SELECT MIN(manual_order) AS minimum_order
+             FROM thread_owners
+             WHERE user_id = ? AND is_pinned = ? AND thread_id <> ? AND manual_order IS NOT NULL`
+          )
+          .get(userId, pinned ? 1 : 0, excludeThreadId) as { minimum_order?: number | null } | undefined
+      : this.db
+          .prepare(
+            `SELECT MIN(manual_order) AS minimum_order
+             FROM thread_owners
+             WHERE user_id = ? AND is_pinned = ? AND manual_order IS NOT NULL`
+          )
+          .get(userId, pinned ? 1 : 0) as { minimum_order?: number | null } | undefined;
+    return typeof row?.minimum_order === "number" ? row.minimum_order - 1 : 0;
   }
 
   private createUnuseTable(): void {

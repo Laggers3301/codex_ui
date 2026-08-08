@@ -395,9 +395,11 @@ async function handleClientMessage(
         if (!prompt) {
           throw new Error("Prompt is required.");
         }
+        const model = pickString(message.model, project.defaultModel).trim() || project.defaultModel;
+        const reasoningEffort = pickReasoningEffort(message.reasoningEffort, project.defaultReasoningEffort);
         const thread = await bridge.request("thread/start", {
           cwd: project.rootPath,
-          model: pickString(message.model, project.defaultModel) || null,
+          model,
           approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
           sandbox: pickString(message.sandbox, project.defaultSandbox),
           threadSource: "user"
@@ -406,15 +408,22 @@ async function handleClientMessage(
         if (!threadId) {
           throw new Error("Codex did not return a thread id.");
         }
-        store.registerThreadOwner({ threadId, userId: sessionUserId, projectId: project.id, rootPath: project.rootPath });
+        store.registerThreadOwner({
+          threadId,
+          userId: sessionUserId,
+          projectId: project.id,
+          rootPath: project.rootPath,
+          model,
+          reasoningEffort
+        });
         const turn = await bridge.request("turn/start", {
           threadId,
           input: textInput(prompt),
           cwd: project.rootPath,
           approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
           sandboxPolicy: sandboxPolicy(project, pickSandbox(message.sandbox, project.defaultSandbox)),
-          model: pickString(message.model, project.defaultModel) || null,
-          effort: pickReasoningEffort(message.reasoningEffort, project.defaultReasoningEffort)
+          model,
+          effort: reasoningEffort
         });
         store.touchThreadOwner(threadId);
         send(ws, { type: "ack", requestId, ok: true, data: { thread, turn } });
@@ -429,13 +438,18 @@ async function handleClientMessage(
           throw new Error("threadId and prompt are required.");
         }
         assertThreadOwnedBy(store, threadId, sessionUserId, project.id, isUserWorkspaceProject(project, sessionUserId));
+        const owner = store.getThreadOwner(threadId);
+        const ownerProject = owner ? store.getProject(owner.projectId, sessionUserId) : null;
+        const modelDefaults = ownerProject ?? project;
+        const model = owner?.modelOverride ?? modelDefaults.defaultModel;
+        const reasoningEffort = owner?.reasoningEffortOverride ?? modelDefaults.defaultReasoningEffort;
         // `total_token_usage` in session telemetry is not a reliable current
         // context occupancy signal after compaction/resume. Do not block a user
         // turn based on that estimate: app-server remains the source of truth.
         await bridge.request("thread/resume", {
           threadId,
           cwd: project.rootPath,
-          model: pickString(message.model, project.defaultModel) || null,
+          model,
           approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
           sandbox: pickString(message.sandbox, project.defaultSandbox)
         });
@@ -445,9 +459,12 @@ async function handleClientMessage(
           cwd: project.rootPath,
           approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
           sandboxPolicy: sandboxPolicy(project, pickSandbox(message.sandbox, project.defaultSandbox)),
-          model: pickString(message.model, project.defaultModel) || null,
-          effort: pickReasoningEffort(message.reasoningEffort, project.defaultReasoningEffort)
+          model,
+          effort: reasoningEffort
         });
+        if (!owner?.modelOverride || !owner.reasoningEffortOverride) {
+          store.setThreadModelConfig(threadId, sessionUserId, model, reasoningEffort);
+        }
         store.touchThreadOwner(threadId);
         send(ws, { type: "ack", requestId, ok: true, data: { turn } });
         break;
