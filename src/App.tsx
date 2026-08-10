@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent } from "react";
+import { createPortal } from "react-dom";
 import "katex/dist/katex.min.css";
 import {
   Archive,
@@ -11,6 +12,7 @@ import {
   PencilLine,
   Pin,
   RefreshCcw,
+  Search,
   Send,
   Settings2,
   Square,
@@ -92,6 +94,21 @@ interface LocalMessage {
   placement?: "tail" | "conversation";
   threadId?: string | null;
   afterTurnId?: string | null;
+}
+
+interface TemporaryAsk {
+  requestId: string;
+  projectId: string;
+  threadId: string | null;
+  selectedText: string;
+  prompt: string;
+  turnId: string | null;
+  status: "ready" | "starting" | "running" | "complete" | "error";
+}
+
+function isTemporaryAskThread(thread: ThreadSummary): boolean {
+  const text = `${thread.name ?? ""} ${thread.preview ?? ""}`;
+  return text.includes("请基于下面选中的文字回答") || text.includes("选中文字：");
 }
 
 type GlobalSearchResult = {
@@ -195,6 +212,7 @@ interface PendingUserMessage {
 interface ComposerUpload extends ProjectFile {
   sourceFile: File | null;
   isImage: boolean;
+  uploading?: boolean;
 }
 
 interface PromptRequestContext {
@@ -1591,12 +1609,48 @@ function skillsMarkdown(skills: CodexSkill[]): string {
   return [`**可用 Codex Skills（${skills.length}）**`, ...skills.slice(0, 80).map((skill) => `- $${skill.name} · ${skill.displayName}${skill.shortDescription ? `：${skill.shortDescription}` : ""}`)].join("\n");
 }
 
+const localizedSkillCopy: Record<string, { name: string; description: string }> = {
+  imagegen: { name: "图像生成", description: "生成或编辑网站、游戏和内容所需的图片" },
+  "openai-docs": { name: "OpenAI 文档", description: "查询 OpenAI 官方文档、Codex 用法与模型迁移指南" },
+  "openai-templates:artifact-template-analytics-dashboard": { name: "数据分析仪表盘", description: "创建包含关键指标与图表的数据分析表格" },
+  "openai-templates:artifact-template-business-review": { name: "经营复盘", description: "创建业务表现、关键指标与后续计划演示文稿" },
+  "openai-templates:artifact-template-design-report": { name: "设计报告", description: "创建包含发现、影响与建议的设计报告" },
+  "openai-templates:artifact-template-experiment-analysis": { name: "实验分析", description: "整理实验假设、方法、结果、局限与下一步" },
+  "openai-templates:artifact-template-financial-budget": { name: "财务预算", description: "创建预算、实际支出、预测与现金周期表格" },
+  "openai-templates:artifact-template-investment-committee-memo": { name: "投委会备忘录", description: "创建投资逻辑、财务分析、风险与建议备忘录" },
+  "openai-templates:artifact-template-legal-memorandum": { name: "法律备忘录", description: "创建问题、事实、分析与结论结构的法律文档" },
+  "openai-templates:artifact-template-market-trends-report": { name: "市场趋势报告", description: "创建市场趋势、证据、影响与应对建议演示文稿" },
+  "openai-templates:artifact-template-minimal-letterhead": { name: "简约商务信函", description: "使用简约抬头版式创建专业商务信函" },
+  "openai-templates:artifact-template-operating-calendar": { name: "运营日历", description: "规划年度与月度里程碑、活动、发布和截止日期" },
+  "openai-templates:artifact-template-operating-review": { name: "运营复盘", description: "创建周度运营计分卡、风险、决策与行动项演示" },
+  "openai-templates:artifact-template-project-kickoff": { name: "项目启动会", description: "对齐项目目标、范围、角色、里程碑和风险" },
+  "openai-templates:artifact-template-project-tracker": { name: "项目跟踪表", description: "跟踪任务、负责人、状态、优先级与甘特计划" },
+  "openai-templates:artifact-template-sales-pipeline": { name: "销售管线", description: "跟踪商机、阶段、金额、概率、预测和下一步" },
+  "openai-templates:artifact-template-simple-dark-mode": { name: "简约深色演示", description: "创建排版清晰的深色主题演示文稿" },
+  "openai-templates:artifact-template-simple-light-mode": { name: "简约浅色演示", description: "创建留白舒展的浅色主题演示文稿" },
+  "openai-templates:artifact-template-strategy-memorandum": { name: "战略备忘录", description: "整理战略背景、选择、风险、里程碑与建议" },
+  "openai-templates:artifact-template-system-design": { name: "系统设计", description: "记录架构、需求、组件、数据流、接口与权衡" },
+  "openai-templates:artifact-template-team-alignment": { name: "团队共识", description: "创建团队目标、优先级、决策与行动项演示" },
+  "openai-templates:artifact-template-three-statement-forecast": { name: "三表预测", description: "创建利润表、资产负债表与现金流联动预测" },
+  "plugin-creator": { name: "插件创建器", description: "创建 Codex 插件结构和市场条目" },
+  "review-agent": { name: "代码审查", description: "检查代码变更并发现可执行的缺陷" },
+  "skill-creator": { name: "技能创建器", description: "创建或更新可复用的 Codex 技能" },
+  "skill-installer": { name: "技能安装器", description: "从官方列表或 GitHub 仓库安装技能" },
+};
+
+function localizedSkill(skill: CodexSkill) {
+  return localizedSkillCopy[skill.name] ?? {
+    name: skill.displayName || skill.name,
+    description: skill.shortDescription || skill.description || "Codex 扩展技能",
+  };
+}
+
 function commandHelpMarkdown(): string {
   return [
     "**Codex Web 命令**",
     "- `/quota` 或 `/usage`：查看 Codex 额度/用量",
-    "- `/skills`：列出当前项目可用 skills",
-    "- `/skill 名称`：把 `$名称` 或 skill 默认提示插入输入框",
+    "- `/skills`：打开中文技能选择器",
+    "- `/skill 名称`：显式选择一个技能，发送时使用 `$技能名` 调用",
     "- `/stop`：终止当前会话正在生成的这一轮（保留历史记录）",
     "- `/compact`：压缩当前会话上下文",
     "- `/rename 新名称`：重命名当前会话",
@@ -1762,6 +1816,36 @@ function beginHorizontalResize(
   window.addEventListener("mouseup", handleUp);
 }
 
+function beginRightPanelResize(
+  event: ReactMouseEvent<HTMLElement>,
+  currentWidth: number,
+  setWidth: ResizeSetter,
+  storageKey: string,
+  minWidth: number,
+  maxWidth: number
+): void {
+  event.preventDefault();
+  const startX = event.clientX;
+  const startWidth = currentWidth;
+  const originalCursor = document.body.style.cursor;
+  const originalUserSelect = document.body.style.userSelect;
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+  const handleMove = (moveEvent: MouseEvent) => {
+    const nextWidth = clampNumber(startWidth - (moveEvent.clientX - startX), minWidth, Math.max(minWidth, maxWidth));
+    setWidth(nextWidth);
+    persistNumber(storageKey, nextWidth);
+  };
+  const handleUp = () => {
+    document.body.style.cursor = originalCursor;
+    document.body.style.userSelect = originalUserSelect;
+    window.removeEventListener("mousemove", handleMove);
+    window.removeEventListener("mouseup", handleUp);
+  };
+  window.addEventListener("mousemove", handleMove);
+  window.addEventListener("mouseup", handleUp);
+}
+
 function beginVerticalResize(
   event: ReactMouseEvent<HTMLElement>,
   currentHeight: number,
@@ -1844,7 +1928,7 @@ export function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>(() => {
     const userId = getApiUserId();
     const projectId = window.localStorage.getItem(sidebarProjectSelectionKey(userId)) ?? "";
-    return projectId ? storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(userId, projectId), []) : [];
+    return projectId ? storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(userId, projectId), []).filter((thread) => !isTemporaryAskThread(thread)) : [];
   });
   const [draggingThreadId, setDraggingThreadId] = useState<string | null>(null);
   const [dragOverThreadId, setDragOverThreadId] = useState<string | null>(null);
@@ -1905,6 +1989,9 @@ export function App() {
   const [leaderboardLoading, setLeaderboardLoading] = useState(false);
   const [skills, setSkills] = useState<CodexSkill[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(false);
+  const [skillsPickerOpen, setSkillsPickerOpen] = useState(false);
+  const [skillSearch, setSkillSearch] = useState("");
+  const [selectedSkillNames, setSelectedSkillNames] = useState<string[]>([]);
   const [localMessages, setLocalMessages] = useState<LocalMessage[]>([]);
   const [handledLocationFileTarget, setHandledLocationFileTarget] = useState(false);
   const [activeTurnsByThread, setActiveTurnsByThread] = useState<Record<string, string>>({});
@@ -1915,6 +2002,13 @@ export function App() {
   const [activePromptNavigationKey, setActivePromptNavigationKey] = useState<string | null>(null);
   const [hoveredPromptNavigationKey, setHoveredPromptNavigationKey] = useState<string | null>(null);
   const [error, setError] = useState<string>("");
+  const [temporaryAsk, setTemporaryAsk] = useState<TemporaryAsk | null>(null);
+  const [temporaryPrompt, setTemporaryPrompt] = useState("");
+  const [temporaryModelProfileId, setTemporaryModelProfileId] = useState(defaultModelProfileId);
+  const [temporaryAskWidth, setTemporaryAskWidth] = useState(() => storedNumber("codex-web-temporary-ask-width", 390, 300, 760));
+  const [selectionAction, setSelectionAction] = useState<{ text: string; left: number; top: number } | null>(null);
+  const [temporaryCloseConfirm, setTemporaryCloseConfirm] = useState(false);
+  const [temporaryCloseDontAsk, setTemporaryCloseDontAsk] = useState(() => storedBoolean("codex-web-temporary-close-dont-ask"));
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -1938,14 +2032,166 @@ export function App() {
     () => modelProfileById(activeModelProfileId, modelProfiles),
     [activeModelProfileId, modelProfiles]
   );
+  const temporaryModelProfile = useMemo(
+    () => modelProfileById(temporaryModelProfileId, modelProfiles),
+    [temporaryModelProfileId, modelProfiles]
+  );
   const selectedUser = useMemo(
     () => users.find((user) => user.id === selectedUserId) ?? users[0] ?? null,
     [users, selectedUserId]
   );
+  const selectedSkills = useMemo(
+    () => selectedSkillNames
+      .map((name) => skills.find((skill) => skill.name === name))
+      .filter((skill): skill is CodexSkill => Boolean(skill)),
+    [selectedSkillNames, skills],
+  );
+  const filteredSkills = useMemo(() => {
+    const query = skillSearch.trim().toLowerCase();
+    if (!query) return skills;
+    return skills.filter((skill) => {
+      const copy = localizedSkill(skill);
+      return `${copy.name} ${copy.description} ${skill.name}`.toLowerCase().includes(query);
+    });
+  }, [skillSearch, skills]);
   const selectedProjectIdRef = useRef(selectedProjectId);
   const selectedThreadRef = useRef<ThreadSummary | null>(selectedThread);
   const threadsRef = useRef<ThreadSummary[]>(threads);
   const projectsRef = useRef<Project[]>(projects);
+  const temporaryAskRef = useRef<TemporaryAsk | null>(null);
+  const temporaryThreadIdsRef = useRef(new Set<string>());
+
+  function performCloseTemporaryAsk() {
+    const current = temporaryAskRef.current;
+    temporaryAskRef.current = null;
+    setTemporaryAsk(null);
+    setTemporaryPrompt("");
+    setSelectionAction(null);
+    if (!current?.threadId) return;
+    setLiveDeltas((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== current.threadId)));
+    setLiveTools((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== current.threadId)));
+    setActiveTurnsByThread((items) => {
+      const next = { ...items };
+      delete next[current.threadId!];
+      return next;
+    });
+    void deleteThread(current.projectId, current.threadId)
+      .then(() => {
+        temporaryThreadIdsRef.current.delete(current.threadId!);
+        return refreshThreads(current.projectId);
+      })
+      .catch((caught) => setError(`删除临时对话失败：${caught instanceof Error ? caught.message : String(caught)}`));
+  }
+
+  function closeTemporaryAsk() {
+    if (temporaryCloseDontAsk) {
+      performCloseTemporaryAsk();
+      return;
+    }
+    setTemporaryCloseConfirm(true);
+  }
+
+  function confirmCloseTemporaryAsk() {
+    if (temporaryCloseDontAsk) {
+      window.localStorage.setItem("codex-web-temporary-close-dont-ask", "true");
+    }
+    setTemporaryCloseConfirm(false);
+    performCloseTemporaryAsk();
+  }
+
+  function openTemporaryAsk(text: string, left: number, top: number) {
+    if (!selectedProject || !text.trim()) return;
+    if (temporaryAskRef.current) {
+      setSelectionAction(null);
+      return;
+    }
+    const requestId = `temp-${requestToken()}`;
+    const next: TemporaryAsk = {
+      requestId,
+      projectId: selectedProject.id,
+      threadId: null,
+      selectedText: text.trim(),
+      prompt: "",
+      turnId: null,
+      status: "ready",
+    };
+    temporaryAskRef.current = next;
+    setTemporaryAsk(next);
+    setTemporaryPrompt("");
+    setTemporaryModelProfileId(activeModelProfileId);
+    setSelectionAction(null);
+  }
+
+  function sendTemporaryPrompt() {
+    const current = temporaryAskRef.current;
+    const text = temporaryPrompt.trim();
+    if (!current || !text || current.status === "starting" || current.status === "running") return;
+    const requestId = `temp-${requestToken()}`;
+    const next = { ...current, requestId, prompt: text, status: "starting" as const };
+    temporaryAskRef.current = next;
+    setTemporaryAsk(next);
+    setTemporaryPrompt("");
+    try {
+      codexSocket.send(current.threadId ? {
+        type: "turn.start",
+        requestId,
+        userId: selectedUserId,
+        projectId: current.projectId,
+        threadId: current.threadId,
+        prompt: text,
+        model: temporaryModelProfile.model,
+        reasoningEffort: temporaryModelProfile.effort,
+        sandbox,
+        approvalPolicy,
+      } : {
+        type: "thread.start",
+        requestId,
+        userId: selectedUserId,
+        projectId: current.projectId,
+        prompt: `请基于下面选中的文字回答问题。\n\n选中文字：\n${current.selectedText}\n\n用户问题：\n${text}`,
+        model: temporaryModelProfile.model,
+        reasoningEffort: temporaryModelProfile.effort,
+        sandbox,
+        approvalPolicy,
+      });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
+
+  useEffect(() => {
+    const updateSelectionAction = () => {
+      const selection = window.getSelection();
+      const text = selection?.toString().trim() ?? "";
+      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+      const commonAncestor = range?.commonAncestorContainer;
+      const ancestorElement = commonAncestor instanceof Element ? commonAncestor : commonAncestor?.parentElement;
+      if (ancestorElement?.closest(".composer, .temporaryAskPanel, .globalSearchDialog") || !text || text.length > 6000 || selection?.isCollapsed) {
+        setSelectionAction(null);
+        return;
+      }
+      const rect = range?.getBoundingClientRect();
+      if (!rect || rect.width === 0 || rect.height === 0) return;
+      setSelectionAction({
+        text,
+        left: Math.min(Math.max(rect.left + rect.width / 2 - 78, 12), window.innerWidth - 190),
+        top: Math.min(rect.bottom + 8, window.innerHeight - 54),
+      });
+    };
+    const handleSelectionChange = () => window.requestAnimationFrame(updateSelectionAction);
+    const handleMouseUp = (event: MouseEvent) => {
+      if ((event.target as HTMLElement | null)?.closest(".selectionAskButton")) return;
+      window.setTimeout(updateSelectionAction, 0);
+    };
+    document.addEventListener("selectionchange", handleSelectionChange, true);
+    document.addEventListener("mouseup", handleMouseUp, true);
+    document.addEventListener("pointerup", handleMouseUp, true);
+    return () => {
+      document.removeEventListener("selectionchange", handleSelectionChange, true);
+      document.removeEventListener("mouseup", handleMouseUp, true);
+      document.removeEventListener("pointerup", handleMouseUp, true);
+    };
+  }, []);
 
   function updateMessageScrollState() {
     const element = messagesRef.current;
@@ -2566,7 +2812,7 @@ export function App() {
     setSandbox(selectedProject.defaultSandbox || "danger-full-access");
     setApprovalPolicy(selectedProject.defaultApprovalPolicy || "never");
     setLocalMessages([]);
-    const cachedThreads = storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(selectedUserId, selectedProject.id), []);
+    const cachedThreads = storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(selectedUserId, selectedProject.id), []).filter((thread) => !isTemporaryAskThread(thread));
     setThreads(cachedThreads);
     threadsRef.current = cachedThreads;
     window.localStorage.setItem(sidebarProjectSelectionKey(selectedUserId), selectedProject.id);
@@ -2770,6 +3016,20 @@ export function App() {
     }
   }
 
+  async function openSkillsPicker(reload = false) {
+    setSkillsPickerOpen(true);
+    setSkillSearch("");
+    if (reload || !skills.length) {
+      await refreshSkills(selectedProjectIdRef.current, reload, false);
+    }
+  }
+
+  function toggleSelectedSkill(name: string) {
+    setSelectedSkillNames((current) => (
+      current.includes(name) ? current.filter((item) => item !== name) : [...current, name]
+    ));
+  }
+
   async function refreshProjects() {
     try {
       const response = await listProjects();
@@ -2852,13 +3112,18 @@ export function App() {
       if (searchRequestId !== threadSearchRequestRef.current) {
         return;
       }
-      setThreads(response.data);
-      threadsRef.current = response.data;
-      window.localStorage.setItem(sidebarThreadsCacheKey(selectedUserId, projectId), JSON.stringify(response.data));
-      for (const thread of response.data) {
+      const leakedTemporaryThreads = response.data.filter((thread) => isTemporaryAskThread(thread) && !temporaryThreadIdsRef.current.has(thread.id));
+      for (const thread of leakedTemporaryThreads) {
+        void deleteThread(projectId, thread.id);
+      }
+      const visibleThreads = response.data.filter((thread) => !temporaryThreadIdsRef.current.has(thread.id) && !isTemporaryAskThread(thread));
+      setThreads(visibleThreads);
+      threadsRef.current = visibleThreads;
+      window.localStorage.setItem(sidebarThreadsCacheKey(selectedUserId, projectId), JSON.stringify(visibleThreads));
+      for (const thread of visibleThreads) {
         threadProjectIdsRef.current.set(thread.id, projectId);
       }
-      const visibleThreadIds = new Set(response.data.map((thread) => thread.id));
+      const visibleThreadIds = new Set(visibleThreads.map((thread) => thread.id));
       const currentThread = selectedThreadRef.current;
       if (currentThread?.id && search.trim() && !visibleThreadIds.has(currentThread.id)) {
         selectedThreadRef.current = null;
@@ -3122,6 +3387,19 @@ export function App() {
     }
     const projectId = selectedProject.id;
     const sourceFiles = Array.from(files);
+    const uploadBatchId = requestToken();
+    const pendingUploads = sourceFiles.map((sourceFile, index): ComposerUpload => ({
+      name: sourceFile.name || `粘贴图片-${index + 1}.png`,
+      path: "",
+      relativePath: `__uploading__/${uploadBatchId}/${index}/${sourceFile.name || "clipboard.png"}`,
+      size: sourceFile.size,
+      mime: sourceFile.type || "application/octet-stream",
+      rawUrl: "",
+      sourceFile,
+      isImage: sourceFile.type.startsWith("image/") || isInlineImageTarget(sourceFile.name),
+      uploading: true,
+    }));
+    setUploadedFiles((current) => [...current, ...pendingUploads]);
     setUploadingFiles(true);
     setError("");
     try {
@@ -3134,11 +3412,16 @@ export function App() {
         return {
           ...file,
           sourceFile,
-          isImage: isImageComposerUpload(file, sourceFile)
+          isImage: isImageComposerUpload(file, sourceFile),
+          uploading: false,
         };
       });
-      setUploadedFiles((current) => [...current, ...uploads]);
+      setUploadedFiles((current) => current.flatMap((file) => {
+        const pendingIndex = pendingUploads.findIndex((pending) => pending.relativePath === file.relativePath);
+        return pendingIndex >= 0 && uploads[pendingIndex] ? [uploads[pendingIndex]!] : [file];
+      }));
     } catch (caught) {
+      setUploadedFiles((current) => current.filter((file) => !pendingUploads.some((pending) => pending.relativePath === file.relativePath)));
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setUploadingFiles(false);
@@ -3552,7 +3835,7 @@ export function App() {
     }
     if (command === "skills") {
       setPrompt("");
-      await refreshSkills(selectedProjectIdRef.current, true, true);
+      await openSkillsPicker(true);
       return true;
     }
     if (command === "skill") {
@@ -3565,9 +3848,14 @@ export function App() {
       }
       const availableSkills = skills.length ? skills : await refreshSkills(selectedProjectIdRef.current, false, false);
       const skill = availableSkills.find((entry) => entry.name === skillName || entry.displayName.toLowerCase() === skillName.toLowerCase());
-      const inserted = skillTask ? `$${skill?.name ?? skillName} ${skillTask}` : (skill?.defaultPrompt || `$${skillName} `);
-      setPrompt(inserted);
-      addLocalMessage(`已插入 skill：${skill ? `$${skill.name}` : `$${skillName}`}。确认后发送即可。`);
+      if (!skill) {
+        addLocalMessage(`没有找到技能：\`${skillName}\`。使用 \`/skills\` 打开技能选择器。`);
+        setPrompt(skillTask);
+        return true;
+      }
+      setSelectedSkillNames((current) => current.includes(skill.name) ? current : [...current, skill.name]);
+      setPrompt(skillTask);
+      setSkillsPickerOpen(false);
       return true;
     }
     if (command === "new") {
@@ -3678,7 +3966,8 @@ export function App() {
       return;
     }
     const promptUploads = [...uploadedFiles];
-    const sentPromptText = promptWithUploadedFiles(promptText, promptUploads);
+    const skillPrefix = selectedSkills.map((skill) => `$${skill.name}`).join(" ");
+    const sentPromptText = promptWithUploadedFiles([skillPrefix, promptText].filter(Boolean).join(" "), promptUploads);
     const visibleText = visiblePromptText(promptText, promptUploads);
     const requestId = `thread-${requestToken()}`;
     const requestViewToken = threadViewTokenRef.current;
@@ -3737,6 +4026,7 @@ export function App() {
       releasePendingPromptBottomHold(requestId, keepAtBottomUntil);
       setPrompt("");
       setUploadedFiles([]);
+      setSelectedSkillNames([]);
     } catch (caught) {
       promptRequestContextsRef.current.delete(requestId);
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -3933,6 +4223,34 @@ export function App() {
     }
 
     if (message.type === "ack") {
+      if (message.requestId?.startsWith("temp-")) {
+        const temporary = temporaryAskRef.current;
+        if (!temporary || temporary.requestId !== message.requestId) {
+          return;
+        }
+        if (!message.ok) {
+          const failed = { ...temporary, status: "error" as const };
+          temporaryAskRef.current = failed;
+          setTemporaryAsk(failed);
+          setError(`临时提问失败：${message.error ?? "Codex 未接受请求。"}`);
+          return;
+        }
+        const data = message.data as { thread?: { thread?: ThreadSummary }; turn?: { turn?: { id?: string } } } | undefined;
+        const threadId = data?.thread?.thread?.id ?? temporary.threadId;
+        const turnId = data?.turn?.turn?.id ?? temporary.turnId;
+        const next = { ...temporary, threadId: threadId ?? null, turnId: turnId ?? null, status: "running" as const };
+        temporaryAskRef.current = next;
+        setTemporaryAsk(next);
+        if (threadId) {
+          temporaryThreadIdsRef.current.add(threadId);
+          threadProjectIdsRef.current.set(threadId, temporary.projectId);
+        }
+        if (turnId && threadId) {
+          turnThreadIdsRef.current.set(turnId, threadId);
+          setActiveTurnsByThread((current) => ({ ...current, [threadId]: turnId }));
+        }
+        return;
+      }
       const interruptContext = message.requestId ? interruptRequestContextsRef.current.get(message.requestId) : undefined;
       if (interruptContext) {
         if (message.requestId) {
@@ -4186,8 +4504,17 @@ export function App() {
           markThreadResult(threadId);
         }
         const threadProjectId = threadProjectIdsRef.current.get(threadId) ?? selectedProjectIdRef.current;
-        if (!wasInterrupted && threadProjectId) {
+        const isTemporaryThread = temporaryAskRef.current?.threadId === threadId;
+        if (!wasInterrupted && threadProjectId && !isTemporaryThread) {
           scheduleAutoSendGeneratedFiles(threadId, threadProjectId, turnId);
+        }
+        if (isTemporaryThread && !wasInterrupted) {
+          const temporary = temporaryAskRef.current;
+          if (temporary) {
+            const completed = { ...temporary, status: "complete" as const };
+            temporaryAskRef.current = completed;
+            setTemporaryAsk(completed);
+          }
         }
         const currentThread = selectedThreadRef.current;
         if (currentThread?.id === threadId) {
@@ -4210,7 +4537,7 @@ export function App() {
             }
           };
           void promotePersistedTurn();
-        } else {
+        } else if (!isTemporaryThread) {
           clearCompletedLiveItems();
         }
         void refreshQuota(false, { background: true, force: true });
@@ -4458,7 +4785,15 @@ export function App() {
   ]);
 
   return (
-    <main className="appShell" style={{ gridTemplateColumns: sidebarCollapsed ? "0px 0px minmax(620px, 1fr)" : `${sidebarWidth}px 8px minmax(620px, 1fr)` }}>
+    <main
+      className={`appShell${temporaryAsk ? " temporaryPanelOpen" : ""}`}
+      style={{
+        gridTemplateColumns: sidebarCollapsed
+          ? `0px 0px minmax(${temporaryAsk ? "0px" : "620px"}, 1fr)`
+          : `${sidebarWidth}px 8px minmax(${temporaryAsk ? "0px" : "620px"}, 1fr)`,
+        paddingRight: temporaryAsk ? `${temporaryAskWidth}px` : undefined,
+      }}
+    >
       <aside className={`sidebar ${sidebarCollapsed ? "collapsed" : ""}`}>
         <div className="brand">
           <Bot size={22} />
@@ -5230,6 +5565,23 @@ export function App() {
                   }
                 }}
                 onScroll={updateMessageScrollState}
+                onMouseUp={(event) => {
+                  const selection = window.getSelection();
+                  const text = selection?.toString().trim() ?? "";
+                  if (!text || text.length > 6000) {
+                    return;
+                  }
+                  const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+                  const rect = range?.getBoundingClientRect();
+                  if (!rect || rect.width === 0 || rect.height === 0) {
+                    return;
+                  }
+                  setSelectionAction({
+                    text,
+                    left: Math.min(Math.max(rect.left + rect.width / 2 - 78, 12), window.innerWidth - 190),
+                    top: Math.min(rect.bottom + 8, window.innerHeight - 54),
+                  });
+                }}
                 onClick={(event) => {
                   const target = event.target as HTMLElement;
                   if (target.closest("a, button, input, textarea, select")) {
@@ -5255,6 +5607,89 @@ export function App() {
                     </button>
                   </div>
                 ) : null}
+                {temporaryAsk ? createPortal((
+                  <aside className="temporaryAskPanel" style={{ width: temporaryAskWidth }} aria-label="临时侧边对话">
+                    <div
+                      className="temporaryAskResizeHandle"
+                      role="separator"
+                      aria-orientation="vertical"
+                      title="拖动调整临时对话宽度"
+                      onMouseDown={(event) => beginRightPanelResize(event, temporaryAskWidth, setTemporaryAskWidth, "codex-web-temporary-ask-width", 340, Math.min(900, window.innerWidth - 420))}
+                    />
+                    <header className="temporaryAskHeader">
+                      <div className="temporaryAskHeaderLeft">
+                        <span className="temporaryAskHeaderBadge" aria-hidden="true"><MessageSquare size={15} /></span>
+                        <div className="temporaryAskHeaderText">
+                          <span className="temporaryAskHeaderTitle">侧边聊天</span>
+                          <span className={`temporaryAskHeaderState ${temporaryAsk.status}`}>
+                            {temporaryAsk.status === "running"
+                              ? "实时处理中"
+                              : temporaryAsk.status === "starting"
+                                ? "启动中"
+                                : temporaryAsk.threadId
+                                  ? "已就绪"
+                                  : "等待提问"}
+                          </span>
+                          <small>关闭后自动删除，不会进入历史会话</small>
+                        </div>
+                      </div>
+                      <button className="iconButton temporaryAskHeaderButton" type="button" onClick={closeTemporaryAsk} title="关闭并删除临时对话" aria-label="关闭并删除临时对话"><X size={16} /></button>
+                    </header>
+                    <div className="temporaryAskMessages messages">
+                      <article className="messageItem kind-user type-userMessage temporaryAskQuote">
+                        <div className="messageMeta">已选文本片段</div>
+                        <CollapsibleUserMessage text={temporaryAsk.selectedText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+                      </article>
+                      {temporaryAsk.prompt ? <article className="messageItem kind-user type-userMessage temporaryAskUser"><div className="messageMeta">用户</div><CollapsibleUserMessage text={temporaryAsk.prompt} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /></article> : null}
+                      {temporaryAsk.threadId ? [
+                        ...Object.entries(liveDeltas).filter(([, item]) => item.threadId === temporaryAsk.threadId).map(([itemId, item]) => ({ kind: "agent" as const, item: { ...item, itemId } })),
+                        ...Object.values(liveTools).filter((item) => item.threadId === temporaryAsk.threadId).map((item) => ({ kind: "tool" as const, item })),
+                      ].sort((left, right) => left.item.startedAt.localeCompare(right.item.startedAt)).map(({ kind, item }) => kind === "agent"
+                        ? <article className="messageItem kind-agent type-agentMessage temporaryAskAgent" key={item.itemId}><div className="messageMeta">Codex</div><MarkdownMessage text={item.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} renderMath /></article>
+                        : <article className="messageItem kind-tool type-toolCall temporaryAskTool" key={item.itemId}><div className="messageMeta">{item.completed ? "工具输出" : "调用工具"} · {item.tool}</div>{item.input ? <pre>{safeText(item.input)}</pre> : null}{item.output ? <DeferredToolOutput text={displayOutputText(item.output)} /> : null}</article>) : null}
+                      {temporaryAsk.status === "starting" ? <div className="v2ThinkingLine">正在建立临时会话</div> : null}
+                      {temporaryAsk.status === "running" ? <div className="v2ThinkingLine">正在思考</div> : null}
+                    </div>
+                    <div className="composer temporaryAskComposer">
+                      <div className="composerBody">
+                        <textarea value={temporaryPrompt} onChange={(event) => setTemporaryPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendTemporaryPrompt(); } }} placeholder="随心输入" disabled={temporaryAsk.status === "starting" || temporaryAsk.status === "running"} />
+                        <div className="composerTools temporaryAskComposerTools">
+                          <span className="temporarySelectionCount"><MessageSquare size={13} />1 个已选文本片段</span>
+                          <PolishedSelect<string>
+                            className="v2ModelPicker"
+                            value={temporaryModelProfileId}
+                            onChange={setTemporaryModelProfileId}
+                            disabled={temporaryAsk.status === "starting" || temporaryAsk.status === "running"}
+                            options={modelProfiles.map((profile) => ({ value: profile.id, label: profile.label, detail: `${profile.model} · 推理 ${profile.effort}` }))}
+                          />
+                          <PolishedSelect<SandboxMode>
+                            className="temporaryPolicySelect"
+                            value={sandbox}
+                            onChange={setSandbox}
+                            options={[{ value: "danger-full-access", label: "完全访问" }, { value: "workspace-write", label: "项目可写" }, { value: "read-only", label: "只读" }]}
+                          />
+                        </div>
+                      </div>
+                      <button className="iconButton sendButton primary" type="button" onClick={sendTemporaryPrompt} disabled={!temporaryPrompt.trim() || temporaryAsk.status === "starting" || temporaryAsk.status === "running"} title="发送临时提问"><Send size={16} /></button>
+                    </div>
+                  </aside>
+                ), document.body) : null}
+                {temporaryCloseConfirm ? createPortal((
+                  <div className="temporaryCloseScrim" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setTemporaryCloseConfirm(false); }}>
+                    <section className="temporaryCloseDialog" role="dialog" aria-modal="true" aria-labelledby="temporary-close-title">
+                      <h2 id="temporary-close-title">关闭侧边聊天?</h2>
+                      <p>这个侧边聊天将被删除，且无法恢复。你确定吗?</p>
+                      <label className="temporaryCloseCheckbox">
+                        <input type="checkbox" checked={temporaryCloseDontAsk} onChange={(event) => setTemporaryCloseDontAsk(event.target.checked)} />
+                        <span>不再询问</span>
+                      </label>
+                      <div className="temporaryCloseActions">
+                        <button type="button" onClick={() => setTemporaryCloseConfirm(false)}>取消</button>
+                        <button className="danger" type="button" onClick={confirmCloseTemporaryAsk}>关闭侧边聊天</button>
+                      </div>
+                    </section>
+                  </div>
+                ), document.body) : null}
                 {(selectedThread?.turns ?? []).flatMap((turn) => {
                   const syntheticUserText = turnHasUserItem(turn) ? "" : turnUserText(turn);
                   const syntheticUserItem: ThreadItem | null = syntheticUserText.trim()
@@ -5403,6 +5838,45 @@ export function App() {
               onDragLeave={handleUploadDragLeave}
               onDrop={handleUploadDrop}
             >
+              {skillsPickerOpen ? (
+                <section className="skillPickerPopover" aria-label="选择 Codex 技能">
+                  <header className="skillPickerHeader">
+                    <div>
+                      <strong>选择技能</strong>
+                      <span>发送时将使用真实的 $技能名 显式调用</span>
+                    </div>
+                    <button className="skillPickerClose" type="button" onClick={() => setSkillsPickerOpen(false)} aria-label="关闭技能选择器">
+                      <X size={16} />
+                    </button>
+                  </header>
+                  <label className="skillPickerSearch">
+                    <Search size={15} />
+                    <input value={skillSearch} onChange={(event) => setSkillSearch(event.target.value)} placeholder="搜索技能名称或用途" autoFocus />
+                  </label>
+                  <div className="skillPickerList">
+                    {filteredSkills.map((skill) => {
+                      const copy = localizedSkill(skill);
+                      const selected = selectedSkillNames.includes(skill.name);
+                      return (
+                        <button className={`skillPickerItem${selected ? " selected" : ""}`} type="button" key={skill.name} onClick={() => toggleSelectedSkill(skill.name)}>
+                          <span className="skillPickerCheck">{selected ? "✓" : ""}</span>
+                          <span className="skillPickerCopy">
+                            <strong>{copy.name}</strong>
+                            <small>{copy.description}</small>
+                            <code>${skill.name}</code>
+                          </span>
+                        </button>
+                      );
+                    })}
+                    {!skillsLoading && !filteredSkills.length ? <div className="skillPickerEmpty">没有匹配的技能</div> : null}
+                    {skillsLoading ? <div className="skillPickerEmpty">正在加载技能...</div> : null}
+                  </div>
+                  <footer className="skillPickerFooter">
+                    <span>已选 {selectedSkillNames.length} 个</span>
+                    <button type="button" onClick={() => setSkillsPickerOpen(false)}>完成</button>
+                  </footer>
+                </section>
+              ) : null}
               <div
                 className="resizeHandle horizontalResizeHandle composerResizeHandle"
                 role="separator"
@@ -5412,6 +5886,12 @@ export function App() {
               />
               <div className="composerBody">
                 <div className="composerTools">
+                  {selectedSkills.map((skill) => (
+                    <button className="selectedSkillChip" type="button" key={skill.name} onClick={() => toggleSelectedSkill(skill.name)} title={`移除 $${skill.name}`}>
+                      <span>{localizedSkill(skill).name}</span>
+                      <X size={12} />
+                    </button>
+                  ))}
                   <PolishedSelect<string>
                     className="v2ModelPicker"
                     value={activeModelProfileId}
@@ -5453,8 +5933,8 @@ export function App() {
                   <button className="iconTextButton" type="button" onClick={() => void refreshQuota(true, { force: true })} disabled={quotaLoading}>
                     {quotaLoading ? "额度..." : "额度"}
                   </button>
-                  <button className="iconTextButton" type="button" onClick={() => void refreshSkills(selectedProjectId, true, true)} disabled={!selectedProject || skillsLoading}>
-                    {skillsLoading ? "Skills..." : `Skills ${skills.length || ""}`}
+                  <button className="iconTextButton skillsButton" type="button" onClick={() => void openSkillsPicker(true)} disabled={!selectedProject || skillsLoading}>
+                    {skillsLoading ? "加载技能..." : `技能 ${skills.length || ""}`}
                   </button>
                   <select
                     className="skillSelect"
@@ -5491,7 +5971,13 @@ export function App() {
                   <button className="iconTextButton composerExportButton" type="button" onClick={() => void exportCurrentThread()} disabled={!selectedThread || exportingThread}>
                     {exportingThread ? "导出中" : "导出记录"}
                   </button>
-                  {uploadedFiles.length ? <span className="uploadCount">{uploadedFiles.length} 个文件已到 4090-left /tmp</span> : null}
+                  {uploadedFiles.length ? (
+                    <span className="uploadCount">
+                      {uploadedFiles.some((file) => file.uploading)
+                        ? `正在上传 ${uploadedFiles.filter((file) => file.uploading).length} 个文件`
+                        : `${uploadedFiles.length} 个文件已上传`}
+                    </span>
+                  ) : null}
                 </div>
                 {uploadedFiles.length ? (
                   <div className="uploadedFileList">
@@ -5501,11 +5987,12 @@ export function App() {
                           className="uploadedFilePreviewButton"
                           type="button"
                           onClick={() => void openFilePreview(file.relativePath)}
+                          disabled={file.uploading}
                           title={file.isImage ? "查看图片预览" : "查看文件预览"}
                         >
                           {file.isImage ? <ComposerImageThumbnail upload={file} /> : <FileText className="uploadedFileIcon" size={14} />}
                           <span>{file.name}</span>
-                          <small>{file.isImage ? `图片 · ${formatBytes(file.size)}` : file.relativePath}</small>
+                          <small>{file.uploading ? "正在上传" : (file.isImage ? `图片 · ${formatBytes(file.size)}` : file.relativePath)}</small>
                         </button>
                         <button
                           className="removeUploadedFileButton"
@@ -5621,6 +6108,18 @@ export function App() {
             </div>
           </section>
         </div>
+      ) : null}
+      {selectionAction ? (
+        <button
+          className="selectionAskButton"
+          type="button"
+          style={{ left: selectionAction.left, top: selectionAction.top }}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => openTemporaryAsk(selectionAction.text, selectionAction.left, selectionAction.top)}
+        >
+          <MessageSquare size={14} />
+          在侧边提问
+        </button>
       ) : null}
     </main>
   );

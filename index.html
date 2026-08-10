@@ -200,7 +200,7 @@
             return;
           }
           [...tools.children].forEach((element) => {
-            if (/上传|额度|Skills|插入 skill|导出记录/i.test(element.textContent || "")) element.classList.add("v2MovedIntoPlus");
+            if (/上传|额度|Skills|技能|插入 skill|导出记录/i.test(element.textContent || "")) element.classList.add("v2MovedIntoPlus");
           });
           const plus = document.createElement("button");
           plus.type = "button";
