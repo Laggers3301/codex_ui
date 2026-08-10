@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codex Web Console 260803</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <div class="v2AccountDock" id="v2AccountDock">
+      <div class="v2AccountMenu" id="v2AccountMenu" hidden>
+        <div class="v2AccountIdentity">
+          <span class="v2Avatar">GY</span>
+          <strong>gyj</strong>
+        </div>
+        <button type="button" id="v2QuotaMenuButton">
+          <span class="v2MenuIcon">◔</span>
+          <span>剩余用量</span>
+          <small id="v2QuotaSummary">查看详情</small>
+          <span class="v2ChevronGlyph" aria-hidden="true"></span>
+        </button>
+        <div class="v2QuotaStrip"><span id="v2QuotaFill"></span></div>
+        <button type="button"><span class="v2MenuIcon">↗</span><span>了解更多</span></button>
+        <button type="button"><span class="v2MenuIcon">◉</span><span>显示宠物</span></button>
+        <button type="button"><span class="v2MenuIcon">⌁</span><span>邀请好友</span></button>
+        <button type="button"><span class="v2MenuIcon">⚙</span><span>设置</span><small>Ctrl+,</small></button>
+        <button type="button"><span class="v2MenuIcon">↪</span><span>退出登录</span></button>
+      </div>
+      <button class="v2AccountTrigger" id="v2AccountTrigger" type="button" aria-expanded="false">
+        <span class="v2Avatar">GY</span>
+        <strong>gyj</strong>
+      </button>
+    </div>
+    <script>
+      (() => {
+        const dock = document.getElementById("v2AccountDock");
+        const menu = document.getElementById("v2AccountMenu");
+        const trigger = document.getElementById("v2AccountTrigger");
+        const quotaMenuButton = document.getElementById("v2QuotaMenuButton");
+        const quotaSummary = document.getElementById("v2QuotaSummary");
+        const quotaFill = document.getElementById("v2QuotaFill");
+
+        function syncQuota() {
+          const source = document.querySelector(".quotaButton");
+          const text = source?.textContent?.trim() || "查看详情";
+          quotaSummary.textContent = text.replace(/^额度\s*/, "剩余 ");
+          const match = text.match(/([0-9]+(?:\.[0-9]+)?)%/);
+          quotaFill.style.width = `${Math.max(4, Math.min(100, Number(match?.[1] || 0)))}%`;
+        }
+
+        trigger.addEventListener("click", () => {
+          const opening = menu.hidden;
+          menu.hidden = !opening;
+          trigger.setAttribute("aria-expanded", String(opening));
+          if (opening) syncQuota();
+        });
+        quotaMenuButton.addEventListener("click", () => {
+          document.querySelector(".quotaButton")?.click();
+          menu.hidden = true;
+          trigger.setAttribute("aria-expanded", "false");
+        });
+        document.addEventListener("click", (event) => {
+          if (!dock.contains(event.target)) {
+            menu.hidden = true;
+            trigger.setAttribute("aria-expanded", "false");
+          }
+        });
+      })();
+    </script>
+    <div class="v2ProjectDock" id="v2ProjectDock">
+      <div class="v2BrandRow"><strong>Codex</strong><span class="v2BuildBadge">260803</span><button class="v2BrandSearch" id="v2BrandSearch" type="button" title="搜索对话">⌕</button></div>
+      <div class="v2PrimaryNav">
+        <button id="v2NewConversation" type="button"><span class="v2NewThreadGlyph" aria-hidden="true"></span><strong>新对话</strong></button>
+        <button id="v2OpenPlugins" type="button"><span class="v2PluginGlyph" aria-hidden="true"></span><strong>插件</strong></button>
+        <button id="v2NewWorkspace" type="button"><span class="v2NewWorkspaceGlyph" aria-hidden="true"></span><strong>新建工作区</strong></button>
+      </div>
+      <button class="v2ProjectTrigger" id="v2ProjectTrigger" type="button" aria-expanded="false">
+        <span class="v2FolderIcon"></span>
+        <span><small>选择文件</small><strong id="v2ProjectName">项目文件夹</strong></span>
+        <span class="v2ChevronGlyph" aria-hidden="true"></span>
+      </button>
+      <div class="v2ProjectMenu" id="v2ProjectMenu" hidden>
+        <div class="v2ProjectSearchRow"><span>⌕</span><input id="v2ProjectSearch" placeholder="检索项目文件夹" /></div>
+        <div class="v2ProjectOptions" id="v2ProjectOptions"></div>
+        <button class="v2OpenFolder" id="v2OpenFolder" type="button"><span>＋</span>连接新的本地文件夹</button>
+      </div>
+    </div>
+
+    <div class="v2PlusMenu" id="v2PlusMenu" hidden>
+      <span class="v2MenuSection">添加</span>
+      <button type="button" data-action="upload"><span>⌕</span><span><strong>文件和文件夹</strong><small>上传到当前工作区</small></span></button>
+      <button type="button" data-action="send-markdown"><span>⇲</span><span><strong>发送对话记录到本机</strong><small>发送当前会话记录</small></span></button>
+      <button type="button" data-action="settings"><span>⚙</span><span><strong>设备与导出设置</strong><small>配置文件发送和对话导出</small></span></button>
+      <button type="button" data-action="quota"><span>◔</span><span><strong>剩余用量</strong><small>查看额度与重置时间</small></span></button>
+      <button type="button" data-action="leaderboard"><span>♜</span><span><strong>排行榜</strong><small>查看 Token 使用排行</small></span></button>
+      <span class="v2MenuSection">能力</span>
+      <button type="button" data-action="skills"><span>◇</span><span><strong>技能与插件</strong><small>管理 Codex 扩展能力</small></span></button>
+      <button type="button" data-action="migration"><span>⇄</span><span><strong>迁移 4090-left 会话</strong><small>保留现有迁移功能</small></span></button>
+    </div>
+
+    <script>
+      (() => {
+        const projectDock = document.getElementById("v2ProjectDock");
+        const projectTrigger = document.getElementById("v2ProjectTrigger");
+        const projectMenu = document.getElementById("v2ProjectMenu");
+        const projectName = document.getElementById("v2ProjectName");
+        const projectSearch = document.getElementById("v2ProjectSearch");
+        const projectOptions = document.getElementById("v2ProjectOptions");
+        const plusMenu = document.getElementById("v2PlusMenu");
+
+        document.getElementById("v2BrandSearch").addEventListener("click", () => {
+          window.dispatchEvent(new Event("v2:open-thread-search"));
+        });
+        document.getElementById("v2NewConversation").addEventListener("click", () => {
+          document.querySelector(".newThreadButton")?.click();
+        });
+        document.getElementById("v2OpenPlugins").addEventListener("click", () => {
+          clickExisting(".skillsButton", /Skills|技能|插件/);
+        });
+        document.getElementById("v2NewWorkspace").addEventListener("click", () => {
+          clickExisting(".projectCreator .iconTextButton", /选择目录/);
+        });
+
+        const projects = () => [...document.querySelectorAll(".projectRow")].map((row) => ({
+          row,
+          button: row.querySelector(".projectSelectButton"),
+          name: row.querySelector(".projectSelectButton strong")?.textContent?.trim() || "未命名项目",
+          path: row.querySelector(".projectSelectButton small")?.textContent?.trim() || ""
+        })).filter((project) => project.button);
+
+        function renderProjects() {
+          const all = projects();
+          const selected = all.find((project) => project.row.classList.contains("selected"));
+          if (selected) projectName.textContent = selected.name;
+          const query = projectSearch.value.trim().toLowerCase();
+          projectOptions.replaceChildren();
+          all.filter((project) => `${project.name} ${project.path}`.toLowerCase().includes(query)).forEach((project) => {
+            const option = document.createElement("button");
+            option.type = "button";
+            option.className = project.row.classList.contains("selected") ? "selected" : "";
+            option.innerHTML = '<span class="v2FolderIcon"></span><span><strong></strong><small></small></span><span class="v2ProjectCheck"></span>';
+            option.querySelector("strong").textContent = project.name;
+            option.querySelector("small").textContent = project.path;
+            option.querySelector(".v2ProjectCheck").textContent = option.className ? "✓" : "";
+            option.addEventListener("click", () => {
+              project.button.click();
+              projectMenu.hidden = true;
+              projectTrigger.setAttribute("aria-expanded", "false");
+              setTimeout(renderProjects, 0);
+            });
+            projectOptions.appendChild(option);
+          });
+        }
+
+        projectTrigger.addEventListener("click", () => {
+          const opening = projectMenu.hidden;
+          projectMenu.hidden = !opening;
+          projectTrigger.setAttribute("aria-expanded", String(opening));
+          if (opening) { renderProjects(); setTimeout(() => projectSearch.focus(), 0); }
+        });
+        projectSearch.addEventListener("input", renderProjects);
+        document.getElementById("v2OpenFolder").addEventListener("click", () => {
+          [...document.querySelectorAll("button")].find((button) => /选择目录|连接本地记录|添加.*项目/i.test(button.textContent || ""))?.click();
+          projectMenu.hidden = true;
+        });
+
+        function clickExisting(selector, pattern) {
+          const direct = document.querySelector(selector);
+          if (direct) { direct.click(); return; }
+          [...document.querySelectorAll("button")].find((button) => pattern.test(button.textContent || ""))?.click();
+        }
+
+        function installShellBridges() {
+          const threadList = document.querySelector(".threadList");
+          if (threadList) {
+            document.documentElement.style.setProperty("--v2-sidebar-width", `${threadList.getBoundingClientRect().width}px`);
+            if (!window.__v2SidebarResizeObserver) {
+              window.__v2SidebarResizeObserver = new ResizeObserver((entries) => {
+                const width = entries[0]?.contentRect.width;
+                if (width !== undefined) document.documentElement.style.setProperty("--v2-sidebar-width", `${width}px`);
+              });
+              window.__v2SidebarResizeObserver.observe(threadList);
+            }
+          }
+          const listLabel = document.querySelector(".threadList .listHeader > span:first-child");
+          if (listLabel) listLabel.textContent = "项目";
+          const conversationTitle = document.querySelector(".conversationHeader h2");
+          if (conversationTitle?.textContent?.trim() === "New Thread") conversationTitle.textContent = "新对话";
+          const emptyState = document.querySelector(".conversation .emptyState");
+          if (emptyState?.textContent?.includes("Ready for a new Codex turn")) emptyState.textContent = "从当前项目开始一个新的 Codex 对话";
+          const controls = document.querySelector(".topbar .controls");
+          const quotaTop = controls?.querySelector(".quotaButton.v2QuotaTopButton");
+          if (quotaTop) quotaTop.title = "悬停查看额度详情";
+          const tools = document.querySelector(".composerTools");
+          if (!tools) return;
+          if (tools.querySelector(".v2ComposerPlus")) {
+            const textarea = document.querySelector(".composer textarea");
+            if (textarea) textarea.placeholder = "随心输入";
+            return;
+          }
+          [...tools.children].forEach((element) => {
+            if (/上传|额度|Skills|插入 skill|导出记录/i.test(element.textContent || "")) element.classList.add("v2MovedIntoPlus");
+          });
+          const plus = document.createElement("button");
+          plus.type = "button";
+          plus.className = "v2ComposerPlus";
+          plus.textContent = "+";
+          plus.title = "添加文件、能力或查看用量";
+          plus.addEventListener("click", (event) => {
+            event.stopPropagation();
+            const opening = plusMenu.hidden;
+            plusMenu.hidden = !opening;
+            if (opening) {
+              const rect = plus.getBoundingClientRect();
+              plusMenu.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - 422))}px`;
+              plusMenu.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+            }
+          });
+          tools.prepend(plus);
+
+          const textarea = document.querySelector(".composer textarea");
+          if (textarea) textarea.placeholder = "随心输入";
+        }
+
+        plusMenu.addEventListener("click", (event) => {
+          const action = event.target.closest("button")?.dataset.action;
+          if (!action) return;
+          if (action === "upload") document.querySelector(".hiddenFileInput")?.click();
+          if (action === "send-markdown") document.querySelector(".v2SendMarkdownLocalAction")?.click();
+          if (action === "settings") document.querySelector(".v2SettingsBridge")?.click();
+          if (action === "quota") clickExisting(".quotaButton", /额度|剩余用量/);
+          if (action === "leaderboard") clickExisting(".leaderboardButton", /排行榜/);
+          if (action === "skills") clickExisting(".skillsButton", /Skills|技能|插件/);
+          if (action === "migration") clickExisting(".handoffButton", /迁移 4090-left|迁移会话/);
+          plusMenu.hidden = true;
+        });
+
+        const accountButtons = document.querySelectorAll(".v2AccountMenu button");
+        const logout = accountButtons[accountButtons.length - 1];
+        if (logout) logout.addEventListener("click", () => window.location.assign("/__v2_logout"));
+
+        let scheduled = false;
+        const observer = new MutationObserver(() => {
+          if (scheduled) return;
+          scheduled = true;
+          requestAnimationFrame(() => {
+            scheduled = false;
+            installShellBridges();
+            renderProjects();
+          });
+        });
+        observer.observe(document.getElementById("root"), { childList: true, subtree: true });
+        installShellBridges();
+
+        document.addEventListener("click", (event) => {
+          if (!projectDock.contains(event.target)) {
+            projectMenu.hidden = true;
+            projectTrigger.setAttribute("aria-expanded", "false");
+          }
+          if (!plusMenu.contains(event.target) && !event.target.closest(".v2ComposerPlus")) plusMenu.hidden = true;
+        });
+      })();
+    </script>
+  </body>
+</html>

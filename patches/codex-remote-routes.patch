@@ -1,0 +1,17 @@
+--- a/app/server/routes.ts
++++ b/app/server/routes.ts
+@@
+-const leaderboardCacheTtlMs = 10_000;
++const leaderboardCacheTtlMs = 60_000;
+@@
+-  app.get<{ Params: { id: string }; Querystring: { archived?: string; search?: string } }>(
++  app.get<{ Params: { id: string }; Querystring: { archived?: string; search?: string; fast?: string } }>(
+@@
+-        const result = await listAllCodexThreads(bridge, {
++        const fastList = request.query.fast === "true";
++        const result = await listAllCodexThreads(bridge, {
+@@
+-          searchTerm: "",
++          searchTerm: fastList ? null : "",
++          useStateDbOnly: fastList
+         });

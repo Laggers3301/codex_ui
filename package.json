@@ -1,0 +1,42 @@
+{
+  "name": "codex-web-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n server,client -c cyan,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:client": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "serve": "tsx server/index.ts",
+    "generate:codex-schema": "node scripts/generate-codex-schema.mjs"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^10.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "fastify": "^5.4.0",
+    "katex": "0.16.22",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "7.0.1",
+    "remark-breaks": "^4.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "6.0.0",
+    "vite": "^7.0.0",
+    "ws": "^8.18.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/ws": "^8.5.0",
+    "concurrently": "^9.1.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
