@@ -6205,7 +6205,9 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .skillPickerClose { width:30px; height:30px; }
 .skillPickerClose:hover,.skillPickerFooter button:hover { background:#454744; color:#fff; }
 .skillPickerSearch { display:flex; align-items:center; gap:9px; margin:0 12px 8px; padding:0 11px; border:1px solid #4b4d49; border-radius:10px; background:#2c2d2c; color:#989c96; }
-.skillPickerSearch input { min-width:0; width:100%; height:38px; border:0; outline:0; background:transparent; color:#ecedea; font:inherit; font-size:13px; }
+.skillPickerSearch input { min-width:0; width:100%; height:38px; padding:0; border:0!important; outline:0!important; background:transparent; box-shadow:none!important; color:#ecedea; font-family:"Segoe UI Variable","Microsoft YaHei UI","Noto Sans SC",sans-serif; font-size:13px; font-weight:400; }
+.skillPickerSearch input:focus,
+.skillPickerSearch input:focus-visible { border:0!important; outline:0!important; box-shadow:none!important; }
 .skillPickerList { overflow-y:auto; padding:3px 8px 8px; }
 .skillPickerItem { display:grid; width:100%; grid-template-columns:22px minmax(0,1fr); gap:8px; padding:10px 9px; border:0; border-radius:10px; background:transparent; color:inherit; text-align:left; cursor:pointer; }
 .skillPickerItem:hover,.skillPickerItem.selected { background:#414340; }
@@ -6215,7 +6217,10 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .skillPickerCopy strong { font-size:13px; font-weight:540; }
 .skillPickerCopy small,.skillPickerCopy code { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .skillPickerCopy small { color:#aaaea8; font-size:12px; line-height:1.45; }
-.skillPickerCopy code { color:#7f847d; font-size:10px; }
+.skillPickerCopy code { color:#7f847d; font-family:"Segoe UI Variable","Microsoft YaHei UI","Noto Sans SC",sans-serif; font-size:10px; font-weight:400; letter-spacing:0; }
+.skillPickerPopover,
+.skillPickerPopover button,
+.skillPickerPopover input { font-family:"Segoe UI Variable","Microsoft YaHei UI","Noto Sans SC",sans-serif; }
 .skillPickerEmpty { padding:24px; color:#989c96; text-align:center; font-size:13px; }
 .skillPickerFooter { border-top:1px solid #444642; padding-block:10px; }
 .skillPickerFooter button { padding:6px 12px; background:#e4e6e1; color:#252625; font-size:12px; }
