@@ -2682,8 +2682,8 @@ pre,
 
 
 .messageItem {
-  content-visibility: auto;
-  contain-intrinsic-block-size: auto 180px;
+  content-visibility: visible;
+  contain-intrinsic-block-size: none;
 }
 
 .messageItem img {
@@ -5520,9 +5520,9 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .quotaPopover header span,
 .quotaPopover p { margin: 0; color: #969993; font-size: 11px; }
 .quotaPopoverRows { display: grid; gap: 7px; padding: 10px 2px 1px; }
-.quotaPopoverRows > div { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 10px; }
+.quotaPopoverRows > div { display: grid; grid-template-columns: 72px minmax(0, 1fr); align-items: start; gap: 10px; }
 .quotaPopoverRows span { color: #969993; font-size: 11px; }
-.quotaPopoverRows strong { overflow: hidden; color: #d7d9d4; font-size: 11px; font-weight: 400; line-height: 16px; text-overflow: ellipsis; white-space: nowrap; }
+.quotaPopoverRows strong { overflow-wrap: anywhere; color: #d7d9d4; font-size: 11px; font-weight: 400; line-height: 16px; white-space: normal; }
 
 /* Keep the composer inside the readable content width while allowing popovers above it. */
 .composer {

@@ -62,6 +62,7 @@ import type {
   CodexLeaderboardScope,
   CodexLeaderboardUserUsage,
   CodexQuota,
+  CodexRateLimitSnapshot,
   CodexRateLimitWindow,
   CodexSkill,
   DirectoryListResponse,
@@ -632,7 +633,6 @@ function projectNameFromPath(rootPath: string): string {
 }
 
 const fallbackModelProfiles: ModelProfile[] = [
-  { id: "gpt-5.6-sol:ultra", label: "GPT-5.6-Sol ultra", model: "gpt-5.6-sol", effort: "ultra" },
   { id: "gpt-5.6-sol:max", label: "GPT-5.6-Sol max", model: "gpt-5.6-sol", effort: "max" },
   { id: "gpt-5.6-sol:xhigh", label: "GPT-5.6-Sol xhigh", model: "gpt-5.6-sol", effort: "xhigh" },
   { id: "gpt-5.6-sol:high", label: "GPT-5.6-Sol high", model: "gpt-5.6-sol", effort: "high" },
@@ -1424,6 +1424,19 @@ function rateWindowText(window: CodexRateLimitWindow | null | undefined): string
   return `剩余 ${percentText(remaining)}% / ${windowLabel}，已用 ${percentText(used)}%，重置 ${formatResetTime(window.resetsAt)}`;
 }
 
+function rateLimitSnapshotText(snapshot: CodexRateLimitSnapshot | null | undefined): string {
+  if (!snapshot) {
+    return "-";
+  }
+  const parts = snapshot.primary ? [rateWindowText(snapshot.primary)] : [];
+  const individual = snapshot.individualLimit;
+  if (individual?.resetsAt && individual.resetsAt !== snapshot.primary?.resetsAt) {
+    const remaining = individual.remainingPercent === null ? "" : `剩余 ${percentText(individual.remainingPercent)}%`;
+    parts.push([remaining, `重置 ${formatResetTime(individual.resetsAt)}`].filter(Boolean).join("，"));
+  }
+  return parts.join("；") || "-";
+}
+
 function quotaSummaryLabel(quota: CodexQuota | null): string {
   const primary = remainingQuotaPercent(quota?.rateLimits?.primary?.usedPercent);
   const secondary = remainingQuotaPercent(quota?.rateLimits?.secondary?.usedPercent);
@@ -1459,6 +1472,7 @@ function quotaMarkdown(quota: CodexQuota): string {
 function QuotaPopover({ quota, loading }: { quota: CodexQuota | null; loading: boolean }) {
   const primary = quota?.rateLimits?.primary ?? null;
   const secondary = quota?.rateLimits?.secondary ?? null;
+  const otherLimits = Object.entries(quota?.rateLimitsByLimitId ?? {}).filter(([key]) => key !== "codex");
   return (
     <section className="quotaPopover" role="status" aria-label="Codex 额度详情">
       <header><strong>Codex 额度</strong><span>{loading ? "更新中" : quota?.account?.planType ?? quota?.rateLimits?.planType ?? ""}</span></header>
@@ -1466,6 +1480,9 @@ function QuotaPopover({ quota, loading }: { quota: CodexQuota | null; loading: b
         <div className="quotaPopoverRows">
           <div><span>主额度</span><strong>{rateWindowText(primary)}</strong></div>
           <div><span>次额度</span><strong>{rateWindowText(secondary)}</strong></div>
+          {otherLimits.map(([key, limit]) => (
+            <div key={key}><span>{limit.limitName ?? key}</span><strong>{rateLimitSnapshotText(limit)}</strong></div>
+          ))}
           <div><span>累计 Token</span><strong>{formatNumber(quota.usage?.summary?.lifetimeTokens)}</strong></div>
           <div><span>重置额度</span><strong>{formatNumber(quota.resetCredits?.availableCount)}</strong></div>
         </div>
@@ -1787,7 +1804,9 @@ export function App() {
   const threadCopyNoticeTimerRef = useRef<number | null>(null);
   const promptMessageElementsRef = useRef(new Map<string, HTMLElement>());
   const historyPrependAnchorRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null);
+  const threadViewCacheRef = useRef(new Map<string, { thread: ThreadSummary; history: ThreadHistoryPage | null }>());
   const autoFollowMessagesRef = useRef(true);
+  const manualMessageScrollLockRef = useRef(false);
   const threadViewTokenRef = useRef(0);
   const promptRequestContextsRef = useRef(new Map<string, PromptRequestContext>());
   const interruptRequestContextsRef = useRef(new Map<string, TurnInterruptContext>());
@@ -1953,8 +1972,13 @@ export function App() {
     }
     const bottomGap = element.scrollHeight - element.scrollTop - element.clientHeight;
     const nearBottom = bottomGap < 96;
-    autoFollowMessagesRef.current = nearBottom;
-    setShowScrollToBottom(!nearBottom);
+    const atBottom = bottomGap < 2;
+    if (atBottom) {
+      manualMessageScrollLockRef.current = false;
+    }
+    const shouldFollow = nearBottom && !manualMessageScrollLockRef.current;
+    autoFollowMessagesRef.current = shouldFollow;
+    setShowScrollToBottom(!shouldFollow);
     schedulePromptNavigationActiveUpdate();
   }
 
@@ -1973,6 +1997,7 @@ export function App() {
     } else {
       messagesEndRef.current?.scrollIntoView({ block: "end", inline: "nearest", behavior });
     }
+    manualMessageScrollLockRef.current = false;
     autoFollowMessagesRef.current = true;
     setShowScrollToBottom(false);
     schedulePromptNavigationActiveUpdate();
@@ -2073,18 +2098,26 @@ export function App() {
 
   function selectThread(threadId: string) {
     const viewToken = ++threadViewTokenRef.current;
+    const projectId = selectedProjectIdRef.current;
     newThreadDraftModeRef.current = false;
     if (selectedProjectIdRef.current) {
       threadProjectIdsRef.current.set(threadId, selectedProjectIdRef.current);
     }
     setThreadContextMenu(null);
     setError("");
-    setThreadHistory(null);
+    const cachedView = projectId ? threadViewCacheRef.current.get(`${projectId}:${threadId}`) : undefined;
+    if (cachedView) {
+      selectedThreadRef.current = cachedView.thread;
+      setSelectedThread(cachedView.thread);
+      setThreadHistory(cachedView.history);
+    } else {
+      setThreadHistory(null);
+    }
     setLoadingOlderHistory(false);
     setContinuationPrompt(null);
     historyPrependAnchorRef.current = null;
     clearThreadResult(threadId);
-    void openThread(threadId, selectedProjectIdRef.current, viewToken);
+    void openThread(threadId, projectId, viewToken);
   }
 
   async function removeThread(thread: ThreadSummary) {
@@ -2600,7 +2633,8 @@ export function App() {
   async function refreshModels() {
     try {
       const response = await listModels();
-      const nextProfiles = response.data.length ? response.data : fallbackModelProfiles;
+      const nextProfiles = (response.data.length ? response.data : fallbackModelProfiles)
+        .filter((profile) => profile.id !== "gpt-5.6-sol:ultra");
       setModelProfiles(nextProfiles);
       setNewThreadModelProfileId((current) => (
         nextProfiles.some((profile) => profile.id === current)
@@ -2862,6 +2896,18 @@ export function App() {
       selectedThreadRef.current = nextThread;
       setSelectedThread(nextThread);
       setThreadHistory(response.history ?? null);
+      if (!options.appendOlder) {
+        const cacheKey = `${projectId}:${nextThread.id}`;
+        threadViewCacheRef.current.delete(cacheKey);
+        threadViewCacheRef.current.set(cacheKey, { thread: nextThread, history: response.history ?? null });
+        while (threadViewCacheRef.current.size > 12) {
+          const oldestKey = threadViewCacheRef.current.keys().next().value;
+          if (!oldestKey) {
+            break;
+          }
+          threadViewCacheRef.current.delete(oldestKey);
+        }
+      }
       const now = Date.now();
       setPendingUserMessages((current) => current.filter((entry) => {
         if (entry.threadId && entry.threadId !== nextThread.id) {
@@ -5173,6 +5219,16 @@ export function App() {
                 className="messages"
                 id="conversation-messages"
                 ref={messagesRef}
+                onWheelCapture={(event) => {
+                  // Disable follow before the browser applies an upward wheel
+                  // scroll. Otherwise a streaming render can run between the
+                  // wheel event and onScroll and pull the reader back down.
+                  if (event.deltaY < 0 && autoFollowMessagesRef.current) {
+                    manualMessageScrollLockRef.current = true;
+                    autoFollowMessagesRef.current = false;
+                    setShowScrollToBottom(true);
+                  }
+                }}
                 onScroll={updateMessageScrollState}
                 onClick={(event) => {
                   const target = event.target as HTMLElement;
@@ -5273,10 +5329,10 @@ export function App() {
                   });
                   return [
                     ...renderedItems,
+                    ...(conversationLocalMessageLayout.byTurn.get(turn.id) ?? []).map(renderLocalMessage),
                     ...(isRunningStatus(turn.status) ? [
                       <div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>
                     ] : []),
-                    ...(conversationLocalMessageLayout.byTurn.get(turn.id) ?? []).map(renderLocalMessage),
                     ...(isRunningStatus(turn.status) ? liveTimelineByTurn.get(turn.id) ?? [] : []).map(renderLiveTimelineEntry)
                   ];
                 })}
