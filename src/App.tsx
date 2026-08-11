@@ -1399,16 +1399,15 @@ const MessageImagePreviews = memo(function MessageImagePreviews({
               key={preview.key}
               onClick={() => onOpenFileLink(preview.target!)}
               title="打开图片预览"
+              aria-label={`打开图片：${displayLabel}`}
             >
               {image}
-              <span>{displayLabel}</span>
             </button>
           );
         }
         return (
           <div className="inlineImageButton inlineImageStatic" key={preview.key}>
             {image}
-            <span>{displayLabel}</span>
           </div>
         );
       })}
@@ -6694,16 +6693,20 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <div className="uploadedFileList">
                     {uploadedFiles.map((file) => (
                       <div className={`uploadedFileChip${file.isImage ? " uploadedImageChip" : ""}${/\.pdf$/i.test(file.name) ? " uploadedPdfChip" : ""}`} key={file.relativePath} title={file.relativePath}>
-                        <button
-                          className="uploadedFilePreviewButton"
+                      <button
+                          className={`uploadedFilePreviewButton${file.isImage ? " uploadedImageFilePreviewButton" : ""}`}
                           type="button"
                           onClick={() => void openFilePreview(file.relativePath)}
                           disabled={file.uploading}
                           title={file.isImage ? "查看图片预览" : "查看文件预览"}
                         >
                           {file.isImage ? <ComposerImageThumbnail upload={file} /> : <FileText className="uploadedFileIcon" size={14} />}
-                          <span>{file.name}</span>
-                          <small>{file.uploading ? "正在上传" : (file.isImage ? `图片 · ${formatBytes(file.size)}` : (file.name.split(".").pop()?.toUpperCase() || "文件"))}</small>
+                          {file.isImage ? null : (
+                            <>
+                              <span>{file.name}</span>
+                              <small>{file.uploading ? "正在上传" : (file.name.split(".").pop()?.toUpperCase() || "文件")}</small>
+                            </>
+                          )}
                         </button>
                         <button
                           className="removeUploadedFileButton"
