@@ -1094,12 +1094,14 @@ const MarkdownMessage = memo(function MarkdownMessage({
   text,
   projectId,
   onOpenFileLink,
-  renderMath = false
+  renderMath = false,
+  suppressImageGrid = false
 }: {
   text: string;
   projectId?: string;
   onOpenFileLink?: (target: string) => void;
   renderMath?: boolean;
+  suppressImageGrid?: boolean;
 }) {
   const inlineImageTargets = useMemo(() => (projectId ? imageTargetsFromText(text) : []), [projectId, text]);
   const markdownText = useMemo(() => (renderMath ? normalizeMathMarkdown(text || " ") : text || " "), [renderMath, text]);
@@ -1156,7 +1158,7 @@ const MarkdownMessage = memo(function MarkdownMessage({
       >
         {markdownText}
       </ReactMarkdown>
-      {projectId && inlineImageTargets.length > 0 ? (
+      {projectId && inlineImageTargets.length > 0 && !suppressImageGrid ? (
         <div className="inlineImagePreviewGrid" aria-label="图片预览">
           {inlineImageTargets.map((target) => (
             <button
@@ -1213,6 +1215,7 @@ const CollapsibleUserMessage = memo(function CollapsibleUserMessage({
   text: string;
   projectId?: string;
   onOpenFileLink?: (target: string) => void;
+  suppressImageGrid?: boolean;
 }) {
   const collapsible = isLongUserMessage(text);
   const [expanded, setExpanded] = useState(false);
@@ -1224,7 +1227,7 @@ const CollapsibleUserMessage = memo(function CollapsibleUserMessage({
   return (
     <>
       <div className={`userMessageContent ${collapsible && !expanded ? "collapsed" : ""}`}>
-        <MarkdownMessage text={text} projectId={projectId} onOpenFileLink={onOpenFileLink} />
+        <MarkdownMessage text={text} projectId={projectId} onOpenFileLink={onOpenFileLink} suppressImageGrid />
       </div>
       {collapsible ? (
         <button
@@ -1497,7 +1500,7 @@ const PendingUserImagePreviews = memo(function PendingUserImagePreviews({
           onClick={() => onOpenFileLink(upload.relativePath)}
           title="打开图片预览"
         >
-          <span className="uploadedImageThumbnail uploadedImageThumbnailFallback" aria-hidden="true"><FileText size={16} /></span>
+          <ComposerImageThumbnail upload={upload} />
         </button>
       ))}
     </div>
@@ -1564,7 +1567,7 @@ const PersistedUserAttachmentPreviews = memo(function PersistedUserAttachmentPre
             title={`打开 ${attachment.name}`}
           >
             {content}
-            <span>{attachment.name}</span>
+            {!attachment.isImage ? <span>{attachment.name}</span> : null}
           </button>
         );
       })}
@@ -6473,7 +6476,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                             />
                           )}
                         {item.aggregatedOutput ? <DeferredToolOutput text={item.aggregatedOutput} /> : null}
-                        <MessageImagePreviews item={item} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+                        {!isUserMessage ? <MessageImagePreviews item={item} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /> : null}
                         {isUserMessage ? (
                           <div className="v2UserMessageActions" aria-label="用户消息操作">
                             <button
