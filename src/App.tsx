@@ -2540,7 +2540,7 @@ export function App() {
       return;
     }
     threadPrefetchesRef.current.add(cacheKey);
-    void readThread(threadId, projectId, { before: 0, limit: 64 })
+    void readThread(threadId, projectId, { before: 0, limit: 128 })
       .then((response) => {
         if (!response.history) {
           return;
@@ -2853,7 +2853,7 @@ export function App() {
       }
       activeThreadReconcileRef.current.add(key);
       try {
-        const response = await readThread(threadId, projectId, { before: 0, limit: 64 });
+        const response = await readThread(threadId, projectId, { before: 0, limit: 128 });
         if (stopped || selectedThreadRef.current?.id !== threadId) {
           return;
         }
@@ -3421,7 +3421,7 @@ export function App() {
     try {
       const response = await readThread(threadId, projectId, {
         before: options.before,
-        limit: options.appendOlder ? 80 : 64
+        limit: options.appendOlder ? 160 : 128
       });
       if (viewToken !== threadViewTokenRef.current) {
         return null;
