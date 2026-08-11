@@ -1977,6 +1977,7 @@ export function App() {
   const threadViewTokenRef = useRef(0);
   const initializedProjectIdRef = useRef("");
   const threadPageCacheRef = useRef(new Map<string, { thread: ThreadSummary; history: ThreadHistoryPage; cachedAt: number }>());
+  const activeThreadReconcileRef = useRef(new Set<string>());
   const threadPrefetchesRef = useRef(new Set<string>());
   const promptRequestContextsRef = useRef(new Map<string, PromptRequestContext>());
   const interruptRequestContextsRef = useRef(new Map<string, TurnInterruptContext>());
@@ -2761,6 +2762,58 @@ export function App() {
     }, 0);
     return () => window.clearTimeout(timer);
   }, [selectedThread?.turns, pendingUserMessages, liveDeltas, localMessages]);
+
+  useEffect(() => {
+    const threadId = selectedThread?.id;
+    const projectId = selectedProjectId;
+    const activeTurnId = threadId ? activeTurnsByThread[threadId] : undefined;
+    if (!threadId || !projectId || !activeTurnId) {
+      return;
+    }
+
+    let stopped = false;
+    let timer: number | null = null;
+    const reconcile = async () => {
+      const key = `${projectId}:${threadId}:${activeTurnId}`;
+      if (stopped || document.visibilityState !== "visible" || activeThreadReconcileRef.current.has(key)) {
+        return;
+      }
+      activeThreadReconcileRef.current.add(key);
+      try {
+        const response = await readThread(threadId, projectId, { before: 0, limit: 16 });
+        if (stopped || selectedThreadRef.current?.id !== threadId) {
+          return;
+        }
+        const nextThread = sanitizeThreadForRender(
+          applyStoredThreadModelProfile(selectedUserId, applyThreadListName(response.thread), modelProfiles)
+        );
+        const cacheKey = `${projectId}:${threadId}`;
+        threadPageCacheRef.current.delete(cacheKey);
+        threadViewCacheRef.current.delete(cacheKey);
+        selectedThreadRef.current = nextThread;
+        setSelectedThread(nextThread);
+        setThreadHistory(response.history ?? null);
+      } catch {
+        // WebSocket remains the primary path; a temporary read failure should
+        // not replace the live rendering with an error banner.
+      } finally {
+        activeThreadReconcileRef.current.delete(key);
+      }
+    };
+    const schedule = () => {
+      if (stopped) return;
+      timer = window.setTimeout(async () => {
+        timer = null;
+        await reconcile();
+        schedule();
+      }, 3_000);
+    };
+    schedule();
+    return () => {
+      stopped = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [selectedProjectId, selectedThread?.id, selectedThread?.id ? activeTurnsByThread[selectedThread.id] : undefined]);
 
   useEffect(() => {
     void refreshModels();
