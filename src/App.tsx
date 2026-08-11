@@ -5266,7 +5266,7 @@ export function App() {
           <div>
             <div className="brandTitleRow">
               <strong>Codex Web</strong>
-              <span className="brandMarker">260803</span>
+              <span className="brandMarker">260707</span>
             </div>
             <span className={`statusDot ${socketStatus}`}>{socketStatus}</span>
           </div>
