@@ -356,6 +356,47 @@ function statusText(status: unknown): string {
   return safeText(status);
 }
 
+function isTurnAbortMarker(text: unknown): boolean {
+  const normalized = safeText(text).trim().toLowerCase();
+  return (
+    normalized === "<turn_aborted>" ||
+    normalized === "<turn_aborted/>" ||
+    normalized === "<turn_aborted />" ||
+    normalized === "the user interrupted the previous turn on purpose."
+  );
+}
+
+function stripInterruptArtifacts(text: string): string {
+  let filtered = text.replace(/<turn_aborted\b[^>]*>[\s\S]*?<\/turn_aborted>/gi, "");
+  if (filtered !== text) {
+    text = filtered;
+  }
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => {
+      const lower = line.toLowerCase();
+      if (!line.trim()) {
+        return false;
+      }
+      return (
+        lower !== "<turn_aborted>" &&
+        lower !== "<turn_aborted/>" &&
+        lower !== "<turn_aborted />" &&
+        lower !== "the user interrupted the previous turn on purpose." &&
+        lower !== "any running unified exec processes may still be running in the background." &&
+        lower !== "if any tools/commands were aborted, they may have partially executed."
+      );
+    })
+    .join("\n")
+    .trim();
+}
+
+function visibleTextFromRawValue(value: unknown): string {
+  const raw = textFromStructuredValue(value);
+  return stripInterruptArtifacts(raw);
+}
+
 function textFromStructuredValue(value: unknown): string {
   if (typeof value === "string") {
     return value;
@@ -388,7 +429,7 @@ function textFromStructuredValue(value: unknown): string {
 }
 
 function itemText(item: ThreadItem): string {
-  const text = textFromStructuredValue(item.text ?? item.message ?? item.content ?? item.input ?? item.prompt ?? item.value ?? item.output);
+  const text = visibleTextFromRawValue(item.text ?? item.message ?? item.content ?? item.input ?? item.prompt ?? item.value ?? item.output);
   if (text.trim()) {
     return text;
   }
@@ -542,7 +583,10 @@ function turnUserText(turn: Turn): string {
   for (const value of [turn.userMessage, turn.prompt, turn.input, turn.message, turn.request, turn.submission]) {
     const text = textFromStructuredValue(value);
     if (text.trim()) {
-      return text;
+      const visible = stripInterruptArtifacts(text);
+      if (visible) {
+        return visible;
+      }
     }
   }
   return "";
@@ -1140,7 +1184,8 @@ function isLongUserMessage(text: string): boolean {
 }
 
 function visibleUserHistoryText(text: string): string {
-  return text.replace(/(?:\r?\n){0,2}上传文件：\s*(?:\r?\n-\s+[^\r\n]+)+\s*$/, "").trim();
+  const withoutUploads = text.replace(/(?:\r?\n){0,2}上传文件：\s*(?:\r?\n-\s+[^\r\n]+)+\s*$/, "").trim();
+  return stripInterruptArtifacts(withoutUploads);
 }
 
 async function copyPlainText(text: string): Promise<void> {
@@ -1453,8 +1498,7 @@ const PendingUserImagePreviews = memo(function PendingUserImagePreviews({
           onClick={() => onOpenFileLink(upload.relativePath)}
           title="打开图片预览"
         >
-          <ComposerImageThumbnail upload={upload} />
-          <span>{upload.name}</span>
+          <span className="uploadedImageThumbnail uploadedImageThumbnailFallback" aria-hidden="true"><FileText size={16} /></span>
         </button>
       ))}
     </div>
@@ -2860,7 +2904,7 @@ export function App() {
     const threadId = selectedThread?.id;
     const projectId = selectedProjectId;
     const activeTurnId = threadId
-      ? activeTurnsByThread[threadId] ?? [...(selectedThread.turns ?? [])].reverse().find((turn) => isRunningStatus(turn.status))?.id
+      ? activeTurnsByThread[threadId]
       : undefined;
     const hasPendingPromptForThread = Boolean(threadId && pendingUserMessages.some((entry) => (
       entry.threadId === threadId && entry.requestId && entry.keepAtBottomUntil > Date.now()
@@ -4247,7 +4291,6 @@ export function App() {
       const activeTurnId = getRunningTurnIdForThread(selectedThread);
       const projectId = selectedProject?.id || (selectedThread?.id ? threadProjectIdsRef.current.get(selectedThread.id) : undefined) || selectedProjectIdRef.current;
       if (!projectId || !selectedThread?.id || !activeTurnId) {
-        addLocalMessage("当前会话没有正在生成的内容，无需终止。");
         setPrompt("");
         return true;
       }
@@ -4461,6 +4504,44 @@ export function App() {
     interruptRequestContextsRef.current.set(requestId, { threadId, turnId, projectId });
     interruptRequestedTurnIdsRef.current.add(turnId);
     setInterruptingTurns((current) => ({ ...current, [turnId]: true }));
+    setActiveTurnsByThread((current) => {
+      if (current[threadId] !== turnId) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    setSelectedThread((current) => {
+      if (!current || current.id !== threadId) {
+        return current;
+      }
+      const nextTurns = current.turns.map((turn) => (
+        turn.id === turnId
+          ? { ...turn, status: "interrupted", completedAt: turn.completedAt || Date.now() }
+          : turn
+      ));
+      return {
+        ...current,
+        status: "interrupted",
+        turns: nextTurns
+      };
+    });
+    setThreads((current) => current.map((thread) => (
+      thread.id !== threadId ? thread : {
+        ...thread,
+        status: "interrupted",
+        turns: thread.turns.map((turn) => (
+          turn.id === turnId ? { ...turn, status: "interrupted", completedAt: turn.completedAt || Date.now() } : turn
+        ))
+      }
+    )));
+    setLiveDeltas((current) => Object.fromEntries(
+      Object.entries(current).filter(([, entry]) => entry.threadId !== threadId || entry.turnId !== turnId)
+    ));
+    setLiveTools((current) => Object.fromEntries(
+      Object.entries(current).filter(([, entry]) => entry.threadId !== threadId || entry.turnId !== turnId)
+    ));
     setError("");
     const timeoutId = window.setTimeout(() => {
       interruptRequestedTurnIdsRef.current.delete(turnId);
@@ -4480,7 +4561,6 @@ export function App() {
           return next;
         });
       }
-      setError("终止请求超时未响应，按钮已恢复，请稍后再试。");
     }, 10_000);
     interruptTimeoutsRef.current.set(turnId, timeoutId);
     try {
@@ -4597,7 +4677,7 @@ export function App() {
     const hasPendingForThread = pendingUserMessagesRef.current.some((entry) => (
       entry.threadId === thread.id && entry.keepAtBottomUntil > now
     ));
-    const isPending = hasPendingForThread || thread.status === "starting" || isRunningStatus(thread.status);
+    const isPending = hasPendingForThread || thread.status === "starting" || isRunning;
     if (!isRunning && !isPending) {
       return;
     }
@@ -4701,7 +4781,6 @@ export function App() {
         });
         if (!message.ok) {
           interruptRequestedTurnIdsRef.current.delete(interruptContext.turnId);
-          setError(`终止当前对话失败：${message.error ?? "Codex 未接受中断请求。"}`);
           return;
         }
         setActiveTurnsByThread((current) => {
@@ -4859,7 +4938,6 @@ export function App() {
         }
       } else if (message.requestId && interruptQueuedForPrompt) {
         clearQueuedInterrupt(message.requestId);
-        setError("终止请求未执行：Codex 没有返回当前轮次 ID。");
       }
       const commandData = message.data as { processId?: string; result?: { exitCode?: number; stdout?: string; stderr?: string } } | undefined;
       if (commandData?.processId && commandData.result) {
@@ -4886,6 +4964,10 @@ export function App() {
       if (notification.method === "item/agentMessage/delta") {
         const itemId = String(params.itemId ?? "");
         const delta = String(params.delta ?? "");
+        const visibleDelta = stripInterruptArtifacts(delta);
+        if (!visibleDelta) {
+          return;
+        }
         if (!itemId) {
           return;
         }
@@ -4898,7 +4980,7 @@ export function App() {
             [itemId]: {
               threadId: existing?.threadId ?? threadId,
               turnId: existing?.turnId ?? turnId,
-              text: `${existing?.text ?? ""}${delta}`,
+              text: `${existing?.text ?? ""}${visibleDelta}`,
               startedAt: existing?.startedAt ?? new Date().toISOString()
             }
           };
@@ -4956,6 +5038,29 @@ export function App() {
         };
         const now = Date.now();
         setPendingUserMessages((current) => current.filter((entry) => entry.threadId !== threadId || entry.keepAtBottomUntil > now));
+        if (turnId) {
+          setSelectedThread((current) => {
+            if (!current || current.id !== threadId) {
+              return current;
+            }
+            return {
+              ...current,
+              status: "completed",
+              turns: current.turns.map((turn) => (
+                turn.id === turnId ? { ...turn, status: "completed", completedAt: turn.completedAt || now } : turn
+              ))
+            };
+          });
+          setThreads((current) => current.map((item) => (
+            item.id !== threadId ? item : {
+              ...item,
+              status: "completed",
+              turns: item.turns.map((turn) => (
+                turn.id === turnId ? { ...turn, status: "completed", completedAt: turn.completedAt || now } : turn
+              ))
+            }
+          )));
+        }
         const wasInterrupted = turnId ? interruptRequestedTurnIdsRef.current.delete(turnId) : false;
         if (turnId) {
           setInterruptingTurns((current) => {
@@ -5025,10 +5130,7 @@ export function App() {
     .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
   const liveTimelineByTurn = new Map<string, LiveTimelineEntry[]>();
   const unmatchedLiveTimeline: LiveTimelineEntry[] = [];
-  const fallbackLiveTurnId = selectedThread?.id
-    ? activeTurnsByThread[selectedThread.id]
-      ?? [...(selectedThread.turns ?? [])].reverse().find((turn) => isRunningStatus(turn.status))?.id
-    : null;
+  const fallbackLiveTurnId = selectedThread?.id ? activeTurnsByThread[selectedThread.id] : null;
   for (const entry of liveTimelineEntries) {
     const turnId = entry.turnId ?? fallbackLiveTurnId;
     if (!turnId) {
@@ -5040,10 +5142,12 @@ export function App() {
     liveTimelineByTurn.set(turnId, entries);
   }
   const renderLiveTimelineEntry = (entry: LiveTimelineEntry) => entry.kind === "agent" ? (
+    stripInterruptArtifacts(entry.text) ? (
     <article className="messageItem kind-agent type-agentMessage live" key={entry.id}>
       <div className="messageMeta">Codex · agentMessage</div>
-      <MarkdownMessage text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} renderMath />
+      <MarkdownMessage text={stripInterruptArtifacts(entry.text)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} renderMath />
     </article>
+    ) : null
   ) : (
     <article className="messageItem kind-tool type-toolCall live" key={entry.id}>
       <div className="messageMeta">{entry.completed ? "工具输出" : "调用工具"} · {entry.tool}</div>
@@ -5142,20 +5246,26 @@ export function App() {
     }
     return hiddenKeys;
   }, [heldPendingUserMessages, selectedThread]);
-  function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null {
+function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null {
     if (!thread?.id) {
       return null;
     }
-    if (activeTurnsByThread[thread.id]) {
-      return activeTurnsByThread[thread.id];
-    }
-    for (let index = thread.turns.length - 1; index >= 0; index -= 1) {
-      const turn = thread.turns[index];
-      if (isRunningStatus(turn.status)) {
-        return turn.id;
+    const snapshotTurnId = activeTurnsByThread[thread.id];
+    if (snapshotTurnId) {
+      const snapshotTurn = thread.turns.find((turn) => turn.id === snapshotTurnId);
+      if (snapshotTurn && isInterruptableTurnRunning(snapshotTurnId, snapshotTurn)) {
+        return snapshotTurnId;
       }
     }
     return null;
+  }
+  function isInterruptableTurnRunning(turnId: string | undefined, turn: { id?: string; status?: unknown }) {
+    if (!turnId) {
+      return false;
+    }
+    return !interruptRequestedTurnIdsRef.current.has(turnId)
+      && !interruptingTurns[turnId]
+      && isRunningStatus(turn.status);
   }
   const currentPendingTurnStart = visiblePendingUserMessages[visiblePendingUserMessages.length - 1] ?? null;
   const selectedActiveTurnId = getRunningTurnIdForThread(selectedThread);
@@ -5163,7 +5273,7 @@ export function App() {
   const composerStopBusy = selectedActiveTurnId
     ? Boolean(interruptingTurns[selectedActiveTurnId])
     : Boolean(currentPendingTurnStart && queuedInterruptPrompts[currentPendingTurnStart.requestId]);
-  const conversationRunState = selectedActiveTurnId || currentPendingTurnStart || isRunningStatus(selectedThread?.status) ? "running" : "idle";
+  const conversationRunState = selectedActiveTurnId || currentPendingTurnStart ? "running" : "idle";
   const olderHistoryItemCount = threadHistory?.hasOlder ? Math.max(0, threadHistory.totalItems - threadHistory.nextBefore) : 0;
   const loadedHistoryItemCount = threadHistory ? Math.min(threadHistory.nextBefore, threadHistory.totalItems) : 0;
   const conversationLocalMessageLayout = useMemo(() => {
@@ -5998,9 +6108,9 @@ export function App() {
               <MessageSquare size={15} />
               新建会话
             </button>
-            {threads.map((thread) => (
+              {threads.map((thread) => (
               (() => {
-                const threadRunning = isRunningStatus(thread.status) || Boolean(activeTurnsByThread[thread.id]);
+                const threadRunning = Boolean(activeTurnsByThread[thread.id]);
                 const hasNewResult = Boolean(unreadResultThreads[thread.id]);
                 const deletePending = pendingDeleteThreadId === thread.id;
                 const dragEnabled = !threadSearch && !savingThreadOrder;
@@ -6321,8 +6431,22 @@ export function App() {
                     : null;
                   const items = syntheticUserItem ? [syntheticUserItem, ...(turn.items ?? [])] : turn.items ?? [];
                   const renderedItems = items.map((item) => {
-                    const isUserMessage = itemKind(item) === "user";
-                    const userVisibleText = isUserMessage ? visibleUserHistoryText(itemText(item)) : "";
+                    const itemKindValue = itemKind(item);
+                    const isUserMessage = itemKindValue === "user";
+                    const rawItemText = itemText(item);
+                    const cleanedItemText = isUserMessage ? visibleUserHistoryText(rawItemText) : stripInterruptArtifacts(rawItemText);
+                    const userVisibleText = isUserMessage ? cleanedItemText : "";
+                    const hasRenderableItemContent =
+                      Boolean(item.command) ||
+                      Boolean(safeText(item.output).trim()) ||
+                      Boolean(safeText(item.input).trim()) ||
+                      Boolean(safeText(item.tool).trim()) ||
+                      (Array.isArray((item as { changes?: unknown[] }).changes) && ((item as { changes?: unknown[] }).changes ?? []).length > 0) ||
+                      Boolean(item.aggregatedOutput) ||
+                      Boolean(cleanedItemText.trim());
+                    if (itemKindValue === "agent" && !hasRenderableItemContent) {
+                      return null;
+                    }
                     const navigationKey = isUserMessage ? promptNavigationKey(turn.id, item.id) : null;
                     if (navigationKey && heldPersistedPromptNavigationKeys.has(navigationKey)) {
                       return null;
@@ -6339,14 +6463,14 @@ export function App() {
                         ) : isUserMessage ? (
                             <>
                               <CollapsibleUserMessage text={userVisibleText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
-                              <PersistedUserAttachmentPreviews text={itemText(item)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+                              <PersistedUserAttachmentPreviews text={rawItemText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
                             </>
                           ) : (
                             <MarkdownMessage
-                              text={itemText(item) || toolItemDetails(item)}
+                              text={cleanedItemText || toolItemDetails(item)}
                               projectId={selectedProject?.id}
                               onOpenFileLink={openFilePreview}
-                              renderMath={itemKind(item) === "agent"}
+                              renderMath={itemKindValue === "agent"}
                             />
                           )}
                         {item.aggregatedOutput ? <DeferredToolOutput text={item.aggregatedOutput} /> : null}
@@ -6387,8 +6511,8 @@ export function App() {
                   return [
                     ...renderedItems,
                     ...(pendingUserMessagesByTurn.get(turn.id) ?? []).map(renderPendingUserMessage),
-                    ...(isRunningStatus(turn.status) ? [
-                      <div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>
+                    ...(turn.id && turn.id === selectedActiveTurnId ? [
+                    <div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>
                     ] : []),
                     ...(conversationLocalMessageLayout.byTurn.get(turn.id) ?? []).map(renderLocalMessage),
                     ...(activeTurnsByThread[selectedThread?.id ?? ""] === turn.id
