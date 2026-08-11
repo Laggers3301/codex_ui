@@ -247,6 +247,7 @@ interface ThreadContextMenu {
 interface ThreadLoadOptions {
   before?: number;
   appendOlder?: boolean;
+  skipCache?: boolean;
 }
 
 interface ContinuationPrompt {
@@ -650,6 +651,19 @@ function threadHasUserText(thread: ThreadSummary, text: string): boolean {
 function threadItemKey(item: ThreadItem, fallbackIndex: number): string {
   const id = safeText(item.id);
   return id ? `id:${id}` : `fallback:${safeText(item.type)}:${itemText(item).slice(0, 160)}:${fallbackIndex}`;
+}
+
+function dedupeThreadListById(threads: ThreadSummary[]): ThreadSummary[] {
+  const result: ThreadSummary[] = [];
+  const seen = new Set<string>();
+  for (const thread of threads) {
+    if (!thread.id || seen.has(thread.id)) {
+      continue;
+    }
+    seen.add(thread.id);
+    result.push(thread);
+  }
+  return result;
 }
 
 function mergeThreadHistoryPages(older: ThreadSummary, newer: ThreadSummary): ThreadSummary {
@@ -2220,6 +2234,8 @@ export function App() {
   const projectsRef = useRef<Project[]>(projects);
   const temporaryAskRef = useRef<TemporaryAsk | null>(null);
   const temporaryThreadIdsRef = useRef(new Set<string>());
+  const pendingUserMessagesRef = useRef<PendingUserMessage[]>(pendingUserMessages);
+  const threadLiveRecoveryAtRef = useRef<Record<string, number>>({});
 
   function performCloseTemporaryAsk() {
     const current = temporaryAskRef.current;
@@ -2770,6 +2786,10 @@ export function App() {
   }, [selectedThread]);
 
   useEffect(() => {
+    pendingUserMessagesRef.current = pendingUserMessages;
+  }, [pendingUserMessages]);
+
+  useEffect(() => {
     if (!threadContextMenu) {
       return;
     }
@@ -2839,33 +2859,39 @@ export function App() {
   useEffect(() => {
     const threadId = selectedThread?.id;
     const projectId = selectedProjectId;
-    const activeTurnId = threadId ? activeTurnsByThread[threadId] : undefined;
-    if (!threadId || !projectId || !activeTurnId) {
+    const activeTurnId = threadId
+      ? activeTurnsByThread[threadId] ?? [...(selectedThread.turns ?? [])].reverse().find((turn) => isRunningStatus(turn.status))?.id
+      : undefined;
+    const hasPendingPromptForThread = Boolean(threadId && pendingUserMessages.some((entry) => (
+      entry.threadId === threadId && entry.requestId && entry.keepAtBottomUntil > Date.now()
+    )));
+    if (!threadId || !projectId || (!activeTurnId && !hasPendingPromptForThread)) {
       return;
     }
+    const reconcileHint = activeTurnId ?? "pending";
 
     let stopped = false;
     let timer: number | null = null;
     const reconcile = async () => {
-      const key = `${projectId}:${threadId}:${activeTurnId}`;
+      const key = `${projectId}:${threadId}:${reconcileHint}`;
       if (stopped || document.visibilityState !== "visible" || activeThreadReconcileRef.current.has(key)) {
         return;
       }
       activeThreadReconcileRef.current.add(key);
       try {
-        const response = await readThread(threadId, projectId, { before: 0, limit: 128 });
+        const nextThread = await openThread(threadId, projectId, threadViewTokenRef.current, { skipCache: true });
+        if (!nextThread) {
+          return;
+        }
         if (stopped || selectedThreadRef.current?.id !== threadId) {
           return;
         }
-        const nextThread = sanitizeThreadForRender(
-          applyStoredThreadModelProfile(selectedUserId, applyThreadListName(response.thread), modelProfiles)
-        );
+        const mergedThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(nextThread), modelProfiles));
         const cacheKey = `${projectId}:${threadId}`;
         threadPageCacheRef.current.delete(cacheKey);
         threadViewCacheRef.current.delete(cacheKey);
-        selectedThreadRef.current = nextThread;
-        setSelectedThread(nextThread);
-        setThreadHistory(response.history ?? null);
+        selectedThreadRef.current = mergedThread;
+        setSelectedThread(mergedThread);
       } catch {
         // WebSocket remains the primary path; a temporary read failure should
         // not replace the live rendering with an error banner.
@@ -2886,7 +2912,7 @@ export function App() {
       stopped = true;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [selectedProjectId, selectedThread?.id, selectedThread?.id ? activeTurnsByThread[selectedThread.id] : undefined]);
+  }, [selectedProjectId, selectedThread?.id, selectedThread?.id ? activeTurnsByThread[selectedThread.id] : undefined, pendingUserMessages]);
 
   useEffect(() => {
     void refreshModels();
@@ -3067,7 +3093,9 @@ export function App() {
     setSandbox(selectedProject.defaultSandbox || "danger-full-access");
     setApprovalPolicy(selectedProject.defaultApprovalPolicy || "never");
     setLocalMessages([]);
-    const cachedThreads = storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(selectedUserId, selectedProject.id), []).filter((thread) => !isTemporaryAskThread(thread));
+    const cachedThreads = dedupeThreadListById(
+      storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(selectedUserId, selectedProject.id), []).filter((thread) => !isTemporaryAskThread(thread))
+    );
     setThreads(cachedThreads);
     threadsRef.current = cachedThreads;
     window.localStorage.setItem(sidebarProjectSelectionKey(selectedUserId), selectedProject.id);
@@ -3371,9 +3399,9 @@ export function App() {
       for (const thread of leakedTemporaryThreads) {
         void deleteThread(projectId, thread.id);
       }
-      const visibleThreads = response.data
+      const visibleThreads = dedupeThreadListById(response.data
         .filter((thread) => !temporaryThreadIdsRef.current.has(thread.id) && !isTemporaryAskThread(thread))
-        .map((thread) => sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, thread, modelProfiles)));
+        .map((thread) => sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, thread, modelProfiles))));
       setThreads(visibleThreads);
       threadsRef.current = visibleThreads;
       window.localStorage.setItem(sidebarThreadsCacheKey(selectedUserId, projectId), JSON.stringify(visibleThreads));
@@ -3406,11 +3434,11 @@ export function App() {
     if (!projectId || viewToken !== threadViewTokenRef.current) {
       return null;
     }
-    if (!options.appendOlder) {
+    if (!options.appendOlder && !options.skipCache) {
       const cached = threadPageCacheRef.current.get(`${projectId}:${threadId}`);
       if (cached && cached.history.totalItems === 0) {
         threadPageCacheRef.current.delete(`${projectId}:${threadId}`);
-      } else if (cached && Date.now() - cached.cachedAt < 30_000) {
+      } else if (cached && Date.now() - cached.cachedAt < 30_000 && (cached.history.returnedItems >= 128 || !cached.history.hasOlder)) {
         const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(cached.thread), modelProfiles));
         selectedThreadRef.current = nextThread;
         setSelectedThread(nextThread);
@@ -4551,6 +4579,37 @@ export function App() {
     }
   }
 
+  function refreshSelectedThreadFromLiveState(snapshot?: LiveStateSnapshot) {
+    if (!snapshot) {
+      return;
+    }
+    const thread = selectedThreadRef.current;
+    if (!thread?.id) {
+      return;
+    }
+    const activeFromSnapshot = activeTurnsFromSnapshot(snapshot);
+    const now = Date.now();
+    const lastRecovery = threadLiveRecoveryAtRef.current[thread.id] ?? 0;
+    if (now - lastRecovery < 2_000) {
+      return;
+    }
+    const isRunning = Boolean(activeFromSnapshot[thread.id]);
+    const hasPendingForThread = pendingUserMessagesRef.current.some((entry) => (
+      entry.threadId === thread.id && entry.keepAtBottomUntil > now
+    ));
+    const isPending = hasPendingForThread || thread.status === "starting" || isRunningStatus(thread.status);
+    if (!isRunning && !isPending) {
+      return;
+    }
+    const projectId = threadProjectIdsRef.current.get(thread.id) ?? selectedProjectIdRef.current;
+    if (!projectId) {
+      return;
+    }
+    const viewToken = threadViewTokenRef.current;
+    threadLiveRecoveryAtRef.current[thread.id] = now;
+    void openThread(thread.id, projectId, viewToken, { skipCache: true });
+  }
+
   function markThreadResult(threadId: string) {
     const currentThread = selectedThreadRef.current;
     if (currentThread?.id !== threadId) {
@@ -4562,11 +4621,13 @@ export function App() {
     if (message.type === "hello") {
       const data = message.data as { liveState?: LiveStateSnapshot } | undefined;
       hydrateLiveState(data?.liveState);
+      refreshSelectedThreadFromLiveState(data?.liveState);
       return;
     }
 
     if (message.type === "live.state") {
       hydrateLiveState(message.data as LiveStateSnapshot | undefined);
+      refreshSelectedThreadFromLiveState(message.data as LiveStateSnapshot | undefined);
       return;
     }
 
@@ -4932,7 +4993,7 @@ export function App() {
               if (delay > 0) {
                 await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
               }
-              const persistedThread = await openThread(threadId, projectId, viewToken);
+              const persistedThread = await openThread(threadId, projectId, viewToken, { skipCache: true });
               if (hasPersistedCompletedTurn(persistedThread, turnId)) {
                 clearCompletedLiveItems();
                 return;
