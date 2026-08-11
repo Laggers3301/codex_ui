@@ -2766,9 +2766,12 @@ export function App() {
     void refreshModels();
     void refreshQuota(false, { force: true });
     void refreshUsers();
-    codexSocket.connect();
     const unsubscribe = codexSocket.subscribe(handleSocketMessage);
     const unsubscribeStatus = codexSocket.subscribeStatus(setSocketStatus);
+    // Subscribe before opening the socket. The server sends the initial
+    // hello/live snapshot immediately; connecting first could lose it in the
+    // small race before the listener was registered.
+    codexSocket.connect();
     return () => {
       unsubscribe();
       unsubscribeStatus();
