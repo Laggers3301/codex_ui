@@ -3828,8 +3828,15 @@ pre,
   white-space: nowrap;
 }
 
-.v2WorkspaceFolderButton .projectRenameButton,
-.v2WorkspaceFolderButton .projectDeleteButton {
+.v2WorkspaceFolderRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px 28px;
+  align-items: center;
+  column-gap: 4px;
+}
+
+.v2WorkspaceFolderRenameButton,
+.v2WorkspaceFolderRow .projectDeleteButton {
   display: grid;
   width: 25px;
   min-width: 25px;
@@ -3844,21 +3851,29 @@ pre,
   color: #d7d9d4;
   font-size: 0;
   opacity: 1;
+  pointer-events: auto;
 }
 
-.v2WorkspaceFolderButton .projectRenameButton > svg,
-.v2WorkspaceFolderButton .projectDeleteButton > svg {
+.v2WorkspaceFolderRenameButton > svg,
+.v2WorkspaceFolderRow .projectDeleteButton > svg {
   width: 14px;
   height: 14px;
+  display: block;
+  stroke: currentColor;
+  fill: none;
 }
 
-.v2WorkspaceFolderButton .projectRenameButton:hover,
-.v2WorkspaceFolderButton .projectDeleteButton:hover {
+.v2WorkspaceFolderRenameButton:hover,
+.v2WorkspaceFolderRow .projectDeleteButton:hover {
   background: rgba(255, 255, 255, 0.08);
   color: #eceee9;
 }
 
-.v2WorkspaceFolderButton .projectDeleteButton.confirm {
+.v2WorkspaceFolderRenameButton {
+  border: 1px solid transparent;
+}
+
+.v2WorkspaceFolderRow .projectDeleteButton.confirm {
   color: #ff5e5e;
 }
 

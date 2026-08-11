@@ -5870,15 +5870,15 @@ export function App() {
                 </button>
               </span>
             </div>
-            <div className="v2WorkspaceTree">
+              <div className="v2WorkspaceTree">
               {projects.map((project) => {
                 const projectSelected = project.id === selectedProjectId;
                 return (
                 <section className={`v2WorkspaceGroup ${projectSelected ? "selected" : ""}`} key={project.id}>
-                    <div
-                      className="v2WorkspaceFolderButton"
-                      role="button"
-                      tabIndex={0}
+                  <div className={`v2WorkspaceFolderRow ${projectSelected ? "selected" : ""}`}>
+                    <button
+                      className={`v2WorkspaceFolderButton ${projectSelected ? "selected" : ""}`}
+                      type="button"
                       onClick={() => {
                         setPendingDeleteProjectId(null);
                         setSelectedProjectId(project.id);
@@ -5893,32 +5893,33 @@ export function App() {
                     >
                       <span className="v2WorkspaceFolderGlyph" aria-hidden="true" />
                       <strong>{project.name}</strong>
-                      <button
-                        className="projectRenameButton"
-                        type="button"
-                        onClick={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          beginProjectRename(project);
-                        }}
-                        title="重命名工作区"
-                        aria-label="重命名工作区"
-                      >
-                        <PencilLine size={14} />
-                      </button>
-                      <button
-                        className={`projectDeleteButton ${pendingDeleteProjectId === project.id ? "confirm" : ""}`}
-                        type="button"
-                        onClick={(event) => {
-                          event.preventDefault();
-                          event.stopPropagation();
-                          requestRemoveProject(project);
-                        }}
-                        title={pendingDeleteProjectId === project.id ? `确认移除 ${project.name}` : `移除 ${project.name}`}
-                      >
-                        {pendingDeleteProjectId === project.id ? "确认" : <Trash2 size={15} />}
-                      </button>
-                    </div>
+                    </button>
+                    <button
+                      className="v2WorkspaceFolderRenameButton"
+                      type="button"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        beginProjectRename(project);
+                      }}
+                      title="重命名工作区"
+                      aria-label="重命名工作区"
+                    >
+                      <PencilLine size={15} />
+                    </button>
+                    <button
+                      className={`projectDeleteButton ${pendingDeleteProjectId === project.id ? "confirm" : ""}`}
+                      type="button"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        requestRemoveProject(project);
+                      }}
+                      title={pendingDeleteProjectId === project.id ? `确认移除 ${project.name}` : `移除 ${project.name}`}
+                    >
+                      {pendingDeleteProjectId === project.id ? "确认" : <Trash2 size={15} />}
+                    </button>
+                  </div>
                     {projectSelected ? <div className="v2WorkspaceThreads">
             <div className="threadSearchBox">
               <input
