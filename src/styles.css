@@ -1710,6 +1710,33 @@ label input {
   font-size: 0.9em;
 }
 
+/* Math blocks use KaTeX's math faces directly, without a code-like panel. */
+.messageMarkdown .katex,
+.messageMarkdown .katex .mathnormal,
+.messageMarkdown .katex .mathrm,
+.messageMarkdown .katex .text {
+  font-family: KaTeX_Main, KaTeX_Math, "Times New Roman", serif !important;
+}
+
+.messageMarkdown .katex-display {
+  display: block;
+  max-width: 100%;
+  margin: 16px 0;
+  padding: 0;
+  overflow-x: auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent !important;
+  text-align: center;
+}
+
+.messageMarkdown .katex-display > .katex {
+  display: inline-block;
+  max-width: 100%;
+  color: inherit;
+  text-align: center;
+}
+
 .messageMeta {
   color: var(--muted);
   font-size: 11px;
@@ -1960,6 +1987,66 @@ pre,
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.persistedUserAttachmentList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.persistedUserAttachment {
+  display: inline-flex;
+  min-width: 0;
+  max-width: min(320px, 100%);
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 9px;
+  padding: 5px 9px 5px 6px;
+  background: #252625;
+  color: #e7e9e4;
+  cursor: pointer;
+  text-align: left;
+}
+
+.persistedUserAttachment:hover {
+  border-color: rgba(255, 255, 255, 0.25);
+  background: #2d2e2d;
+}
+
+.persistedUserAttachment > span:last-child {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.persistedUserAttachmentThumbnail {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: #303230;
+}
+
+.persistedUserAttachmentIcon {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  place-items: center;
+  border-radius: 6px;
+  background: #3a3b3a;
+  color: #aeb2aa;
+}
+
+.persistedUserAttachmentIcon.pdf {
+  background: #4a292b;
+  color: #ff8b8f;
 }
 
 .sendButton {
@@ -6010,22 +6097,38 @@ body:has(.globalSearchScrim) .v2AccountDock {
   font-weight: 400 !important;
 }
 
-/* KaTeX blocks follow the dark V2 surface instead of the legacy light skin. */
+/* KaTeX blocks keep a clean, borderless block in the dark theme too. */
 .messageMarkdown .katex-display {
-  margin:14px 0 !important;
-  padding:12px 15px !important;
-  border:1px solid #4b4f49 !important;
-  border-radius:10px !important;
-  background:#292b29 !important;
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.045), 0 7px 20px rgba(0,0,0,.12);
-  color:#eef1eb !important;
-  font-size:1.08em !important;
-  line-height:1.55 !important;
+  margin: 14px 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: inherit !important;
+  font-size: 1.08em !important;
+  line-height: 1.55 !important;
+  text-align: center;
 }
 .messageMarkdown .katex-display > .katex,
 .messageMarkdown .katex-display .katex,
 .messageMarkdown .katex-display .katex * {
-  color:#eef1eb !important;
+  color: inherit !important;
+  text-align: center !important;
+}
+
+.messageMarkdown .katex-display,
+.messageMarkdown .katex-display .katex-display,
+.messageItem .katex-display,
+.messageItem .messageMarkdown .katex-display,
+.messageItem .messageMarkdown .katex-html,
+.katex-display,
+.katex-display .katex-html {
+  background: transparent !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  padding: 0 !important;
 }
 .messageMarkdown > p .katex,
 .messageMarkdown > li .katex,

@@ -1446,6 +1446,74 @@ const PendingUserImagePreviews = memo(function PendingUserImagePreviews({
   );
 });
 
+interface PersistedUserAttachment {
+  name: string;
+  target: string;
+  isImage: boolean;
+}
+
+function persistedUserAttachmentsFromText(text: string): PersistedUserAttachment[] {
+  const marker = text.lastIndexOf("上传文件：");
+  if (marker < 0) {
+    return [];
+  }
+  const attachments: PersistedUserAttachment[] = [];
+  const seen = new Set<string>();
+  const lines = text.slice(marker).split(/\r?\n/);
+  for (const line of lines) {
+    const match = line.match(/^\s*-\s+(.+?):\s*(\S+)\s*$/);
+    if (!match) {
+      continue;
+    }
+    const name = match[1].trim();
+    const target = match[2].trim();
+    if (!name || !target || seen.has(target)) {
+      continue;
+    }
+    seen.add(target);
+    attachments.push({ name, target, isImage: isInlineImageTarget(target) });
+  }
+  return attachments.slice(0, 12);
+}
+
+const PersistedUserAttachmentPreviews = memo(function PersistedUserAttachmentPreviews({
+  text,
+  projectId,
+  onOpenFileLink
+}: {
+  text: string;
+  projectId?: string;
+  onOpenFileLink: (target: string) => void;
+}) {
+  const attachments = useMemo(() => persistedUserAttachmentsFromText(text), [text]);
+  if (!attachments.length) {
+    return null;
+  }
+  return (
+    <div className="persistedUserAttachmentList" aria-label="本条消息的文件附件">
+      {attachments.map((attachment) => {
+        const content = attachment.isImage && projectId ? (
+          <img className="persistedUserAttachmentThumbnail" src={rawFileUrlForProject(projectId, attachment.target)} alt={attachment.name} loading="lazy" decoding="async" />
+        ) : (
+          <span className={`persistedUserAttachmentIcon${/\.pdf$/i.test(attachment.name) ? " pdf" : ""}`}><FileText size={16} /></span>
+        );
+        return (
+          <button
+            className={`persistedUserAttachment${attachment.isImage ? " image" : ""}`}
+            type="button"
+            key={attachment.target}
+            onClick={() => onOpenFileLink(attachment.target)}
+            title={`打开 ${attachment.name}`}
+          >
+            {content}
+            <span>{attachment.name}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+});
+
 function modelProfileById(id: string, profiles: ModelProfile[]): ModelProfile {
   return profiles.find((profile) => profile.id === id) ?? profiles[0] ?? fallbackModelProfiles[0];
 }
@@ -6020,7 +6088,10 @@ export function App() {
                         {item.command ? (
                           <pre>{safeText(item.command)}</pre>
                         ) : isUserMessage ? (
-                            <CollapsibleUserMessage text={userVisibleText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+                            <>
+                              <CollapsibleUserMessage text={userVisibleText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+                              <PersistedUserAttachmentPreviews text={itemText(item)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+                            </>
                           ) : (
                             <MarkdownMessage
                               text={itemText(item) || toolItemDetails(item)}
