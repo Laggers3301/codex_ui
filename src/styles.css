@@ -856,7 +856,7 @@ label input {
 
 .projectRow {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 54px;
+  grid-template-columns: minmax(0, 1fr) 30px 30px;
   align-items: center;
   gap: 4px;
   width: 100%;
@@ -916,6 +916,7 @@ label input {
   height: 30px;
   place-items: center;
   justify-self: end;
+  padding: 0;
   border: 1px solid transparent;
   border-radius: 7px;
   background: transparent;
@@ -924,10 +925,50 @@ label input {
   font-weight: 650;
 }
 
+.projectRenameButton {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  justify-self: end;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font-size: 0;
+}
+
+.projectRenameButton:hover {
+  border-color: rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+}
+
+.projectRenameButton > svg,
+.projectDeleteButton > svg {
+  width: 15px;
+  height: 15px;
+  stroke: currentColor;
+  fill: none;
+  display: block;
+}
+
+.projectRenameButton,
+.projectDeleteButton {
+  flex: 0 0 auto;
+}
+
 .projectDeleteButton:hover {
   border-color: rgba(181, 68, 68, 0.24);
   background: rgba(181, 68, 68, 0.08);
   color: var(--red);
+}
+
+.projectRenameButton > svg,
+.projectDeleteButton > svg {
+  width: 14px;
+  height: 14px;
 }
 
 .projectDeleteButton.confirm {
@@ -3044,7 +3085,8 @@ body {
 }
 
 .threadDeleteButton,
-.projectDeleteButton {
+.projectDeleteButton,
+.projectRenameButton {
   border-color: transparent;
   background: transparent;
   color: #737570;
@@ -3758,7 +3800,7 @@ pre,
 
 .v2WorkspaceFolderButton {
   display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) 16px;
+  grid-template-columns: 20px minmax(0, 1fr) 26px 26px;
   min-height: 34px;
   align-items: center;
   gap: 8px;
@@ -3784,6 +3826,40 @@ pre,
   line-height: 20px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.v2WorkspaceFolderButton .projectRenameButton,
+.v2WorkspaceFolderButton .projectDeleteButton {
+  display: grid;
+  width: 25px;
+  min-width: 25px;
+  height: 25px;
+  min-height: 25px;
+  place-items: center;
+  margin-right: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #d7d9d4;
+  font-size: 0;
+  opacity: 1;
+}
+
+.v2WorkspaceFolderButton .projectRenameButton > svg,
+.v2WorkspaceFolderButton .projectDeleteButton > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.v2WorkspaceFolderButton .projectRenameButton:hover,
+.v2WorkspaceFolderButton .projectDeleteButton:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #eceee9;
+}
+
+.v2WorkspaceFolderButton .projectDeleteButton.confirm {
+  color: #ff5e5e;
 }
 
 .v2WorkspaceFolderGlyph {
@@ -6441,7 +6517,7 @@ body:has(.globalSearchScrim) .v2AccountDock {
 }
 
 .v2WorkspaceFolderButton {
-  grid-template-columns: 20px minmax(0, 1fr) !important;
+  grid-template-columns: 20px minmax(0, 1fr) 26px 26px !important;
 }
 
 .v2WorkspaceChevron {

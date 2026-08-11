@@ -51,6 +51,7 @@ import {
   setApiUserId,
   testLocalSendSettings,
   updateLocalSendSettings,
+  updateProject,
   updateThreadModelProfile,
   updateThreadOrder,
   updateThreadPresentation,
@@ -2057,6 +2058,7 @@ export function App() {
   const autoSendEnabledRef = useRef(true);
   const autoSentGeneratedFileKeysRef = useRef(new Set<string>());
   const autoSendInFlightFileKeysRef = useRef(new Set<string>());
+  const interruptTimeoutsRef = useRef(new Map<string, number>());
   const newThreadDraftModeRef = useRef(true);
   const quotaRefreshInFlightRef = useRef<Promise<QuotaRefreshResult> | null>(null);
   const leaderboardRefreshInFlightRef = useRef<Promise<LeaderboardRefreshResult> | null>(null);
@@ -2098,6 +2100,9 @@ export function App() {
   const [directoryBrowser, setDirectoryBrowser] = useState<DirectoryListResponse | null>(null);
   const [directoryBrowserLoading, setDirectoryBrowserLoading] = useState(false);
   const [pendingDeleteProjectId, setPendingDeleteProjectId] = useState<string | null>(null);
+  const [renamingProject, setRenamingProject] = useState<Project | null>(null);
+  const [projectRenameDraft, setProjectRenameDraft] = useState("");
+  const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
   const [pendingDeleteThreadId, setPendingDeleteThreadId] = useState<string | null>(null);
   const [threadContextMenu, setThreadContextMenu] = useState<ThreadContextMenu | null>(null);
   const [threadCopyNotice, setThreadCopyNotice] = useState<string | null>(null);
@@ -2535,7 +2540,7 @@ export function App() {
       return;
     }
     threadPrefetchesRef.current.add(cacheKey);
-    void readThread(threadId, projectId, { before: 0, limit: 16 })
+    void readThread(threadId, projectId, { before: 0, limit: 64 })
       .then((response) => {
         if (!response.history) {
           return;
@@ -2848,7 +2853,7 @@ export function App() {
       }
       activeThreadReconcileRef.current.add(key);
       try {
-        const response = await readThread(threadId, projectId, { before: 0, limit: 16 });
+        const response = await readThread(threadId, projectId, { before: 0, limit: 64 });
         if (stopped || selectedThreadRef.current?.id !== threadId) {
           return;
         }
@@ -3416,7 +3421,7 @@ export function App() {
     try {
       const response = await readThread(threadId, projectId, {
         before: options.before,
-        limit: options.appendOlder ? 80 : 16
+        limit: options.appendOlder ? 80 : 64
       });
       if (viewToken !== threadViewTokenRef.current) {
         return null;
@@ -3657,6 +3662,52 @@ export function App() {
       return;
     }
     void removeProject(project);
+  }
+
+  function beginProjectRename(project: Project) {
+    setPendingDeleteProjectId(null);
+    setError("");
+    setProjectRenameDraft(project.name);
+    setRenamingProject(project);
+  }
+
+  function closeProjectRename() {
+    if (renamingProjectId) {
+      return;
+    }
+    setRenamingProject(null);
+    setProjectRenameDraft("");
+  }
+
+  async function submitProjectRename() {
+    const project = renamingProject;
+    const name = projectRenameDraft.trim();
+    if (!project || !name) {
+      setError("请输入工作区名称。");
+      return;
+    }
+    if (name.length > 120) {
+      setError("工作区名称最多 120 个字符。");
+      return;
+    }
+    if (name === project.name) {
+      setRenamingProject(null);
+      setProjectRenameDraft("");
+      return;
+    }
+
+    setRenamingProjectId(project.id);
+    try {
+      setError("");
+      const response = await updateProject(project.id, { name });
+      setProjects((current) => current.map((entry) => (entry.id === project.id ? response.data : entry)));
+      setRenamingProject(null);
+      setProjectRenameDraft("");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setRenamingProjectId(null);
+    }
   }
 
   async function handleFileUpload(files: FileList | readonly File[] | null) {
@@ -4165,13 +4216,14 @@ export function App() {
       return true;
     }
     if (command === "stop" || command === "interrupt") {
-      const activeTurnId = selectedThread?.id ? activeTurnsByThread[selectedThread.id] : null;
-      if (!selectedProject || !selectedThread?.id || !activeTurnId) {
+      const activeTurnId = getRunningTurnIdForThread(selectedThread);
+      const projectId = selectedProject?.id || (selectedThread?.id ? threadProjectIdsRef.current.get(selectedThread.id) : undefined) || selectedProjectIdRef.current;
+      if (!projectId || !selectedThread?.id || !activeTurnId) {
         addLocalMessage("当前会话没有正在生成的内容，无需终止。");
         setPrompt("");
         return true;
       }
-      interruptCurrentTurn(selectedThread.id, activeTurnId, selectedProject.id);
+      interruptCurrentTurn(selectedThread.id, activeTurnId, projectId);
       setPrompt("");
       return true;
     }
@@ -4382,6 +4434,27 @@ export function App() {
     interruptRequestedTurnIdsRef.current.add(turnId);
     setInterruptingTurns((current) => ({ ...current, [turnId]: true }));
     setError("");
+    const timeoutId = window.setTimeout(() => {
+      interruptRequestedTurnIdsRef.current.delete(turnId);
+      setInterruptingTurns((current) => {
+        const next = { ...current };
+        delete next[turnId];
+        return next;
+      });
+      interruptTimeoutsRef.current.delete(turnId);
+      const currentTurnId = activeTurnsByThread[threadId];
+      if (currentTurnId === turnId) {
+        setActiveTurnsByThread((current) => {
+          const next = { ...current };
+          if (next[threadId] === turnId) {
+            delete next[threadId];
+          }
+          return next;
+        });
+      }
+      setError("终止请求超时未响应，按钮已恢复，请稍后再试。");
+    }, 10_000);
+    interruptTimeoutsRef.current.set(turnId, timeoutId);
     try {
       codexSocket.send({
         type: "turn.interrupt",
@@ -4394,6 +4467,11 @@ export function App() {
     } catch (caught) {
       interruptRequestContextsRef.current.delete(requestId);
       interruptRequestedTurnIdsRef.current.delete(turnId);
+      const timeout = interruptTimeoutsRef.current.get(turnId);
+      if (timeout !== undefined) {
+        window.clearTimeout(timeout);
+        interruptTimeoutsRef.current.delete(turnId);
+      }
       setInterruptingTurns((current) => {
         const next = { ...current };
         delete next[turnId];
@@ -4416,8 +4494,11 @@ export function App() {
     if (composerStopBusy) {
       return false;
     }
-    if (selectedActiveTurnId && selectedProject && selectedThread?.id) {
-      interruptCurrentTurn(selectedThread.id, selectedActiveTurnId, selectedProject.id);
+    const projectId = selectedProject?.id
+      || (selectedThread?.id ? threadProjectIdsRef.current.get(selectedThread.id) : undefined)
+      || selectedProjectIdRef.current;
+    if (selectedActiveTurnId && projectId && selectedThread?.id) {
+      interruptCurrentTurn(selectedThread.id, selectedActiveTurnId, projectId);
       return true;
     }
     if (currentPendingTurnStart) {
@@ -4541,11 +4622,17 @@ export function App() {
         }
         return;
       }
-      const interruptContext = message.requestId ? interruptRequestContextsRef.current.get(message.requestId) : undefined;
+    const interruptContext = message.requestId ? interruptRequestContextsRef.current.get(message.requestId) : undefined;
       if (interruptContext) {
         if (message.requestId) {
           interruptRequestContextsRef.current.delete(message.requestId);
         }
+        const timeout = interruptTimeoutsRef.current.get(interruptContext.turnId);
+        if (timeout !== undefined) {
+          window.clearTimeout(timeout);
+          interruptTimeoutsRef.current.delete(interruptContext.turnId);
+        }
+        interruptRequestedTurnIdsRef.current.delete(interruptContext.turnId);
         setInterruptingTurns((current) => {
           const next = { ...current };
           delete next[interruptContext.turnId];
@@ -4994,8 +5081,23 @@ export function App() {
     }
     return hiddenKeys;
   }, [heldPendingUserMessages, selectedThread]);
-  const selectedActiveTurnId = selectedThread?.id ? activeTurnsByThread[selectedThread.id] ?? null : null;
+  function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null {
+    if (!thread?.id) {
+      return null;
+    }
+    if (activeTurnsByThread[thread.id]) {
+      return activeTurnsByThread[thread.id];
+    }
+    for (let index = thread.turns.length - 1; index >= 0; index -= 1) {
+      const turn = thread.turns[index];
+      if (isRunningStatus(turn.status)) {
+        return turn.id;
+      }
+    }
+    return null;
+  }
   const currentPendingTurnStart = visiblePendingUserMessages[visiblePendingUserMessages.length - 1] ?? null;
+  const selectedActiveTurnId = getRunningTurnIdForThread(selectedThread);
   const composerIsStopMode = Boolean(selectedActiveTurnId || currentPendingTurnStart);
   const composerStopBusy = selectedActiveTurnId
     ? Boolean(interruptingTurns[selectedActiveTurnId])
@@ -5261,6 +5363,15 @@ export function App() {
                 >
                   {deletePending ? "确认" : <Trash2 size={15} />}
                 </button>
+                <button
+                  className="projectRenameButton"
+                  type="button"
+                  onClick={() => beginProjectRename(project)}
+                  title="重命名工作区"
+                  aria-label="重命名工作区"
+                >
+                  <PencilLine size={15} />
+                </button>
               </div>
             );
           })}
@@ -5389,6 +5500,51 @@ export function App() {
               </button>
               <button className="iconTextButton primary" type="submit" disabled={renamingThreadId === renamingThread.id || !threadRenameDraft.trim()}>
                 {renamingThreadId === renamingThread.id ? "重命名中" : "保存"}
+              </button>
+            </div>
+          </form>
+        </div>
+      ) : null}
+
+      {renamingProject ? (
+        <div className="modalScrim" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) {
+            closeProjectRename();
+          }
+        }}>
+          <form
+            className="renameThreadDialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="rename-project-title"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void submitProjectRename();
+            }}
+          >
+            <h2 id="rename-project-title">重命名工作区</h2>
+            <p>仅修改当前登录用户在此实例下创建的工作区名称。</p>
+            <label className="renameThreadLabel" htmlFor="project-rename-input">工作区名称</label>
+            <input
+              id="project-rename-input"
+              autoFocus
+              value={projectRenameDraft}
+              onChange={(event) => setProjectRenameDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  closeProjectRename();
+                }
+              }}
+              maxLength={120}
+              disabled={renamingProjectId === renamingProject.id}
+            />
+            <div className="dialogActions">
+              <button className="iconTextButton" type="button" onClick={closeProjectRename} disabled={renamingProjectId === renamingProject.id}>
+                取消
+              </button>
+              <button className="iconTextButton primary" type="submit" disabled={renamingProjectId === renamingProject.id || !projectRenameDraft.trim()}>
+                {renamingProjectId === renamingProject.id ? "重命名中" : "保存"}
               </button>
             </div>
           </form>
@@ -5718,19 +5874,51 @@ export function App() {
               {projects.map((project) => {
                 const projectSelected = project.id === selectedProjectId;
                 return (
-                  <section className={`v2WorkspaceGroup ${projectSelected ? "selected" : ""}`} key={project.id}>
-                    <button
+                <section className={`v2WorkspaceGroup ${projectSelected ? "selected" : ""}`} key={project.id}>
+                    <div
                       className="v2WorkspaceFolderButton"
-                      type="button"
+                      role="button"
+                      tabIndex={0}
                       onClick={() => {
                         setPendingDeleteProjectId(null);
                         setSelectedProjectId(project.id);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          setPendingDeleteProjectId(null);
+                          setSelectedProjectId(project.id);
+                        }
                       }}
                       title={project.rootPath}
                     >
                       <span className="v2WorkspaceFolderGlyph" aria-hidden="true" />
                       <strong>{project.name}</strong>
-                    </button>
+                      <button
+                        className="projectRenameButton"
+                        type="button"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          beginProjectRename(project);
+                        }}
+                        title="重命名工作区"
+                        aria-label="重命名工作区"
+                      >
+                        <PencilLine size={14} />
+                      </button>
+                      <button
+                        className={`projectDeleteButton ${pendingDeleteProjectId === project.id ? "confirm" : ""}`}
+                        type="button"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          requestRemoveProject(project);
+                        }}
+                        title={pendingDeleteProjectId === project.id ? `确认移除 ${project.name}` : `移除 ${project.name}`}
+                      >
+                        {pendingDeleteProjectId === project.id ? "确认" : <Trash2 size={15} />}
+                      </button>
+                    </div>
                     {projectSelected ? <div className="v2WorkspaceThreads">
             <div className="threadSearchBox">
               <input
