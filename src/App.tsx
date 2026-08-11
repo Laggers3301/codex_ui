@@ -448,6 +448,42 @@ function itemKind(item: ThreadItem): MessageKind {
   return "system";
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isThreadItem(value: unknown): value is ThreadItem {
+  return isRecord(value) && typeof (value as { id?: unknown }).id === "string";
+}
+
+function sanitizeTurnItems(items: unknown[]): ThreadItem[] {
+  return items
+    .filter(isThreadItem)
+    .map((item) => ({
+      ...item,
+      changes: Array.isArray(item.changes) ? item.changes.filter((change) => change !== null && change !== undefined) : []
+    }));
+}
+
+function sanitizeThreadForRender(thread: ThreadSummary): ThreadSummary {
+  if (!Array.isArray(thread.turns)) {
+    return {
+      ...thread,
+      turns: []
+    };
+  }
+
+  return {
+    ...thread,
+    turns: thread.turns
+      .filter((turn): turn is Turn => isRecord(turn) && typeof (turn as { id?: unknown }).id === "string")
+      .map((turn) => ({
+        ...turn,
+        items: Array.isArray((turn as Turn).items) ? sanitizeTurnItems((turn as Turn).items) : []
+      }))
+  };
+}
+
 function toolItemDetails(item: ThreadItem): string {
   if (!Array.isArray(item.changes) || item.changes.length === 0) {
     return "";
@@ -822,7 +858,7 @@ interface GeneratedFileCandidate {
 }
 
 function autoSendPreferenceStorageKey(userId: string): string {
-  return `codex-web-auto-send-generated-files:${encodeURIComponent(userId || "default")}`;
+  return `codex-web-auto-send-generated-files:v2:${encodeURIComponent(userId || "default")}`;
 }
 
 function storedBooleanWithDefault(key: string, fallback: boolean): boolean {
@@ -908,11 +944,21 @@ function collectGeneratedFileCandidates(
   if (depth > 5 || candidates.length >= 12 || value === null || value === undefined) {
     return;
   }
+  const explicitFileField = /(?:^|[_-])(?:file|filepath|filename|path|outputpath|savedpath|imagepath|artifactpath)(?:$|[_-])/i.test(fieldName);
   const allowOutsideProject = /(?:saved|image)[_-]?(?:path|file)?/i.test(fieldName);
   if (typeof value === "string") {
-    addGeneratedFileCandidate(candidates, seen, value, projectRoot, allowOutsideProject, turnId);
-    for (const match of value.matchAll(autoSendFilePathPattern)) {
-      addGeneratedFileCandidate(candidates, seen, match[0], projectRoot, allowOutsideProject, turnId);
+    if (explicitFileField) {
+      addGeneratedFileCandidate(candidates, seen, value, projectRoot, allowOutsideProject, turnId);
+    } else {
+      // Do not interpret arbitrary assistant/tool prose such as
+      // "document.doc" as a generated artifact. Only accept path-shaped
+      // references from non-file fields, never bare filenames in sentences.
+      for (const match of value.matchAll(autoSendFilePathPattern)) {
+        const candidate = match[0];
+        if (/^(?:file:\/\/|\/|\.\.?(?:\/|\\))/.test(candidate)) {
+          addGeneratedFileCandidate(candidates, seen, candidate, projectRoot, allowOutsideProject, turnId);
+        }
+      }
     }
     return;
   }
@@ -1121,8 +1167,12 @@ const CollapsibleUserMessage = memo(function CollapsibleUserMessage({
         <MarkdownMessage text={text} projectId={projectId} onOpenFileLink={onOpenFileLink} />
       </div>
       {collapsible ? (
-        <button className="userMessageToggle" type="button" onClick={() => setExpanded((current) => !current)}>
-          {expanded ? "Show less" : "Show more"}
+        <button
+          className={`userMessageToggle ${expanded ? "expanded" : ""}`}
+          type="button"
+          onClick={() => setExpanded((current) => !current)}
+        >
+          <span>{expanded ? "收起内容" : "展开更多"}</span>
         </button>
       ) : null}
     </>
@@ -1677,7 +1727,7 @@ function liveDeltasFromSnapshot(snapshot: LiveStateSnapshot): Record<string, Liv
 
 function liveToolsFromSnapshot(snapshot: LiveStateSnapshot): Record<string, LiveToolEntry> {
   return Object.fromEntries(
-    snapshot.toolItems
+    (snapshot.toolItems ?? [])
       .filter((item) => item.itemId)
       .map((item) => [item.itemId, item])
   );
@@ -1749,6 +1799,39 @@ const threadListCollapsedStorageKey = "codex-web-thread-list-collapsed";
 const sidebarProjectsCacheKey = (userId: string) => `codex-v2-projects-${userId}`;
 const sidebarProjectSelectionKey = (userId: string) => `codex-v2-project-${userId}`;
 const sidebarThreadsCacheKey = (userId: string, projectId: string) => `codex-v2-threads-${userId}-${projectId}`;
+const modelPreferenceStorageKey = (userId: string, projectId: string) => `codex-v2-model-${encodeURIComponent(userId)}-${encodeURIComponent(projectId)}`;
+const threadModelPreferenceStorageKey = (userId: string, threadId: string) => `codex-v2-thread-model-${encodeURIComponent(userId)}-${encodeURIComponent(threadId)}`;
+
+function lookupThreadModelProfileId(userId: string, threadId: string, profiles: ModelProfile[]): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const profileId = window.localStorage.getItem(threadModelPreferenceStorageKey(userId, threadId));
+  return profiles.some((profile) => profile.id === profileId) ? profileId : null;
+}
+
+function applyStoredThreadModelProfile(
+  userId: string,
+  thread: ThreadSummary,
+  profiles: ModelProfile[]
+): ThreadSummary {
+  const profileId = lookupThreadModelProfileId(userId, thread.id, profiles);
+  if (!profileId) {
+    return thread;
+  }
+  const profile = profiles.find((item) => item.id === profileId);
+  if (!profile) {
+    return thread;
+  }
+  if (thread.configuredModel === profile.model && thread.configuredReasoningEffort === profile.effort) {
+    return thread;
+  }
+  return {
+    ...thread,
+    configuredModel: profile.model,
+    configuredReasoningEffort: profile.effort
+  };
+}
 
 function storedJson<T>(key: string, fallback: T): T {
   try {
@@ -1892,6 +1975,9 @@ export function App() {
   const autoFollowMessagesRef = useRef(true);
   const manualMessageScrollLockRef = useRef(false);
   const threadViewTokenRef = useRef(0);
+  const initializedProjectIdRef = useRef("");
+  const threadPageCacheRef = useRef(new Map<string, { thread: ThreadSummary; history: ThreadHistoryPage; cachedAt: number }>());
+  const threadPrefetchesRef = useRef(new Set<string>());
   const promptRequestContextsRef = useRef(new Map<string, PromptRequestContext>());
   const interruptRequestContextsRef = useRef(new Map<string, TurnInterruptContext>());
   const threadRenameRequestContextsRef = useRef(new Map<string, ThreadRenameRequestContext>());
@@ -1971,7 +2057,7 @@ export function App() {
   const localSendSettingsRef = useRef<LocalSendSettings>(defaultLocalSendSettings);
   const [detectedClientHost, setDetectedClientHost] = useState("");
   const [autoSendGeneratedFiles, setAutoSendGeneratedFiles] = useState(() =>
-    storedBooleanWithDefault(autoSendPreferenceStorageKey(getApiUserId()), true)
+    storedBooleanWithDefault(autoSendPreferenceStorageKey(getApiUserId()), false)
   );
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsTesting, setSettingsTesting] = useState(false);
@@ -2318,13 +2404,6 @@ export function App() {
     setUploadedFiles([]);
     setDraggingUpload(false);
     setError("");
-    if (selectedProject) {
-      setNewThreadModelProfileId(modelProfileIdFor(
-        selectedProject.defaultModel || "gpt-5.5",
-        selectedProject.defaultReasoningEffort || "xhigh",
-        modelProfiles
-      ));
-    }
     if (clearPrompt) {
       setPrompt("");
     }
@@ -2342,6 +2421,13 @@ export function App() {
     });
   }
 
+  function applyThreadListName(thread: ThreadSummary): ThreadSummary {
+    const listedThread = threadsRef.current.find((entry) => entry.id === thread.id);
+    return listedThread?.name && listedThread.name !== thread.name
+      ? { ...thread, name: listedThread.name }
+      : thread;
+  }
+
   function selectThread(threadId: string) {
     const viewToken = ++threadViewTokenRef.current;
     const projectId = selectedProjectIdRef.current;
@@ -2352,9 +2438,13 @@ export function App() {
     setThreadContextMenu(null);
     setError("");
     const cachedView = projectId ? threadViewCacheRef.current.get(`${projectId}:${threadId}`) : undefined;
-    if (cachedView) {
-      selectedThreadRef.current = cachedView.thread;
-      setSelectedThread(cachedView.thread);
+    if (cachedView?.history?.totalItems === 0) {
+      threadViewCacheRef.current.delete(`${projectId}:${threadId}`);
+    }
+    if (cachedView && (cachedView.history?.totalItems ?? 1) > 0) {
+      const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(cachedView.thread), modelProfiles));
+      selectedThreadRef.current = nextThread;
+      setSelectedThread(nextThread);
       setThreadHistory(cachedView.history);
     } else {
       setThreadHistory(null);
@@ -2364,6 +2454,31 @@ export function App() {
     historyPrependAnchorRef.current = null;
     clearThreadResult(threadId);
     void openThread(threadId, projectId, viewToken);
+  }
+
+  function prefetchThread(threadId: string, projectId = selectedProjectIdRef.current) {
+    if (!projectId || !threadId) {
+      return;
+    }
+    const cacheKey = `${projectId}:${threadId}`;
+    const cached = threadPageCacheRef.current.get(cacheKey);
+    if ((cached && Date.now() - cached.cachedAt < 30_000) || threadPrefetchesRef.current.has(cacheKey)) {
+      return;
+    }
+    threadPrefetchesRef.current.add(cacheKey);
+    void readThread(threadId, projectId, { before: 0, limit: 16 })
+      .then((response) => {
+        if (!response.history) {
+          return;
+        }
+        const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, response.thread, modelProfiles));
+        threadPageCacheRef.current.set(cacheKey, { thread: nextThread, history: response.history, cachedAt: Date.now() });
+        threadViewCacheRef.current.set(cacheKey, { thread: nextThread, history: response.history });
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        threadPrefetchesRef.current.delete(cacheKey);
+      });
   }
 
   async function removeThread(thread: ThreadSummary) {
@@ -2378,6 +2493,7 @@ export function App() {
       setThreads((current) => current.filter((entry) => entry.id !== thread.id));
       threadsRef.current = threadsRef.current.filter((entry) => entry.id !== thread.id);
       clearThreadResult(thread.id);
+      window.localStorage.removeItem(threadModelPreferenceStorageKey(selectedUserId, thread.id));
       if (selectedThreadRef.current?.id === thread.id) {
         resetToNewThread(false);
       }
@@ -2757,6 +2873,7 @@ export function App() {
     autoSentGeneratedFileKeysRef.current.clear();
     autoSendInFlightFileKeysRef.current.clear();
     threadProjectIdsRef.current.clear();
+    initializedProjectIdRef.current = "";
     setSelectedProjectId("");
     setThreadSearch("");
     setSelectedThread(null);
@@ -2794,6 +2911,10 @@ export function App() {
     if (!selectedProject) {
       return;
     }
+    if (initializedProjectIdRef.current === selectedProject.id) {
+      return;
+    }
+    initializedProjectIdRef.current = selectedProject.id;
     threadViewTokenRef.current += 1;
     newThreadDraftModeRef.current = true;
     selectedThreadRef.current = null;
@@ -2808,7 +2929,12 @@ export function App() {
     setFilePreview(null);
     setFilePreviewObjectUrl("");
     setPendingDeleteThreadId(null);
-    setNewThreadModelProfileId(modelProfileIdFor(selectedProject.defaultModel || "gpt-5.5", selectedProject.defaultReasoningEffort || "xhigh", modelProfiles));
+    const savedModelProfileId = window.localStorage.getItem(modelPreferenceStorageKey(selectedUserId, selectedProject.id));
+    setNewThreadModelProfileId(savedModelProfileId || modelProfileIdFor(
+      selectedProject.defaultModel || "gpt-5.5",
+      selectedProject.defaultReasoningEffort || "xhigh",
+      modelProfiles
+    ));
     setSandbox(selectedProject.defaultSandbox || "danger-full-access");
     setApprovalPolicy(selectedProject.defaultApprovalPolicy || "never");
     setLocalMessages([]);
@@ -2879,8 +3005,8 @@ export function App() {
   async function refreshModels() {
     try {
       const response = await listModels();
-      const nextProfiles = (response.data.length ? response.data : fallbackModelProfiles)
-        .filter((profile) => profile.id !== "gpt-5.6-sol:ultra");
+      const visibleProfiles = response.data.filter((profile) => !(profile.model === "gpt-5.6-sol" && profile.effort === "ultra"));
+      const nextProfiles = visibleProfiles.length ? visibleProfiles : fallbackModelProfiles;
       setModelProfiles(nextProfiles);
       setNewThreadModelProfileId((current) => (
         nextProfiles.some((profile) => profile.id === current)
@@ -3050,7 +3176,7 @@ export function App() {
     }
   }
 
-  async function migrateAllSessionsFrom4090() {
+  async function migrateAllSessionsFromLittleRight() {
     if (migratingSessions) {
       return;
     }
@@ -3073,7 +3199,7 @@ export function App() {
       }
       const skipped = result.skippedThreadIds.length ? `；${result.skippedThreadIds.length} 个源端记录文件缺失，未迁移` : "";
       addLocalMessage(
-        response.message ?? `已从 ${result.sourceLabel} 迁移 ${result.importedThreadIds.length} 个会话，已存在 ${result.alreadyPresentThreadIds.length} 个。${skipped}`,
+          response.message ?? `已从 little right 导入 ${result.importedThreadIds.length} 个新会话，已存在 ${result.alreadyPresentThreadIds.length} 个。${skipped}`,
         "Codex Web · 会话迁移"
       );
     } catch (caught) {
@@ -3116,7 +3242,9 @@ export function App() {
       for (const thread of leakedTemporaryThreads) {
         void deleteThread(projectId, thread.id);
       }
-      const visibleThreads = response.data.filter((thread) => !temporaryThreadIdsRef.current.has(thread.id) && !isTemporaryAskThread(thread));
+      const visibleThreads = response.data
+        .filter((thread) => !temporaryThreadIdsRef.current.has(thread.id) && !isTemporaryAskThread(thread))
+        .map((thread) => sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, thread, modelProfiles)));
       setThreads(visibleThreads);
       threadsRef.current = visibleThreads;
       window.localStorage.setItem(sidebarThreadsCacheKey(selectedUserId, projectId), JSON.stringify(visibleThreads));
@@ -3149,22 +3277,38 @@ export function App() {
     if (!projectId || viewToken !== threadViewTokenRef.current) {
       return null;
     }
+    if (!options.appendOlder) {
+      const cached = threadPageCacheRef.current.get(`${projectId}:${threadId}`);
+      if (cached && cached.history.totalItems === 0) {
+        threadPageCacheRef.current.delete(`${projectId}:${threadId}`);
+      } else if (cached && Date.now() - cached.cachedAt < 30_000) {
+        const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(cached.thread), modelProfiles));
+        selectedThreadRef.current = nextThread;
+        setSelectedThread(nextThread);
+        setThreadHistory(cached.history);
+        return nextThread;
+      }
+    }
     try {
-      const response = await readThread(threadId, projectId, { before: options.before });
+      const response = await readThread(threadId, projectId, {
+        before: options.before,
+        limit: options.appendOlder ? 80 : 16
+      });
       if (viewToken !== threadViewTokenRef.current) {
         return null;
       }
       const current = selectedThreadRef.current;
-      const nextThread = options.appendOlder && current?.id === response.thread.id
+      const mergedThread = options.appendOlder && current?.id === response.thread.id
         ? mergeThreadHistoryPages(response.thread, current)
         : response.thread;
-      selectedThreadRef.current = nextThread;
-      setSelectedThread(nextThread);
+      const nextThreadWithStoredModel = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(mergedThread), modelProfiles));
+      selectedThreadRef.current = nextThreadWithStoredModel;
+      setSelectedThread(nextThreadWithStoredModel);
       setThreadHistory(response.history ?? null);
       if (!options.appendOlder) {
-        const cacheKey = `${projectId}:${nextThread.id}`;
+        const cacheKey = `${projectId}:${nextThreadWithStoredModel.id}`;
         threadViewCacheRef.current.delete(cacheKey);
-        threadViewCacheRef.current.set(cacheKey, { thread: nextThread, history: response.history ?? null });
+        threadViewCacheRef.current.set(cacheKey, { thread: nextThreadWithStoredModel, history: response.history ?? null });
         while (threadViewCacheRef.current.size > 12) {
           const oldestKey = threadViewCacheRef.current.keys().next().value;
           if (!oldestKey) {
@@ -3173,14 +3317,22 @@ export function App() {
           threadViewCacheRef.current.delete(oldestKey);
         }
       }
+      if (!options.appendOlder && response.history) {
+        threadPageCacheRef.current.set(`${projectId}:${threadId}`, {
+          thread: nextThreadWithStoredModel,
+          history: response.history,
+          cachedAt: Date.now()
+        });
+      }
       const now = Date.now();
       setPendingUserMessages((current) => current.filter((entry) => {
-        if (entry.threadId && entry.threadId !== nextThread.id) {
+        if (entry.threadId && entry.threadId !== nextThreadWithStoredModel.id) {
           return true;
         }
-        return entry.keepAtBottomUntil > now || !threadHasUserText(nextThread, entry.text);
+        const attachedToLoadedTurn = Boolean(entry.turnId && nextThreadWithStoredModel.turns.some((turn) => turn.id === entry.turnId));
+        return (!attachedToLoadedTurn && entry.keepAtBottomUntil > now) || !threadHasUserText(nextThreadWithStoredModel, entry.text);
       }));
-      return nextThread;
+      return nextThreadWithStoredModel;
     } catch (caught) {
       if (options.appendOlder) {
         historyPrependAnchorRef.current = null;
@@ -3252,6 +3404,9 @@ export function App() {
     const thread = selectedThreadRef.current;
     if (!thread?.id) {
       setNewThreadModelProfileId(profile.id);
+      if (selectedProjectIdRef.current) {
+        window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, selectedProjectIdRef.current), profile.id);
+      }
       return;
     }
     const projectId = selectedProjectIdRef.current;
@@ -3262,6 +3417,9 @@ export function App() {
     const previousEffort = thread.configuredReasoningEffort ?? selectedProject?.defaultReasoningEffort ?? profile.effort;
     setError("");
     setSavingThreadModel(true);
+    setNewThreadModelProfileId(profile.id);
+    window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, projectId), profile.id);
+    window.localStorage.setItem(threadModelPreferenceStorageKey(selectedUserId, thread.id), profile.id);
     applyThreadModelProfile(thread.id, profile.model, profile.effort);
     try {
       const response = await updateThreadModelProfile(projectId, thread.id, {
@@ -3405,6 +3563,7 @@ export function App() {
     try {
       const response = await uploadProjectFiles(projectId, sourceFiles);
       if (selectedProjectIdRef.current !== projectId) {
+        setUploadedFiles((current) => current.filter((file) => !pendingUploads.some((pending) => pending.relativePath === file.relativePath)));
         return;
       }
       const uploads = response.data.map((file, index): ComposerUpload => {
@@ -4209,7 +4368,14 @@ export function App() {
     if (message.type === "live.tool") {
       const item = message.data as LiveToolEntry | undefined;
       if (item?.itemId) {
-        setLiveTools((current) => ({ ...current, [item.itemId]: item }));
+        setLiveTools((current) => {
+          const next = { ...current };
+          // Keep completed tool rows visible until the completed turn has
+          // been confirmed by the history response. Removing them here
+          // creates a gap where tools only reappear after the whole answer.
+          next[item.itemId] = item;
+          return next;
+        });
       }
       return;
     }
@@ -4328,7 +4494,12 @@ export function App() {
           return;
         }
         if (isThreadVisibilityError(errorMessage)) {
-          if (!isStalePromptAck) {
+          const requestThreadId = requestContext?.threadId;
+          const isCurrentThreadVisibilityError = isPromptRequest
+            && requestThreadId != null
+            && requestThreadId === selectedThreadRef.current?.id
+            && (requestContext?.projectId ? requestContext.projectId === selectedProjectIdRef.current : true);
+          if (!isStalePromptAck && isCurrentThreadVisibilityError) {
             selectedThreadRef.current = null;
             setSelectedThread(null);
           }
@@ -4360,6 +4531,13 @@ export function App() {
         }
       }
       if (newThread?.id) {
+        if (requestContext) {
+          const createdThreadProfileId = modelProfileIdFor(requestContext.model, requestContext.reasoningEffort, modelProfiles);
+          window.localStorage.setItem(threadModelPreferenceStorageKey(selectedUserId, newThread.id), createdThreadProfileId);
+          if (requestContext.projectId) {
+            window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, requestContext.projectId), createdThreadProfileId);
+          }
+        }
         const normalizedThread = {
           ...newThread,
           pinned: false,
@@ -4367,10 +4545,11 @@ export function App() {
           configuredReasoningEffort: requestContext?.reasoningEffort ?? newThread.configuredReasoningEffort ?? null,
           turns: newThread.turns ?? []
         };
+        const normalizedThreadWithStoredModel = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, normalizedThread, modelProfiles));
         setThreads((current) => {
-          const next = current.filter((thread) => thread.id !== normalizedThread.id);
+          const next = current.filter((thread) => thread.id !== normalizedThreadWithStoredModel.id);
           const firstUnpinnedIndex = next.findIndex((thread) => !thread.pinned);
-          next.splice(firstUnpinnedIndex === -1 ? next.length : firstUnpinnedIndex, 0, normalizedThread);
+          next.splice(firstUnpinnedIndex === -1 ? next.length : firstUnpinnedIndex, 0, normalizedThreadWithStoredModel);
           threadsRef.current = next;
           return next;
         });
@@ -4381,8 +4560,8 @@ export function App() {
         }
         if (!isStalePromptAck) {
           newThreadDraftModeRef.current = false;
-          selectedThreadRef.current = normalizedThread;
-          setSelectedThread(normalizedThread);
+          selectedThreadRef.current = normalizedThreadWithStoredModel;
+          setSelectedThread(normalizedThreadWithStoredModel);
           setThreadHistory(null);
           if (data?.migratedFromThreadId) {
             addLocalMessage("原会话的 Codex 上下文已用尽，继续发送会没有输出。已自动新建续接会话；原记录仍保留，可随时查看或导出。", "Codex Web · 会话迁移");
@@ -4465,6 +4644,22 @@ export function App() {
         const turnId = notificationTurnId(params);
         const threadId = notificationThreadId(params) ?? (turnId ? turnThreadIdsRef.current.get(turnId) ?? null : null);
         if (!threadId) {
+          if (turnId) {
+            turnThreadIdsRef.current.delete(turnId);
+            setLiveDeltas((current) => Object.fromEntries(
+              Object.entries(current).filter(([, entry]) => entry.turnId !== turnId)
+            ));
+            setLiveTools((current) => Object.fromEntries(
+              Object.entries(current).filter(([, entry]) => entry.turnId !== turnId)
+            ));
+          } else {
+            setLiveDeltas((current) => Object.fromEntries(
+              Object.entries(current).filter(([, entry]) => entry.threadId !== null)
+            ));
+            setLiveTools((current) => Object.fromEntries(
+              Object.entries(current).filter(([, entry]) => entry.threadId !== null)
+            ));
+          }
           void refreshThreads(selectedProjectIdRef.current);
           return;
         }
@@ -4535,6 +4730,9 @@ export function App() {
                 return;
               }
             }
+            if (viewToken === threadViewTokenRef.current) {
+              clearCompletedLiveItems();
+            }
           };
           void promotePersistedTurn();
         } else if (!isTemporaryThread) {
@@ -4551,18 +4749,23 @@ export function App() {
     ...Object.entries(liveDeltas).map(([id, entry]) => ({ id, kind: "agent" as const, ...entry })),
     ...Object.values(liveTools).map((entry) => ({ id: entry.itemId, kind: "tool" as const, ...entry }))
   ]
-    .filter((entry) => selectedThread?.id ? entry.threadId === selectedThread.id : entry.threadId === null)
+    .filter((entry) => selectedThread?.id ? entry.threadId === selectedThread.id || entry.threadId === null : entry.threadId === null)
     .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
   const liveTimelineByTurn = new Map<string, LiveTimelineEntry[]>();
   const unmatchedLiveTimeline: LiveTimelineEntry[] = [];
+  const fallbackLiveTurnId = selectedThread?.id
+    ? activeTurnsByThread[selectedThread.id]
+      ?? [...(selectedThread.turns ?? [])].reverse().find((turn) => isRunningStatus(turn.status))?.id
+    : null;
   for (const entry of liveTimelineEntries) {
-    if (!entry.turnId) {
+    const turnId = entry.turnId ?? fallbackLiveTurnId;
+    if (!turnId) {
       unmatchedLiveTimeline.push(entry);
       continue;
     }
-    const entries = liveTimelineByTurn.get(entry.turnId) ?? [];
+    const entries = liveTimelineByTurn.get(turnId) ?? [];
     entries.push(entry);
-    liveTimelineByTurn.set(entry.turnId, entries);
+    liveTimelineByTurn.set(turnId, entries);
   }
   const renderLiveTimelineEntry = (entry: LiveTimelineEntry) => entry.kind === "agent" ? (
     <article className="messageItem kind-agent type-agentMessage live" key={entry.id}>
@@ -4576,19 +4779,56 @@ export function App() {
       {entry.output ? <pre className="outputBlock">{displayOutputText(entry.output)}</pre> : entry.completed ? null : <div className="messageBody">正在执行...</div>}
     </article>
   );
+  const renderPendingUserMessage = (entry: PendingUserMessage) => {
+    const item: ThreadItem = {
+      id: entry.id,
+      type: "userMessage",
+      role: "user",
+      text: entry.text
+    };
+    const navigationKey = pendingPromptNavigationKey(entry.id);
+    return (
+      <article
+        className={messageClassName(item, "live pending")}
+        key={entry.id}
+        ref={(element) => setPromptMessageElement(navigationKey, element)}
+      >
+        <div className="messageMeta">用户 · sending</div>
+        <CollapsibleUserMessage text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+        <PendingUserImagePreviews uploads={entry.attachments} onOpenFileLink={openFilePreview} />
+      </article>
+    );
+  };
   const visiblePendingUserMessages = useMemo(() => pendingUserMessages.filter((entry) => {
     if (!selectedThread?.id) {
       return entry.threadId === null && entry.viewToken === threadViewTokenRef.current;
     }
     return entry.threadId === selectedThread.id;
   }), [pendingUserMessages, selectedThread]);
+  const pendingUserMessagesByTurn = useMemo(() => {
+    const byTurn = new Map<string, PendingUserMessage[]>();
+    const turnIds = new Set((selectedThread?.turns ?? []).map((turn) => turn.id));
+    for (const entry of visiblePendingUserMessages) {
+      if (!entry.turnId || !turnIds.has(entry.turnId)) {
+        continue;
+      }
+      const entries = byTurn.get(entry.turnId) ?? [];
+      entries.push(entry);
+      byTurn.set(entry.turnId, entries);
+    }
+    return byTurn;
+  }, [selectedThread, visiblePendingUserMessages]);
+  const detachedPendingUserMessages = useMemo(() => {
+    const turnIds = new Set((selectedThread?.turns ?? []).map((turn) => turn.id));
+    return visiblePendingUserMessages.filter((entry) => !entry.turnId || !turnIds.has(entry.turnId));
+  }, [selectedThread, visiblePendingUserMessages]);
   const heldPendingUserMessages = useMemo(
-    () => visiblePendingUserMessages.filter((entry) => entry.keepAtBottomUntil > promptBottomHoldNow),
-    [promptBottomHoldNow, visiblePendingUserMessages]
+    () => detachedPendingUserMessages.filter((entry) => entry.keepAtBottomUntil > promptBottomHoldNow),
+    [detachedPendingUserMessages, promptBottomHoldNow]
   );
   const timelinePendingUserMessages = useMemo(
-    () => visiblePendingUserMessages.filter((entry) => entry.keepAtBottomUntil <= promptBottomHoldNow),
-    [promptBottomHoldNow, visiblePendingUserMessages]
+    () => detachedPendingUserMessages.filter((entry) => entry.keepAtBottomUntil <= promptBottomHoldNow),
+    [detachedPendingUserMessages, promptBottomHoldNow]
   );
   const heldPersistedPromptNavigationKeys = useMemo(() => {
     const hiddenKeys = new Set<string>();
@@ -4834,14 +5074,14 @@ export function App() {
           <button
             className="iconTextButton full"
             type="button"
-            onClick={() => void migrateAllSessionsFrom4090()}
+            onClick={() => void migrateAllSessionsFromLittleRight()}
             disabled={migratingSessions}
-            title="仅迁移当前登录用户名在 4090-left 上可见的会话；不会迁移密码、Token、额度或其他用户数据。"
+            title="仅导入 little right 上当前用户的新会话；已有会话跳过，不覆盖本地记录。"
           >
             <Archive size={15} />
-            {migratingSessions ? "迁移中…" : "迁移 4090-left 会话"}
+            {migratingSessions ? "导入中…" : "导入 little right 会话"}
           </button>
-          <p className="creatorHint">仅迁移当前用户的会话记录；4090-left 无会话会提示无法迁移。</p>
+          <p className="creatorHint">只导入新会话，已有记录自动跳过，不会覆盖本地内容。</p>
         </div>
 
         <div className="projectCreator">
@@ -5403,7 +5643,7 @@ export function App() {
                     onDragEnd={clearThreadDragState}
                     title={threadSearch ? "清空搜索后可拖动排序" : thread.pinned ? "已置顶；可在同组内拖动排序" : "可拖动调整会话顺序"}
                   >
-                    <button className="threadSelectButton" type="button" title="右键打开会话操作" onClick={() => {
+                    <button className="threadSelectButton" type="button" title="右键打开会话操作" onMouseEnter={() => prefetchThread(thread.id)} onFocus={() => prefetchThread(thread.id)} onClick={() => {
                       setPendingDeleteThreadId(null);
                       selectThread(thread.id);
                     }}>
@@ -5421,7 +5661,16 @@ export function App() {
                       title="重命名会话"
                       aria-label="重命名会话"
                     >
-                      ✎
+                      <PencilLine size={14} />
+                    </button>
+                    <button
+                      className={`threadRenameButton threadPinButton ${thread.pinned ? "active" : ""}`}
+                      type="button"
+                      onClick={() => void toggleThreadPin(thread)}
+                      title={thread.pinned ? "取消置顶" : "置顶会话"}
+                      aria-label={thread.pinned ? "取消置顶" : "置顶会话"}
+                    >
+                      <Pin size={14} />
                     </button>
                     <button
                       className={`threadDeleteButton ${deletePending ? "confirm" : ""}`}
@@ -5493,7 +5742,7 @@ export function App() {
                     ? "当前会话运行中；完成后可切换下一轮模型"
                     : `仅影响${selectedThread ? "当前会话后续轮次" : "这次新会话"}：${selectedModelProfile.model} / ${selectedModelProfile.effort}`}
                 >
-                  {modelProfiles.map((profile) => (
+                  {modelProfiles.filter((profile) => profile.id !== "gpt-5.6-sol:ultra").map((profile) => (
                     <option key={profile.id} value={profile.id}>
                       {profile.label}
                     </option>
@@ -5555,9 +5804,6 @@ export function App() {
                 id="conversation-messages"
                 ref={messagesRef}
                 onWheelCapture={(event) => {
-                  // Disable follow before the browser applies an upward wheel
-                  // scroll. Otherwise a streaming render can run between the
-                  // wheel event and onScroll and pull the reader back down.
                   if (event.deltaY < 0 && autoFollowMessagesRef.current) {
                     manualMessageScrollLockRef.current = true;
                     autoFollowMessagesRef.current = false;
@@ -5764,56 +6010,21 @@ export function App() {
                   });
                   return [
                     ...renderedItems,
-                    ...(conversationLocalMessageLayout.byTurn.get(turn.id) ?? []).map(renderLocalMessage),
+                    ...(pendingUserMessagesByTurn.get(turn.id) ?? []).map(renderPendingUserMessage),
                     ...(isRunningStatus(turn.status) ? [
                       <div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>
                     ] : []),
-                    ...(isRunningStatus(turn.status) ? liveTimelineByTurn.get(turn.id) ?? [] : []).map(renderLiveTimelineEntry)
+                    ...(conversationLocalMessageLayout.byTurn.get(turn.id) ?? []).map(renderLocalMessage),
+                    ...(activeTurnsByThread[selectedThread?.id ?? ""] === turn.id
+                      ? (liveTimelineByTurn.get(turn.id) ?? []).map(renderLiveTimelineEntry)
+                      : [])
                   ];
                 })}
                 {conversationLocalMessageLayout.beforePending.map(renderLocalMessage)}
-                {timelinePendingUserMessages.map((entry) => {
-                  const item: ThreadItem = {
-                    id: entry.id,
-                    type: "userMessage",
-                    role: "user",
-                    text: entry.text
-                  };
-                  const navigationKey = pendingPromptNavigationKey(entry.id);
-                  return (
-                    <article
-                      className={messageClassName(item, "live pending")}
-                      key={entry.id}
-                      ref={(element) => setPromptMessageElement(navigationKey, element)}
-                    >
-                      <div className="messageMeta">用户 · sending</div>
-                      <CollapsibleUserMessage text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
-                      <PendingUserImagePreviews uploads={entry.attachments} onOpenFileLink={openFilePreview} />
-                    </article>
-                  );
-                })}
-                {unmatchedLiveTimeline.map(renderLiveTimelineEntry)}
+                {timelinePendingUserMessages.map(renderPendingUserMessage)}
+                {!selectedThread ? unmatchedLiveTimeline.map(renderLiveTimelineEntry) : null}
                 {conversationLocalMessageLayout.tail.map(renderLocalMessage)}
-                {heldPendingUserMessages.map((entry) => {
-                  const item: ThreadItem = {
-                    id: entry.id,
-                    type: "userMessage",
-                    role: "user",
-                    text: entry.text
-                  };
-                  const navigationKey = pendingPromptNavigationKey(entry.id);
-                  return (
-                    <article
-                      className={messageClassName(item, "live pending heldAtBottom")}
-                      key={entry.id}
-                      ref={(element) => setPromptMessageElement(navigationKey, element)}
-                    >
-                      <div className="messageMeta">用户 · sending</div>
-                      <CollapsibleUserMessage text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
-                      <PendingUserImagePreviews uploads={entry.attachments} onOpenFileLink={openFilePreview} />
-                    </article>
-                  );
-                })}
+                {heldPendingUserMessages.map((entry) => renderPendingUserMessage(entry))}
                 {!selectedThread && liveTimelineEntries.length === 0 && visiblePendingUserMessages.length === 0 && localMessages.length === 0 ? (
                   <div className="emptyState">Ready for a new Codex turn.</div>
                 ) : null}
@@ -5898,7 +6109,7 @@ export function App() {
                     onChange={(profileId) => void changeConversationModelProfile(profileId)}
                     disabled={savingThreadModel || conversationRunState === "running"}
                     title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
-                    options={modelProfiles.map((profile) => ({
+                    options={modelProfiles.filter((profile) => profile.id !== "gpt-5.6-sol:ultra").map((profile) => ({
                       value: profile.id,
                       label: profile.label,
                       detail: `${profile.model} · 推理 ${profile.effort}`
@@ -5982,7 +6193,7 @@ export function App() {
                 {uploadedFiles.length ? (
                   <div className="uploadedFileList">
                     {uploadedFiles.map((file) => (
-                      <div className={`uploadedFileChip${file.isImage ? " uploadedImageChip" : ""}`} key={file.relativePath} title={file.relativePath}>
+                      <div className={`uploadedFileChip${file.isImage ? " uploadedImageChip" : ""}${/\.pdf$/i.test(file.name) ? " uploadedPdfChip" : ""}`} key={file.relativePath} title={file.relativePath}>
                         <button
                           className="uploadedFilePreviewButton"
                           type="button"
@@ -5992,7 +6203,7 @@ export function App() {
                         >
                           {file.isImage ? <ComposerImageThumbnail upload={file} /> : <FileText className="uploadedFileIcon" size={14} />}
                           <span>{file.name}</span>
-                          <small>{file.uploading ? "正在上传" : (file.isImage ? `图片 · ${formatBytes(file.size)}` : file.relativePath)}</small>
+                          <small>{file.uploading ? "正在上传" : (file.isImage ? `图片 · ${formatBytes(file.size)}` : (file.name.split(".").pop()?.toUpperCase() || "文件"))}</small>
                         </button>
                         <button
                           className="removeUploadedFileButton"

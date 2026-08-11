@@ -4,10 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Codex Web Console 260803</title>
+    <script type="module" src="/src/main.tsx"></script>
   </head>
   <body>
     <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
     <div class="v2AccountDock" id="v2AccountDock">
       <div class="v2AccountMenu" id="v2AccountMenu" hidden>
         <div class="v2AccountIdentity">
@@ -40,6 +40,30 @@
         const quotaMenuButton = document.getElementById("v2QuotaMenuButton");
         const quotaSummary = document.getElementById("v2QuotaSummary");
         const quotaFill = document.getElementById("v2QuotaFill");
+        const accountAvatars = [...document.querySelectorAll(".v2Avatar")];
+        const accountNames = [...document.querySelectorAll(".v2AccountIdentity strong, .v2AccountTrigger strong")];
+
+        function userInitials(username) {
+          const value = String(username || "").trim();
+          if (!value) return "?";
+          const parts = value.split(/[._\\-\\s]+/).filter(Boolean);
+          if (parts.length > 1) return parts.slice(0, 2).map((part) => part[0]).join("").toUpperCase();
+          return Array.from(value).slice(0, 2).join("").toUpperCase();
+        }
+
+        async function syncAccountIdentity() {
+          try {
+            const response = await fetch("/api/auth/me", { credentials: "same-origin", cache: "no-store" });
+            const body = await response.json().catch(() => ({}));
+            const username = body?.data?.username;
+            if (!username) return;
+            const initials = userInitials(username);
+            accountAvatars.forEach((element) => { element.textContent = initials; });
+            accountNames.forEach((element) => { element.textContent = username; });
+          } catch {
+            // The login page and static shell remain usable while auth is unavailable.
+          }
+        }
 
         function syncQuota() {
           const source = document.querySelector(".quotaButton");
@@ -66,6 +90,7 @@
             trigger.setAttribute("aria-expanded", "false");
           }
         });
+        void syncAccountIdentity();
       })();
     </script>
     <div class="v2ProjectDock" id="v2ProjectDock">
@@ -174,11 +199,18 @@
         function installShellBridges() {
           const threadList = document.querySelector(".threadList");
           if (threadList) {
-            document.documentElement.style.setProperty("--v2-sidebar-width", `${threadList.getBoundingClientRect().width}px`);
+            const applySidebarWidth = (width) => {
+              // During conversation switches the grid briefly reports 0px.
+              // Do not persist that transient layout state into the fixed V2 dock.
+              if (Number.isFinite(width) && width >= 180) {
+                document.documentElement.style.setProperty("--v2-sidebar-width", `${width}px`);
+              }
+            };
+            applySidebarWidth(threadList.getBoundingClientRect().width);
             if (!window.__v2SidebarResizeObserver) {
               window.__v2SidebarResizeObserver = new ResizeObserver((entries) => {
                 const width = entries[0]?.contentRect.width;
-                if (width !== undefined) document.documentElement.style.setProperty("--v2-sidebar-width", `${width}px`);
+                if (width !== undefined) applySidebarWidth(width);
               });
               window.__v2SidebarResizeObserver.observe(threadList);
             }

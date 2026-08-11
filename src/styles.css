@@ -1579,6 +1579,9 @@ label input {
 }
 
 .userMessageToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   margin-top: 8px;
   border: 1px solid #4a4c48;
   border-radius: 6px;
@@ -3187,6 +3190,50 @@ pre,
   box-shadow: 0 28px 90px rgba(0, 0, 0, 0.58);
 }
 
+.renameThreadDialog .renameThreadLabel {
+  color: #aeb1ab;
+}
+
+.renameThreadDialog input {
+  border-color: var(--line-strong);
+  background: #1b1c1b;
+  color: var(--text);
+  caret-color: var(--text);
+}
+
+.renameThreadDialog input:focus {
+  border-color: #60635d;
+  box-shadow: 0 0 0 3px rgba(224, 226, 221, 0.08);
+  outline: none;
+}
+
+.renameThreadDialog .dialogActions .iconTextButton {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #b8bbb5;
+}
+
+.renameThreadDialog .dialogActions .iconTextButton:hover {
+  background: #383a37;
+  color: #eceee9;
+}
+
+.renameThreadDialog .dialogActions .iconTextButton.primary {
+  border-color: #5f625d;
+  background: #e0e2dd;
+  color: #202120;
+}
+
+.renameThreadDialog .dialogActions .iconTextButton.primary:hover {
+  background: #f0f1ed;
+}
+
+.renameThreadDialog .dialogActions .iconTextButton:focus-visible,
+.userMessageToggle:focus-visible {
+  outline: 2px solid rgba(224, 226, 221, 0.52);
+  outline-offset: 2px;
+}
+
 @media (max-width: 1100px) {
   .appShell {
     grid-template-columns: 0 0 minmax(0, 1fr) !important;
@@ -3403,6 +3450,21 @@ pre,
   display: none !important;
 }
 
+.composer.draggingUpload {
+  outline:1px solid #666a63 !important;
+  outline-offset:-7px;
+  background:#303230 !important;
+}
+.composer.draggingUpload::after {
+  inset:10px 58px 10px 10px;
+  border:1px solid #5b5f58;
+  border-radius:12px;
+  background:rgba(55,58,54,.94) !important;
+  box-shadow:0 12px 34px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.05);
+  color:#e7eae4 !important;
+  font:400 13px/20px inherit;
+}
+
 .composer .uploadedImageThumbnail {
   width: 72px;
   height: 54px;
@@ -3481,6 +3543,81 @@ pre,
 .composer .uploadedFileList {
   gap: 9px;
   padding: 1px 1px 3px;
+}
+
+/* Keep non-image uploads in the same dark composer-card language as image uploads. */
+.composer .uploadedFileChip:not(.uploadedImageChip) {
+  position: relative;
+  width: 280px;
+  min-width: 280px;
+  max-width: 300px;
+  min-height: 64px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 12px;
+  background: #2a2b2a;
+  color: #eceee9;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+
+.composer .uploadedFileChip:not(.uploadedImageChip) .uploadedFilePreviewButton {
+  grid-template-columns: 44px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 2px 10px;
+  width: 100%;
+  min-height: 64px;
+  padding: 8px 38px 8px 10px;
+}
+
+.composer .uploadedFileChip:not(.uploadedImageChip) .uploadedFileIcon {
+  grid-row: 1 / span 2;
+  width: 28px;
+  height: 28px;
+  padding: 8px;
+  border-radius: 8px;
+  background: #3a3c3a;
+  color: #c8ccc5;
+}
+
+.composer .uploadedFileChip.uploadedPdfChip .uploadedFileIcon {
+  background: #55262c;
+  color: #ff646b;
+}
+
+.composer .uploadedFileChip:not(.uploadedImageChip) .uploadedFilePreviewButton > span {
+  align-self: end;
+  color: #f1f2ee;
+  font-size: 14px;
+  font-weight: 620;
+}
+
+.composer .uploadedFileChip:not(.uploadedImageChip) .uploadedFilePreviewButton > small {
+  align-self: start;
+  color: #a7aaa4;
+  font-size: 12px;
+}
+
+.composer .uploadedFileChip:not(.uploadedImageChip) .removeUploadedFileButton {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: grid;
+  width: 20px;
+  min-width: 20px;
+  height: 20px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: #f1f2ee;
+  color: #282a28;
+  box-shadow: none;
+}
+
+.composer .uploadedFileChip:not(.uploadedImageChip) .removeUploadedFileButton:hover {
+  background: #ffffff;
+  color: #111211;
 }
 
 /* Keep compact tool summaries on the same icon/text baseline as expanded rows. */
@@ -3690,8 +3827,9 @@ pre,
   border-radius: 9px !important;
   background: #202120 !important;
   color: #d7d9d4 !important;
-  font-size: 12px;
-  font-weight: 620;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
   white-space: nowrap;
 }
 
@@ -4607,8 +4745,9 @@ pre,
 
 .v2WorkspaceThreads .threadRow {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) 25px 25px 25px;
   min-width: 0;
+  column-gap: 1px;
 }
 
 .v2WorkspaceThreads .threadSelectButton {
@@ -4645,15 +4784,26 @@ pre,
 
 .v2WorkspaceThreads .threadDeleteButton { opacity: 0; }
 .v2WorkspaceThreads .threadRenameButton {
+  display: grid;
   width: 25px;
   min-width: 25px;
+  height: 25px;
+  min-height: 25px;
+  place-items: center;
   padding: 0;
   border: 0;
   border-radius: 5px;
   background: transparent;
   color: #8c8f89;
-  font-size: 15px;
+  font-size: 0;
   opacity: 0;
+}
+.v2WorkspaceThreads .threadRenameButton > svg {
+  width: 14px;
+  height: 14px;
+}
+.v2WorkspaceThreads .threadPinButton.active {
+  color: var(--accent);
 }
 .v2WorkspaceThreads .threadRow:hover .threadDeleteButton,
 .v2WorkspaceThreads .threadRow:hover .threadRenameButton { opacity: 1; }
@@ -4664,6 +4814,13 @@ pre,
   font-weight: 400 !important;
   line-height: 20px;
   letter-spacing: 0 !important;
+}
+
+.quotaPopoverAnchor .quotaButton.v2QuotaTopButton {
+  font-family: inherit !important;
+  font-size: 14px !important;
+  font-weight: 400 !important;
+  line-height: 20px !important;
 }
 
 /* Put the active conversation title in the same top row as settings/quota. */
@@ -4708,11 +4865,15 @@ pre,
 .topbar .controls > select,
 .topbar .controls > .v2QuotaTopButton {
   font-family: inherit !important;
-  font-size: 14px !important;
+  font-size: 12px !important;
   font-weight: 400 !important;
   font-style: normal !important;
   letter-spacing: 0 !important;
   -webkit-text-stroke: 0 !important;
+}
+
+.topbar .controls > select {
+  font-size: 10px !important;
 }
 
 /* Seamless shimmer: identical loop endpoints, constant opacity and speed. */
@@ -5185,6 +5346,19 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
   padding: 6px;
 }
 
+.topbarPolicySelect .polishedSelectTrigger,
+.topbar .controls .topbarPolicySelect .polishedSelectTrigger {
+  font-family: inherit !important;
+  font-size: 14px !important;
+  font-weight: 400 !important;
+  line-height: 20px !important;
+  min-height: 31px;
+}
+
+.topbar .controls .topbarPolicySelect .polishedSelectTrigger > span:first-child {
+  font-size: 14px !important;
+}
+
 .topbarPolicySelect .polishedSelectOption,
 .topbar .controls .topbarPolicySelect .polishedSelectOption {
   min-height: 38px;
@@ -5200,6 +5374,12 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
 .topbar .controls .topbarPolicySelect .polishedSelectOption:hover,
 .topbar .controls .topbarPolicySelect .polishedSelectOption.selected {
   background: #353735 !important;
+}
+
+.topbarPolicySelect .polishedSelectOption strong,
+.topbar .controls .topbarPolicySelect .polishedSelectOption strong {
+  font-size: 14px;
+  font-weight: 400;
 }
 
 .topbarPolicySelect .polishedSelectOption small {
@@ -5489,6 +5669,8 @@ body:has(.globalSearchScrim) .v2AccountDock {
 
 .topbar .quotaButton.v2QuotaTopButton {
   display: inline-flex !important;
+  font-size: 14px !important;
+  line-height: 20px !important;
 }
 
 .quotaPopover {
@@ -5517,13 +5699,13 @@ body:has(.globalSearchScrim) .v2AccountDock {
   border-bottom: 1px solid #393b37;
 }
 
-.quotaPopover header strong { font-size: 13px; font-weight: 560; }
+.quotaPopover header strong { font-size: 14px !important; font-weight: 560; }
 .quotaPopover header span,
-.quotaPopover p { margin: 0; color: #969993; font-size: 11px; }
+.quotaPopover p { margin: 0; color: #969993; font-size: 14px !important; }
 .quotaPopoverRows { display: grid; gap: 7px; padding: 10px 2px 1px; }
 .quotaPopoverRows > div { display: grid; grid-template-columns: 72px minmax(0, 1fr); align-items: start; gap: 10px; }
-.quotaPopoverRows span { color: #969993; font-size: 11px; }
-.quotaPopoverRows strong { overflow-wrap: anywhere; color: #d7d9d4; font-size: 11px; font-weight: 400; line-height: 16px; white-space: normal; }
+.quotaPopoverRows span { color: #969993; font-size: 14px !important; }
+.quotaPopoverRows strong { overflow-wrap: anywhere; color: #d7d9d4; font-size: 14px !important; font-weight: 400; line-height: 20px; white-space: normal; }
 
 /* Keep the composer inside the readable content width while allowing popovers above it. */
 .composer {
@@ -5826,6 +6008,29 @@ body:has(.globalSearchScrim) .v2AccountDock {
 /* Normal-weight tool summaries with optical icon alignment. */
 .messageItem.kind-tool .messageMeta {
   font-weight: 400 !important;
+}
+
+/* KaTeX blocks follow the dark V2 surface instead of the legacy light skin. */
+.messageMarkdown .katex-display {
+  margin:14px 0 !important;
+  padding:12px 15px !important;
+  border:1px solid #4b4f49 !important;
+  border-radius:10px !important;
+  background:#292b29 !important;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.045), 0 7px 20px rgba(0,0,0,.12);
+  color:#eef1eb !important;
+  font-size:1.08em !important;
+  line-height:1.55 !important;
+}
+.messageMarkdown .katex-display > .katex,
+.messageMarkdown .katex-display .katex,
+.messageMarkdown .katex-display .katex * {
+  color:#eef1eb !important;
+}
+.messageMarkdown > p .katex,
+.messageMarkdown > li .katex,
+.messageMarkdown > blockquote .katex {
+  color:#edf0ea !important;
 }
 
 .messageItem.kind-tool::before,

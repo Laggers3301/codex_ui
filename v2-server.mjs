@@ -25,10 +25,24 @@ const mime = new Map([
   [".ttf", "font/ttf"]
 ]);
 
+function hasSessionCookie(request) {
+  return /(?:^|;\s*)codex_remote_session=/.test(request.headers.cookie ?? "");
+}
+
+function isPublicPath(requestUrl) {
+  const pathname = new URL(requestUrl ?? "/", "http://localhost").pathname;
+  return pathname === "/login" || pathname === "/api/auth/login";
+}
+
 function requireAuthorization(request, response) {
   const remoteAddress = request.socket.remoteAddress;
   if (remoteAddress === "127.0.0.1" || remoteAddress === "::1" || remoteAddress === "::ffff:127.0.0.1") return true;
-  if (request.headers.authorization) return true;
+  if (request.headers.authorization || hasSessionCookie(request) || isPublicPath(request.url)) return true;
+  if (new URL(request.url ?? "/", "http://localhost").pathname === "/") {
+    response.writeHead(302, { Location: "/login", "Cache-Control": "no-store" });
+    response.end();
+    return false;
+  }
   response.writeHead(401, {
     "WWW-Authenticate": "Basic realm=\"Codex Web V2\"",
     "Content-Type": "text/plain; charset=utf-8"
@@ -66,12 +80,12 @@ async function staticFileFor(url) {
 
 const server = http.createServer(async (request, response) => {
   if (request.url === "/__v2_logout") {
-    response.writeHead(401, {
-      "WWW-Authenticate": "Basic realm=\"Codex Web V2 signed out\"",
-      "Clear-Site-Data": "\"cache\", \"cookies\", \"storage\"",
-      "Content-Type": "text/plain; charset=utf-8"
+    response.writeHead(302, {
+      Location: "/logout",
+      "Cache-Control": "no-store",
+      "Clear-Site-Data": "\"cache\", \"storage\""
     });
-    response.end("Signed out. Close this tab or sign in again.");
+    response.end();
     return;
   }
   if (!requireAuthorization(request, response)) return;
@@ -90,7 +104,7 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.on("upgrade", (request, socket, head) => {
-  if (!request.headers.authorization) {
+  if (!request.headers.authorization && !hasSessionCookie(request)) {
     socket.end("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Codex Web V2\"\r\n\r\n");
     return;
   }
