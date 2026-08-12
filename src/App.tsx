@@ -115,7 +115,16 @@ function isTemporaryAskThread(thread: ThreadSummary): boolean {
 type GlobalSearchResult = {
   project: Project;
   thread: ThreadSummary;
+  match?: {
+    projectId: string;
+    threadId: string;
+    turnId?: string;
+    itemId?: string;
+    query: string;
+    snippet: string;
+  };
 };
+type GlobalSearchMatch = NonNullable<GlobalSearchResult["match"]>;
 
 interface PolishedSelectOption<T extends string> {
   value: T;
@@ -653,6 +662,91 @@ function promptNavigationItemsForThread(thread: ThreadSummary | null): PromptNav
     }
   }
   return items;
+}
+
+function searchResultSnippet(sourceText: string, query: string, pad = 72): string {
+  const text = safeText(sourceText);
+  const normalizedQuery = safeText(query).toLocaleLowerCase();
+  const haystack = text.toLocaleLowerCase();
+  if (!normalizedQuery) {
+    return text.slice(0, pad).trim();
+  }
+  const index = haystack.indexOf(normalizedQuery);
+  if (index === -1) {
+    return text.slice(0, 120).trim();
+  }
+  const start = Math.max(0, index - pad);
+  const end = Math.min(text.length, index + normalizedQuery.length + pad);
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < text.length ? "…" : "";
+  return `${prefix}${text.slice(start, end).trim()}${suffix}`;
+}
+
+function normalizeSearchQuery(value: string): string {
+  return safeText(value).toLocaleLowerCase().trim();
+}
+
+function textContainsQuery(sourceText: string, query: string): boolean {
+  const normalizedQuery = normalizeSearchQuery(query);
+  if (!normalizedQuery) {
+    return false;
+  }
+  const haystack = safeText(sourceText).toLocaleLowerCase();
+  if (!haystack) {
+    return false;
+  }
+  if (haystack.includes(normalizedQuery)) {
+    return true;
+  }
+  const compactNeedle = normalizedQuery.replace(/\s+/g, "");
+  const compactHaystack = haystack.replace(/\s+/g, "");
+  if (compactNeedle.length > 1 && compactHaystack.includes(compactNeedle)) {
+    return true;
+  }
+  const terms = normalizedQuery.split(/\s+/).filter(Boolean);
+  return terms.length > 1 && terms.every((term) => haystack.includes(term));
+}
+
+function createGlobalSearchMatch(
+  projectId: string,
+  threadId: string,
+  query: string,
+  sourceText: string,
+  turnId?: string,
+  itemId?: string
+): GlobalSearchMatch {
+  return {
+    projectId,
+    threadId,
+    turnId,
+    itemId,
+    query: normalizeSearchQuery(query),
+    snippet: searchResultSnippet(sourceText, normalizeSearchQuery(query))
+  };
+}
+
+function findSearchMatchInThread(thread: ThreadSummary, query: string, projectId: string): GlobalSearchMatch | null {
+  const normalizedQuery = safeText(query).toLocaleLowerCase().trim();
+  if (!normalizedQuery) {
+    return null;
+  }
+  for (const turn of thread.turns ?? []) {
+    if (!turn?.id) {
+      continue;
+    }
+    const syntheticText = turnHasUserItem(turn) ? "" : visibleUserHistoryText(turnUserText(turn));
+    if (textContainsQuery(safeText(syntheticText), normalizedQuery)) {
+      return createGlobalSearchMatch(projectId, turn.id, normalizedQuery, safeText(syntheticText), turn.id, `${turn.id}-user-input`);
+    }
+    for (const item of turn.items ?? []) {
+      const itemTextValue = itemKind(item) === "user" ? visibleUserHistoryText(itemText(item)) : stripInterruptArtifacts(itemText(item));
+      if (!textContainsQuery(safeText(itemTextValue), normalizedQuery)) {
+        continue;
+      }
+      return createGlobalSearchMatch(projectId, turn.id, normalizedQuery, safeText(itemTextValue), turn.id, item.id);
+    }
+  }
+  return null;
 }
 
 function blocksGlobalEnterSend(target: EventTarget | null): boolean {
@@ -2138,8 +2232,10 @@ export function App() {
   const promptNavigationFrameRef = useRef<number | null>(null);
   const threadCopyNoticeTimerRef = useRef<number | null>(null);
   const promptMessageElementsRef = useRef(new Map<string, HTMLElement>());
+  const messageElementsRef = useRef(new Map<string, HTMLElement>());
   const historyPrependAnchorRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null);
   const threadViewCacheRef = useRef(new Map<string, { thread: ThreadSummary; history: ThreadHistoryPage | null }>());
+  const threadHistoryRef = useRef<ThreadHistoryPage | null>(null);
   const autoFollowMessagesRef = useRef(true);
   const manualMessageScrollLockRef = useRef(false);
   const threadViewTokenRef = useRef(0);
@@ -2181,6 +2277,7 @@ export function App() {
   const [globalSearchQuery, setGlobalSearchQuery] = useState("");
   const [globalSearchResults, setGlobalSearchResults] = useState<GlobalSearchResult[]>([]);
   const [globalSearchLoading, setGlobalSearchLoading] = useState(false);
+  const [globalSearchJumpNotice, setGlobalSearchJumpNotice] = useState<string | null>(null);
   const [threads, setThreads] = useState<ThreadSummary[]>(() => {
     const userId = getApiUserId();
     const projectId = window.localStorage.getItem(sidebarProjectSelectionKey(userId)) ?? "";
@@ -2216,6 +2313,7 @@ export function App() {
   const [socketStatus, setSocketStatus] = useState<"connecting" | "open" | "closed">("closed");
   const [liveDeltas, setLiveDeltas] = useState<Record<string, LiveDeltaEntry>>({});
   const [liveTools, setLiveTools] = useState<Record<string, LiveToolEntry>>({});
+  const [expandedToolBundles, setExpandedToolBundles] = useState<Record<string, true>>({});
   const [pendingUserMessages, setPendingUserMessages] = useState<PendingUserMessage[]>([]);
   const [promptBottomHoldNow, setPromptBottomHoldNow] = useState(() => Date.now());
   const [uploadedFiles, setUploadedFiles] = useState<ComposerUpload[]>([]);
@@ -2518,6 +2616,110 @@ export function App() {
     }
   }, []);
 
+  const messageElementKey = useCallback((threadId: string, turnId: string, itemId: string) => `${threadId}:${turnId}:${itemId}`, []);
+
+  const setMessageElement = useCallback((key: string, element: HTMLElement | null) => {
+    if (element) {
+      messageElementsRef.current.set(key, element);
+    } else {
+      messageElementsRef.current.delete(key);
+    }
+  }, []);
+
+  const globalSearchJumpNoticeTimerRef = useRef<number | null>(null);
+
+  function setGlobalSearchJumpNoticeWithFade(message: string | null) {
+    setGlobalSearchJumpNotice(message);
+    if (globalSearchJumpNoticeTimerRef.current !== null) {
+      window.clearTimeout(globalSearchJumpNoticeTimerRef.current);
+      globalSearchJumpNoticeTimerRef.current = null;
+    }
+    if (message) {
+      globalSearchJumpNoticeTimerRef.current = window.setTimeout(() => {
+        setGlobalSearchJumpNotice(null);
+      }, 1600);
+    }
+  }
+
+  const flashMessageElement = useCallback((element: HTMLElement | null, text: string) => {
+    if (!element) {
+      return;
+    }
+    element.classList.remove("globalSearchMatchFlash");
+    element.dataset.searchMatchSnippet = text;
+    element.classList.add("globalSearchMatchFlash");
+    window.setTimeout(() => {
+      element.classList.remove("globalSearchMatchFlash");
+    }, 1400);
+  }, []);
+
+  async function revealGlobalSearchMatch(
+    match: GlobalSearchMatch | null,
+    attempt = 0
+  ) {
+    if (!match) {
+      return false;
+    }
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    const selected = selectedThreadRef.current;
+    if (!selected || selected.id !== match.threadId) {
+      return false;
+    }
+
+    const resolvedMatch = (match.turnId && match.itemId)
+      ? match
+      : findSearchMatchInThread(selected, match.query, match.projectId) ?? null;
+    if (!resolvedMatch) {
+      if (attempt < 8 && threadHistoryRef.current?.hasOlder && threadHistoryRef.current?.nextBefore && selectedProjectIdRef.current) {
+        await openThread(match.threadId, selectedProjectIdRef.current, threadViewTokenRef.current, {
+          appendOlder: true,
+          before: threadHistoryRef.current.nextBefore
+        });
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 20));
+        return revealGlobalSearchMatch(match, attempt + 1);
+      }
+      return false;
+    }
+
+    const container = messagesRef.current;
+    const key = messageElementKey(selected.id, resolvedMatch.turnId ?? "", resolvedMatch.itemId ?? "");
+    const target = messageElementsRef.current.get(key);
+    if (target && container) {
+      const top = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+      container.scrollTo({ top: Math.max(0, top - 28), left: 0, behavior: "smooth" });
+      autoFollowMessagesRef.current = false;
+      setShowScrollToBottom(true);
+      flashMessageElement(target, resolvedMatch.snippet);
+      setGlobalSearchJumpNoticeWithFade(`已定位到：${resolvedMatch.snippet}`);
+      return true;
+    }
+
+    if (attempt < 8 && match.query !== "" && threadHistoryRef.current?.hasOlder && threadHistoryRef.current?.nextBefore && selectedProjectIdRef.current) {
+      await openThread(match.threadId, selectedProjectIdRef.current, threadViewTokenRef.current, {
+        appendOlder: true,
+        before: threadHistoryRef.current.nextBefore
+      });
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 20));
+      return revealGlobalSearchMatch(match, attempt + 1);
+    }
+
+    const fallbackMatch = findSearchMatchInThread(selected, match.query, match.projectId);
+    if (fallbackMatch) {
+      const fallbackKey = messageElementKey(selected.id, fallbackMatch.turnId ?? "", fallbackMatch.itemId ?? "");
+      const fallbackTarget = messageElementsRef.current.get(fallbackKey);
+      if (fallbackTarget && container) {
+        const top = fallbackTarget.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+        container.scrollTo({ top: Math.max(0, top - 28), left: 0, behavior: "smooth" });
+        autoFollowMessagesRef.current = false;
+        setShowScrollToBottom(true);
+        flashMessageElement(fallbackTarget, fallbackMatch.snippet);
+        setGlobalSearchJumpNoticeWithFade(`已定位到：${fallbackMatch.snippet}`);
+        return true;
+      }
+    }
+    return false;
+  }
+
   function updatePromptNavigationActive() {
     const container = messagesRef.current;
     if (!container || promptNavigationItems.length === 0) {
@@ -2570,6 +2772,7 @@ export function App() {
     newThreadDraftModeRef.current = true;
     selectedThreadRef.current = null;
     autoFollowMessagesRef.current = true;
+    messageElementsRef.current.clear();
     setSelectedThread(null);
     setThreadHistory(null);
     setLoadingOlderHistory(false);
@@ -3219,10 +3422,22 @@ export function App() {
       setGlobalSearchLoading(true);
       void Promise.all(projects.map(async (project) => {
         const response = await listThreads(project.id, query);
-        const normalizedQuery = query.toLocaleLowerCase();
-        return response.data
-          .filter((thread) => `${thread.name ?? ""} ${thread.preview ?? ""}`.toLocaleLowerCase().includes(normalizedQuery))
-          .map((thread): GlobalSearchResult => ({ project, thread }));
+        const normalizedQuery = normalizeSearchQuery(query);
+        return response.data.map((thread) => {
+          const titleMatch = `${thread.name ?? ""} ${thread.preview ?? ""}`.toLocaleLowerCase().includes(normalizedQuery);
+          const match = findSearchMatchInThread(thread, normalizedQuery, project.id);
+          const snippetSource = `${thread.name ?? ""} ${thread.preview ?? ""}`.trim() || thread.id;
+          return {
+            project,
+            thread,
+            match: match ?? createGlobalSearchMatch(
+              project.id,
+              thread.id,
+              normalizedQuery,
+              titleMatch ? thread.preview ?? thread.name ?? "" : snippetSource
+            )
+          };
+        });
       })).then((groups) => {
         if (requestId === globalSearchRequestRef.current) {
           setGlobalSearchResults(groups.flat().slice(0, 30));
@@ -3237,12 +3452,22 @@ export function App() {
   }, [globalSearchOpen, globalSearchQuery, projects]);
 
   useEffect(() => {
+    threadHistoryRef.current = threadHistory;
+  }, [threadHistory]);
+
+  useEffect(() => {
     return () => {
       if (filePreviewObjectUrl) {
         URL.revokeObjectURL(filePreviewObjectUrl);
       }
     };
   }, [filePreviewObjectUrl]);
+
+  useEffect(() => () => {
+    if (globalSearchJumpNoticeTimerRef.current !== null) {
+      window.clearTimeout(globalSearchJumpNoticeTimerRef.current);
+    }
+  }, []);
 
   async function refreshModels() {
     try {
@@ -3593,7 +3818,20 @@ export function App() {
     setThreadSearch("");
     setGlobalSearchOpen(false);
     setGlobalSearchQuery("");
-    await openThread(result.thread.id, result.project.id, viewToken);
+    const match = result.match ?? null;
+    const selected = await openThread(result.thread.id, result.project.id, viewToken);
+    if (!selected || selected.id !== result.thread.id) {
+      return;
+    }
+    if (match) {
+      const found = await revealGlobalSearchMatch(match);
+      if (!found) {
+        const fallback = match.query ? `“${match.query}”` : "目标内容";
+        setGlobalSearchJumpNoticeWithFade(`已打开会话，但未找到匹配消息：${fallback}`);
+      }
+      return;
+    }
+    setGlobalSearchJumpNoticeWithFade(`已打开会话：${selected.name || selected.preview || "未命名会话"}`);
   }
 
   async function loadOlderHistory() {
@@ -5196,6 +5434,217 @@ export function App() {
       {entry.output ? <pre className="outputBlock">{displayOutputText(entry.output)}</pre> : entry.completed ? null : <div className="messageBody">正在执行...</div>}
     </article>
   );
+
+  const toggleToolCardExpanded = (toolCard: HTMLElement | null) => {
+    if (!toolCard) {
+      return;
+    }
+    const expanded = toolCard.classList.toggle("toolExpanded");
+    toolCard.setAttribute("aria-expanded", String(expanded));
+    const output = toolCard.querySelector<DeferredToolOutputElement>("[data-deferred-tool-output]");
+    if (output) {
+      output.textContent = expanded ? output.fullToolOutput ?? "" : output.previewToolOutput ?? "";
+    }
+  };
+
+  const renderToolBundleGroup = (bundleId: string, entries: ThreadItem[], groupIndex: number) => {
+    const call = entries.find((entry) => safeText(entry.type).toLowerCase() === "toolcall") ?? entries[0];
+    const toolName = safeText(call.tool).trim() || "tool";
+    const inputText = safeText(call.input) || safeText(call.command);
+    const toolSummary = [
+      ...(Array.isArray(call.summary) ? call.summary.map(safeText) : []),
+      safeText(call.command),
+      inputText
+    ].map((text) => text.replace(/\s+/g, " ").trim()).find(Boolean) ?? "";
+    const hasChanges = Array.isArray(call.changes) && call.changes.length > 0;
+    const outputItems = entries.filter((entry) => entry !== call);
+    const outputText = outputItems
+      .map((entry) => {
+        if (typeof entry.aggregatedOutput === "string" && entry.aggregatedOutput.trim()) return entry.aggregatedOutput;
+        if (typeof entry.output === "string" && safeText(entry.output).trim()) return safeText(entry.output);
+        return itemText(entry);
+      })
+      .filter((text) => text.trim())
+      .join("\n");
+    const running = call.completed === false;
+    return (
+      <article
+        className={`messageItem kind-tool type-toolCall toolBundleEntry${running ? " live" : ""}`}
+        key={`${bundleId}-group-${groupIndex}`}
+        onClick={(event) => {
+          event.stopPropagation();
+          toggleToolCardExpanded(event.currentTarget);
+        }}
+      >
+        <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
+        {inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
+        {hasChanges ? <pre>{toolItemDetails(call)}</pre> : null}
+        {outputText ? <DeferredToolOutput text={displayOutputText(outputText)} /> : null}
+        {!outputText && running ? <div className="messageBody">正在执行...</div> : null}
+      </article>
+    );
+  };
+
+  const getToolBundleGroups = (bundleItems: ThreadItem[]): ThreadItem[][] => {
+    const groups: ThreadItem[][] = [];
+    for (let index = 0; index < bundleItems.length; ) {
+      const item = bundleItems[index];
+      const type = safeText(item.type).toLowerCase();
+      if (type === "toolcall") {
+        const group: ThreadItem[] = [item];
+        index += 1;
+        while (index < bundleItems.length) {
+          const nextItem = bundleItems[index];
+          if (safeText(nextItem.type).toLowerCase() === "toolcall") {
+            break;
+          }
+          if (safeText(nextItem.type).toLowerCase() === "toolcalloutput") {
+            group.push(nextItem);
+            index += 1;
+            continue;
+          }
+          break;
+        }
+        groups.push(group);
+        continue;
+      }
+      if (type === "toolcalloutput") {
+        groups.push([item]);
+        index += 1;
+        continue;
+      }
+      groups.push([item]);
+      index += 1;
+    }
+    return groups;
+  };
+
+  const summarizeToolBundleTitle = (bundleItems: ThreadItem[], complete = true): string => {
+    const toolCallItems = bundleItems.filter((item) => safeText(item.type).toLowerCase() === "toolcall");
+    const callToolNames = Array.from(new Set(
+      bundleItems
+        .filter((item) => safeText(item.type).toLowerCase() === "toolcall")
+        .map((item) => safeText(item.tool).trim())
+        .filter(Boolean)
+    ));
+    const displayedCount = toolCallItems.length > 0 ? toolCallItems.length : bundleItems.length;
+    const toolLabel = callToolNames.length === 1
+      ? callToolNames[0]
+      : callToolNames.length > 1
+        ? "工具"
+        : "tool";
+    return `调用工具 · ${toolLabel} × ${Math.max(1, displayedCount)}`;
+  };
+
+  const renderPersistedToolBundle = (bundleId: string, bundleItems: ThreadItem[], complete = true) => {
+    const hasRunningTool = bundleItems.some((item) => safeText(item.type).toLowerCase() === "toolcall" && item.completed === false);
+    // A turn can still be generating text after its tools have completed.
+    // The bundle shimmer must follow tool completion only, not turn completion.
+    const running = hasRunningTool;
+    const expanded = Boolean(expandedToolBundles[bundleId]);
+    return (
+      <article
+        className={`messageItem kind-tool type-toolCall toolBundle${expanded ? " toolExpanded" : ""}${running ? " live" : ""}${running ? " toolBundleRunning" : ""}`}
+        key={bundleId}
+        aria-expanded={expanded}
+        onClick={(event) => {
+          event.preventDefault();
+          setExpandedToolBundles((current) => {
+            if (current[bundleId]) {
+              const next = { ...current };
+              delete next[bundleId];
+              return next;
+            }
+            return { ...current, [bundleId]: true };
+          });
+        }}
+      >
+        <div className={`messageMeta toolBundleTitle${running ? " live" : ""}`}>{summarizeToolBundleTitle(bundleItems, !running)}</div>
+        <div className="toolBundleEntries">
+          {getToolBundleGroups(bundleItems).map((bundleGroup, groupIndex) => (
+            renderToolBundleGroup(bundleId, bundleGroup, groupIndex)
+          ))}
+        </div>
+      </article>
+    );
+  };
+
+  const renderPersistedThreadItem = (item: ThreadItem, turn: Turn, navigationKey: string | null, messageRefKey: string) => {
+    const itemKindValue = itemKind(item);
+    const isUserMessage = itemKindValue === "user";
+    const rawItemText = itemText(item);
+    const cleanedItemText = isUserMessage ? visibleUserHistoryText(rawItemText) : stripInterruptArtifacts(rawItemText);
+    const userVisibleText = isUserMessage ? cleanedItemText : "";
+    const hasRenderableItemContent =
+      Boolean(item.command) ||
+      Boolean(safeText(item.output).trim()) ||
+      Boolean(safeText(item.input).trim()) ||
+      Boolean(safeText(item.tool).trim()) ||
+      (Array.isArray((item as { changes?: unknown[] }).changes) && ((item as { changes?: unknown[] }).changes ?? []).length > 0) ||
+      Boolean(item.aggregatedOutput) ||
+      Boolean(cleanedItemText.trim());
+    if (itemKindValue === "agent" && !hasRenderableItemContent) {
+      return null;
+    }
+    if (navigationKey && heldPersistedPromptNavigationKeys.has(navigationKey)) {
+      return null;
+    }
+    return (
+      <article
+        className={messageClassName(item)}
+        key={`${turn.id}-${item.id}`}
+        ref={(element) => {
+          if (navigationKey) {
+            setPromptMessageElement(navigationKey, element);
+          }
+          setMessageElement(messageRefKey, element);
+        }}
+      >
+        <div className="messageMeta">{itemLabel(item)}</div>
+        {item.command ? (
+          <pre>{safeText(item.command)}</pre>
+        ) : isUserMessage ? (
+          <>
+            <CollapsibleUserMessage text={userVisibleText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+            <PersistedUserAttachmentPreviews text={rawItemText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+          </>
+        ) : (
+          <MarkdownMessage
+            text={cleanedItemText || toolItemDetails(item)}
+            projectId={selectedProject?.id}
+            onOpenFileLink={openFilePreview}
+            renderMath={itemKindValue === "agent"}
+          />
+        )}
+        {item.aggregatedOutput ? <DeferredToolOutput text={item.aggregatedOutput} /> : null}
+        {!isUserMessage ? <MessageImagePreviews item={item} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /> : null}
+        {isUserMessage ? (
+          <div className="v2UserMessageActions" aria-label="用户消息操作">
+            <button
+              type="button"
+              title="复制消息"
+              aria-label="复制消息"
+              onClick={() => void copyPlainText(userVisibleText)}
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
+            </button>
+            <button
+              type="button"
+              title="编辑并重新发送"
+              aria-label="编辑并重新发送"
+              onClick={() => {
+                setPrompt(userVisibleText);
+                window.requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus());
+              }}
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 11.7-.5 2.1 2.1-.5L12.8 5 11 3.2 3 11.7Z" /><path d="m9.9 4.3 1.8 1.8" /></svg>
+            </button>
+          </div>
+        ) : null}
+      </article>
+    );
+  };
+
   const renderPendingUserMessage = (entry: PendingUserMessage) => {
     const item: ThreadItem = {
       id: entry.id,
@@ -5662,9 +6111,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               {!globalSearchQuery.trim() ? <p className="globalSearchHint">输入关键词，搜索全部项目中的会话标题和摘要。</p> : null}
               {globalSearchLoading ? <p className="globalSearchHint">正在搜索…</p> : null}
               {!globalSearchLoading && globalSearchQuery.trim() && !globalSearchResults.length ? <p className="globalSearchHint">没有匹配的会话。</p> : null}
-              {globalSearchResults.map(({ project, thread }) => (
-                <button className="globalSearchResult" type="button" key={`${project.id}-${thread.id}`} onClick={() => void openGlobalSearchResult({ project, thread })}>
-                  <span><strong>{thread.name || thread.preview || "未命名会话"}</strong><small>{thread.preview || "点击打开此会话"}</small></span>
+              {globalSearchResults.map(({ project, thread, match }) => (
+                <button className="globalSearchResult" type="button" key={`${project.id}-${thread.id}-${match?.itemId ?? "thread"}`} onClick={() => void openGlobalSearchResult({ project, thread, match })}>
+                  <span>
+                    <strong>{thread.name || thread.preview || "未命名会话"}</strong>
+                    <small className="searchResultSnippet">{match ? match.snippet : (thread.preview || "点击打开此会话")}</small>
+                    <em className="searchResultType">{match ? "命中消息" : "会话标题/摘要匹配"}</em>
+                  </span>
                   <em>{project.name}</em>
                 </button>
               ))}
@@ -6471,8 +6924,45 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       }
                     : null;
                   const items = syntheticUserItem ? [syntheticUserItem, ...(turn.items ?? [])] : turn.items ?? [];
-                  const renderedItems = items.map((item) => {
-                    const itemKindValue = itemKind(item);
+                  const turnHasPersistedTools = items.some((item) => itemKind(item) === "tool");
+                  const renderedItems: React.ReactNode[] = [];
+                  const pendingToolGroup: ThreadItem[] = [];
+                  const flushToolGroup = (indexBase: number) => {
+                    if (pendingToolGroup.length === 0) {
+                      return indexBase;
+                    }
+                    const bundleId = `${turn.id}-toolbundle-${indexBase}`;
+                    const isLiveRunningTurn = Boolean(selectedActiveTurnId && turn.id === selectedActiveTurnId);
+                    const isBundleComplete = !isLiveRunningTurn || pendingToolGroup.every((toolItem) => safeText(toolItem.type).toLowerCase() !== "toolcall" || toolItem.completed !== false);
+                    renderedItems.push(
+                      renderPersistedToolBundle(
+                        bundleId,
+                        [...pendingToolGroup],
+                        isBundleComplete
+                      )
+                    );
+                    pendingToolGroup.length = 0;
+                    return indexBase + 1;
+                  };
+                  let toolGroupIndex = 0;
+                  for (const item of items) {
+                    const kind = itemKind(item);
+                    if (kind === "tool") {
+                    const itemRefText = itemText(item);
+                    const hasRenderableItemContent = Boolean(item.command) ||
+                      Boolean(safeText(item.output).trim()) ||
+                      Boolean(safeText(item.input).trim()) ||
+                      Boolean(safeText(item.tool).trim()) ||
+                        (Array.isArray((item as { changes?: unknown[] }).changes) && ((item as { changes?: unknown[] }).changes ?? []).length > 0) ||
+                        Boolean(item.aggregatedOutput) ||
+                        Boolean(stripInterruptArtifacts(itemRefText).trim());
+                      if (hasRenderableItemContent) {
+                        pendingToolGroup.push(item);
+                        continue;
+                      }
+                    }
+                    toolGroupIndex = flushToolGroup(toolGroupIndex);
+                    const itemKindValue = kind;
                     const isUserMessage = itemKindValue === "user";
                     const rawItemText = itemText(item);
                     const cleanedItemText = isUserMessage ? visibleUserHistoryText(rawItemText) : stripInterruptArtifacts(rawItemText);
@@ -6486,78 +6976,44 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       Boolean(item.aggregatedOutput) ||
                       Boolean(cleanedItemText.trim());
                     if (itemKindValue === "agent" && !hasRenderableItemContent) {
-                      return null;
+                      continue;
                     }
                     const navigationKey = isUserMessage ? promptNavigationKey(turn.id, item.id) : null;
+                    const messageRefKey = messageElementKey(selectedThread?.id ?? "", turn.id, item.id);
                     if (navigationKey && heldPersistedPromptNavigationKeys.has(navigationKey)) {
-                      return null;
+                      continue;
                     }
-                    return (
-                      <article
-                        className={messageClassName(item)}
-                        key={`${turn.id}-${item.id}`}
-                        ref={navigationKey ? (element) => setPromptMessageElement(navigationKey, element) : undefined}
-                      >
-                        <div className="messageMeta">{itemLabel(item)}</div>
-                        {item.command ? (
-                          <pre>{safeText(item.command)}</pre>
-                        ) : isUserMessage ? (
-                            <>
-                              <CollapsibleUserMessage text={userVisibleText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
-                              <PersistedUserAttachmentPreviews text={rawItemText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
-                            </>
-                          ) : (
-                            <MarkdownMessage
-                              text={cleanedItemText || toolItemDetails(item)}
-                              projectId={selectedProject?.id}
-                              onOpenFileLink={openFilePreview}
-                              renderMath={itemKindValue === "agent"}
-                            />
-                          )}
-                        {item.aggregatedOutput ? <DeferredToolOutput text={item.aggregatedOutput} /> : null}
-                        {!isUserMessage ? <MessageImagePreviews item={item} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /> : null}
-                        {isUserMessage ? (
-                          <div className="v2UserMessageActions" aria-label="用户消息操作">
-                            <button
-                              type="button"
-                              title="复制消息"
-                              aria-label="复制消息"
-                              onClick={() => void copyPlainText(userVisibleText)}
-                            >
-                              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
-                            </button>
-                            <button
-                              type="button"
-                              title="编辑并重新发送"
-                              aria-label="编辑并重新发送"
-                              onClick={() => {
-                                setPrompt(userVisibleText);
-                                window.requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>(".composer textarea")?.focus());
-                              }}
-                            >
-                              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 11.7-.5 2.1 2.1-.5L12.8 5 11 3.2 3 11.7Z" /><path d="m9.9 4.3 1.8 1.8" /></svg>
-                            </button>
-                          </div>
-                        ) : null}
-                        {itemKind(item) === "agent" ? (
-                          <div className="v2AgentMessageActions" aria-label="AI 回答操作">
-                            <button type="button" title="复制回答" aria-label="复制回答" onClick={() => void copyPlainText(itemText(item))}>
-                              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
-                            </button>
-                          </div>
-                        ) : null}
-                      </article>
+                    renderedItems.push(renderPersistedThreadItem(item, turn, navigationKey, messageRefKey));
+                  }
+                  flushToolGroup(toolGroupIndex);
+
+                  const turnAgentText = items
+                    .filter((item) => itemKind(item) === "agent")
+                    .map((item) => stripInterruptArtifacts(itemText(item)).trim())
+                    .filter(Boolean)
+                    .join("\n\n");
+                  if (turnAgentText) {
+                    renderedItems.push(
+                      <div className="v2AgentMessageActions v2TurnCopyAction" key={`${turn.id}-copy-all`} aria-label="本轮回答操作">
+                        <button type="button" title="复制本次回答全部文字" aria-label="复制本次回答全部文字" onClick={() => void copyPlainText(turnAgentText)}>
+                          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
+                        </button>
+                      </div>
                     );
-                  });
+                  }
+
+                  const renderedTurnItems = renderedItems.flatMap((item) => (item ? [item] : []));
                   return [
-                    ...renderedItems,
+                    ...renderedTurnItems,
                     ...(pendingUserMessagesByTurn.get(turn.id) ?? []).map(renderPendingUserMessage),
                     ...(turn.id && turn.id === selectedActiveTurnId ? [
                     <div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>
                     ] : []),
                     ...(conversationLocalMessageLayout.byTurn.get(turn.id) ?? []).map(renderLocalMessage),
                     ...(activeTurnsByThread[selectedThread?.id ?? ""] === turn.id
-                      ? (liveTimelineByTurn.get(turn.id) ?? []).map(renderLiveTimelineEntry)
+                      ? (liveTimelineByTurn.get(turn.id) ?? [])
+                        .filter((entry) => entry.kind !== "tool" || !turnHasPersistedTools)
+                        .map(renderLiveTimelineEntry)
                       : [])
                   ];
                 })}
@@ -6569,6 +7025,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 {!selectedThread && liveTimelineEntries.length === 0 && visiblePendingUserMessages.length === 0 && localMessages.length === 0 ? (
                   <div className="emptyState">Ready for a new Codex turn.</div>
                 ) : null}
+                {globalSearchJumpNotice ? <div className="globalSearchJumpNotice" role="status">{globalSearchJumpNotice}</div> : null}
                 <div ref={messagesEndRef} className="messagesEnd" aria-hidden="true" />
               </div>
             </div>
