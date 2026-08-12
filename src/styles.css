@@ -1699,10 +1699,28 @@ label input {
 }
 
 .messageMarkdown table {
-  display: block;
+  width: 100%;
+  max-width: 100%;
+  table-layout: auto;
   overflow-x: auto;
   border-collapse: collapse;
+  border-spacing: 0;
   max-width: 100%;
+}
+
+.markdownTableWrap {
+  overflow-x: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  margin: 10px 0 0;
+  background: rgba(25, 27, 24, 0.54);
+}
+
+.markdownTable {
+  width: 100%;
+  min-width: 620px;
+  border-collapse: collapse;
+  margin: 0;
 }
 
 .messageMarkdown th,
@@ -1713,9 +1731,24 @@ label input {
   vertical-align: top;
 }
 
+.markdownTableCell {
+  line-height: 1.45;
+  white-space: normal;
+  word-break: break-word;
+}
+
 .messageMarkdown th {
   background: rgba(35, 38, 37, 0.06);
   font-weight: 700;
+}
+
+.markdownTableHeaderCell {
+  color: #f0f1ed;
+  background: #2d2f2e;
+}
+
+.markdownTableBodyCell {
+  background: transparent;
 }
 
 .messageMarkdown :not(pre) > code {
@@ -5471,7 +5504,21 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
 .leaderboardDialog .iconButton { background: #333532; color: #d8dad5; }
 .leaderboardDialog .iconButton:hover { background: #41433f; }
 
-.leaderboardBody { gap: 11px; padding: 12px; }
+.leaderboardBody {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 11px;
+  padding: 12px;
+}
+
+
+.leaderboardBody > .leaderboardWarning,
+.leaderboardBody > .leaderboardUpdated,
+.leaderboardBody > .emptyState {
+  grid-column: 1 / -1;
+}
+
 
 .leaderboardScope {
   border-color: #383a36;

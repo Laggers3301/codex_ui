@@ -279,7 +279,7 @@ type LeaderboardRefreshResult = {
   error: string | null;
 };
 
-const quotaAutoRefreshMs = 10_000;
+const quotaAutoRefreshMs = 180_000;
 const sentPromptBottomHoldMs = 5_000;
 // A leading slash is common in filesystem paths. Only reserve the commands
 // that this UI actually implements; everything else must reach Codex verbatim.
@@ -1127,6 +1127,39 @@ const MarkdownMessage = memo(function MarkdownMessage({
           </a>
         );
       },
+      table({ children, ...props }) {
+        return (
+          <div className="markdownTableWrap">
+            <table className="markdownTable" {...props}>
+              {children}
+            </table>
+          </div>
+        );
+      },
+      th({ children, align, ...props }) {
+        const aligned = align === "center" || align === "right" || align === "left" || align === "justify" ? align : undefined;
+        return (
+          <th
+            className="markdownTableCell markdownTableHeaderCell"
+            style={aligned ? { textAlign: aligned } : undefined}
+            {...props}
+          >
+            {children}
+          </th>
+        );
+      },
+      td({ children, align, ...props }) {
+        const aligned = align === "center" || align === "right" || align === "left" || align === "justify" ? align : undefined;
+        return (
+          <td
+            className="markdownTableCell markdownTableBodyCell"
+            style={aligned ? { textAlign: aligned } : undefined}
+            {...props}
+          >
+            {children}
+          </td>
+        );
+      },
       img({ src, alt }) {
         const srcText = typeof src === "string" ? src : "";
         const fileTarget = fileTargetFromHref(srcText);
@@ -1693,9 +1726,15 @@ function userDisplayName(userId: string, users: UserProfile[]): string {
 }
 
 function leaderboardScopeLabel(scope: CodexLeaderboardScope): string {
-  const resetText = scope.resetAt ? `，重置 ${formatResetTime(scope.resetAt)}` : "";
+  const windowText = scope.startAt && scope.resetAt
+    ? `，窗口 ${formatResetTime(scope.startAt)} ~ ${formatResetTime(scope.resetAt)}`
+    : scope.resetAt
+      ? `，重置 ${formatResetTime(scope.resetAt)}`
+      : scope.startAt
+        ? `，统计自 ${formatResetTime(scope.startAt)}`
+      : "";
   const quotaText = scope.quotaUsedPercent === null ? "" : `，当前额度已用 ${percentText(scope.quotaUsedPercent)}%`;
-  return `${formatNumber(scope.totalTokens)} token${quotaText}${resetText}`;
+  return `${formatNumber(scope.totalTokens)} token${quotaText}${windowText}`;
 }
 
 function leaderboardMarkdown(leaderboard: CodexLeaderboard, users: UserProfile[]): string {
@@ -2962,7 +3001,7 @@ export function App() {
 
   useEffect(() => {
     void refreshModels();
-    void refreshQuota(false, { force: true });
+    void refreshQuota(false, { force: false });
     void refreshUsers();
     const unsubscribe = codexSocket.subscribe(handleSocketMessage);
     const unsubscribeStatus = codexSocket.subscribeStatus(setSocketStatus);
@@ -3001,7 +3040,7 @@ export function App() {
       if (document.visibilityState !== "visible") {
         return;
       }
-      void refreshQuota(false, { background: true, force: true });
+      void refreshQuota(false, { background: true });
       scheduleNext();
     };
 
@@ -5117,7 +5156,7 @@ export function App() {
         } else if (!isTemporaryThread) {
           clearCompletedLiveItems();
         }
-        void refreshQuota(false, { background: true, force: true });
+        void refreshQuota(false, { background: true });
         void refreshThreads(selectedProjectIdRef.current);
       }
       return;
@@ -5974,7 +6013,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               <button
                 className="quotaButton v2QuotaTopButton"
                 type="button"
-                onClick={() => void refreshQuota(false, { force: false })}
+                onClick={() => void refreshQuota(false, { force: true })}
                 disabled={quotaLoading}
                 title="悬停查看额度详情"
               >

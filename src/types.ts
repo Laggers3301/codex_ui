@@ -73,6 +73,8 @@ export interface CodexLeaderboardUserUsage extends CodexTokenBreakdown {
 export interface CodexLeaderboardScope {
   totalTokens: number;
   resetAt: number | null;
+  resetWindowMins: number | null;
+  startAt: number | null;
   quotaUsedPercent: number | null;
   users: CodexLeaderboardUserUsage[];
 }
