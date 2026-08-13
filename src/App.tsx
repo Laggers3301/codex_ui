@@ -2259,6 +2259,9 @@ export function App() {
   const leaderboardRefreshInFlightRef = useRef<Promise<LeaderboardRefreshResult> | null>(null);
   const threadSearchRequestRef = useRef(0);
   const globalSearchRequestRef = useRef(0);
+  const pendingLiveDeltasRef = useRef(new Map<string, LiveDeltaEntry>());
+  const liveDeltaFlushTimerRef = useRef<number | null>(null);
+  const lastLiveEventAtRef = useRef<Record<string, number>>({});
   const [projects, setProjects] = useState<Project[]>(() => storedJson<Project[]>(sidebarProjectsCacheKey(getApiUserId()), []));
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [selectedUserId, setSelectedUserId] = useState(getApiUserId());
@@ -2419,6 +2422,50 @@ export function App() {
   const temporaryThreadIdsRef = useRef(new Set<string>());
   const pendingUserMessagesRef = useRef<PendingUserMessage[]>(pendingUserMessages);
   const threadLiveRecoveryAtRef = useRef<Record<string, number>>({});
+
+  function markLiveEvent(threadId: string | null | undefined): void {
+    if (threadId) {
+      lastLiveEventAtRef.current[threadId] = Date.now();
+    }
+  }
+
+  function flushPendingLiveDeltas(): void {
+    if (liveDeltaFlushTimerRef.current !== null) {
+      window.clearTimeout(liveDeltaFlushTimerRef.current);
+      liveDeltaFlushTimerRef.current = null;
+    }
+    if (pendingLiveDeltasRef.current.size === 0) {
+      return;
+    }
+    const pending = pendingLiveDeltasRef.current;
+    pendingLiveDeltasRef.current = new Map();
+    setLiveDeltas((current) => {
+      const next = { ...current };
+      for (const [itemId, entry] of pending) {
+        const existing = next[itemId];
+        next[itemId] = {
+          threadId: existing?.threadId ?? entry.threadId,
+          turnId: existing?.turnId ?? entry.turnId,
+          text: `${existing?.text ?? ""}${entry.text}`,
+          startedAt: existing?.startedAt ?? entry.startedAt
+        };
+      }
+      return next;
+    });
+  }
+
+  function enqueueLiveDelta(itemId: string, entry: LiveDeltaEntry): void {
+    const existing = pendingLiveDeltasRef.current.get(itemId);
+    pendingLiveDeltasRef.current.set(itemId, {
+      threadId: existing?.threadId ?? entry.threadId,
+      turnId: existing?.turnId ?? entry.turnId,
+      text: `${existing?.text ?? ""}${entry.text}`,
+      startedAt: existing?.startedAt ?? entry.startedAt
+    });
+    if (liveDeltaFlushTimerRef.current === null) {
+      liveDeltaFlushTimerRef.current = window.setTimeout(flushPendingLiveDeltas, 40);
+    }
+  }
 
   function performCloseTemporaryAsk() {
     const current = temporaryAskRef.current;
@@ -3156,12 +3203,10 @@ export function App() {
     if (!threadId || !projectId || (!activeTurnId && !hasPendingPromptForThread)) {
       return;
     }
-    const reconcileHint = activeTurnId ?? "pending";
-
     let stopped = false;
     let timer: number | null = null;
     const reconcile = async () => {
-      const key = `${projectId}:${threadId}:${reconcileHint}`;
+      const key = `${projectId}:${threadId}:${activeTurnId ?? "pending"}`;
       if (stopped || document.visibilityState !== "visible" || activeThreadReconcileRef.current.has(key)) {
         return;
       }
@@ -3187,20 +3232,38 @@ export function App() {
         activeThreadReconcileRef.current.delete(key);
       }
     };
-    const schedule = () => {
-      if (stopped) return;
+    const scheduleRecoveryCheck = () => {
+      if (stopped) {
+        return;
+      }
+      const lastLiveAt = lastLiveEventAtRef.current[threadId] ?? Date.now();
+      const silenceMs = Date.now() - lastLiveAt;
+      const delay = socketStatus !== "open" ? 0 : Math.max(250, 8_000 - silenceMs);
       timer = window.setTimeout(async () => {
         timer = null;
-        await reconcile();
-        schedule();
-      }, 3_000);
+        const latestLiveAt = lastLiveEventAtRef.current[threadId] ?? 0;
+        if (socketStatus !== "open" || Date.now() - latestLiveAt >= 8_000) {
+          await reconcile();
+          lastLiveEventAtRef.current[threadId] = Date.now();
+        }
+        scheduleRecoveryCheck();
+      }, delay);
     };
-    schedule();
+    if (!lastLiveEventAtRef.current[threadId]) {
+      lastLiveEventAtRef.current[threadId] = Date.now();
+    }
+    scheduleRecoveryCheck();
     return () => {
       stopped = true;
       if (timer !== null) window.clearTimeout(timer);
     };
-  }, [selectedProjectId, selectedThread?.id, selectedThread?.id ? activeTurnsByThread[selectedThread.id] : undefined, pendingUserMessages]);
+  }, [selectedProjectId, selectedThread?.id, selectedThread?.id ? activeTurnsByThread[selectedThread.id] : undefined, pendingUserMessages, socketStatus]);
+
+  useEffect(() => () => {
+    if (liveDeltaFlushTimerRef.current !== null) {
+      window.clearTimeout(liveDeltaFlushTimerRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     void refreshModels();
@@ -4927,6 +4990,11 @@ export function App() {
     if (!snapshot) {
       return;
     }
+    pendingLiveDeltasRef.current.clear();
+    if (liveDeltaFlushTimerRef.current !== null) {
+      window.clearTimeout(liveDeltaFlushTimerRef.current);
+      liveDeltaFlushTimerRef.current = null;
+    }
     setLiveDeltas(liveDeltasFromSnapshot(snapshot));
     setLiveTools(liveToolsFromSnapshot(snapshot));
     setActiveTurnsByThread(activeTurnsFromSnapshot(snapshot));
@@ -4934,6 +5002,7 @@ export function App() {
     for (const turn of snapshot.activeTurns) {
       if (turn.threadId && turn.turnId) {
         turnThreadIdsRef.current.set(turn.turnId, turn.threadId);
+        markLiveEvent(turn.threadId);
       }
     }
   }
@@ -4993,6 +5062,7 @@ export function App() {
     if (message.type === "live.tool") {
       const item = message.data as LiveToolEntry | undefined;
       if (item?.itemId) {
+        markLiveEvent(item.threadId);
         setLiveTools((current) => {
           const next = { ...current };
           // Keep completed tool rows visible until the completed turn has
@@ -5243,7 +5313,20 @@ export function App() {
       if (notification.method === "item/agentMessage/delta") {
         const itemId = String(params.itemId ?? "");
         const delta = String(params.delta ?? "");
-        const visibleDelta = stripInterruptArtifacts(delta);
+        const cleanedDelta = stripInterruptArtifacts(delta);
+        // Markdown block boundaries often arrive as whitespace-only deltas or
+        // as leading/trailing whitespace around a text delta. The history
+        // sanitizer may trim those boundaries, which makes headings, lists and
+        // blockquotes collapse into prose until the completed history reloads.
+        const visibleDelta = delta && !delta.trim()
+          ? delta
+          : (() => {
+              const leadingWhitespace = delta.match(/^\s+/)?.[0] ?? "";
+              const trailingWhitespace = delta.match(/\s+$/)?.[0] ?? "";
+              const leading = leadingWhitespace && !cleanedDelta.startsWith(leadingWhitespace) ? leadingWhitespace : "";
+              const trailing = trailingWhitespace && !cleanedDelta.endsWith(trailingWhitespace) ? trailingWhitespace : "";
+              return `${leading}${cleanedDelta}${trailing}`;
+            })();
         if (!visibleDelta) {
           return;
         }
@@ -5252,23 +5335,19 @@ export function App() {
         }
         const turnId = notificationTurnId(params);
         const threadId = notificationThreadId(params) ?? (turnId ? turnThreadIdsRef.current.get(turnId) ?? null : null);
-        setLiveDeltas((current) => {
-          const existing = current[itemId];
-          return {
-            ...current,
-            [itemId]: {
-              threadId: existing?.threadId ?? threadId,
-              turnId: existing?.turnId ?? turnId,
-              text: `${existing?.text ?? ""}${visibleDelta}`,
-              startedAt: existing?.startedAt ?? new Date().toISOString()
-            }
-          };
+        markLiveEvent(threadId);
+        enqueueLiveDelta(itemId, {
+          threadId,
+          turnId,
+          text: visibleDelta,
+          startedAt: new Date().toISOString()
         });
       }
       if (notification.method === "turn/started") {
         const turnId = notificationTurnId(params);
         const threadId = notificationThreadId(params);
         if (threadId && turnId) {
+          markLiveEvent(threadId);
           turnThreadIdsRef.current.set(turnId, threadId);
           setActiveTurnsByThread((current) => ({ ...current, [threadId]: turnId }));
         }
@@ -5276,6 +5355,8 @@ export function App() {
       if (notification.method === "turn/completed") {
         const turnId = notificationTurnId(params);
         const threadId = notificationThreadId(params) ?? (turnId ? turnThreadIdsRef.current.get(turnId) ?? null : null);
+        flushPendingLiveDeltas();
+        markLiveEvent(threadId);
         if (!threadId) {
           if (turnId) {
             turnThreadIdsRef.current.delete(turnId);
@@ -6924,8 +7005,26 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       }
                     : null;
                   const items = syntheticUserItem ? [syntheticUserItem, ...(turn.items ?? [])] : turn.items ?? [];
-                  const turnHasPersistedTools = items.some((item) => itemKind(item) === "tool");
-                  const renderedItems: React.ReactNode[] = [];
+                  const persistedTurnItemIds = new Set((items ?? []).map((item) => item.id).filter((id): id is string => Boolean(id)));
+                  const activeTurnLiveItems = selectedActiveTurnId && selectedActiveTurnId === turn.id
+                    ? (liveTimelineByTurn.get(turn.id) ?? [])
+                    : [];
+                  const isActiveTurn = Boolean(selectedActiveTurnId && selectedActiveTurnId === turn.id);
+                  const activeLiveAgentItemIds = new Set(
+                    activeTurnLiveItems.filter((entry) => entry.kind === "agent").map((entry) => entry.id)
+                  );
+                  const activeTrailingToolIndexes = new Set<number>();
+                  if (isActiveTurn) {
+                    for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+                      if (itemKind(items[itemIndex]) !== "tool") {
+                        break;
+                      }
+                      activeTrailingToolIndexes.add(itemIndex);
+                    }
+                  }
+                  const activeTrailingToolItems: ThreadItem[] = [];
+                  const renderedUserItems: React.ReactNode[] = [];
+                  const renderedHistoryItems: React.ReactNode[] = [];
                   const pendingToolGroup: ThreadItem[] = [];
                   const flushToolGroup = (indexBase: number) => {
                     if (pendingToolGroup.length === 0) {
@@ -6934,7 +7033,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     const bundleId = `${turn.id}-toolbundle-${indexBase}`;
                     const isLiveRunningTurn = Boolean(selectedActiveTurnId && turn.id === selectedActiveTurnId);
                     const isBundleComplete = !isLiveRunningTurn || pendingToolGroup.every((toolItem) => safeText(toolItem.type).toLowerCase() !== "toolcall" || toolItem.completed !== false);
-                    renderedItems.push(
+                    renderedHistoryItems.push(
                       renderPersistedToolBundle(
                         bundleId,
                         [...pendingToolGroup],
@@ -6945,9 +7044,19 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     return indexBase + 1;
                   };
                   let toolGroupIndex = 0;
-                  for (const item of items) {
+                  for (const [itemIndex, item] of items.entries()) {
                     const kind = itemKind(item);
+                    // A recovery/history read can contain an incomplete copy of
+                    // the same agent item. Keep the live copy authoritative until
+                    // the turn completes so subsequent deltas remain visible.
+                    if (kind === "agent" && item.id && activeLiveAgentItemIds.has(item.id)) {
+                      continue;
+                    }
                     if (kind === "tool") {
+                    if (activeTrailingToolIndexes.has(itemIndex)) {
+                      activeTrailingToolItems.push(item);
+                      continue;
+                    }
                     const itemRefText = itemText(item);
                     const hasRenderableItemContent = Boolean(item.command) ||
                       Boolean(safeText(item.output).trim()) ||
@@ -6983,7 +7092,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     if (navigationKey && heldPersistedPromptNavigationKeys.has(navigationKey)) {
                       continue;
                     }
-                    renderedItems.push(renderPersistedThreadItem(item, turn, navigationKey, messageRefKey));
+                    const renderedItem = renderPersistedThreadItem(item, turn, navigationKey, messageRefKey);
+                    if (isUserMessage) {
+                      renderedUserItems.push(renderedItem);
+                    } else {
+                      renderedHistoryItems.push(renderedItem);
+                    }
                   }
                   flushToolGroup(toolGroupIndex);
 
@@ -6993,7 +7107,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     .filter(Boolean)
                     .join("\n\n");
                   if (turnAgentText) {
-                    renderedItems.push(
+                    renderedHistoryItems.push(
                       <div className="v2AgentMessageActions v2TurnCopyAction" key={`${turn.id}-copy-all`} aria-label="本轮回答操作">
                         <button type="button" title="复制本次回答全部文字" aria-label="复制本次回答全部文字" onClick={() => void copyPlainText(turnAgentText)}>
                           <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
@@ -7002,19 +7116,55 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     );
                   }
 
-                  const renderedTurnItems = renderedItems.flatMap((item) => (item ? [item] : []));
+                  const renderedHistoryTurnItems = renderedHistoryItems.flatMap((item) => (item ? [item] : []));
+                  const runningTurnLiveAgentItems = activeTurnLiveItems.filter((entry) => entry.kind === "agent");
+                  const runningTurnLiveToolItems = activeTurnLiveItems
+                    .filter((entry) => entry.kind === "tool")
+                    .map((entry) => ({
+                      id: entry.id,
+                      type: "toolCall",
+                      tool: entry.tool,
+                      input: entry.input,
+                      output: entry.output,
+                      completed: entry.completed
+                    } as ThreadItem));
+                  const mergedRunningToolItems = [...activeTrailingToolItems];
+                  const mergedRunningToolIndexes = new Map(
+                    mergedRunningToolItems.map((item, index) => [item.id, index] as const).filter(([id]) => Boolean(id))
+                  );
+                  for (const liveToolItem of runningTurnLiveToolItems) {
+                    const existingIndex = liveToolItem.id ? mergedRunningToolIndexes.get(liveToolItem.id) : undefined;
+                    if (existingIndex === undefined) {
+                      mergedRunningToolIndexes.set(liveToolItem.id, mergedRunningToolItems.length);
+                      mergedRunningToolItems.push(liveToolItem);
+                      continue;
+                    }
+                    const persistedToolItem = mergedRunningToolItems[existingIndex];
+                    mergedRunningToolItems[existingIndex] = {
+                      ...persistedToolItem,
+                      ...liveToolItem,
+                      input: liveToolItem.input || persistedToolItem.input,
+                      output: liveToolItem.output || persistedToolItem.output
+                    };
+                  }
+                  const runningTurnLiveToolBundle = mergedRunningToolItems.length > 0
+                    ? [renderPersistedToolBundle(
+                        `${turn.id}-toolbundle-${toolGroupIndex}`,
+                        mergedRunningToolItems,
+                        mergedRunningToolItems.every((item) => item.completed !== false)
+                      )]
+                    : [];
+                  const runningTurnThinking = selectedActiveTurnId && selectedActiveTurnId === turn.id
+                    ? [<div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>]
+                    : [];
                   return [
-                    ...renderedTurnItems,
+                    ...renderedUserItems,
                     ...(pendingUserMessagesByTurn.get(turn.id) ?? []).map(renderPendingUserMessage),
-                    ...(turn.id && turn.id === selectedActiveTurnId ? [
-                    <div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>
-                    ] : []),
+                    ...runningTurnThinking,
+                    ...renderedHistoryTurnItems,
+                    ...runningTurnLiveAgentItems.map(renderLiveTimelineEntry),
+                    ...runningTurnLiveToolBundle,
                     ...(conversationLocalMessageLayout.byTurn.get(turn.id) ?? []).map(renderLocalMessage),
-                    ...(activeTurnsByThread[selectedThread?.id ?? ""] === turn.id
-                      ? (liveTimelineByTurn.get(turn.id) ?? [])
-                        .filter((entry) => entry.kind !== "tool" || !turnHasPersistedTools)
-                        .map(renderLiveTimelineEntry)
-                      : [])
                   ];
                 })}
                 {conversationLocalMessageLayout.beforePending.map(renderLocalMessage)}
