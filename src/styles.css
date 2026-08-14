@@ -1782,82 +1782,50 @@ label input {
   padding-left: 22px;
 }
 
-.messageMarkdown li > input[type="checkbox"],
-.messageMarkdown li > p > input[type="checkbox"] {
+.messageMarkdown li + li {
+  margin-top: 4px;
+}
+
+.messageMarkdown .task-list-item,
+.messageMarkdown .task-list-item-checkbox,
+.messageMarkdown .messageTodoCheckbox {
+  margin: 0;
+}
+
+.messageMarkdown .messageTodoCheckbox {
   -webkit-appearance: none !important;
   appearance: none !important;
-  width: 14px !important;
-  height: 14px !important;
+  width: 12px !important;
+  height: 12px !important;
   margin: 0 8px 0 0 !important;
-  flex-shrink: 0 !important;
   border: 1px solid #7a8179 !important;
-  border-radius: 2px !important;
+  border-radius: 3px !important;
   background: #282b29 !important;
   color: #d9ddd8 !important;
   vertical-align: middle !important;
   pointer-events: none !important;
   position: relative !important;
+  top: 0.05em !important;
+  flex-shrink: 0 !important;
+  box-sizing: border-box !important;
 }
 
-.messageMarkdown li > input[type="checkbox"]::before,
-.messageMarkdown li > p > input[type="checkbox"]::before {
+.messageMarkdown .messageTodoCheckbox::before {
   content: "";
-  display: block;
-  width: 7px;
-  height: 11px;
-  margin: 1px 2px;
-  border-right: 2px solid currentColor;
-  border-bottom: 2px solid currentColor;
-  transform: rotate(45deg);
-  transform-origin: center;
-  opacity: 0;
-  transition: opacity 0.1s;
-  pointer-events: none;
-}
-
-.messageMarkdown li > input[type="checkbox"]:checked::before,
-.messageMarkdown li > p > input[type="checkbox"]:checked::before {
-  opacity: 1;
-}
-
-.messageMarkdown li + li {
-  margin-top: 4px;
-}
-
-.messageMarkdown li > label > input[type="checkbox"],
-.messageMarkdown li > span > input[type="checkbox"],
-.messageMarkdown .task-list-item input[type="checkbox"] {
-  -webkit-appearance: none !important;
-  appearance: none !important;
-  width: 14px !important;
-  height: 14px !important;
-  border: 1px solid #7a8179 !important;
-  border-radius: 2px !important;
-  background: #282b29 !important;
-  margin: 0 8px 0 0 !important;
-  pointer-events: none !important;
-  vertical-align: middle !important;
-}
-
-.messageMarkdown li > label > input[type="checkbox"]::before,
-.messageMarkdown li > span > input[type="checkbox"]::before,
-.messageMarkdown .task-list-item input[type="checkbox"]::before {
-  content: "";
-  display: block;
-  width: 7px;
-  height: 11px;
-  margin: 1px 2px;
+  display: block !important;
+  width: 6px !important;
+  height: 10px !important;
+  margin: 0.8px 2px !important;
   border-right: 2px solid currentColor !important;
   border-bottom: 2px solid currentColor !important;
-  transform: rotate(45deg);
-  transform-origin: center;
-  opacity: 0;
+  transform: rotate(45deg) !important;
+  transform-origin: center !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
 }
 
-.messageMarkdown li > label > input[type="checkbox"]:checked::before,
-.messageMarkdown li > span > input[type="checkbox"]:checked::before,
-.messageMarkdown .task-list-item input[type="checkbox"]:checked::before {
-  opacity: 1;
+.messageMarkdown .messageTodoCheckbox:checked::before {
+  opacity: 1 !important;
 }
 
 .messageMarkdown blockquote {

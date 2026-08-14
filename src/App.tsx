@@ -1251,6 +1251,21 @@ const MarkdownMessage = memo(function MarkdownMessage({
           </a>
         );
       },
+      input({ type, checked, ...props }) {
+        if (type === "checkbox") {
+          return (
+            <input
+              {...props}
+              type="checkbox"
+              checked={checked}
+              readOnly
+              className={`messageTodoCheckbox${props.className ? ` ${props.className}` : ""}`}
+              onChange={() => {}}
+            />
+          );
+        }
+        return <input type={type} {...props} />;
+      },
       table({ children, ...props }) {
         return (
           <div className="markdownTableWrap">
