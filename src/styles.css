@@ -1682,6 +1682,41 @@ label input {
   padding-left: 22px;
 }
 
+.messageMarkdown li > input[type="checkbox"],
+.messageMarkdown li > p > input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  margin: 0 8px 0 0;
+  flex-shrink: 0;
+  border: 1px solid #7a8179;
+  border-radius: 2px;
+  background: #282b29;
+  color: #d9ddd8;
+  vertical-align: middle;
+}
+
+.messageMarkdown li > input[type="checkbox"]::before,
+.messageMarkdown li > p > input[type="checkbox"]::before {
+  content: "";
+  display: block;
+  width: 7px;
+  height: 11px;
+  margin: 1px 2px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(45deg);
+  transform-origin: center;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.messageMarkdown li > input[type="checkbox"]:checked::before,
+.messageMarkdown li > p > input[type="checkbox"]:checked::before {
+  opacity: 1;
+}
+
 .messageMarkdown li + li {
   margin-top: 4px;
 }
