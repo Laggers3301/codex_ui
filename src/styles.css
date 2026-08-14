@@ -430,14 +430,43 @@ label input {
   padding: 0 12px;
 }
 
-.iconTextButton.v2FastModeButtonActive {
-  border-color: #4fb0a3;
-  color: #f4f7f2;
-  background: rgba(79, 176, 163, 0.14);
+.composerTools .iconTextButton.v2FastModeButton {
+  order: 89;
+  height: 30px !important;
+  min-height: 30px !important;
+  margin-left: auto !important;
+  padding: 0 12px !important;
+  border: 0 !important;
+  border-radius: 12px !important;
+  background: #303130 !important;
+  color: #a7aaa4 !important;
+  font-family: inherit !important;
+  font-size: 12px !important;
+  font-weight: 400 !important;
+  line-height: 20px !important;
+  white-space: nowrap !important;
+  box-shadow: none !important;
 }
 
-.iconTextButton.v2FastModeButtonActive:hover {
-  background: rgba(79, 176, 163, 0.2);
+.composerTools .iconTextButton.v2FastModeButton:hover {
+  background: #343534 !important;
+  color: var(--text) !important;
+}
+
+.composerTools .iconTextButton.v2FastModeButton:disabled {
+  opacity: 0.6;
+}
+
+.composerTools .iconTextButton.v2FastModeButtonActive {
+  border: 0 !important;
+  background: #3a3d39 !important;
+  color: #eef0eb !important;
+  font-weight: 400 !important;
+  box-shadow: none !important;
+}
+
+.composerTools .iconTextButton.v2FastModeButtonActive:hover {
+  background: #3e413d !important;
 }
 
 .iconTextButton.full {
@@ -6886,7 +6915,7 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .v2ModelPicker {
   order: 90;
   width: min(230px, 38vw);
-  margin-left: auto;
+  margin-left: 0;
 }
 
 .v2ModelPicker .polishedSelectTrigger {

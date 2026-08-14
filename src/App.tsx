@@ -2553,7 +2553,7 @@ export function App() {
         prompt: text,
         model: temporaryModelProfile.model,
         reasoningEffort: temporaryModelProfile.effort,
-        ...(resolveServiceTier(codexFastModeEnabled) ? { serviceTier: "fast" } : {}),
+        serviceTier: resolveServiceTier(codexFastModeEnabled),
         sandbox,
         approvalPolicy,
       } : {
@@ -2564,7 +2564,7 @@ export function App() {
         prompt: `请基于下面选中的文字回答问题。\n\n选中文字：\n${current.selectedText}\n\n用户问题：\n${text}`,
         model: temporaryModelProfile.model,
         reasoningEffort: temporaryModelProfile.effort,
-        ...(resolveServiceTier(codexFastModeEnabled) ? { serviceTier: "fast" } : {}),
+        serviceTier: resolveServiceTier(codexFastModeEnabled),
         sandbox,
         approvalPolicy,
       });
@@ -4750,7 +4750,7 @@ export function App() {
           prompt: sentPromptText,
           model: selectedModelProfile.model,
           reasoningEffort: selectedModelProfile.effort,
-          ...(resolveServiceTier(codexFastModeEnabled) ? { serviceTier: "fast" } : {}),
+          serviceTier: resolveServiceTier(codexFastModeEnabled),
           sandbox,
           approvalPolicy
         }
@@ -4762,7 +4762,7 @@ export function App() {
           prompt: sentPromptText,
           model: selectedModelProfile.model,
           reasoningEffort: selectedModelProfile.effort,
-          ...(resolveServiceTier(codexFastModeEnabled) ? { serviceTier: "fast" } : {}),
+          serviceTier: resolveServiceTier(codexFastModeEnabled),
           sandbox,
           approvalPolicy
         };
@@ -4826,7 +4826,7 @@ export function App() {
         prompt: continuation.sentPromptText,
         model: selectedModelProfile.model,
         reasoningEffort: selectedModelProfile.effort,
-        ...(resolveServiceTier(codexFastModeEnabled) ? { serviceTier: "fast" } : {}),
+        serviceTier: resolveServiceTier(codexFastModeEnabled),
         sandbox,
         approvalPolicy
       });
@@ -7258,8 +7258,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               />
               <div className="composerBody">
                 <div className="composerTools">
+                  {selectedSkills.map((skill) => (
+                    <button className="selectedSkillChip" type="button" key={skill.name} onClick={() => toggleSelectedSkill(skill.name)} title={`移除 $${skill.name}`}>
+                      <span>{localizedSkill(skill).name}</span>
+                      <X size={12} />
+                    </button>
+                  ))}
                   <button
-                    className={`iconTextButton ${codexFastModeEnabled ? "v2FastModeButtonActive" : ""}`}
+                    className={`iconTextButton v2FastModeButton ${codexFastModeEnabled ? "v2FastModeButtonActive" : ""}`}
                     type="button"
                     onClick={() => {
                       const next = !codexFastModeEnabled;
@@ -7270,14 +7276,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     }}
                     title={codexFastModeEnabled ? "已开启 Fast 模式（下次请求会带 service_tier: fast）" : "开启 Fast 模式"}
                   >
-                    {codexFastModeEnabled ? "Fast 开" : "Fast"}
+                    {codexFastModeEnabled ? "Fast On" : "Fast Off"}
                   </button>
-                  {selectedSkills.map((skill) => (
-                    <button className="selectedSkillChip" type="button" key={skill.name} onClick={() => toggleSelectedSkill(skill.name)} title={`移除 $${skill.name}`}>
-                      <span>{localizedSkill(skill).name}</span>
-                      <X size={12} />
-                    </button>
-                  ))}
                   <PolishedSelect<string>
                     className="v2ModelPicker"
                     value={activeModelProfileId}
