@@ -3329,7 +3329,7 @@ body {
   margin-right: 0;
   margin-left: auto;
   padding: 11px 15px;
-  border: 1px solid var(--line);
+  border: 0;
   border-radius: 15px 15px 4px 15px;
   background: #282928;
 }
@@ -3688,6 +3688,7 @@ pre,
   max-height: min(360px, 58vh) !important;
   min-height: 94px !important;
   padding: 10px 12px;
+  border: 0 !important;
   background: #292a29 !important;
   box-shadow: 0 12px 34px rgba(0, 0, 0, 0.24) !important;
 }
@@ -4335,8 +4336,8 @@ pre,
 }
 
 .composer:focus-within {
-  border-color: rgba(255, 255, 255, 0.24);
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.44), 0 0 0 1px rgba(255, 255, 255, 0.035);
+  border-color: transparent;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.44) !important;
   transform: translateY(-1px);
 }
 
@@ -5542,6 +5543,17 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
 
 .messageItem.kind-user .pendingUserImagePreview > span:last-child {
   display: none;
+}
+
+/* Keep every user attachment visually flush with the borderless message bubble. */
+.messageItem.kind-user .inlineImageButton,
+.messageItem.kind-user .persistedUserAttachment,
+.messageItem.kind-user .pendingUserImagePreview,
+.messageItem.kind-user .uploadedFileChip,
+.messageItem.kind-user .uploadedFilePreviewButton {
+  border: 0 !important;
+  outline: 0 !important;
+  box-shadow: none !important;
 }
 
 /* A compact running ring replaces the redundant text badge. */
@@ -7267,6 +7279,107 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .temporaryAskComposer .v2ModelPicker { margin-left:auto; }
 .temporaryAskComposer .temporaryPolicySelect { flex:0 1 auto; }
 .temporaryAskComposer .sendButton { align-self:flex-end; flex:0 0 auto; margin:0 0 1px 7px; }
+
+/* Borderless surface language: separate controls with tone, radius and shadow. */
+.topbar .controls button,
+.topbar .controls select,
+.quotaButton,
+.leaderboardButton,
+.polishedSelectTrigger,
+.polishedSelectMenu,
+.v2PlusMenu,
+.skillPickerPopover,
+.selectionAskButton,
+.contextMenu,
+.modalDialog,
+.renameThreadDialog,
+.directoryDialog,
+.settingsDialog,
+.leaderboardDialog,
+.temporaryCloseDialog,
+.temporaryAskQuote,
+.temporaryAskComposer.composer,
+.messageItem.kind-tool,
+pre,
+.outputBlock {
+  border: 0 !important;
+}
+
+.polishedSelectTrigger:hover,
+.polishedSelect.open .polishedSelectTrigger,
+.polishedSelect.open .polishedSelectTrigger:focus-visible {
+  border: 0 !important;
+  box-shadow: none !important;
+}
+
+:where([class^="quotaPopover"], [class*=" quotaPopover"], [class^="filePreview"], [class*=" filePreview"], [class^="imagePreview"], [class*=" imagePreview"]) {
+  border: 0 !important;
+  outline: 0 !important;
+}
+
+.skillPickerSearch,
+.selectedSkillChip,
+.temporarySelectionCount,
+.temporaryAskHeaderButton,
+.temporaryAskPanel .temporaryAskHeaderText {
+  border: 0 !important;
+}
+
+.temporaryAskPanel {
+  border-left: 0 !important;
+}
+
+.threadSearchBox input,
+.threadSearchBox input:hover,
+.threadSearchBox input:focus,
+.threadSearchBox input:focus-visible,
+.globalSearchDialog,
+.globalSearchInputRow,
+.globalSearchInputRow input,
+.globalSearchInputRow input:hover,
+.globalSearchInputRow input:focus,
+.globalSearchInputRow input:focus-visible {
+  border: 0 !important;
+  outline: 0 !important;
+  box-shadow: none !important;
+}
+
+.userMessageToggle,
+.userMessageToggle:hover,
+.userMessageToggle:focus,
+.userMessageToggle:focus-visible,
+.iconButton,
+.iconTextButton,
+.miniDangerButton,
+button:not(.messageMarkdown input),
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+  border: 0 !important;
+  outline: 0 !important;
+}
+
+.userMessageToggle:focus,
+.userMessageToggle:focus-visible,
+input:not([type="checkbox"]):not([type="radio"]):focus,
+select:focus,
+textarea:focus {
+  box-shadow: none !important;
+}
+
+.userSwitcher,
+.lockedUserBadge,
+.threadContextMenu,
+.historyPageControl,
+.continuationPrompt,
+.promptNavigatorPreview,
+.settingsExportBox,
+.settingsTestStatus,
+.directoryList,
+.globalSearchJumpNotice,
+:where([class*="Toast"], [class*="Banner"]) {
+  border: 0 !important;
+}
 @media (max-width:1050px) {
   .temporaryAskPanel { max-width:64vw; }
   .appShell.temporaryPanelOpen .threadList,.appShell.temporaryPanelOpen .threadListResizeHandle { display:none; }
