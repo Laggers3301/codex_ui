@@ -1868,6 +1868,7 @@ const threadListCollapsedStorageKey = "codex-web-thread-list-collapsed";
 const sidebarProjectsCacheKey = (userId: string) => `codex-v2-projects-${userId}`;
 const sidebarProjectSelectionKey = (userId: string) => `codex-v2-project-${userId}`;
 const sidebarThreadsCacheKey = (userId: string, projectId: string) => `codex-v2-threads-${userId}-${projectId}`;
+const threadListFastModeStorageKey = (userId: string) => `codex-v2-thread-list-fast-${encodeURIComponent(userId || "default")}`;
 const modelPreferenceStorageKey = (userId: string, projectId: string) => `codex-v2-model-${encodeURIComponent(userId)}-${encodeURIComponent(projectId)}`;
 const threadModelPreferenceStorageKey = (userId: string, threadId: string) => `codex-v2-thread-model-${encodeURIComponent(userId)}-${encodeURIComponent(threadId)}`;
 
@@ -2078,6 +2079,7 @@ export function App() {
   const [selectedProjectId, setSelectedProjectId] = useState<string>(() => window.localStorage.getItem(sidebarProjectSelectionKey(getApiUserId())) ?? "");
   const [threadSearch, setThreadSearch] = useState("");
   const [threadSearchLoading, setThreadSearchLoading] = useState(false);
+  const [threadListUseFastMode, setThreadListUseFastMode] = useState(() => storedBooleanWithDefault(threadListFastModeStorageKey(getApiUserId()), true));
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
   const [globalSearchQuery, setGlobalSearchQuery] = useState("");
   const [globalSearchResults, setGlobalSearchResults] = useState<GlobalSearchResult[]>([]);
@@ -3076,6 +3078,10 @@ export function App() {
   }, [selectedProjectId]);
 
   useEffect(() => {
+    setThreadListUseFastMode(storedBooleanWithDefault(threadListFastModeStorageKey(selectedUserId), true));
+  }, [selectedUserId]);
+
+  useEffect(() => {
     if (!selectedProjectId) {
       return;
     }
@@ -3105,7 +3111,7 @@ export function App() {
     const timer = window.setTimeout(() => {
       setGlobalSearchLoading(true);
       void Promise.all(projects.map(async (project) => {
-        const response = await listThreads(project.id, query);
+        const response = await listThreads(project.id, query, threadListUseFastMode);
         const normalizedQuery = query.toLocaleLowerCase();
         return response.data
           .filter((thread) => `${thread.name ?? ""} ${thread.preview ?? ""}`.toLocaleLowerCase().includes(normalizedQuery))
@@ -3121,7 +3127,7 @@ export function App() {
       });
     }, 180);
     return () => window.clearTimeout(timer);
-  }, [globalSearchOpen, globalSearchQuery, projects]);
+  }, [globalSearchOpen, globalSearchQuery, projects, threadListUseFastMode]);
 
   useEffect(() => {
     return () => {
@@ -3363,7 +3369,7 @@ export function App() {
       setThreadSearchLoading(true);
     }
     try {
-      const response = await listThreads(projectId, search);
+      const response = await listThreads(projectId, search, threadListUseFastMode);
       if (searchRequestId !== threadSearchRequestRef.current) {
         return;
       }
@@ -3395,6 +3401,12 @@ export function App() {
         setThreadSearchLoading(false);
       }
     }
+  }
+
+  function setThreadListFastModeEnabled(next: boolean) {
+    setThreadListUseFastMode(next);
+    window.localStorage.setItem(threadListFastModeStorageKey(selectedUserId), String(next));
+    void refreshThreads(selectedProjectIdRef.current, threadSearch);
   }
 
   async function openThread(
@@ -6418,6 +6430,14 @@ export function App() {
                       <X size={12} />
                     </button>
                   ))}
+                  <button
+                    className={`v2FastModeButton ${threadListUseFastMode ? "active" : ""}`}
+                    type="button"
+                    onClick={() => setThreadListFastModeEnabled(!threadListUseFastMode)}
+                    title={`会话列表查询 ${threadListUseFastMode ? "关闭" : "开启"} fast 模式`}
+                  >
+                    Fast {threadListUseFastMode ? "ON" : "OFF"}
+                  </button>
                   <PolishedSelect<string>
                     className="v2ModelPicker"
                     value={activeModelProfileId}

@@ -193,9 +193,9 @@ export function deleteProject(id: string): Promise<{ ok: boolean }> {
   return request(`/api/projects/${id}`, { method: "DELETE" });
 }
 
-export function listThreads(projectId: string, search?: string): Promise<ThreadListResponse> {
+export function listThreads(projectId: string, search?: string, fast = true): Promise<ThreadListResponse> {
   const params = new URLSearchParams();
-  params.set("fast", "true");
+  params.set("fast", fast ? "true" : "false");
   if (search?.trim()) {
     params.set("search", search.trim());
   }
