@@ -1684,17 +1684,19 @@ label input {
 
 .messageMarkdown li > input[type="checkbox"],
 .messageMarkdown li > p > input[type="checkbox"] {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 13px;
-  height: 13px;
-  margin: 0 8px 0 0;
-  flex-shrink: 0;
-  border: 1px solid #7a8179;
-  border-radius: 2px;
-  background: #282b29;
-  color: #d9ddd8;
-  vertical-align: middle;
+  -webkit-appearance: none !important;
+  appearance: none !important;
+  width: 14px !important;
+  height: 14px !important;
+  margin: 0 8px 0 0 !important;
+  flex-shrink: 0 !important;
+  border: 1px solid #7a8179 !important;
+  border-radius: 2px !important;
+  background: #282b29 !important;
+  color: #d9ddd8 !important;
+  vertical-align: middle !important;
+  pointer-events: none !important;
+  position: relative !important;
 }
 
 .messageMarkdown li > input[type="checkbox"]::before,
@@ -1710,6 +1712,7 @@ label input {
   transform-origin: center;
   opacity: 0;
   transition: opacity 0.1s;
+  pointer-events: none;
 }
 
 .messageMarkdown li > input[type="checkbox"]:checked::before,
@@ -1719,6 +1722,42 @@ label input {
 
 .messageMarkdown li + li {
   margin-top: 4px;
+}
+
+.messageMarkdown li > label > input[type="checkbox"],
+.messageMarkdown li > span > input[type="checkbox"],
+.messageMarkdown .task-list-item input[type="checkbox"] {
+  -webkit-appearance: none !important;
+  appearance: none !important;
+  width: 14px !important;
+  height: 14px !important;
+  border: 1px solid #7a8179 !important;
+  border-radius: 2px !important;
+  background: #282b29 !important;
+  margin: 0 8px 0 0 !important;
+  pointer-events: none !important;
+  vertical-align: middle !important;
+}
+
+.messageMarkdown li > label > input[type="checkbox"]::before,
+.messageMarkdown li > span > input[type="checkbox"]::before,
+.messageMarkdown .task-list-item input[type="checkbox"]::before {
+  content: "";
+  display: block;
+  width: 7px;
+  height: 11px;
+  margin: 1px 2px;
+  border-right: 2px solid currentColor !important;
+  border-bottom: 2px solid currentColor !important;
+  transform: rotate(45deg);
+  transform-origin: center;
+  opacity: 0;
+}
+
+.messageMarkdown li > label > input[type="checkbox"]:checked::before,
+.messageMarkdown li > span > input[type="checkbox"]:checked::before,
+.messageMarkdown .task-list-item input[type="checkbox"]:checked::before {
+  opacity: 1;
 }
 
 .messageMarkdown blockquote {
