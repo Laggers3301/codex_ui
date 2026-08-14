@@ -2063,6 +2063,11 @@ const sidebarProjectSelectionKey = (userId: string) => `codex-v2-project-${userI
 const sidebarThreadsCacheKey = (userId: string, projectId: string) => `codex-v2-threads-${userId}-${projectId}`;
 const modelPreferenceStorageKey = (userId: string, projectId: string) => `codex-v2-model-${encodeURIComponent(userId)}-${encodeURIComponent(projectId)}`;
 const threadModelPreferenceStorageKey = (userId: string, threadId: string) => `codex-v2-thread-model-${encodeURIComponent(userId)}-${encodeURIComponent(threadId)}`;
+const codexFastModeStorageKey = (userId: string) => `codex-v2-codex-fast-mode-${encodeURIComponent(userId)}`;
+
+function resolveServiceTier(enabled: boolean): "fast" | null {
+  return enabled ? "fast" : null;
+}
 
 function lookupThreadModelProfileId(userId: string, threadId: string, profiles: ModelProfile[]): string | null {
   if (typeof window === "undefined") {
@@ -2274,6 +2279,7 @@ export function App() {
   const [threadListCollapsed, setThreadListCollapsed] = useState(() => storedBoolean(threadListCollapsedStorageKey));
   const [systemDirectoryPickerAvailable, setSystemDirectoryPickerAvailable] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState<string>(() => window.localStorage.getItem(sidebarProjectSelectionKey(getApiUserId())) ?? "");
+  const [codexFastModeEnabled, setCodexFastModeEnabled] = useState(() => storedBoolean(codexFastModeStorageKey(getApiUserId())));
   const [threadSearch, setThreadSearch] = useState("");
   const [threadSearchLoading, setThreadSearchLoading] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
@@ -2547,6 +2553,7 @@ export function App() {
         prompt: text,
         model: temporaryModelProfile.model,
         reasoningEffort: temporaryModelProfile.effort,
+        ...(resolveServiceTier(codexFastModeEnabled) ? { serviceTier: "fast" } : {}),
         sandbox,
         approvalPolicy,
       } : {
@@ -2557,6 +2564,7 @@ export function App() {
         prompt: `请基于下面选中的文字回答问题。\n\n选中文字：\n${current.selectedText}\n\n用户问题：\n${text}`,
         model: temporaryModelProfile.model,
         reasoningEffort: temporaryModelProfile.effort,
+        ...(resolveServiceTier(codexFastModeEnabled) ? { serviceTier: "fast" } : {}),
         sandbox,
         approvalPolicy,
       });
@@ -3363,6 +3371,7 @@ export function App() {
     if (!userEffectInitializedRef.current) {
       userEffectInitializedRef.current = true;
       setApiUserId(selectedUserId);
+      setCodexFastModeEnabled(storedBoolean(codexFastModeStorageKey(selectedUserId)));
       const savedAutoSendPreference = storedBooleanWithDefault(autoSendPreferenceStorageKey(selectedUserId), true);
       autoSendEnabledRef.current = savedAutoSendPreference;
       setAutoSendGeneratedFiles(savedAutoSendPreference);
@@ -3376,6 +3385,7 @@ export function App() {
     const savedAutoSendPreference = storedBooleanWithDefault(autoSendPreferenceStorageKey(selectedUserId), true);
     autoSendEnabledRef.current = savedAutoSendPreference;
     setAutoSendGeneratedFiles(savedAutoSendPreference);
+    setCodexFastModeEnabled(storedBoolean(codexFastModeStorageKey(selectedUserId)));
     autoSentGeneratedFileKeysRef.current.clear();
     autoSendInFlightFileKeysRef.current.clear();
     threadProjectIdsRef.current.clear();
@@ -4740,6 +4750,7 @@ export function App() {
           prompt: sentPromptText,
           model: selectedModelProfile.model,
           reasoningEffort: selectedModelProfile.effort,
+          ...(resolveServiceTier(codexFastModeEnabled) ? { serviceTier: "fast" } : {}),
           sandbox,
           approvalPolicy
         }
@@ -4751,9 +4762,10 @@ export function App() {
           prompt: sentPromptText,
           model: selectedModelProfile.model,
           reasoningEffort: selectedModelProfile.effort,
+          ...(resolveServiceTier(codexFastModeEnabled) ? { serviceTier: "fast" } : {}),
           sandbox,
           approvalPolicy
-    };
+        };
     try {
       codexSocket.send(payload);
       autoFollowMessagesRef.current = true;
@@ -4814,6 +4826,7 @@ export function App() {
         prompt: continuation.sentPromptText,
         model: selectedModelProfile.model,
         reasoningEffort: selectedModelProfile.effort,
+        ...(resolveServiceTier(codexFastModeEnabled) ? { serviceTier: "fast" } : {}),
         sandbox,
         approvalPolicy
       });
@@ -7245,6 +7258,20 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               />
               <div className="composerBody">
                 <div className="composerTools">
+                  <button
+                    className={`iconTextButton ${codexFastModeEnabled ? "v2FastModeButtonActive" : ""}`}
+                    type="button"
+                    onClick={() => {
+                      const next = !codexFastModeEnabled;
+                      setCodexFastModeEnabled(next);
+                      if (typeof window !== "undefined") {
+                        window.localStorage.setItem(codexFastModeStorageKey(selectedUserId), String(next));
+                      }
+                    }}
+                    title={codexFastModeEnabled ? "已开启 Fast 模式（下次请求会带 service_tier: fast）" : "开启 Fast 模式"}
+                  >
+                    {codexFastModeEnabled ? "Fast 开" : "Fast"}
+                  </button>
                   {selectedSkills.map((skill) => (
                     <button className="selectedSkillChip" type="button" key={skill.name} onClick={() => toggleSelectedSkill(skill.name)} title={`移除 $${skill.name}`}>
                       <span>{localizedSkill(skill).name}</span>

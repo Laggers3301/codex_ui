@@ -430,6 +430,16 @@ label input {
   padding: 0 12px;
 }
 
+.iconTextButton.v2FastModeButtonActive {
+  border-color: #4fb0a3;
+  color: #f4f7f2;
+  background: rgba(79, 176, 163, 0.14);
+}
+
+.iconTextButton.v2FastModeButtonActive:hover {
+  background: rgba(79, 176, 163, 0.2);
+}
+
 .iconTextButton.full {
   width: 100%;
 }
