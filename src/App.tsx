@@ -205,8 +205,8 @@ interface LiveDeltaEntry {
 interface LiveToolEntry extends LiveToolItem {}
 
 type LiveTimelineEntry =
-  | { id: string; kind: "agent"; threadId: string | null; turnId: string | null; startedAt: string; text: string }
-  | { id: string; kind: "tool"; threadId: string | null; turnId: string | null; startedAt: string; tool: string; input: string; output: string; completed: boolean };
+  | { id: string; kind: "agent"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; text: string }
+  | { id: string; kind: "tool"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; tool: string; input: string; output: string; completed: boolean };
 
 interface PendingUserMessage {
   id: string;
@@ -2266,6 +2266,8 @@ export function App() {
   const globalSearchRequestRef = useRef(0);
   const pendingLiveDeltasRef = useRef(new Map<string, LiveDeltaEntry>());
   const liveDeltaFlushTimerRef = useRef<number | null>(null);
+  const liveTimelineSequenceRef = useRef(0);
+  const liveTimelineOrderRef = useRef(new Map<string, number>());
   const lastLiveEventAtRef = useRef<Record<string, number>>({});
   const [projects, setProjects] = useState<Project[]>(() => storedJson<Project[]>(sidebarProjectsCacheKey(getApiUserId()), []));
   const [users, setUsers] = useState<UserProfile[]>([]);
@@ -2435,6 +2437,21 @@ export function App() {
     }
   }
 
+  function liveTimelineSequence(kind: "agent" | "tool", itemId: string): number {
+    const key = `${kind}:${itemId}`;
+    const existing = liveTimelineOrderRef.current.get(key);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const sequence = ++liveTimelineSequenceRef.current;
+    liveTimelineOrderRef.current.set(key, sequence);
+    if (liveTimelineOrderRef.current.size > 4096) {
+      const oldestKey = liveTimelineOrderRef.current.keys().next().value;
+      if (oldestKey) liveTimelineOrderRef.current.delete(oldestKey);
+    }
+    return sequence;
+  }
+
   function flushPendingLiveDeltas(): void {
     if (liveDeltaFlushTimerRef.current !== null) {
       window.clearTimeout(liveDeltaFlushTimerRef.current);
@@ -2461,6 +2478,7 @@ export function App() {
   }
 
   function enqueueLiveDelta(itemId: string, entry: LiveDeltaEntry): void {
+    liveTimelineSequence("agent", itemId);
     const existing = pendingLiveDeltasRef.current.get(itemId);
     pendingLiveDeltasRef.current.set(itemId, {
       threadId: existing?.threadId ?? entry.threadId,
@@ -5003,6 +5021,12 @@ export function App() {
     if (!snapshot) {
       return;
     }
+    [
+      ...snapshot.agentMessages.filter((item) => item.itemId).map((item) => ({ kind: "agent" as const, id: item.itemId, startedAt: item.startedAt ?? item.updatedAt ?? "" })),
+      ...(snapshot.toolItems ?? []).filter((item) => item.itemId).map((item) => ({ kind: "tool" as const, id: item.itemId, startedAt: item.startedAt ?? "" }))
+    ]
+      .sort((left, right) => left.startedAt.localeCompare(right.startedAt))
+      .forEach((item) => liveTimelineSequence(item.kind, item.id));
     pendingLiveDeltasRef.current.clear();
     if (liveDeltaFlushTimerRef.current !== null) {
       window.clearTimeout(liveDeltaFlushTimerRef.current);
@@ -5075,6 +5099,7 @@ export function App() {
     if (message.type === "live.tool") {
       const item = message.data as LiveToolEntry | undefined;
       if (item?.itemId) {
+        liveTimelineSequence("tool", item.itemId);
         markLiveEvent(item.threadId);
         setLiveTools((current) => {
           const next = { ...current };
@@ -5496,11 +5521,11 @@ export function App() {
   }
 
   const liveTimelineEntries: LiveTimelineEntry[] = [
-    ...Object.entries(liveDeltas).map(([id, entry]) => ({ id, kind: "agent" as const, ...entry })),
-    ...Object.values(liveTools).map((entry) => ({ id: entry.itemId, kind: "tool" as const, ...entry }))
+    ...Object.entries(liveDeltas).map(([id, entry]) => ({ id, kind: "agent" as const, sequence: liveTimelineSequence("agent", id), ...entry })),
+    ...Object.values(liveTools).map((entry) => ({ id: entry.itemId, kind: "tool" as const, sequence: liveTimelineSequence("tool", entry.itemId), ...entry }))
   ]
     .filter((entry) => selectedThread?.id ? entry.threadId === selectedThread.id || entry.threadId === null : entry.threadId === null)
-    .sort((left, right) => left.startedAt.localeCompare(right.startedAt));
+    .sort((left, right) => left.sequence - right.sequence || left.startedAt.localeCompare(right.startedAt));
   const liveTimelineByTurn = new Map<string, LiveTimelineEntry[]>();
   const unmatchedLiveTimeline: LiveTimelineEntry[] = [];
   const fallbackLiveTurnId = selectedThread?.id ? activeTurnsByThread[selectedThread.id] : null;
@@ -5765,11 +5790,16 @@ export function App() {
     }
     return entry.threadId === selectedThread.id;
   }), [pendingUserMessages, selectedThread]);
+  const persistedUserTurnIds = useMemo(() => new Set(
+    (selectedThread?.turns ?? [])
+      .filter((turn) => turnHasUserItem(turn) || Boolean(turnUserText(turn).trim()))
+      .map((turn) => turn.id)
+  ), [selectedThread]);
   const pendingUserMessagesByTurn = useMemo(() => {
     const byTurn = new Map<string, PendingUserMessage[]>();
     const turnIds = new Set((selectedThread?.turns ?? []).map((turn) => turn.id));
     for (const entry of visiblePendingUserMessages) {
-      if (!entry.turnId || !turnIds.has(entry.turnId)) {
+      if (!entry.turnId || !turnIds.has(entry.turnId) || persistedUserTurnIds.has(entry.turnId)) {
         continue;
       }
       const entries = byTurn.get(entry.turnId) ?? [];
@@ -5777,7 +5807,7 @@ export function App() {
       byTurn.set(entry.turnId, entries);
     }
     return byTurn;
-  }, [selectedThread, visiblePendingUserMessages]);
+  }, [persistedUserTurnIds, selectedThread, visiblePendingUserMessages]);
   const detachedPendingUserMessages = useMemo(() => {
     const turnIds = new Set((selectedThread?.turns ?? []).map((turn) => turn.id));
     return visiblePendingUserMessages.filter((entry) => !entry.turnId || !turnIds.has(entry.turnId));
@@ -5898,7 +5928,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       const belongsToCurrentThread = selectedThread?.id
         ? pendingMessage.threadId === selectedThread.id
         : pendingMessage.threadId === null && pendingMessage.viewToken === threadViewTokenRef.current;
-      if (!belongsToCurrentThread) {
+      if (!belongsToCurrentThread || (pendingMessage.turnId && persistedUserTurnIds.has(pendingMessage.turnId))) {
         continue;
       }
       const navigationItem = createPromptNavigationItem(pendingPromptNavigationKey(pendingMessage.id), pendingMessage.text);
@@ -5907,7 +5937,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       }
     }
     return items;
-  }, [heldPersistedPromptNavigationKeys, pendingUserMessages, selectedThread]);
+  }, [heldPersistedPromptNavigationKeys, pendingUserMessages, persistedUserTurnIds, selectedThread]);
   const hoveredPromptNavigationItem = promptNavigationItems.find((item) => item.key === hoveredPromptNavigationKey) ?? null;
   const showPromptNavigator = promptNavigationItems.length > 0 || Boolean(selectedThread && threadHistory?.hasOlder);
   const globalEnterSendBlocked = Boolean(
@@ -7119,54 +7149,72 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     .map((item) => stripInterruptArtifacts(itemText(item)).trim())
                     .filter(Boolean)
                     .join("\n\n");
-                  if (turnAgentText) {
-                    renderedHistoryItems.push(
-                      <div className="v2AgentMessageActions v2TurnCopyAction" key={`${turn.id}-copy-all`} aria-label="本轮回答操作">
-                        <button type="button" title="复制本次回答全部文字" aria-label="复制本次回答全部文字" onClick={() => void copyPlainText(turnAgentText)}>
-                          <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
-                        </button>
-                      </div>
-                    );
-                  }
+                  const normalizedTurnStatus = normalizedToken(turn.status);
+                  const turnHasTerminalStatus = Boolean(turn.completedAt)
+                    || ["completed", "succeeded", "failed", "interrupted", "cancelled", "canceled", "aborted"]
+                      .some((status) => normalizedTurnStatus.includes(status));
+                  const turnCopyAction = turnAgentText
+                    && turnHasTerminalStatus
+                    && selectedActiveTurnId !== turn.id
+                    ? [
+                        <div className="v2AgentMessageActions v2TurnCopyAction" key={`${turn.id}-copy-all`} aria-label="本轮回答操作">
+                          <button type="button" title="复制本次回答全部文字" aria-label="复制本次回答全部文字" onClick={() => void copyPlainText(turnAgentText)}>
+                            <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
+                          </button>
+                        </div>
+                      ]
+                    : [];
 
                   const renderedHistoryTurnItems = renderedHistoryItems.flatMap((item) => (item ? [item] : []));
-                  const runningTurnLiveAgentItems = activeTurnLiveItems.filter((entry) => entry.kind === "agent");
-                  const runningTurnLiveToolItems = activeTurnLiveItems
-                    .filter((entry) => entry.kind === "tool")
-                    .map((entry) => ({
+                  const toRunningToolItem = (entry: Extract<LiveTimelineEntry, { kind: "tool" }>): ThreadItem => ({
                       id: entry.id,
                       type: "toolCall",
                       tool: entry.tool,
                       input: entry.input,
                       output: entry.output,
                       completed: entry.completed
-                    } as ThreadItem));
-                  const mergedRunningToolItems = [...activeTrailingToolItems];
-                  const mergedRunningToolIndexes = new Map(
-                    mergedRunningToolItems.map((item, index) => [item.id, index] as const).filter(([id]) => Boolean(id))
+                    } as ThreadItem);
+                  const runningTurnLiveToolEntries = activeTurnLiveItems.filter(
+                    (entry): entry is Extract<LiveTimelineEntry, { kind: "tool" }> => entry.kind === "tool"
                   );
-                  for (const liveToolItem of runningTurnLiveToolItems) {
-                    const existingIndex = liveToolItem.id ? mergedRunningToolIndexes.get(liveToolItem.id) : undefined;
-                    if (existingIndex === undefined) {
-                      mergedRunningToolIndexes.set(liveToolItem.id, mergedRunningToolItems.length);
-                      mergedRunningToolItems.push(liveToolItem);
-                      continue;
-                    }
-                    const persistedToolItem = mergedRunningToolItems[existingIndex];
-                    mergedRunningToolItems[existingIndex] = {
+                  const runningToolEntriesById = new Map(runningTurnLiveToolEntries.map((entry) => [entry.id, entry]));
+                  const consumedLiveToolIds = new Set<string>();
+                  const mergedTrailingToolItems = activeTrailingToolItems.map((persistedToolItem) => {
+                    const liveEntry = persistedToolItem.id ? runningToolEntriesById.get(persistedToolItem.id) : undefined;
+                    if (!liveEntry) return persistedToolItem;
+                    consumedLiveToolIds.add(liveEntry.id);
+                    const liveToolItem = toRunningToolItem(liveEntry);
+                    return {
                       ...persistedToolItem,
                       ...liveToolItem,
                       input: liveToolItem.input || persistedToolItem.input,
                       output: liveToolItem.output || persistedToolItem.output
                     };
+                  });
+                  const runningTurnTimelineItems: React.ReactNode[] = [];
+                  const runningToolGroup: ThreadItem[] = [...mergedTrailingToolItems];
+                  let runningToolGroupIndex = toolGroupIndex;
+                  const flushRunningToolGroup = () => {
+                    if (runningToolGroup.length === 0) return;
+                    const bundleItems = [...runningToolGroup];
+                    runningTurnTimelineItems.push(renderPersistedToolBundle(
+                      `${turn.id}-toolbundle-${runningToolGroupIndex}`,
+                      bundleItems,
+                      bundleItems.every((item) => item.completed !== false)
+                    ));
+                    runningToolGroup.length = 0;
+                    runningToolGroupIndex += 1;
+                  };
+                  for (const entry of activeTurnLiveItems) {
+                    if (entry.kind === "tool") {
+                      if (!consumedLiveToolIds.has(entry.id)) runningToolGroup.push(toRunningToolItem(entry));
+                      continue;
+                    }
+                    flushRunningToolGroup();
+                    const renderedEntry = renderLiveTimelineEntry(entry);
+                    if (renderedEntry) runningTurnTimelineItems.push(renderedEntry);
                   }
-                  const runningTurnLiveToolBundle = mergedRunningToolItems.length > 0
-                    ? [renderPersistedToolBundle(
-                        `${turn.id}-toolbundle-${toolGroupIndex}`,
-                        mergedRunningToolItems,
-                        mergedRunningToolItems.every((item) => item.completed !== false)
-                      )]
-                    : [];
+                  flushRunningToolGroup();
                   const runningTurnThinking = selectedActiveTurnId && selectedActiveTurnId === turn.id
                     ? [<div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>]
                     : [];
@@ -7175,9 +7223,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     ...(pendingUserMessagesByTurn.get(turn.id) ?? []).map(renderPendingUserMessage),
                     ...runningTurnThinking,
                     ...renderedHistoryTurnItems,
-                    ...runningTurnLiveAgentItems.map(renderLiveTimelineEntry),
-                    ...runningTurnLiveToolBundle,
+                    ...runningTurnTimelineItems,
                     ...(conversationLocalMessageLayout.byTurn.get(turn.id) ?? []).map(renderLocalMessage),
+                    ...turnCopyAction,
                   ];
                 })}
                 {conversationLocalMessageLayout.beforePending.map(renderLocalMessage)}

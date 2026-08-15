@@ -7390,3 +7390,511 @@ textarea:focus {
   .temporaryAskResizeHandle { display:none; }
 }
 @media (max-width:700px) { .skillPickerPopover { left:4px; width:calc(100vw - 28px); max-height:62vh; } }
+
+/* Phone layout: keep the desktop composition untouched above this breakpoint. */
+@media (max-width: 720px) {
+  html,
+  body,
+  #root {
+    width: 100%;
+    min-width: 0 !important;
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  .appShell {
+    width: 100dvw;
+    max-width: 100dvw;
+    grid-template-columns: 0 0 minmax(0, 1fr) !important;
+  }
+
+  .threadColumn {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .topbar {
+    display: grid;
+    min-width: 0;
+    min-height: 94px;
+    grid-template-columns: minmax(0, 1fr);
+    align-content: center;
+    gap: 7px;
+    padding: 8px max(10px, env(safe-area-inset-right)) 8px max(10px, env(safe-area-inset-left));
+  }
+
+  .projectTitle {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .projectTitle h1 {
+    overflow: hidden;
+    font-size: 14px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .topbar .controls {
+    display: flex;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    gap: 6px;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .topbar .controls::-webkit-scrollbar,
+  .composerTools::-webkit-scrollbar {
+    display: none;
+  }
+
+  .topbar .controls > * {
+    flex: 0 0 auto;
+  }
+
+  .topbarPolicySelect {
+    width: 112px;
+  }
+
+  .topbarPolicySelect.approvalSelect {
+    width: 120px;
+  }
+
+  .v2QuotaTopButton {
+    min-width: 76px;
+  }
+
+  .workspace {
+    width: 100%;
+    min-width: 0;
+    grid-template-columns: 0 0 minmax(0, 1fr) !important;
+  }
+
+  .workspace > .threadList:not(.collapsed) {
+    position: absolute;
+    inset: 0 auto 0 0;
+    z-index: 180;
+    display: flex;
+    width: min(86dvw, 320px);
+    max-width: calc(100dvw - 42px);
+    padding-top: 66px;
+    box-shadow: 18px 0 48px rgba(0, 0, 0, 0.42);
+  }
+
+  .workspace > .threadListResizeHandle {
+    display: none !important;
+  }
+
+  .workspace > .conversation {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .v2ProjectDock,
+  .v2AccountDock {
+    width: min(86dvw, 320px) !important;
+    max-width: calc(100dvw - 42px);
+  }
+
+  .conversationHeader {
+    min-width: 0;
+    min-height: 48px;
+    padding: 7px 12px;
+  }
+
+  .conversationHeader h2 {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .messages {
+    width: 100%;
+    min-width: 0;
+    padding: 22px max(14px, env(safe-area-inset-right)) 176px max(14px, env(safe-area-inset-left));
+    overflow-x: hidden;
+    overscroll-behavior-x: none;
+  }
+
+  .messages > *,
+  .messageItem,
+  .messageItem.commandExecution,
+  .messageItem.kind-tool,
+  .messageMarkdown,
+  .messageMarkdown > * {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .messageItem.userMessage,
+  .messageItem.kind-user {
+    max-width: 92%;
+  }
+
+  .messageMarkdown,
+  .messageMarkdown p,
+  .messageMarkdown li,
+  .toolClusterSummary,
+  .toolClusterItem {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  .messageMarkdown pre,
+  .messageMarkdown table,
+  .messageItem pre,
+  .messageItem .outputBlock {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .messageMarkdown table {
+    display: block;
+    width: max-content;
+  }
+
+  .composer {
+    right: max(10px, env(safe-area-inset-right)) !important;
+    bottom: max(10px, env(safe-area-inset-bottom)) !important;
+    left: max(10px, env(safe-area-inset-left)) !important;
+    width: auto !important;
+    min-width: 0;
+    max-width: none;
+    grid-template-columns: minmax(0, 1fr) 40px;
+    gap: 7px;
+    padding: 10px 10px 9px 12px;
+    border-radius: 17px;
+  }
+
+  .composerBody,
+  .composer textarea {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .composerTools {
+    min-width: 0;
+    max-width: 100%;
+    gap: 4px;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .composerTools > * {
+    flex: 0 0 auto;
+  }
+
+  .composerTools .v2ModelPicker {
+    width: 132px;
+  }
+
+  .v2ModelPicker .polishedSelectMenu,
+  .polishedSelectMenu {
+    right: 0;
+    left: auto;
+    width: min(280px, calc(100dvw - 20px));
+    max-width: calc(100dvw - 20px);
+  }
+
+  .v2PlusMenu,
+  .skillPickerPopover,
+  .globalSearchDialog,
+  .leaderboardDialog,
+  .settingsDialog,
+  .directoryDialog,
+  .filePreviewDialog,
+  .imagePreviewDialog {
+    width: calc(100dvw - 20px) !important;
+    max-width: calc(100dvw - 20px) !important;
+  }
+
+  .temporaryAskPanel {
+    width: 100dvw !important;
+    min-width: 0;
+    max-width: 100dvw !important;
+  }
+
+  .temporaryAskMessages.messages {
+    padding: 22px 14px 170px;
+  }
+
+  .temporaryAskComposer.composer {
+    right: max(10px, env(safe-area-inset-right));
+    left: max(10px, env(safe-area-inset-left));
+  }
+
+  .scrollToBottomButton {
+    right: 16px;
+    bottom: 154px;
+  }
+
+  /* Compact mobile chrome: title above three equal policy controls. */
+  .topbar {
+    min-height: 88px;
+    gap: 6px;
+    padding-top: 7px;
+    padding-bottom: 7px;
+  }
+
+  .topbar .controls {
+    display: grid;
+    grid-template-columns: minmax(0, .84fr) minmax(0, 1fr) minmax(0, 1fr);
+    gap: 6px;
+    overflow: visible;
+  }
+
+  .topbar .controls > *,
+  .topbar .quotaPopoverAnchor,
+  .topbarPolicySelect,
+  .topbarPolicySelect.approvalSelect {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+  }
+
+  .topbar .quotaButton.v2QuotaTopButton,
+  .topbarPolicySelect .polishedSelectTrigger {
+    width: 100%;
+    min-width: 0;
+    min-height: 34px;
+    height: 34px;
+    justify-content: center;
+    padding-inline: 8px;
+    border-radius: 10px !important;
+    font-size: 12px !important;
+    line-height: 18px !important;
+  }
+
+  .topbarPolicySelect .polishedSelectTrigger > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .topbarPolicySelect .polishedSelectTrigger svg {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 13px;
+  }
+
+  .topbar .polishedSelectMenu {
+    position: fixed;
+    top: 92px;
+    right: 10px;
+    left: 10px;
+    width: auto;
+    max-width: none;
+  }
+
+  /* The desktop sidebar becomes a self-contained full-screen mobile drawer. */
+  .workspace > .threadList:not(.collapsed) {
+    position: fixed;
+    inset: 0;
+    z-index: 180;
+    width: 100dvw;
+    max-width: 100dvw;
+    height: 100dvh;
+    box-sizing: border-box;
+    gap: 5px;
+    padding: 142px 10px max(66px, env(safe-area-inset-bottom)) !important;
+    background: #191a19;
+    box-shadow: none;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  .v2ProjectDock {
+    top: 0;
+    z-index: 184;
+    width: 100dvw !important;
+    max-width: 100dvw;
+    height: 142px !important;
+    box-sizing: border-box;
+    padding: max(10px, env(safe-area-inset-top)) 12px 8px !important;
+    border: 0 !important;
+    background: #191a19 !important;
+  }
+
+  .v2BrandRow {
+    min-height: 32px;
+    margin-bottom: 3px;
+  }
+
+  .v2BrandRow strong {
+    font-size: 16px;
+  }
+
+  .v2PrimaryNav {
+    display: grid;
+    gap: 1px;
+  }
+
+  .v2PrimaryNav button {
+    min-height: 30px !important;
+    padding-block: 3px !important;
+    border-radius: 8px;
+  }
+
+  .threadList .listHeader {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    min-height: 34px;
+    padding: 0 8px;
+    background: #191a19;
+  }
+
+  .v2WorkspaceTree {
+    min-width: 0;
+  }
+
+  .v2WorkspaceFolderButton {
+    min-height: 38px;
+    border-radius: 10px;
+  }
+
+  .v2WorkspaceThreads {
+    gap: 1px;
+  }
+
+  .v2WorkspaceThreads .threadRow,
+  .v2WorkspaceThreads .threadSelectButton {
+    min-height: 36px;
+  }
+
+  .threadSearchBox {
+    margin: 5px 8px 7px;
+  }
+
+  .threadSearchBox input {
+    height: 36px;
+    padding-inline: 12px 32px;
+    border-radius: 10px;
+    font-size: 13px;
+  }
+
+  .v2AccountDock {
+    z-index: 184;
+    width: 100dvw !important;
+    max-width: 100dvw;
+    padding: 6px max(10px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
+    border: 0;
+    background: #191a19;
+  }
+
+  .v2AccountTrigger {
+    height: 42px;
+  }
+
+  .threadListRestoreButton {
+    position: fixed;
+    top: max(10px, env(safe-area-inset-top));
+    left: max(8px, env(safe-area-inset-left));
+    z-index: 700 !important;
+    width: 34px;
+    height: 34px;
+    border-radius: 10px;
+    background: rgba(43, 45, 43, .92) !important;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .28);
+    backdrop-filter: blur(12px);
+  }
+
+  .threadColumn {
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .projectTitle {
+    box-sizing: border-box;
+    padding-left: 42px;
+  }
+
+  .topbar {
+    position: relative;
+    z-index: 20;
+    overflow: visible;
+  }
+
+  .workspace {
+    z-index: auto;
+  }
+
+  .threadColumn {
+    grid-column: 1 / -1 !important;
+    width: 100dvw !important;
+    max-width: 100dvw !important;
+    overflow-x: clip;
+  }
+
+  .workspace {
+    width: 100dvw !important;
+    max-width: 100dvw !important;
+    overflow-x: visible;
+  }
+
+  .workspace > .conversation {
+    grid-column: 1 / -1 !important;
+    width: 100dvw !important;
+    max-width: 100dvw !important;
+    overflow-x: clip;
+  }
+
+  .topbar,
+  .conversationContent,
+  .messages {
+    box-sizing: border-box;
+    width: 100dvw !important;
+    max-width: 100dvw !important;
+  }
+
+  .topbar .controls,
+  .topbar .controls > *,
+  .topbar .quotaPopoverAnchor,
+  .topbarPolicySelect,
+  .topbarPolicySelect .polishedSelectTrigger,
+  .composer,
+  .composerBody,
+  .composerTools {
+    box-sizing: border-box;
+  }
+
+  .composer {
+    width: calc(100dvw - max(10px, env(safe-area-inset-left)) - max(10px, env(safe-area-inset-right))) !important;
+    max-width: calc(100dvw - max(10px, env(safe-area-inset-left)) - max(10px, env(safe-area-inset-right))) !important;
+  }
+}
+
+/* The restore control must not remain inside the zero-width sidebar grid. */
+@media (min-width: 721px) {
+  .threadListRestoreButton {
+    position: fixed !important;
+    top: 13px !important;
+    left: 13px !important;
+    z-index: 500 !important;
+    display: inline-grid !important;
+    width: 34px;
+    min-width: 34px;
+    height: 34px;
+    place-items: center;
+    border: 0 !important;
+    border-radius: 10px;
+    background: rgba(43, 45, 43, .94) !important;
+    color: #d7dad4;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .28);
+    backdrop-filter: blur(12px);
+  }
+
+  .threadListRestoreButton:hover {
+    background: #393b38 !important;
+    color: #fff;
+  }
+}
