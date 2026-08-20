@@ -1313,69 +1313,6 @@ const MarkdownMessage = memo(function MarkdownMessage({
   );
 });
 
-function stableStreamingMarkdownPrefix(text: string): string {
-  const reserveLength = 360;
-  const targetEnd = text.length - reserveLength;
-  if (targetEnd <= 0) {
-    return "";
-  }
-  const paragraphEnd = text.lastIndexOf("\n\n", targetEnd);
-  if (paragraphEnd >= 0) {
-    return text.slice(0, paragraphEnd + 2);
-  }
-  const lineEnd = text.lastIndexOf("\n", targetEnd);
-  return lineEnd >= 0 ? text.slice(0, lineEnd + 1) : "";
-}
-
-const LiveAgentStreamMessage = memo(function LiveAgentStreamMessage({
-  text,
-  projectId,
-  onOpenFileLink
-}: {
-  text: string;
-  projectId?: string;
-  onOpenFileLink?: (target: string) => void;
-}) {
-  const latestTextRef = useRef(text);
-  const commitTimerRef = useRef<number | null>(null);
-  const [committedPrefix, setCommittedPrefix] = useState("");
-
-  latestTextRef.current = text;
-
-  useEffect(() => {
-    if (commitTimerRef.current !== null) {
-      return;
-    }
-    commitTimerRef.current = window.setTimeout(() => {
-      commitTimerRef.current = null;
-      const nextPrefix = stableStreamingMarkdownPrefix(latestTextRef.current);
-      setCommittedPrefix((current) => current === nextPrefix ? current : nextPrefix);
-    }, 180);
-  }, [text]);
-
-  useEffect(() => () => {
-    if (commitTimerRef.current !== null) {
-      window.clearTimeout(commitTimerRef.current);
-    }
-  }, []);
-
-  const stablePrefix = text.startsWith(committedPrefix) ? committedPrefix : "";
-  const stableBlocks = useMemo(
-    () => stablePrefix.split(/\n{2,}/).filter((block) => block.trim()),
-    [stablePrefix]
-  );
-  const liveTail = text.slice(stablePrefix.length);
-
-  return (
-    <div className="liveAgentStreamMessage">
-      {stableBlocks.map((block, index) => (
-        <MarkdownMessage key={index} text={block} projectId={projectId} onOpenFileLink={onOpenFileLink} />
-      ))}
-      {liveTail ? <div className="liveAgentStreamTail">{liveTail}</div> : null}
-    </div>
-  );
-});
-
 const userMessageCollapseMaxLines = 12;
 const userMessageCollapseMaxCharacters = 900;
 const userMessagePlainTextThreshold = 4_000;
@@ -5766,7 +5703,7 @@ export function App() {
     stripInterruptArtifacts(entry.text) ? (
     <article className="messageItem kind-agent type-agentMessage live" key={entry.id}>
       <div className="messageMeta">Codex · agentMessage</div>
-      <LiveAgentStreamMessage text={stripInterruptArtifacts(entry.text)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+      <MarkdownMessage text={stripInterruptArtifacts(entry.text)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} renderMath />
     </article>
     ) : null
   ) : (

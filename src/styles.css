@@ -3377,23 +3377,6 @@ body {
   line-height: 1.68;
 }
 
-.liveAgentStreamMessage {
-  min-width: 0;
-}
-
-.liveAgentStreamMessage .messageMarkdown + .messageMarkdown {
-  margin-top: 12px;
-}
-
-.liveAgentStreamTail {
-  min-width: 0;
-  color: #e4e5e1;
-  font-size: 15px;
-  line-height: 1.68;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
-}
-
 .messageMarkdown a {
   color: #6bb7ef;
 }
