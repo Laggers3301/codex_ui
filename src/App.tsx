@@ -292,7 +292,7 @@ const quotaAutoRefreshMs = 180_000;
 const sentPromptBottomHoldMs = 5_000;
 // A leading slash is common in filesystem paths. Only reserve the commands
 // that this UI actually implements; everything else must reach Codex verbatim.
-const localSlashCommands = new Set(["help", "?", "quota", "usage", "skills", "skill", "new", "send", "stop", "interrupt", "compact", "rename", "shell", "cmd"]);
+const localSlashCommands = new Set(["help", "?", "quota", "usage", "skills", "skill", "new", "send", "stop", "interrupt", "goal-stop", "goalstop", "compact", "rename", "shell", "cmd"]);
 
 function safeText(value: unknown): string {
   if (typeof value === "string") {
@@ -868,10 +868,10 @@ const fallbackModelProfiles: ModelProfile[] = [
   { id: "gpt-5.4-mini:high", label: "GPT-5.4-Mini high", model: "gpt-5.4-mini", effort: "high" },
   { id: "gpt-5.4-mini:medium", label: "GPT-5.4-Mini medium", model: "gpt-5.4-mini", effort: "medium" },
   { id: "gpt-5.4-mini:low", label: "GPT-5.4-Mini low", model: "gpt-5.4-mini", effort: "low" },
-  { id: "gpt-5.3-codex-spark:xhigh", label: "GPT-5.3-Codex-Spark xhigh", model: "gpt-5.3-codex-spark", effort: "xhigh" },
-  { id: "gpt-5.3-codex-spark:high", label: "GPT-5.3-Codex-Spark high", model: "gpt-5.3-codex-spark", effort: "high" },
-  { id: "gpt-5.3-codex-spark:medium", label: "GPT-5.3-Codex-Spark medium", model: "gpt-5.3-codex-spark", effort: "medium" },
-  { id: "gpt-5.3-codex-spark:low", label: "GPT-5.3-Codex-Spark low", model: "gpt-5.3-codex-spark", effort: "low" }
+  { id: "gpt-5.3-codex-spark:xhigh", label: "Spark xhigh", model: "gpt-5.3-codex-spark", effort: "xhigh" },
+  { id: "gpt-5.3-codex-spark:high", label: "Spark high", model: "gpt-5.3-codex-spark", effort: "high" },
+  { id: "gpt-5.3-codex-spark:medium", label: "Spark medium", model: "gpt-5.3-codex-spark", effort: "medium" },
+  { id: "gpt-5.3-codex-spark:low", label: "Spark low", model: "gpt-5.3-codex-spark", effort: "low" }
 ];
 
 const defaultModelProfileId = "gpt-5.5:xhigh";
@@ -978,7 +978,15 @@ function fileTargetFromHref(href?: string): string | null {
     if (typeof window === "undefined") {
       return null;
     }
-    const parsed = new URL(href, window.location.href);
+    let parsed: URL;
+    try {
+      parsed = new URL(href, window.location.href);
+    } catch {
+      // Terminal output and JSON can leave quotes/braces attached to a URL.
+      // Markdown may turn that fragment into a malformed link; one bad link
+      // must never be allowed to crash the whole conversation renderer.
+      return null;
+    }
     if (parsed.origin !== window.location.origin || parsed.pathname.startsWith("/api/")) {
       return null;
     }
@@ -1305,11 +1313,90 @@ const MarkdownMessage = memo(function MarkdownMessage({
   );
 });
 
+function stableStreamingMarkdownPrefix(text: string): string {
+  const reserveLength = 360;
+  const targetEnd = text.length - reserveLength;
+  if (targetEnd <= 0) {
+    return "";
+  }
+  const paragraphEnd = text.lastIndexOf("\n\n", targetEnd);
+  if (paragraphEnd >= 0) {
+    return text.slice(0, paragraphEnd + 2);
+  }
+  const lineEnd = text.lastIndexOf("\n", targetEnd);
+  return lineEnd >= 0 ? text.slice(0, lineEnd + 1) : "";
+}
+
+const LiveAgentStreamMessage = memo(function LiveAgentStreamMessage({
+  text,
+  projectId,
+  onOpenFileLink
+}: {
+  text: string;
+  projectId?: string;
+  onOpenFileLink?: (target: string) => void;
+}) {
+  const latestTextRef = useRef(text);
+  const commitTimerRef = useRef<number | null>(null);
+  const [committedPrefix, setCommittedPrefix] = useState("");
+
+  latestTextRef.current = text;
+
+  useEffect(() => {
+    if (commitTimerRef.current !== null) {
+      return;
+    }
+    commitTimerRef.current = window.setTimeout(() => {
+      commitTimerRef.current = null;
+      const nextPrefix = stableStreamingMarkdownPrefix(latestTextRef.current);
+      setCommittedPrefix((current) => current === nextPrefix ? current : nextPrefix);
+    }, 180);
+  }, [text]);
+
+  useEffect(() => () => {
+    if (commitTimerRef.current !== null) {
+      window.clearTimeout(commitTimerRef.current);
+    }
+  }, []);
+
+  const stablePrefix = text.startsWith(committedPrefix) ? committedPrefix : "";
+  const stableBlocks = useMemo(
+    () => stablePrefix.split(/\n{2,}/).filter((block) => block.trim()),
+    [stablePrefix]
+  );
+  const liveTail = text.slice(stablePrefix.length);
+
+  return (
+    <div className="liveAgentStreamMessage">
+      {stableBlocks.map((block, index) => (
+        <MarkdownMessage key={index} text={block} projectId={projectId} onOpenFileLink={onOpenFileLink} />
+      ))}
+      {liveTail ? <div className="liveAgentStreamTail">{liveTail}</div> : null}
+    </div>
+  );
+});
+
 const userMessageCollapseMaxLines = 12;
 const userMessageCollapseMaxCharacters = 900;
+const userMessagePlainTextThreshold = 4_000;
+const userMessageLongLineThreshold = 800;
+const userMessageCollapsedPreviewCharacters = 6_000;
 
 function isLongUserMessage(text: string): boolean {
   return text.length > userMessageCollapseMaxCharacters || text.split(/\r?\n/).length > userMessageCollapseMaxLines;
+}
+
+function shouldRenderUserMessageAsPlainText(text: string): boolean {
+  return text.length > userMessagePlainTextThreshold || text.split(/\r?\n/).some((line) => line.length > userMessageLongLineThreshold);
+}
+
+function collapsedUserMessagePreview(text: string): string {
+  if (text.length <= userMessageCollapsedPreviewCharacters) {
+    return text;
+  }
+  const headLength = Math.floor(userMessageCollapsedPreviewCharacters * 0.72);
+  const tailLength = userMessageCollapsedPreviewCharacters - headLength;
+  return `${text.slice(0, headLength)}\n\n… 已折叠 ${text.length - userMessageCollapsedPreviewCharacters} 个字符，点击“展开更多”查看完整内容 …\n\n${text.slice(-tailLength)}`;
 }
 
 function visibleUserHistoryText(text: string): string {
@@ -1346,6 +1433,8 @@ const CollapsibleUserMessage = memo(function CollapsibleUserMessage({
 }) {
   const collapsible = isLongUserMessage(text);
   const [expanded, setExpanded] = useState(false);
+  const plainText = shouldRenderUserMessageAsPlainText(text);
+  const visibleText = collapsible && !expanded ? collapsedUserMessagePreview(text) : text;
 
   useEffect(() => {
     setExpanded(false);
@@ -1354,7 +1443,11 @@ const CollapsibleUserMessage = memo(function CollapsibleUserMessage({
   return (
     <>
       <div className={`userMessageContent ${collapsible && !expanded ? "collapsed" : ""}`}>
-        <MarkdownMessage text={text} projectId={projectId} onOpenFileLink={onOpenFileLink} suppressImageGrid />
+        {plainText ? (
+          <pre className="userMessagePreformatted">{visibleText}</pre>
+        ) : (
+          <MarkdownMessage text={visibleText} projectId={projectId} onOpenFileLink={onOpenFileLink} suppressImageGrid />
+        )}
       </div>
       {collapsible ? (
         <button
@@ -1497,7 +1590,8 @@ function imagePreviewsFromItem(item: ThreadItem, projectId?: string): MessageIma
   collectImagePreviewsFromValue(item, projectId, previews, seen);
   const uploadPathPattern = /(\/tmp\/codex_remote_uploads\/[^\s)\]]+\.(?:png|jpe?g|gif|webp|bmp))/gi;
   for (const match of itemText(item).matchAll(uploadPathPattern)) {
-    addImagePreview(previews, seen, match[1], projectId, "图片");
+    const uploadPath = match[0];
+    addImagePreview(previews, seen, uploadPath, projectId, "图片");
   }
   return previews;
 }
@@ -1738,11 +1832,80 @@ function percentText(value: number | null | undefined): string {
   return Number.isInteger(value) ? `${value}` : `${value.toFixed(1)}`;
 }
 
+function rateWindowLabel(window: CodexRateLimitWindow): string {
+  const minutes = window.windowDurationMins;
+  if (!minutes) {
+    return "窗口";
+  }
+  if (minutes % (24 * 60) === 0) {
+    return `${minutes / (24 * 60)}天`;
+  }
+  if (minutes % 60 === 0) {
+    return `${minutes / 60}小时`;
+  }
+  return `${minutes}分钟`;
+}
+
+function rateWindowSafePercentAtTonight(window: CodexRateLimitWindow | null | undefined): number | null {
+  if (!window) {
+    return null;
+  }
+  const durationMins = window.windowDurationMins;
+  const resetsAt = window.resetsAt;
+  if (durationMins === null || !resetsAt || durationMins <= 0) {
+    return null;
+  }
+  const durationMs = durationMins * 60 * 1000;
+  const windowEndMs = resetsAt * 1000;
+  const windowStartMs = windowEndMs - durationMs;
+  if (!Number.isFinite(windowEndMs) || !Number.isFinite(windowStartMs) || windowStartMs >= windowEndMs) {
+    return null;
+  }
+  const todayEnd = new Date();
+  todayEnd.setHours(24, 0, 0, 0);
+  const cutoffMs = todayEnd.getTime();
+  if (cutoffMs <= windowStartMs) {
+    return 0;
+  }
+  const elapsedPercent = ((cutoffMs - windowStartMs) / durationMs) * 100;
+  const safeRemainingPercent = 100 - elapsedPercent;
+  return Math.max(0, Math.min(100, Number(safeRemainingPercent.toFixed(1))));
+}
+
+function formatTodayCutoffLabel(): string {
+  const now = new Date();
+  return `${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()} 24:00:00`;
+}
+
+function rateWindowDailyLimitLabel(window: CodexRateLimitWindow | null | undefined): string {
+  const percent = rateWindowSafePercentAtTonight(window);
+  if (percent === null) {
+    return "-";
+  }
+  return `${percentText(percent)}%（截止 ${formatTodayCutoffLabel()}）`;
+}
+
+function weeklyRateWindow(
+  primary: CodexRateLimitWindow | null | undefined,
+  secondary: CodexRateLimitWindow | null | undefined
+): CodexRateLimitWindow | null {
+  const windows = [primary, secondary].filter((window): window is CodexRateLimitWindow => Boolean(window));
+  return windows.sort((left, right) => (right.windowDurationMins ?? 0) - (left.windowDurationMins ?? 0))[0] ?? null;
+}
+
+function cleanLimitName(raw: string | null | undefined): string {
+  const next = (raw ?? "")
+    .replace(/gpt-5\.3-codex(?:-spark)?/gi, "Spark")
+    .replace(/\s+/g, " ")
+    .trim();
+  return next || "模型额度";
+}
+
 function rateWindowText(window: CodexRateLimitWindow | null | undefined): string {
   if (!window) {
     return "-";
   }
-  const windowLabel = window.windowDurationMins ? `${Math.round(window.windowDurationMins / 60)}h` : "window";
+  const windowLabel = rateWindowLabel(window);
   const remaining = remainingQuotaPercent(window.usedPercent);
   const used = window.usedPercent ?? null;
   return `剩余 ${percentText(remaining)}% / ${windowLabel}，已用 ${percentText(used)}%，重置 ${formatResetTime(window.resetsAt)}`;
@@ -1752,7 +1915,9 @@ function rateLimitSnapshotText(snapshot: CodexRateLimitSnapshot | null | undefin
   if (!snapshot) {
     return "-";
   }
-  const parts = snapshot.primary ? [rateWindowText(snapshot.primary)] : [];
+  const parts = [snapshot.primary, snapshot.secondary]
+    .filter((window): window is CodexRateLimitWindow => Boolean(window))
+    .map(rateWindowText);
   const individual = snapshot.individualLimit;
   if (individual?.resetsAt && individual.resetsAt !== snapshot.primary?.resetsAt) {
     const remaining = individual.remainingPercent === null ? "" : `剩余 ${percentText(individual.remainingPercent)}%`;
@@ -1784,7 +1949,15 @@ function quotaMarkdown(quota: CodexQuota): string {
   if (otherLimits.length) {
     lines.push("", "**其它模型额度**");
     for (const [key, value] of otherLimits) {
-      lines.push(`- ${value.limitName ?? key}：${rateWindowText(value.primary)}`);
+      const name = cleanLimitName(value.limitName ?? key);
+      const windows = [value.primary, value.secondary].filter((window): window is CodexRateLimitWindow => Boolean(window));
+      if (windows.length) {
+        for (const window of windows) {
+          lines.push(`- ${name} ${rateWindowLabel(window)}：${rateWindowText(window)}`);
+        }
+      } else {
+        lines.push(`- ${name}：${rateLimitSnapshotText(value)}`);
+      }
     }
   }
   if (quota.errors.length) {
@@ -1796,7 +1969,20 @@ function quotaMarkdown(quota: CodexQuota): string {
 function QuotaPopover({ quota, loading }: { quota: CodexQuota | null; loading: boolean }) {
   const primary = quota?.rateLimits?.primary ?? null;
   const secondary = quota?.rateLimits?.secondary ?? null;
+  const weekly = weeklyRateWindow(primary, secondary);
   const otherLimits = Object.entries(quota?.rateLimitsByLimitId ?? {}).filter(([key]) => key !== "codex");
+  const otherLimitRows = otherLimits.flatMap(([key, limit]) => {
+    const name = cleanLimitName(limit.limitName ?? key);
+    const windows = ([
+      ["primary", limit.primary],
+      ["secondary", limit.secondary]
+    ] as const).flatMap(([kind, window]) => window ? [{
+      key: `${key}:${kind}`,
+      label: `${name} ${rateWindowLabel(window)}`,
+      text: rateWindowText(window)
+    }] : []);
+    return windows.length ? windows : [{ key, label: name, text: rateLimitSnapshotText(limit) }];
+  });
   return (
     <section className="quotaPopover" role="status" aria-label="Codex 额度详情">
       <header><strong>Codex 额度</strong><span>{loading ? "更新中" : quota?.account?.planType ?? quota?.rateLimits?.planType ?? ""}</span></header>
@@ -1804,10 +1990,11 @@ function QuotaPopover({ quota, loading }: { quota: CodexQuota | null; loading: b
         <div className="quotaPopoverRows">
           <div><span>主额度</span><strong>{rateWindowText(primary)}</strong></div>
           <div><span>次额度</span><strong>{rateWindowText(secondary)}</strong></div>
-          {otherLimits.map(([key, limit]) => (
-            <div key={key}><span>{limit.limitName ?? key}</span><strong>{rateLimitSnapshotText(limit)}</strong></div>
+          <div><span>每日建议额度上限</span><strong>{rateWindowDailyLimitLabel(weekly)}</strong></div>
+          {otherLimitRows.map((row) => (
+            <div key={row.key}><span>{row.label}</span><strong>{row.text}</strong></div>
           ))}
-          <div><span>累计 Token</span><strong>{formatNumber(quota.usage?.summary?.lifetimeTokens)}</strong></div>
+          <div><span>总token</span><strong>{formatNumber(quota.usage?.summary?.lifetimeTokens)}</strong></div>
           <div><span>重置额度</span><strong>{formatNumber(quota.resetCredits?.availableCount)}</strong></div>
         </div>
       ) : <p>{loading ? "正在读取额度…" : "暂未读取到额度"}</p>}
@@ -1963,7 +2150,8 @@ function commandHelpMarkdown(): string {
     "- `/quota` 或 `/usage`：查看 Codex 额度/用量",
     "- `/skills`：打开中文技能选择器",
     "- `/skill 名称`：显式选择一个技能，发送时使用 `$技能名` 调用",
-    "- `/stop`：终止当前会话正在生成的这一轮（保留历史记录）",
+    "- `/stop`：终止当前轮次；存在 active Goal 时同时暂停 Goal，防止自动续跑",
+    "- `/goal-stop`：彻底结束并清除当前会话的 Goal",
     "- `/compact`：压缩当前会话上下文",
     "- `/rename 新名称`：重命名当前会话",
     "- `/shell 命令`：把 shell 命令作为 Codex thread 命令执行（需要当前会话）",
@@ -4668,6 +4856,23 @@ export function App() {
       setPrompt("");
       return true;
     }
+    if (command === "goal-stop" || command === "goalstop") {
+      if (!selectedThread?.id) {
+        addLocalMessage("/goal-stop 需要先打开一个已有会话。");
+        setPrompt("");
+        return true;
+      }
+      const requestId = `goal-clear-${requestToken()}`;
+      codexSocket.send({
+        type: "goal.clear",
+        requestId,
+        userId: selectedUserId,
+        threadId: selectedThread.id
+      });
+      addLocalMessage("已请求彻底结束当前 Goal；现有轮次会停止，之后不会再自动续跑。", "Codex Web · Goal");
+      setPrompt("");
+      return true;
+    }
     if (command === "compact") {
       if (!selectedProject || !selectedThread?.id) {
         addLocalMessage("/compact 需要先打开一个当前用户自己的会话。");
@@ -4758,7 +4963,17 @@ export function App() {
       sentPromptText,
       visibleText
     });
-    const payload = selectedThread
+    const payload = selectedThread && selectedActiveTurnId
+      ? {
+          type: "turn.steer",
+          requestId,
+          userId: selectedUserId,
+          projectId: selectedProject.id,
+          threadId: selectedThread.id,
+          expectedTurnId: selectedActiveTurnId,
+          prompt: sentPromptText
+        }
+      : selectedThread
       ? {
           type: "turn.start",
           requestId,
@@ -5053,17 +5268,22 @@ export function App() {
       return;
     }
     const activeFromSnapshot = activeTurnsFromSnapshot(snapshot);
+    const activeTurnFromSnapshot = activeFromSnapshot[thread.id];
     const now = Date.now();
     const lastRecovery = threadLiveRecoveryAtRef.current[thread.id] ?? 0;
-    if (now - lastRecovery < 2_000) {
+    if (now - lastRecovery < 10_000) {
       return;
     }
-    const isRunning = Boolean(activeFromSnapshot[thread.id]);
+    const isRunning = Boolean(activeTurnFromSnapshot);
     const hasPendingForThread = pendingUserMessagesRef.current.some((entry) => (
       entry.threadId === thread.id && entry.keepAtBottomUntil > now
     ));
     const isPending = hasPendingForThread || thread.status === "starting" || isRunning;
     if (!isRunning && !isPending) {
+      return;
+    }
+    const localActiveTurn = activeTurnsByThread[thread.id];
+    if (isRunning && localActiveTurn === activeTurnFromSnapshot && !isPending) {
       return;
     }
     const projectId = threadProjectIdsRef.current.get(thread.id) ?? selectedProjectIdRef.current;
@@ -5332,16 +5552,19 @@ export function App() {
         appendLocalMessage(commandData.processId, `${output}${output.endsWith("\n") || !output ? "" : "\n"}[exit ${commandData.result.exitCode ?? "?"}]\n`, "Codex Web · command", "tool");
       }
       const shouldRefreshPromptThread = isPromptRequest && !isStalePromptAck;
-      const refreshViewToken = requestViewToken ?? threadViewTokenRef.current;
       if (shouldRefreshPromptThread && promptThreadId) {
         const refreshProjectId = requestContext?.projectId ?? selectedProjectIdRef.current;
-        window.setTimeout(() => void openThread(promptThreadId, refreshProjectId, refreshViewToken), 900);
-        window.setTimeout(() => void openThread(promptThreadId, refreshProjectId, refreshViewToken), 2_500);
+        // `ack` now updates selectedThread and thread index directly in-memory.
+        // Only a lightweight thread list refresh is needed here; avoid forcing
+        // repeated full history reads that can block streaming.
+        window.setTimeout(() => void refreshThreads(refreshProjectId), 750);
       }
       if (message.requestId) {
         promptRequestContextsRef.current.delete(message.requestId);
       }
-      window.setTimeout(() => void refreshThreads(selectedProjectIdRef.current), 750);
+      if (!shouldRefreshPromptThread) {
+        window.setTimeout(() => void refreshThreads(selectedProjectIdRef.current), 750);
+      }
       return;
     }
 
@@ -5543,7 +5766,7 @@ export function App() {
     stripInterruptArtifacts(entry.text) ? (
     <article className="messageItem kind-agent type-agentMessage live" key={entry.id}>
       <div className="messageMeta">Codex · agentMessage</div>
-      <MarkdownMessage text={stripInterruptArtifacts(entry.text)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} renderMath />
+      <LiveAgentStreamMessage text={stripInterruptArtifacts(entry.text)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
     </article>
     ) : null
   ) : (
@@ -5867,7 +6090,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     const snapshotTurnId = activeTurnsByThread[thread.id];
     if (snapshotTurnId) {
       const snapshotTurn = thread.turns.find((turn) => turn.id === snapshotTurnId);
-      if (snapshotTurn && isInterruptableTurnRunning(snapshotTurnId, snapshotTurn)) {
+      if ((!snapshotTurn && !interruptRequestedTurnIdsRef.current.has(snapshotTurnId) && !interruptingTurns[snapshotTurnId])
+        || (snapshotTurn && isInterruptableTurnRunning(snapshotTurnId, snapshotTurn))) {
         return snapshotTurnId;
       }
     }
@@ -5884,6 +6108,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
   const currentPendingTurnStart = visiblePendingUserMessages[visiblePendingUserMessages.length - 1] ?? null;
   const selectedActiveTurnId = getRunningTurnIdForThread(selectedThread);
   const composerIsStopMode = Boolean(selectedActiveTurnId || currentPendingTurnStart);
+  const composerHasDraft = Boolean(prompt.trim() || uploadedFiles.length);
+  const composerCanSteer = Boolean(selectedActiveTurnId && composerHasDraft);
+  const composerShowsStop = composerIsStopMode && !composerCanSteer;
   const composerStopBusy = selectedActiveTurnId
     ? Boolean(interruptingTurns[selectedActiveTurnId])
     : Boolean(currentPendingTurnStart && queuedInterruptPrompts[currentPendingTurnStart.requestId]);
@@ -5983,7 +6210,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         event.ctrlKey ||
         event.metaKey ||
         globalEnterSendBlocked ||
-        composerIsStopMode ||
+        (composerIsStopMode && !selectedActiveTurnId) ||
         uploadingFiles ||
         !selectedProject ||
         (!prompt.trim() && !uploadedFiles.length) ||
@@ -5997,7 +6224,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
     window.addEventListener("keydown", handleGlobalEnter);
     return () => window.removeEventListener("keydown", handleGlobalEnter);
-  }, [composerIsStopMode, globalEnterSendBlocked, prompt, selectedProject, sendPrompt, uploadedFiles.length, uploadingFiles]);
+  }, [composerIsStopMode, globalEnterSendBlocked, prompt, selectedActiveTurnId, selectedProject, sendPrompt, uploadedFiles.length, uploadingFiles]);
 
   useEffect(() => {
     const handleGlobalEscape = (event: KeyboardEvent) => {
@@ -7230,6 +7457,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 })}
                 {conversationLocalMessageLayout.beforePending.map(renderLocalMessage)}
                 {timelinePendingUserMessages.map(renderPendingUserMessage)}
+                {!selectedActiveTurnId && currentPendingTurnStart ? <div className="v2ThinkingLine v2PendingThinkingLine">正在思考</div> : null}
                 {!selectedThread ? unmatchedLiveTimeline.map(renderLiveTimelineEntry) : null}
                 {conversationLocalMessageLayout.tail.map(renderLocalMessage)}
                 {heldPendingUserMessages.map((entry) => renderPendingUserMessage(entry))}
@@ -7475,19 +7703,19 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 />
               </div>
               <button
-                className={`iconButton sendButton ${composerIsStopMode ? "stopMode" : "primary"}`}
+                className={`iconButton sendButton ${composerShowsStop ? "stopMode" : "primary"}`}
                 type="button"
                 onClick={() => {
-                  if (requestInterruptSelectedConversation()) {
+                  if (composerShowsStop && requestInterruptSelectedConversation()) {
                     return;
                   }
                   void sendPrompt();
                 }}
-                disabled={composerIsStopMode ? composerStopBusy : uploadingFiles || !selectedProject || (!prompt.trim() && !uploadedFiles.length)}
-                aria-label={composerIsStopMode ? "终止当前对话" : "发送"}
-                title={composerIsStopMode ? (composerStopBusy ? "正在终止当前对话" : "终止当前对话（Esc）") : "发送"}
+                disabled={composerShowsStop ? composerStopBusy : uploadingFiles || !selectedProject || !composerHasDraft}
+                aria-label={composerShowsStop ? "终止当前对话" : (composerCanSteer ? "追加到当前回答" : "发送")}
+                title={composerShowsStop ? (composerStopBusy ? "正在终止当前对话" : "终止当前对话（Esc）") : (composerCanSteer ? "在当前回答中追加消息" : "发送")}
               >
-                {composerIsStopMode ? <Square size={16} fill="currentColor" /> : <Send size={18} />}
+                {composerShowsStop ? <Square size={16} fill="currentColor" /> : <Send size={18} />}
               </button>
             </div>
           </section>
