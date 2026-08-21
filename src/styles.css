@@ -7902,10 +7902,125 @@ textarea:focus {
 
 /* The restore control must not remain inside the zero-width sidebar grid. */
 @media (min-width: 721px) {
+  :root {
+    /* 29px toggle + 26px avatar fit comfortably in a 56px action rail. */
+    --v2-collapsed-sidebar-width: 56px;
+  }
+
+  /* Keep the header and workspace aligned with the draggable sidebar width. */
+  .topbar {
+    padding-left: calc(var(--v2-sidebar-width, 280px) + 16px);
+    transition: padding-left 160ms ease;
+  }
+
+  .errorBanner {
+    margin-left: calc(var(--v2-sidebar-width, 280px) + 12px);
+    transition: margin-left 160ms ease;
+  }
+
+  .threadList .listHeader .panelCollapseButton {
+    display: none !important;
+  }
+
+  body:has(.threadList.collapsed) .topbar {
+    padding-left: calc(var(--v2-collapsed-sidebar-width) + 16px);
+  }
+
+  body:has(.threadList.collapsed) .errorBanner {
+    margin-left: calc(var(--v2-collapsed-sidebar-width) + 12px);
+  }
+
+  /* A collapsed sidebar remains a compact, fully interactive action rail. */
+  body:has(.threadList.collapsed) .v2ProjectDock,
+  body:has(.threadList.collapsed) .v2AccountDock {
+    display: block !important;
+    width: var(--v2-collapsed-sidebar-width) !important;
+  }
+
+  body:has(.threadList.collapsed) .v2ProjectDock {
+    height: 140px !important;
+    padding: 13px 8px 0 !important;
+  }
+
+  body:has(.threadList.collapsed) .v2BrandRow {
+    display: flex;
+    justify-content: center;
+    min-height: 30px;
+  }
+
+  body:has(.threadList.collapsed) .v2BrandRow > strong,
+  body:has(.threadList.collapsed) .v2BuildBadge,
+  body:has(.threadList.collapsed) .v2PrimaryNav button > strong,
+  body:has(.threadList.collapsed) .v2AccountTrigger strong {
+    display: none !important;
+  }
+
+  body:has(.threadList.collapsed) .v2PrimaryNav {
+    margin-top: 6px;
+  }
+
+  body:has(.threadList.collapsed) .v2PrimaryNav button {
+    grid-template-columns: 1fr;
+    justify-items: center;
+    min-height: 30px;
+    padding: 3px 8px;
+  }
+
+  body:has(.threadList.collapsed) .v2PrimaryNav button > span {
+    place-self: center;
+  }
+
+  body:has(.threadList.collapsed) .v2AccountDock {
+    padding: 8px 10px;
+  }
+
+  body:has(.threadList.collapsed) .v2AccountTrigger {
+    justify-content: center;
+    padding: 0;
+  }
+
+  /* Keep the list mounted in the centre rail so it continues rendering, while
+     hiding only its content for a visually continuous collapsed sidebar. */
+  body:has(.threadList.collapsed) .workspace > .threadList {
+    display: flex !important;
+    grid-column: 1;
+    grid-row: 1;
+    padding: 0 !important;
+  }
+
+  body:has(.threadList.collapsed) .workspace > .threadList > * {
+    visibility: hidden;
+    pointer-events: none;
+  }
+
+  body:has(.threadList.collapsed) .workspace > .conversation {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  /* The sidebar toggle replaces the old top search control; search now lives
+     in the thread-list header, where the old collapse control was. */
+  .v2SidebarToggle {
+    display: grid;
+    width: 29px;
+    height: 29px;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: #aeb1ab;
+    font-size: 22px;
+    line-height: 1;
+  }
+
+  .v2SidebarToggle:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: #f1f2ee;
+  }
+
   .threadListRestoreButton {
     position: fixed !important;
-    top: 13px !important;
-    left: 13px !important;
     z-index: 500 !important;
     display: inline-grid !important;
     width: 34px;
@@ -7923,5 +8038,10 @@ textarea:focus {
   .threadListRestoreButton:hover {
     background: #393b38 !important;
     color: #fff;
+  }
+
+  /* The fixed V2 toggle is the sole restore control on desktop. */
+  .threadListRestoreButton {
+    display: none !important;
   }
 }

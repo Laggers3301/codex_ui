@@ -6801,11 +6801,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </div>
         ) : null}
 
-        <div className="workspace" style={{ gridTemplateColumns: threadListCollapsed ? "0px 0px minmax(0, 1fr)" : `${threadListWidth}px 8px minmax(0, 1fr)` }}>
+        <div className="workspace" style={{ gridTemplateColumns: threadListCollapsed ? "56px 0px minmax(0, 1fr)" : `${threadListWidth}px 8px minmax(0, 1fr)` }}>
           <nav className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
             <div className="listHeader">
               <span>项目</span>
               <span className="listHeaderActions">
+                <button className="iconButton v2SidebarSearchButton" type="button" onClick={() => setGlobalSearchOpen(true)} title="搜索会话和消息" aria-label="搜索会话和消息">
+                  <Search size={15} />
+                </button>
                 <button className="iconButton" type="button" onClick={() => void refreshThreads(selectedProjectIdRef.current, threadSearch)} title="Refresh threads">
                   <RefreshCcw size={15} />
                 </button>
