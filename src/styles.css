@@ -7944,8 +7944,11 @@ textarea:focus {
 
   body:has(.threadList.collapsed) .v2BrandRow {
     display: flex;
-    justify-content: center;
-    min-height: 30px;
+    justify-content: flex-start;
+    padding-left: 8px;
+    /* Match the expanded brand row so the three action icons never shift
+       vertically when the rail is toggled. */
+    min-height: 32px;
   }
 
   body:has(.threadList.collapsed) .v2BrandRow > strong,
@@ -7961,22 +7964,23 @@ textarea:focus {
 
   body:has(.threadList.collapsed) .v2PrimaryNav button {
     grid-template-columns: 1fr;
-    justify-items: center;
+    justify-items: start;
     min-height: 30px;
     padding: 3px 8px;
   }
 
   body:has(.threadList.collapsed) .v2PrimaryNav button > span {
-    place-self: center;
+    place-self: center start;
   }
 
   body:has(.threadList.collapsed) .v2AccountDock {
-    padding: 8px 10px;
+    /* Keep the avatar on the exact expanded-state baseline. */
+    padding: 7px 8px;
   }
 
   body:has(.threadList.collapsed) .v2AccountTrigger {
-    justify-content: center;
-    padding: 0;
+    justify-content: flex-start;
+    padding: 0 8px;
   }
 
   /* Keep the list mounted in the centre rail so it continues rendering, while
