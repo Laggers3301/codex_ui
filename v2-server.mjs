@@ -95,7 +95,7 @@ const server = http.createServer(async (request, response) => {
     const extension = path.extname(filePath).toLowerCase();
     response.writeHead(200, {
       "Content-Type": mime.get(extension) ?? "application/octet-stream",
-      "Cache-Control": extension === ".html" ? "no-cache" : "public, max-age=31536000, immutable"
+      "Cache-Control": extension === ".html" ? "no-store" : "public, max-age=31536000, immutable"
     });
     response.end(body);
     return;

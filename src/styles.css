@@ -19,6 +19,40 @@
   --ink: #101214;
 }
 
+/* Stable turn virtualization keeps history prepends anchored without remounting the conversation. */
+.virtualConversationSizer {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}
+
+.virtualConversationRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  contain: layout style;
+}
+
+.virtualConversationFlow,
+.virtualConversationFlowRow {
+  width: 100%;
+  min-width: 0;
+}
+
+.virtualConversationFlowRow {
+  contain: layout style;
+}
+
+.conversationTurnRow,
+.conversationLiveTail {
+  display: flow-root;
+  width: 100%;
+  min-width: 0;
+}
+
 * {
   box-sizing: border-box;
 }

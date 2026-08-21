@@ -86,6 +86,7 @@ import type {
   Turn,
   UserProfile
 } from "./types";
+import { VirtualConversation, type VirtualConversationHandle } from "./VirtualConversation";
 
 interface LocalMessage {
   id: string;
@@ -806,6 +807,24 @@ function dedupeThreadListById(threads: ThreadSummary[]): ThreadSummary[] {
 
 function mergeThreadHistoryPages(older: ThreadSummary, newer: ThreadSummary): ThreadSummary {
   const mergedTurns = new Map<string, Turn>();
+  const contentKeys = ["text", "content", "command", "input", "output", "aggregatedOutput", "summary", "changes"] as const;
+  const mergeThreadItem = (existing: ThreadItem, incoming: ThreadItem): ThreadItem => {
+    const merged = { ...existing, ...incoming } as ThreadItem;
+    for (const key of contentKeys) {
+      const previousValue = existing[key as keyof ThreadItem];
+      const incomingValue = incoming[key as keyof ThreadItem];
+      const previousHasContent = Array.isArray(previousValue)
+        ? previousValue.length > 0
+        : Boolean(safeText(previousValue).trim());
+      const incomingHasContent = Array.isArray(incomingValue)
+        ? incomingValue.length > 0
+        : Boolean(safeText(incomingValue).trim());
+      if (previousHasContent && !incomingHasContent) {
+        (merged as Record<string, unknown>)[key] = previousValue;
+      }
+    }
+    return merged;
+  };
   const appendTurns = (turns: Turn[]) => {
     for (const turn of turns ?? []) {
       const existing = mergedTurns.get(turn.id);
@@ -813,16 +832,19 @@ function mergeThreadHistoryPages(older: ThreadSummary, newer: ThreadSummary): Th
         mergedTurns.set(turn.id, { ...turn, items: [...(turn.items ?? [])] });
         continue;
       }
-      const known = new Set((existing.items ?? []).map(threadItemKey));
-      const added = (turn.items ?? []).filter((item, index) => {
-        const key = threadItemKey(item, index);
-        if (known.has(key)) {
-          return false;
+      const mergedItems = [...(existing.items ?? [])];
+      const known = new Map(mergedItems.map((item, index) => [threadItemKey(item, index), index]));
+      for (const [itemIndex, item] of (turn.items ?? []).entries()) {
+        const key = threadItemKey(item, itemIndex);
+        const existingIndex = known.get(key);
+        if (existingIndex !== undefined) {
+          mergedItems[existingIndex] = mergeThreadItem(mergedItems[existingIndex], item);
+          continue;
         }
-        known.add(key);
-        return true;
-      });
-      mergedTurns.set(turn.id, { ...existing, ...turn, items: [...(existing.items ?? []), ...added] });
+        known.set(key, mergedItems.length);
+        mergedItems.push(item);
+      }
+      mergedTurns.set(turn.id, { ...existing, ...turn, items: mergedItems });
     }
   };
 
@@ -2357,17 +2379,17 @@ function beginVerticalResize(
 export function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
+  const conversationVirtualRef = useRef<VirtualConversationHandle | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  const scrollRepaintFrameRef = useRef<number | null>(null);
   const promptNavigationFrameRef = useRef<number | null>(null);
   const threadCopyNoticeTimerRef = useRef<number | null>(null);
   const promptMessageElementsRef = useRef(new Map<string, HTMLElement>());
   const messageElementsRef = useRef(new Map<string, HTMLElement>());
-  const historyPrependAnchorRef = useRef<{ scrollTop: number; scrollHeight: number } | null>(null);
   const threadViewCacheRef = useRef(new Map<string, { thread: ThreadSummary; history: ThreadHistoryPage | null }>());
   const threadHistoryRef = useRef<ThreadHistoryPage | null>(null);
   const autoFollowMessagesRef = useRef(true);
   const manualMessageScrollLockRef = useRef(false);
+  const lastMessageScrollTopRef = useRef(0);
   const threadViewTokenRef = useRef(0);
   const initializedProjectIdRef = useRef("");
   const threadPageCacheRef = useRef(new Map<string, { thread: ThreadSummary; history: ThreadHistoryPage; cachedAt: number }>());
@@ -2762,21 +2784,18 @@ export function App() {
     if (element.scrollLeft !== 0) {
       element.scrollLeft = 0;
     }
-    // Safari/WebKit can occasionally leave a composited scroll layer blank while
-    // the user scrolls upward through large text/image cards. Toggle a harmless
-    // data attribute in the next frame to force the scroll layer to repaint
-    // without changing React state or the user-visible scroll position.
-    if (scrollRepaintFrameRef.current === null) {
-      const repaintTarget = element;
-      scrollRepaintFrameRef.current = window.requestAnimationFrame(() => {
-        scrollRepaintFrameRef.current = null;
-        repaintTarget.toggleAttribute("data-scroll-repaint");
-      });
+    const currentScrollTop = element.scrollTop;
+    const previousScrollTop = lastMessageScrollTopRef.current;
+    const userMovedUp = currentScrollTop + 1 < previousScrollTop;
+    const userMovedDown = currentScrollTop > previousScrollTop + 1;
+    lastMessageScrollTopRef.current = currentScrollTop;
+    if (userMovedUp) {
+      manualMessageScrollLockRef.current = true;
+      autoFollowMessagesRef.current = false;
     }
     const bottomGap = element.scrollHeight - element.scrollTop - element.clientHeight;
     const nearBottom = bottomGap < 96;
-    const atBottom = bottomGap < 2;
-    if (atBottom) {
+    if (bottomGap < 2 && userMovedDown) {
       manualMessageScrollLockRef.current = false;
     }
     const shouldFollow = nearBottom && !manualMessageScrollLockRef.current;
@@ -2786,6 +2805,13 @@ export function App() {
   }
 
   function scrollMessagesToBottom(behavior: ScrollBehavior = "smooth") {
+    manualMessageScrollLockRef.current = false;
+    autoFollowMessagesRef.current = true;
+    setShowScrollToBottom(false);
+    if (conversationVirtualRef.current) {
+      conversationVirtualRef.current.scrollToEnd(behavior === "smooth" ? "smooth" : "auto");
+      return;
+    }
     const element = messagesRef.current;
     if (element) {
       if (element.scrollLeft !== 0) {
@@ -2800,9 +2826,6 @@ export function App() {
     } else {
       messagesEndRef.current?.scrollIntoView({ block: "end", inline: "nearest", behavior });
     }
-    manualMessageScrollLockRef.current = false;
-    autoFollowMessagesRef.current = true;
-    setShowScrollToBottom(false);
     schedulePromptNavigationActiveUpdate();
   }
 
@@ -2975,7 +2998,6 @@ export function App() {
     setThreadHistory(null);
     setLoadingOlderHistory(false);
     setContinuationPrompt(null);
-    historyPrependAnchorRef.current = null;
     setLocalMessages([]);
     setUploadedFiles([]);
     setDraggingUpload(false);
@@ -3027,7 +3049,6 @@ export function App() {
     }
     setLoadingOlderHistory(false);
     setContinuationPrompt(null);
-    historyPrependAnchorRef.current = null;
     clearThreadResult(threadId);
     void openThread(threadId, projectId, viewToken);
   }
@@ -3293,21 +3314,6 @@ export function App() {
     };
   }, [threadContextMenu]);
 
-  useLayoutEffect(() => {
-    const anchor = historyPrependAnchorRef.current;
-    const element = messagesRef.current;
-    if (!anchor || !element) {
-      return;
-    }
-    historyPrependAnchorRef.current = null;
-    element.scrollTop = anchor.scrollTop + (element.scrollHeight - anchor.scrollHeight);
-    if (element.scrollLeft !== 0) {
-      element.scrollLeft = 0;
-    }
-    autoFollowMessagesRef.current = false;
-    setShowScrollToBottom(true);
-  }, [selectedThread?.turns]);
-
   useEffect(() => {
     threadsRef.current = threads;
   }, [threads]);
@@ -3539,7 +3545,6 @@ export function App() {
     setThreadHistory(null);
     setLoadingOlderHistory(false);
     setContinuationPrompt(null);
-    historyPrependAnchorRef.current = null;
     setThreads([]);
     setLiveDeltas({});
     setActiveTurnsByThread({});
@@ -3581,7 +3586,6 @@ export function App() {
     setThreadHistory(null);
     setLoadingOlderHistory(false);
     setContinuationPrompt(null);
-    historyPrependAnchorRef.current = null;
     setPendingUserMessages([]);
     setUploadedFiles([]);
     setDraggingUpload(false);
@@ -4017,9 +4021,6 @@ export function App() {
       }));
       return nextThreadWithStoredModel;
     } catch (caught) {
-      if (options.appendOlder) {
-        historyPrependAnchorRef.current = null;
-      }
       if (viewToken === threadViewTokenRef.current) {
         setError(caught instanceof Error ? caught.message : String(caught));
       }
@@ -4058,10 +4059,9 @@ export function App() {
       return;
     }
 
-    const element = messagesRef.current;
-    if (element) {
-      historyPrependAnchorRef.current = { scrollTop: element.scrollTop, scrollHeight: element.scrollHeight };
-    }
+    manualMessageScrollLockRef.current = true;
+    autoFollowMessagesRef.current = false;
+    conversationVirtualRef.current?.captureHistoryAnchor();
     setLoadingOlderHistory(true);
     setError("");
     try {
@@ -7064,10 +7064,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   ) : null}
                 </nav>
               ) : null}
-              <div
+              <VirtualConversation
+                ref={conversationVirtualRef}
+                containerRef={messagesRef}
+                threadKey={`${selectedProjectId}:${selectedThread?.id ?? "new"}`}
                 className="messages"
                 id="conversation-messages"
-                ref={messagesRef}
                 onWheelCapture={(event) => {
                   if (event.deltaY < 0 && autoFollowMessagesRef.current) {
                     manualMessageScrollLockRef.current = true;
@@ -7201,7 +7203,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     </section>
                   </div>
                 ), document.body) : null}
-                {(selectedThread?.turns ?? []).flatMap((turn) => {
+                {(selectedThread?.turns ?? []).map((turn) => {
                   const syntheticUserText = turnHasUserItem(turn) ? "" : turnUserText(turn);
                   const syntheticUserItem: ThreadItem | null = syntheticUserText.trim()
                     ? {
@@ -7382,28 +7384,34 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   const runningTurnThinking = selectedActiveTurnId && selectedActiveTurnId === turn.id
                     ? [<div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>]
                     : [];
-                  return [
-                    ...renderedUserItems,
-                    ...(pendingUserMessagesByTurn.get(turn.id) ?? []).map(renderPendingUserMessage),
-                    ...runningTurnThinking,
-                    ...renderedHistoryTurnItems,
-                    ...runningTurnTimelineItems,
-                    ...(conversationLocalMessageLayout.byTurn.get(turn.id) ?? []).map(renderLocalMessage),
-                    ...turnCopyAction,
-                  ];
+                  return (
+                    <section className="conversationTurnRow" data-turn-id={turn.id} key={`turn:${turn.id}`}>
+                      {[
+                        ...renderedUserItems,
+                        ...(pendingUserMessagesByTurn.get(turn.id) ?? []).map(renderPendingUserMessage),
+                        ...runningTurnThinking,
+                        ...renderedHistoryTurnItems,
+                        ...runningTurnTimelineItems,
+                        ...(conversationLocalMessageLayout.byTurn.get(turn.id) ?? []).map(renderLocalMessage),
+                        ...turnCopyAction,
+                      ]}
+                    </section>
+                  );
                 })}
-                {conversationLocalMessageLayout.beforePending.map(renderLocalMessage)}
-                {timelinePendingUserMessages.map(renderPendingUserMessage)}
-                {!selectedActiveTurnId && currentPendingTurnStart ? <div className="v2ThinkingLine v2PendingThinkingLine">正在思考</div> : null}
-                {!selectedThread ? unmatchedLiveTimeline.map(renderLiveTimelineEntry) : null}
-                {conversationLocalMessageLayout.tail.map(renderLocalMessage)}
-                {heldPendingUserMessages.map((entry) => renderPendingUserMessage(entry))}
-                {!selectedThread && liveTimelineEntries.length === 0 && visiblePendingUserMessages.length === 0 && localMessages.length === 0 ? (
-                  <div className="emptyState">Ready for a new Codex turn.</div>
-                ) : null}
-                {globalSearchJumpNotice ? <div className="globalSearchJumpNotice" role="status">{globalSearchJumpNotice}</div> : null}
-                <div ref={messagesEndRef} className="messagesEnd" aria-hidden="true" />
-              </div>
+                <div className="conversationLiveTail" key={`tail:${selectedThread?.id ?? "new"}`}>
+                  {conversationLocalMessageLayout.beforePending.map(renderLocalMessage)}
+                  {timelinePendingUserMessages.map(renderPendingUserMessage)}
+                  {!selectedActiveTurnId && currentPendingTurnStart ? <div className="v2ThinkingLine v2PendingThinkingLine">正在思考</div> : null}
+                  {!selectedThread ? unmatchedLiveTimeline.map(renderLiveTimelineEntry) : null}
+                  {conversationLocalMessageLayout.tail.map(renderLocalMessage)}
+                  {heldPendingUserMessages.map((entry) => renderPendingUserMessage(entry))}
+                  {!selectedThread && liveTimelineEntries.length === 0 && visiblePendingUserMessages.length === 0 && localMessages.length === 0 ? (
+                    <div className="emptyState">Ready for a new Codex turn.</div>
+                  ) : null}
+                  {globalSearchJumpNotice ? <div className="globalSearchJumpNotice" role="status">{globalSearchJumpNotice}</div> : null}
+                  <div ref={messagesEndRef} className="messagesEnd" aria-hidden="true" />
+                </div>
+              </VirtualConversation>
             </div>
             {showScrollToBottom ? (
               <button
