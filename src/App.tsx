@@ -3441,7 +3441,15 @@ export function App() {
       timer = window.setTimeout(async () => {
         timer = null;
         const latestLiveAt = lastLiveEventAtRef.current[threadId] ?? 0;
-        if (socketStatus !== "open" || Date.now() - latestLiveAt >= 8_000) {
+        const silenceMs = Date.now() - latestLiveAt;
+        if (socketStatus === "open" && silenceMs >= 8_000) {
+          try {
+            codexSocket.send({ type: "live.state", requestId: `live-${requestToken()}` });
+          } catch {
+            // The history recovery below remains the fallback.
+          }
+        }
+        if (socketStatus !== "open" || silenceMs >= 8_000) {
           await reconcile();
           lastLiveEventAtRef.current[threadId] = Date.now();
         }
@@ -5235,7 +5243,6 @@ export function App() {
     for (const turn of safeLiveSnapshotItems(snapshot.activeTurns)) {
       if (turn.threadId && turn.turnId) {
         turnThreadIdsRef.current.set(turn.turnId, turn.threadId);
-        markLiveEvent(turn.threadId);
       }
     }
   }
@@ -5259,12 +5266,12 @@ export function App() {
     const hasPendingForThread = pendingUserMessagesRef.current.some((entry) => (
       entry.threadId === thread.id && entry.keepAtBottomUntil > now
     ));
-    const isPending = hasPendingForThread || thread.status === "starting" || isRunning;
+    const isPending = hasPendingForThread || thread.status === "starting";
     if (!isRunning && !isPending) {
       return;
     }
     const localActiveTurn = activeTurnsByThread[thread.id];
-    if (isRunning && localActiveTurn === activeTurnFromSnapshot && !isPending) {
+    if (isRunning && localActiveTurn === activeTurnFromSnapshot) {
       return;
     }
     const projectId = threadProjectIdsRef.current.get(thread.id) ?? selectedProjectIdRef.current;
