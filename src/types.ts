@@ -204,6 +204,17 @@ export interface ThreadSummary {
   createdAt: number;
   status: unknown;
   turns: Turn[];
+  searchMatch?: ThreadSearchMatch;
+}
+
+export interface ThreadSearchMatch {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  query: string;
+  snippet: string;
+  cursor: string;
+  ordinal: number;
 }
 
 export interface ThreadPresentation {
@@ -264,6 +275,8 @@ export interface ThreadHistoryPage {
   before: number;
   nextBefore: number;
   hasOlder: boolean;
+  nextCursor?: string | null;
+  indexState?: "fresh" | "stale" | "built";
 }
 
 export interface ThreadListResponse {
@@ -291,6 +304,7 @@ export interface LiveAgentMessage {
   turnId: string | null;
   text: string;
   completed: boolean;
+  sequence?: number;
   startedAt: string;
   updatedAt: string;
 }
@@ -311,6 +325,7 @@ export interface LiveToolItem {
   input: string;
   output: string;
   completed: boolean;
+  sequence?: number;
   startedAt: string;
   updatedAt: string;
 }

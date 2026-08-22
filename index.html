@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Codex Web Console 260803</title>
+    <title>Codex Web Console 260707</title>
     <script type="module" src="/src/main.tsx"></script>
   </head>
   <body>
@@ -94,7 +94,7 @@
       })();
     </script>
     <div class="v2ProjectDock" id="v2ProjectDock">
-      <div class="v2BrandRow"><strong>Codex</strong><span class="v2BuildBadge">260803</span><button class="v2BrandSearch" id="v2BrandSearch" type="button" title="搜索对话">⌕</button></div>
+      <div class="v2BrandRow"><strong>Codex</strong><span class="v2BuildBadge">260707</span><button class="v2SidebarToggle" id="v2SidebarToggle" type="button" title="折叠侧边栏" aria-label="折叠侧边栏">‹</button></div>
       <div class="v2PrimaryNav">
         <button id="v2NewConversation" type="button"><span class="v2NewThreadGlyph" aria-hidden="true"></span><strong>新对话</strong></button>
         <button id="v2OpenPlugins" type="button"><span class="v2PluginGlyph" aria-hidden="true"></span><strong>插件</strong></button>
@@ -121,7 +121,7 @@
       <button type="button" data-action="leaderboard"><span>♜</span><span><strong>排行榜</strong><small>查看 Token 使用排行</small></span></button>
       <span class="v2MenuSection">能力</span>
       <button type="button" data-action="skills"><span>◇</span><span><strong>技能与插件</strong><small>管理 Codex 扩展能力</small></span></button>
-      <button type="button" data-action="migration"><span>⇄</span><span><strong>迁移 4090-left 会话</strong><small>保留现有迁移功能</small></span></button>
+      <button type="button" data-action="migration"><span>⇄</span><span><strong>迁移 little right 会话</strong><small>只导入新会话，不覆盖已有记录</small></span></button>
     </div>
 
     <script>
@@ -134,8 +134,13 @@
         const projectOptions = document.getElementById("v2ProjectOptions");
         const plusMenu = document.getElementById("v2PlusMenu");
 
-        document.getElementById("v2BrandSearch").addEventListener("click", () => {
-          window.dispatchEvent(new Event("v2:open-thread-search"));
+        const sidebarToggle = document.getElementById("v2SidebarToggle");
+        sidebarToggle.addEventListener("click", () => {
+          const threadList = document.querySelector(".threadList");
+          const target = threadList?.classList.contains("collapsed")
+            ? document.querySelector(".threadListRestoreButton")
+            : document.querySelector(".threadList .panelCollapseButton");
+          target?.click();
         });
         document.getElementById("v2NewConversation").addEventListener("click", () => {
           document.querySelector(".newThreadButton")?.click();
@@ -199,6 +204,10 @@
         function installShellBridges() {
           const threadList = document.querySelector(".threadList");
           if (threadList) {
+            const collapsed = threadList.classList.contains("collapsed");
+            sidebarToggle.textContent = collapsed ? "›" : "‹";
+            sidebarToggle.title = collapsed ? "展开侧边栏" : "折叠侧边栏";
+            sidebarToggle.setAttribute("aria-label", sidebarToggle.title);
             const applySidebarWidth = (width) => {
               // During conversation switches the grid briefly reports 0px.
               // Do not persist that transient layout state into the fixed V2 dock.
@@ -264,8 +273,20 @@
           if (action === "quota") clickExisting(".quotaButton", /额度|剩余用量/);
           if (action === "leaderboard") clickExisting(".leaderboardButton", /排行榜/);
           if (action === "skills") clickExisting(".skillsButton", /Skills|技能|插件/);
-          if (action === "migration") clickExisting(".handoffButton", /迁移 4090-left|迁移会话/);
+          if (action === "migration") window.dispatchEvent(new CustomEvent("codex:migrate-little-right"));
           plusMenu.hidden = true;
+        });
+
+        window.addEventListener("codex:migration-status", (event) => {
+          const button = plusMenu.querySelector('[data-action="migration"]');
+          if (!button) return;
+          const status = event.detail || {};
+          const running = status.kind === "running";
+          button.disabled = running;
+          const title = button.querySelector("strong");
+          const detail = button.querySelector("small");
+          if (title) title.textContent = running ? "正在迁移 little right 会话…" : "迁移 little right 会话";
+          if (detail) detail.textContent = status.message || "只导入新会话，不覆盖已有记录";
         });
 
         const accountButtons = document.querySelectorAll(".v2AccountMenu button");

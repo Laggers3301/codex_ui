@@ -89,8 +89,7 @@ function VirtualConversationInner(
     // upward gesture reaches them; genuinely long loaded histories remain
     // virtualized beyond this window.
     overscan: 100,
-    useAnimationFrameWithResizeObserver: false,
-    anchorTo: "end",
+useAnimationFrameWithResizeObserver: true,    anchorTo: "end",
     followOnAppend: "auto",
     scrollEndThreshold: 120,
     isScrollingResetDelay: 500,
@@ -140,7 +139,9 @@ function VirtualConversationInner(
       flowAnchorCleanupRef.current?.();
       flowAnchorCleanupRef.current = null;
       captureFlowAnchor();
-    }
+if (flowAnchorRef.current) {
+        scrollElementRef.current?.style.setProperty("overflow-anchor", "none");
+      }    }
   }), [useFlowLayout, virtualizer]);
 
   useLayoutEffect(() => {
@@ -169,12 +170,12 @@ function VirtualConversationInner(
       observer?.disconnect();
       flowAnchorRef.current = null;
       flowAnchorCleanupRef.current = null;
-    }, 1_500);
+container.style.removeProperty("overflow-anchor");    }, 1_500);
     flowAnchorCleanupRef.current = () => {
       observer?.disconnect();
       window.cancelAnimationFrame(frame);
       window.clearTimeout(timer);
-    };
+container.style.removeProperty("overflow-anchor");    };
     return flowAnchorCleanupRef.current;
   }, [rowSignature, useFlowLayout]);
 
@@ -197,8 +198,7 @@ function VirtualConversationInner(
   return (
     <div
       {...containerProps}
-      className={className}
-      onScroll={onScroll}
+className={[className, useFlowLayout ? "virtualConversationFlowMode" : "virtualConversationVirtualMode"].filter(Boolean).join(" ")}      onScroll={onScroll}
       onScrollCapture={(event) => {
         containerProps.onScrollCapture?.(event);
         if (flowAnchorRef.current && !flowAnchorApplyingRef.current) captureFlowAnchor();

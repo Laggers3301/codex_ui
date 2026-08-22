@@ -40,16 +40,20 @@ import {
   listProjects,
   listThreads,
   listUsers,
-  migrateSessionsFrom4090,
+  locateThreadItem,
+  migrateSessionsFromLittleRight,
+  readSessionMigrationFromLittleRight,
   previewProjectFile,
   readCodexLeaderboard,
   readCodexQuota,
   readLocalSendSettings,
   readThread,
+  readThreadItemOutput,
   selectDirectory,
   sendProjectFileToLocal,
   setApiUserId,
   testLocalSendSettings,
+  THREAD_READ_MAX_LIMIT,
   updateLocalSendSettings,
   updateProject,
   updateThreadModelProfile,
@@ -123,6 +127,7 @@ type GlobalSearchResult = {
     itemId?: string;
     query: string;
     snippet: string;
+    cursor?: string;
   };
 };
 type GlobalSearchMatch = NonNullable<GlobalSearchResult["match"]>;
@@ -201,6 +206,7 @@ interface LiveDeltaEntry {
   turnId: string | null;
   text: string;
   startedAt: string;
+  sequence?: number;
 }
 
 interface LiveToolEntry extends LiveToolItem {}
@@ -256,6 +262,7 @@ interface ThreadContextMenu {
 
 interface ThreadLoadOptions {
   before?: number;
+  cursor?: string;
   appendOlder?: boolean;
   skipCache?: boolean;
 }
@@ -459,8 +466,23 @@ type DeferredToolOutputElement = HTMLPreElement & {
   previewToolOutput?: string;
 };
 
-const DeferredToolOutput = memo(function DeferredToolOutput({ text }: { text: string }) {
-  const output = useMemo(() => displayOutputText(text), [text]);
+const DeferredToolOutput = memo(function DeferredToolOutput({
+  text,
+  deferred = false,
+  threadId,
+  itemId,
+  projectId
+}: {
+  text: string;
+  deferred?: boolean;
+  threadId?: string;
+  itemId?: string;
+  projectId?: string;
+}) {
+  const [loadedOutput, setLoadedOutput] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const loadingRef = useRef(false);
+  const output = useMemo(() => displayOutputText(loadedOutput ?? text), [loadedOutput, text]);
   const preview = useMemo(() => {
     const lines = output.split(/\r?\n/).filter((line) => line.trim()).slice(0, 2).join("\n");
     return lines.length > 420 ? `${lines.slice(0, 420)}...` : lines;
@@ -468,14 +490,46 @@ const DeferredToolOutput = memo(function DeferredToolOutput({ text }: { text: st
   const outputRef = useRef<DeferredToolOutputElement>(null);
 
   useEffect(() => {
+    setLoadedOutput(null);
+    setLoadError("");
+    loadingRef.current = false;
+  }, [deferred, itemId, projectId, text, threadId]);
+
+  const loadFullOutput = useCallback(async () => {
+    if (!deferred || !threadId || !itemId || loadingRef.current || loadedOutput !== null) return;
+    loadingRef.current = true;
+    setLoadError("");
+    try {
+      const response = await readThreadItemOutput(threadId, itemId, projectId);
+      setLoadedOutput(response.data.output);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : String(error));
+    } finally {
+      loadingRef.current = false;
+    }
+  }, [deferred, itemId, loadedOutput, projectId, threadId]);
+
+  useEffect(() => {
+    const element = outputRef.current;
+    const toolCard = element?.closest<HTMLElement>(".messageItem.kind-tool");
+    if (!toolCard) return;
+    const handleExpanded = () => {
+      if (toolCard.classList.contains("toolExpanded")) void loadFullOutput();
+    };
+    toolCard.addEventListener("codex:tool-expanded", handleExpanded);
+    if (toolCard.classList.contains("toolExpanded")) void loadFullOutput();
+    return () => toolCard.removeEventListener("codex:tool-expanded", handleExpanded);
+  }, [loadFullOutput]);
+
+  useEffect(() => {
     const element = outputRef.current;
     if (!element) {
       return;
     }
-    element.fullToolOutput = output;
+    element.fullToolOutput = `${output}${loadError ? `\n\n完整输出加载失败：${loadError}` : ""}`;
     element.previewToolOutput = preview;
     element.textContent = element.closest(".toolExpanded") ? output : preview;
-  }, [output, preview]);
+  }, [loadError, output, preview]);
 
   return <pre ref={outputRef} className="outputBlock" data-deferred-tool-output>{preview}</pre>;
 });
@@ -867,7 +921,6 @@ const fallbackModelProfiles: ModelProfile[] = [
   { id: "gpt-5.6-sol:high", label: "GPT-5.6-Sol high", model: "gpt-5.6-sol", effort: "high" },
   { id: "gpt-5.6-sol:medium", label: "GPT-5.6-Sol medium", model: "gpt-5.6-sol", effort: "medium" },
   { id: "gpt-5.6-sol:low", label: "GPT-5.6-Sol low", model: "gpt-5.6-sol", effort: "low" },
-  { id: "gpt-5.6-terra:ultra", label: "GPT-5.6-Terra ultra", model: "gpt-5.6-terra", effort: "ultra" },
   { id: "gpt-5.6-terra:max", label: "GPT-5.6-Terra max", model: "gpt-5.6-terra", effort: "max" },
   { id: "gpt-5.6-terra:xhigh", label: "GPT-5.6-Terra xhigh", model: "gpt-5.6-terra", effort: "xhigh" },
   { id: "gpt-5.6-terra:high", label: "GPT-5.6-Terra high", model: "gpt-5.6-terra", effort: "high" },
@@ -1350,6 +1403,62 @@ const MarkdownMessage = memo(function MarkdownMessage({
   );
 });
 
+function stableStreamingMarkdownPrefix(text: string): string {
+  const reserveLength = 360;
+  const targetEnd = text.length - reserveLength;
+  if (targetEnd <= 0) return "";
+  const paragraphEnd = text.lastIndexOf("\n\n", targetEnd);
+  if (paragraphEnd >= 0) return text.slice(0, paragraphEnd + 2);
+  const lineEnd = text.lastIndexOf("\n", targetEnd);
+  return lineEnd >= 0 ? text.slice(0, lineEnd + 1) : "";
+}
+
+const LiveAgentStreamMessage = memo(function LiveAgentStreamMessage({
+  text,
+  projectId,
+  onOpenFileLink
+}: {
+  text: string;
+  projectId?: string;
+  onOpenFileLink?: (target: string) => void;
+}) {
+  const latestTextRef = useRef(text);
+  const commitTimerRef = useRef<number | null>(null);
+  const [committedPrefix, setCommittedPrefix] = useState("");
+  latestTextRef.current = text;
+
+  useEffect(() => {
+    if (commitTimerRef.current !== null) return;
+    commitTimerRef.current = window.setTimeout(() => {
+      commitTimerRef.current = null;
+      const nextPrefix = stableStreamingMarkdownPrefix(latestTextRef.current);
+      setCommittedPrefix((current) => current === nextPrefix ? current : nextPrefix);
+    }, 180);
+  }, [text]);
+
+  useEffect(() => () => {
+    if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
+  }, []);
+
+  const stablePrefix = text.startsWith(committedPrefix) ? committedPrefix : "";
+  const stableBlocks = useMemo(
+    () => stablePrefix.split(/\n{2,}/).filter((block) => block.trim()),
+    [stablePrefix]
+  );
+  const liveTail = text.slice(stablePrefix.length);
+
+  return (
+    <div className="liveAgentStreamMessage">
+      {stableBlocks.map((block, index) => (
+        <MarkdownMessage key={index} text={block} projectId={projectId} onOpenFileLink={onOpenFileLink} renderMath />
+      ))}
+      {liveTail ? (
+        <MarkdownMessage text={liveTail} projectId={projectId} onOpenFileLink={onOpenFileLink} renderMath />
+      ) : null}
+    </div>
+  );
+});
+
 const userMessageCollapseMaxLines = 12;
 const userMessageCollapseMaxCharacters = 900;
 const userMessagePlainTextThreshold = 4_000;
@@ -1774,6 +1883,12 @@ function modelProfileById(id: string, profiles: ModelProfile[]): ModelProfile {
   return profiles.find((profile) => profile.id === id) ?? profiles[0] ?? fallbackModelProfiles[0];
 }
 
+function isUltraModelProfile(profile: ModelProfile): boolean {
+  return String(profile.effort).toLowerCase() === "ultra"
+    || profile.id.toLowerCase().includes("ultra")
+    || profile.label.toLowerCase().includes("ultra");
+}
+
 function modelProfileIdFor(model: string, effort: ReasoningEffort, profiles: ModelProfile[]): string {
   return profiles.find((profile) => profile.model === model && profile.effort === effort)?.id ?? profiles[0]?.id ?? defaultModelProfileId;
 }
@@ -2138,20 +2253,26 @@ function isThreadVisibilityError(message: string | undefined): boolean {
   return Boolean(message && message.includes("Thread is not visible for this logged-in user"));
 }
 
+function safeLiveSnapshotItems<T>(value: T[] | null | undefined): T[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is T => Boolean(item && typeof item === "object"))
+    : [];
+}
+
 function liveDeltasFromSnapshot(snapshot: LiveStateSnapshot): Record<string, LiveDeltaEntry> {
   return Object.fromEntries(
-    snapshot.agentMessages
+    safeLiveSnapshotItems(snapshot.agentMessages)
       .filter((message) => message.itemId && message.text && !message.completed)
       .map((message) => [
         message.itemId,
-        { threadId: message.threadId, turnId: message.turnId, text: message.text, startedAt: message.startedAt ?? message.updatedAt }
+        { threadId: message.threadId, turnId: message.turnId, text: message.text, startedAt: message.startedAt ?? message.updatedAt, sequence: message.sequence }
       ])
   );
 }
 
 function liveToolsFromSnapshot(snapshot: LiveStateSnapshot): Record<string, LiveToolEntry> {
   return Object.fromEntries(
-    (snapshot.toolItems ?? [])
+    safeLiveSnapshotItems(snapshot.toolItems)
       .filter((item) => item.itemId)
       .map((item) => [item.itemId, item])
   );
@@ -2159,7 +2280,7 @@ function liveToolsFromSnapshot(snapshot: LiveStateSnapshot): Record<string, Live
 
 function activeTurnsFromSnapshot(snapshot: LiveStateSnapshot): Record<string, string> {
   return Object.fromEntries(
-    snapshot.activeTurns
+    safeLiveSnapshotItems(snapshot.activeTurns)
       .filter((turn) => turn.status === "running" && turn.threadId && turn.turnId)
       .map((turn) => [turn.threadId as string, turn.turnId as string])
   );
@@ -2405,6 +2526,7 @@ export function App() {
   const autoFollowMessagesRef = useRef(true);
   const manualMessageScrollLockRef = useRef(false);
   const lastMessageScrollTopRef = useRef(0);
+  const searchNavigationLockUntilRef = useRef(0);
   const threadViewTokenRef = useRef(0);
   const initializedProjectIdRef = useRef("");
   const threadPageCacheRef = useRef(new Map<string, { thread: ThreadSummary; history: ThreadHistoryPage; cachedAt: number }>());
@@ -2510,6 +2632,7 @@ export function App() {
   const [exportSendLocal, setExportSendLocal] = useState(false);
   const [exportingThread, setExportingThread] = useState(false);
   const [migratingSessions, setMigratingSessions] = useState(false);
+  const [migrationStatus, setMigrationStatus] = useState<{ kind: "running" | "success" | "error"; message: string } | null>(null);
   const [sendingLocalFile, setSendingLocalFile] = useState(false);
   const [quota, setQuota] = useState<CodexQuota | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(false);
@@ -2649,7 +2772,7 @@ export function App() {
       startedAt: existing?.startedAt ?? entry.startedAt
     });
     if (liveDeltaFlushTimerRef.current === null) {
-      liveDeltaFlushTimerRef.current = window.setTimeout(flushPendingLiveDeltas, 40);
+      liveDeltaFlushTimerRef.current = window.setTimeout(flushPendingLiveDeltas, 24);
     }
   }
 
@@ -2792,6 +2915,15 @@ export function App() {
     if (!element) {
       return;
     }
+    const currentScrollTop = element.scrollTop;
+    const previousScrollTop = lastMessageScrollTopRef.current;
+    const userMovedUp = currentScrollTop + 1 < previousScrollTop;
+    const userMovedDown = currentScrollTop > previousScrollTop + 1;
+    lastMessageScrollTopRef.current = currentScrollTop;
+    if (userMovedUp && Date.now() >= searchNavigationLockUntilRef.current) {
+      manualMessageScrollLockRef.current = true;
+      autoFollowMessagesRef.current = false;
+    }
     // The conversation is vertical-only. Some WebKit/Safari trackpad gestures can
     // leave a scrollable message container with a non-zero horizontal offset when
     // a long path/image exists; visually this looks like a huge blank white block.
@@ -2799,14 +2931,13 @@ export function App() {
     if (element.scrollLeft !== 0) {
       element.scrollLeft = 0;
     }
-    const currentScrollTop = element.scrollTop;
-    const previousScrollTop = lastMessageScrollTopRef.current;
-    const userMovedUp = currentScrollTop + 1 < previousScrollTop;
-    const userMovedDown = currentScrollTop > previousScrollTop + 1;
-    lastMessageScrollTopRef.current = currentScrollTop;
-    if (userMovedUp) {
+    // Safari/WebKit can occasionally leave a composited scroll layer blank while
+    if (Date.now() < searchNavigationLockUntilRef.current) {
       manualMessageScrollLockRef.current = true;
       autoFollowMessagesRef.current = false;
+      setShowScrollToBottom(true);
+      schedulePromptNavigationActiveUpdate();
+      return;
     }
     const bottomGap = element.scrollHeight - element.scrollTop - element.clientHeight;
     const nearBottom = bottomGap < 96;
@@ -2820,6 +2951,7 @@ export function App() {
   }
 
   function scrollMessagesToBottom(behavior: ScrollBehavior = "smooth") {
+    searchNavigationLockUntilRef.current = 0;
     manualMessageScrollLockRef.current = false;
     autoFollowMessagesRef.current = true;
     setShowScrollToBottom(false);
@@ -2902,9 +3034,8 @@ export function App() {
       return false;
     }
 
-    const resolvedMatch = (match.turnId && match.itemId)
-      ? match
-      : findSearchMatchInThread(selected, match.query, match.projectId) ?? null;
+    const resolvedMatch = findSearchMatchInThread(selected, match.query, match.projectId)
+      ?? ((match.turnId && match.itemId) ? match : null);
     if (!resolvedMatch) {
       if (attempt < 8 && threadHistoryRef.current?.hasOlder && threadHistoryRef.current?.nextBefore && selectedProjectIdRef.current) {
         await openThread(match.threadId, selectedProjectIdRef.current, threadViewTokenRef.current, {
@@ -2921,13 +3052,41 @@ export function App() {
     const key = messageElementKey(selected.id, resolvedMatch.turnId ?? "", resolvedMatch.itemId ?? "");
     const target = messageElementsRef.current.get(key);
     if (target && container) {
-      const top = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
-      container.scrollTo({ top: Math.max(0, top - 28), left: 0, behavior: "smooth" });
+      searchNavigationLockUntilRef.current = Date.now() + 5_000;
+      manualMessageScrollLockRef.current = true;
       autoFollowMessagesRef.current = false;
       setShowScrollToBottom(true);
+      const positionTarget = () => {
+        const top = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+        container.scrollTo({ top: Math.max(0, top - 28), left: 0, behavior: "auto" });
+      };
+      positionTarget();
+      window.requestAnimationFrame(() => window.requestAnimationFrame(positionTarget));
       flashMessageElement(target, resolvedMatch.snippet);
       setGlobalSearchJumpNoticeWithFade(`已定位到：${resolvedMatch.snippet}`);
       return true;
+    }
+
+    if (attempt < 3 && resolvedMatch.turnId && conversationVirtualRef.current?.scrollToKey(`turn:${resolvedMatch.turnId}`, "start")) {
+      searchNavigationLockUntilRef.current = Date.now() + 5_000;
+      manualMessageScrollLockRef.current = true;
+      autoFollowMessagesRef.current = false;
+      setShowScrollToBottom(true);
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())));
+      return revealGlobalSearchMatch({ ...match, itemId: undefined }, attempt + 1);
+    }
+
+    if (attempt === 0 && match.itemId && selectedProjectIdRef.current) {
+      try {
+        const position = await locateThreadItem(selected.id, match.itemId, selectedProjectIdRef.current);
+        await openThread(selected.id, selectedProjectIdRef.current, threadViewTokenRef.current, {
+          cursor: position.data.cursor,
+          skipCache: true
+        });
+        return revealGlobalSearchMatch({ ...match, turnId: position.data.turnId }, attempt + 1);
+      } catch {
+        // Legacy sessions continue through the compatible page walk below.
+      }
     }
 
     if (attempt < 8 && match.query !== "" && threadHistoryRef.current?.hasOlder && threadHistoryRef.current?.nextBefore && selectedProjectIdRef.current) {
@@ -2944,10 +3103,16 @@ export function App() {
       const fallbackKey = messageElementKey(selected.id, fallbackMatch.turnId ?? "", fallbackMatch.itemId ?? "");
       const fallbackTarget = messageElementsRef.current.get(fallbackKey);
       if (fallbackTarget && container) {
-        const top = fallbackTarget.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
-        container.scrollTo({ top: Math.max(0, top - 28), left: 0, behavior: "smooth" });
+        searchNavigationLockUntilRef.current = Date.now() + 5_000;
+        manualMessageScrollLockRef.current = true;
         autoFollowMessagesRef.current = false;
         setShowScrollToBottom(true);
+        const positionTarget = () => {
+          const top = fallbackTarget.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+          container.scrollTo({ top: Math.max(0, top - 28), left: 0, behavior: "auto" });
+        };
+        positionTarget();
+        window.requestAnimationFrame(() => window.requestAnimationFrame(positionTarget));
         flashMessageElement(fallbackTarget, fallbackMatch.snippet);
         setGlobalSearchJumpNoticeWithFade(`已定位到：${fallbackMatch.snippet}`);
         return true;
@@ -2996,10 +3161,12 @@ export function App() {
     if (!container || !target) {
       return;
     }
-    const targetTop = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
-    container.scrollTo({ top: Math.max(0, targetTop - 18), left: 0, behavior: "smooth" });
+    searchNavigationLockUntilRef.current = Date.now() + 5_000;
+    manualMessageScrollLockRef.current = true;
     autoFollowMessagesRef.current = false;
     setShowScrollToBottom(true);
+    const targetTop = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+    container.scrollTo({ top: Math.max(0, targetTop - 18), left: 0, behavior: "auto" });
     setActivePromptNavigationKey(key);
   }
 
@@ -3044,6 +3211,11 @@ export function App() {
   function selectThread(threadId: string) {
     const viewToken = ++threadViewTokenRef.current;
     const projectId = selectedProjectIdRef.current;
+    try {
+      codexSocket.send({ type: "live.state", requestId: `live-${requestToken()}` });
+    } catch {
+      // Reconnection requests the authoritative live snapshot again.
+    }
     newThreadDraftModeRef.current = false;
     if (selectedProjectIdRef.current) {
       threadProjectIdsRef.current.set(threadId, selectedProjectIdRef.current);
@@ -3051,14 +3223,21 @@ export function App() {
     setThreadContextMenu(null);
     setError("");
     const cachedView = projectId ? threadViewCacheRef.current.get(`${projectId}:${threadId}`) : undefined;
-    if (cachedView?.history?.totalItems === 0) {
+    const cachedHistory = cachedView?.history;
+    const cachedViewIsUsable = Boolean(
+      cachedView
+      && cachedHistory
+      && cachedHistory.totalItems > 0
+      && (!cachedHistory.hasOlder || Boolean(cachedHistory.nextCursor || cachedHistory.nextBefore > 0))
+    );
+    if (cachedView && !cachedViewIsUsable) {
       threadViewCacheRef.current.delete(`${projectId}:${threadId}`);
     }
-    if (cachedView && (cachedView.history?.totalItems ?? 1) > 0) {
+    if (cachedView && cachedHistory && cachedViewIsUsable) {
       const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(cachedView.thread), modelProfiles));
       selectedThreadRef.current = nextThread;
       setSelectedThread(nextThread);
-      setThreadHistory(cachedView.history);
+      setThreadHistory(cachedHistory);
     } else {
       setThreadHistory(null);
     }
@@ -3085,7 +3264,6 @@ export function App() {
         }
         const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, response.thread, modelProfiles));
         threadPageCacheRef.current.set(cacheKey, { thread: nextThread, history: response.history, cachedAt: Date.now() });
-        threadViewCacheRef.current.set(cacheKey, { thread: nextThread, history: response.history });
       })
       .catch(() => undefined)
       .finally(() => {
@@ -3408,13 +3586,19 @@ export function App() {
       if (stopped) {
         return;
       }
-      const lastLiveAt = lastLiveEventAtRef.current[threadId] ?? Date.now();
-      const silenceMs = Date.now() - lastLiveAt;
-      const delay = socketStatus !== "open" ? 0 : Math.max(250, 8_000 - silenceMs);
+      const delay = socketStatus === "open" ? 2_000 : 500;
       timer = window.setTimeout(async () => {
         timer = null;
         const latestLiveAt = lastLiveEventAtRef.current[threadId] ?? 0;
-        if (socketStatus !== "open" || Date.now() - latestLiveAt >= 8_000) {
+        const silenceMs = Date.now() - latestLiveAt;
+        if (socketStatus === "open") {
+          try {
+            codexSocket.send({ type: "live.state", requestId: `live-${requestToken()}` });
+          } catch {
+            // The history recovery below remains the fallback.
+          }
+        }
+        if (socketStatus !== "open" || silenceMs >= 8_000) {
           await reconcile();
           lastLiveEventAtRef.current[threadId] = Date.now();
         }
@@ -3660,7 +3844,10 @@ export function App() {
         const normalizedQuery = normalizeSearchQuery(query);
         return response.data.map((thread) => {
           const titleMatch = `${thread.name ?? ""} ${thread.preview ?? ""}`.toLocaleLowerCase().includes(normalizedQuery);
-          const match = findSearchMatchInThread(thread, normalizedQuery, project.id);
+          const indexedMatch = thread.searchMatch
+            ? { ...thread.searchMatch, projectId: project.id, threadId: thread.id }
+            : null;
+          const match = indexedMatch ?? findSearchMatchInThread(thread, normalizedQuery, project.id);
           const snippetSource = `${thread.name ?? ""} ${thread.preview ?? ""}`.trim() || thread.id;
           return {
             project,
@@ -3707,7 +3894,7 @@ export function App() {
   async function refreshModels() {
     try {
       const response = await listModels();
-      const visibleProfiles = response.data.filter((profile) => !(profile.model === "gpt-5.6-sol" && profile.effort === "ultra"));
+      const visibleProfiles = response.data.filter((profile) => !isUltraModelProfile(profile));
       const nextProfiles = visibleProfiles.length ? visibleProfiles : fallbackModelProfiles;
       setModelProfiles(nextProfiles);
       setNewThreadModelProfileId((current) => (
@@ -3882,11 +4069,35 @@ export function App() {
     if (migratingSessions) {
       return;
     }
+    const publishStatus = (kind: "running" | "success" | "error", message: string) => {
+      setMigrationStatus({ kind, message });
+      window.dispatchEvent(new CustomEvent("codex:migration-status", { detail: { kind, message } }));
+    };
     setMigratingSessions(true);
     setError("");
+    publishStatus("running", "正在从 little right 导出并传输当前用户会话，请勿重复点击…");
     try {
-      const response = await migrateSessionsFrom4090();
-      const result = response.data;
+      const started = await migrateSessionsFromLittleRight();
+      let job = started.data;
+      while (job.status === "running") {
+        const transferred = job.bytesTransferred > 0
+          ? `，已传输 ${(job.bytesTransferred / (1024 * 1024)).toFixed(1)} MB`
+          : "";
+        const phaseText = job.phase === "connecting"
+          ? "正在连接 little right"
+          : job.phase === "transferring"
+            ? `正在导出并传输会话${transferred}`
+            : job.phase === "extracting"
+              ? "传输完成，正在校验并解压"
+              : "正在写入当前账号的会话索引";
+        publishStatus("running", `${phaseText}，请勿重复点击…`);
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1_000));
+        job = (await readSessionMigrationFromLittleRight(job.id)).data;
+      }
+      if (job.status === "failed" || !job.result) {
+        throw new Error(job.error || "迁移任务未返回结果。");
+      }
+      const result = job.result;
       await refreshProjects();
       if (result.projectId) {
         const projectId = result.projectId;
@@ -3900,16 +4111,28 @@ export function App() {
         await refreshThreads(projectId, "");
       }
       const skipped = result.skippedThreadIds.length ? `；${result.skippedThreadIds.length} 个源端记录文件缺失，未迁移` : "";
+      const resultMessage = job.message ?? `已从 little right 导入 ${result.importedThreadIds.length} 个新会话，已存在 ${result.alreadyPresentThreadIds.length} 个。${skipped}`;
+      publishStatus("success", resultMessage);
       addLocalMessage(
-          response.message ?? `已从 little right 导入 ${result.importedThreadIds.length} 个新会话，已存在 ${result.alreadyPresentThreadIds.length} 个。${skipped}`,
+        resultMessage,
         "Codex Web · 会话迁移"
       );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      const message = caught instanceof Error ? caught.message : String(caught);
+      publishStatus("error", `迁移失败：${message}`);
+      setError(message);
     } finally {
       setMigratingSessions(false);
     }
   }
+
+  useEffect(() => {
+    const requestMigration = () => {
+      if (!migratingSessions) void migrateAllSessionsFromLittleRight();
+    };
+    window.addEventListener("codex:migrate-little-right", requestMigration);
+    return () => window.removeEventListener("codex:migrate-little-right", requestMigration);
+  }, [migratingSessions]);
 
   async function refreshUsers() {
     try {
@@ -3981,36 +4204,89 @@ export function App() {
     }
     if (!options.appendOlder && !options.skipCache) {
       const cached = threadPageCacheRef.current.get(`${projectId}:${threadId}`);
-      if (cached && cached.history.totalItems === 0) {
+      const cachedHistoryIsUsable = Boolean(
+        cached
+        && cached.history.totalItems > 0
+        && (cached.history.returnedItems >= 128 || !cached.history.hasOlder)
+        && (!cached.history.hasOlder || Boolean(cached.history.nextCursor || cached.history.nextBefore > 0))
+      );
+      if (cached && !cachedHistoryIsUsable) {
         threadPageCacheRef.current.delete(`${projectId}:${threadId}`);
-      } else if (cached && Date.now() - cached.cachedAt < 30_000 && (cached.history.returnedItems >= 128 || !cached.history.hasOlder)) {
-        const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(cached.thread), modelProfiles));
+      } else if (cached && cachedHistoryIsUsable && Date.now() - cached.cachedAt < 30_000) {
+        const current = selectedThreadRef.current;
+        const currentHistory = current?.id === cached.thread.id ? threadHistoryRef.current : null;
+        const preserveLoadedHistory = Boolean(current && currentHistory && currentHistory.nextBefore > cached.history.nextBefore);
+        const cachedThread = preserveLoadedHistory && current
+          ? mergeThreadHistoryPages(current, cached.thread)
+          : cached.thread;
+        const nextHistory = preserveLoadedHistory && currentHistory
+          ? {
+              ...currentHistory,
+              totalItems: cached.history.totalItems,
+              nextBefore: Math.min(
+                cached.history.totalItems,
+                currentHistory.nextBefore + Math.max(0, cached.history.totalItems - currentHistory.totalItems)
+              ),
+              indexState: cached.history.indexState
+            }
+          : cached.history;
+        const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(cachedThread), modelProfiles));
         selectedThreadRef.current = nextThread;
         setSelectedThread(nextThread);
-        setThreadHistory(cached.history);
+        threadHistoryRef.current = nextHistory;
+        setThreadHistory(nextHistory);
+        threadViewCacheRef.current.set(`${projectId}:${threadId}`, { thread: nextThread, history: nextHistory });
         return nextThread;
       }
     }
     try {
       const response = await readThread(threadId, projectId, {
         before: options.before,
+        cursor: options.cursor,
         limit: options.appendOlder ? 160 : 128
       });
       if (viewToken !== threadViewTokenRef.current) {
         return null;
       }
       const current = selectedThreadRef.current;
+      const currentHistory = current?.id === response.thread.id ? threadHistoryRef.current : null;
+      const preserveLoadedHistory = Boolean(
+        !options.appendOlder
+        && current
+        && currentHistory
+        && response.history
+        && currentHistory.nextBefore > response.history.nextBefore
+      );
       const mergedThread = options.appendOlder && current?.id === response.thread.id
         ? mergeThreadHistoryPages(response.thread, current)
-        : response.thread;
+        : preserveLoadedHistory && current
+          ? mergeThreadHistoryPages(current, response.thread)
+          : response.thread;
+      const nextHistory = preserveLoadedHistory && currentHistory && response.history
+        ? {
+            ...currentHistory,
+            totalItems: response.history.totalItems,
+            nextBefore: Math.min(
+              response.history.totalItems,
+              currentHistory.nextBefore + Math.max(0, response.history.totalItems - currentHistory.totalItems)
+            ),
+            indexState: response.history.indexState
+          }
+        : response.history ?? null;
+      const latestThreadWithStoredModel = sanitizeThreadForRender(applyStoredThreadModelProfile(
+        selectedUserId,
+        applyThreadListName(response.thread),
+        modelProfiles
+      ));
       const nextThreadWithStoredModel = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(mergedThread), modelProfiles));
       selectedThreadRef.current = nextThreadWithStoredModel;
       setSelectedThread(nextThreadWithStoredModel);
-      setThreadHistory(response.history ?? null);
-      if (!options.appendOlder) {
+      threadHistoryRef.current = nextHistory;
+      setThreadHistory(nextHistory);
+      if (nextHistory) {
         const cacheKey = `${projectId}:${nextThreadWithStoredModel.id}`;
         threadViewCacheRef.current.delete(cacheKey);
-        threadViewCacheRef.current.set(cacheKey, { thread: nextThreadWithStoredModel, history: response.history ?? null });
+        threadViewCacheRef.current.set(cacheKey, { thread: nextThreadWithStoredModel, history: nextHistory });
         while (threadViewCacheRef.current.size > 12) {
           const oldestKey = threadViewCacheRef.current.keys().next().value;
           if (!oldestKey) {
@@ -4021,7 +4297,7 @@ export function App() {
       }
       if (!options.appendOlder && response.history) {
         threadPageCacheRef.current.set(`${projectId}:${threadId}`, {
-          thread: nextThreadWithStoredModel,
+          thread: latestThreadWithStoredModel,
           history: response.history,
           cachedAt: Date.now()
         });
@@ -4051,7 +4327,10 @@ export function App() {
     setGlobalSearchOpen(false);
     setGlobalSearchQuery("");
     const match = result.match ?? null;
-    const selected = await openThread(result.thread.id, result.project.id, viewToken);
+    const selected = await openThread(result.thread.id, result.project.id, viewToken, match?.cursor ? {
+      cursor: match.cursor,
+      skipCache: true
+    } : {});
     if (!selected || selected.id !== result.thread.id) {
       return;
     }
@@ -4082,6 +4361,7 @@ export function App() {
     try {
       await openThread(thread.id, projectId, threadViewTokenRef.current, {
         before: history.nextBefore,
+        cursor: history.nextCursor ?? undefined,
         appendOlder: true
       });
     } finally {
@@ -4618,7 +4898,8 @@ export function App() {
       void openThread(threadId, projectId, threadViewTokenRef.current);
     }
 
-    const candidates = generatedFileCandidatesFromThread(response.thread, project.rootPath);
+    const candidates = generatedFileCandidatesFromThread(response.thread, project.rootPath)
+      .filter((candidate) => !afterTurnId || candidate.turnId === afterTurnId);
     let nextIndex = 0;
     const transferOne = async () => {
       for (;;) {
@@ -4646,8 +4927,16 @@ export function App() {
             }
           );
         } catch (caught) {
+          const failureMessage = caught instanceof Error ? caught.message : String(caught);
+          // Completion is checked twice to catch delayed persistence. A missing
+          // path is a stale prose/history reference, not a user-facing transfer
+          // failure, and must not be retried or injected into the conversation.
+          autoSentGeneratedFileKeysRef.current.add(key);
+          if (/file does not exist|enoent/i.test(failureMessage)) {
+            continue;
+          }
           addLocalMessage(
-            `自动发送 ${compactFileLabel(candidate.target)} 失败：${caught instanceof Error ? caught.message : String(caught)}`,
+            `自动发送 ${compactFileLabel(candidate.target)} 失败：${failureMessage}`,
             "Codex Web · 自动发送",
             "tool",
             undefined,
@@ -5189,8 +5478,8 @@ export function App() {
       return;
     }
     [
-      ...snapshot.agentMessages.filter((item) => item.itemId).map((item) => ({ kind: "agent" as const, id: item.itemId, startedAt: item.startedAt ?? item.updatedAt ?? "" })),
-      ...(snapshot.toolItems ?? []).filter((item) => item.itemId).map((item) => ({ kind: "tool" as const, id: item.itemId, startedAt: item.startedAt ?? "" }))
+      ...safeLiveSnapshotItems(snapshot.agentMessages).filter((item) => item.itemId).map((item) => ({ kind: "agent" as const, id: item.itemId, startedAt: item.startedAt ?? item.updatedAt ?? "" })),
+      ...safeLiveSnapshotItems(snapshot.toolItems).filter((item) => item.itemId).map((item) => ({ kind: "tool" as const, id: item.itemId, startedAt: item.startedAt ?? "" }))
     ]
       .sort((left, right) => left.startedAt.localeCompare(right.startedAt))
       .forEach((item) => liveTimelineSequence(item.kind, item.id));
@@ -5203,7 +5492,7 @@ export function App() {
     setLiveTools(liveToolsFromSnapshot(snapshot));
     setActiveTurnsByThread(activeTurnsFromSnapshot(snapshot));
     turnThreadIdsRef.current.clear();
-    for (const turn of snapshot.activeTurns) {
+    for (const turn of safeLiveSnapshotItems(snapshot.activeTurns)) {
       if (turn.threadId && turn.turnId) {
         turnThreadIdsRef.current.set(turn.turnId, turn.threadId);
         markLiveEvent(turn.threadId);
@@ -5718,7 +6007,7 @@ export function App() {
     stripInterruptArtifacts(entry.text) ? (
     <article className="messageItem kind-agent type-agentMessage live" key={entry.id}>
       <div className="messageMeta">Codex · agentMessage</div>
-      <MarkdownMessage text={stripInterruptArtifacts(entry.text)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} renderMath />
+      <LiveAgentStreamMessage text={stripInterruptArtifacts(entry.text)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
     </article>
     ) : null
   ) : (
@@ -5739,6 +6028,7 @@ export function App() {
     if (output) {
       output.textContent = expanded ? output.fullToolOutput ?? "" : output.previewToolOutput ?? "";
     }
+    toolCard.dispatchEvent(new CustomEvent("codex:tool-expanded", { detail: { expanded } }));
   };
 
   const renderToolBundleGroup = (bundleId: string, entries: ThreadItem[], groupIndex: number) => {
@@ -5752,14 +6042,17 @@ export function App() {
     ].map((text) => text.replace(/\s+/g, " ").trim()).find(Boolean) ?? "";
     const hasChanges = Array.isArray(call.changes) && call.changes.length > 0;
     const outputItems = entries.filter((entry) => entry !== call);
-    const outputText = outputItems
+    const outputText = [call, ...outputItems]
       .map((entry) => {
         if (typeof entry.aggregatedOutput === "string" && entry.aggregatedOutput.trim()) return entry.aggregatedOutput;
         if (typeof entry.output === "string" && safeText(entry.output).trim()) return safeText(entry.output);
+        if (entry === call) return "";
         return itemText(entry);
       })
       .filter((text) => text.trim())
+      .filter((text, index, values) => values.indexOf(text) === index)
       .join("\n");
+    const deferredOutputItem = [call, ...outputItems].find((entry) => entry.outputDeferred === true);
     const running = call.completed === false;
     return (
       <article
@@ -5773,7 +6066,7 @@ export function App() {
         <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
         {inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
         {hasChanges ? <pre>{toolItemDetails(call)}</pre> : null}
-        {outputText ? <DeferredToolOutput text={displayOutputText(outputText)} /> : null}
+        {outputText ? <DeferredToolOutput text={displayOutputText(outputText)} deferred={Boolean(deferredOutputItem)} threadId={selectedThread?.id} itemId={deferredOutputItem?.id ?? call.id} projectId={selectedProject?.id} /> : null}
         {!outputText && running ? <div className="messageBody">正在执行...</div> : null}
       </article>
     );
@@ -5854,11 +6147,13 @@ export function App() {
         }}
       >
         <div className={`messageMeta toolBundleTitle${running ? " live" : ""}`}>{summarizeToolBundleTitle(bundleItems, !running)}</div>
-        <div className="toolBundleEntries">
-          {getToolBundleGroups(bundleItems).map((bundleGroup, groupIndex) => (
-            renderToolBundleGroup(bundleId, bundleGroup, groupIndex)
-          ))}
-        </div>
+        {expanded ? (
+          <div className="toolBundleEntries">
+            {getToolBundleGroups(bundleItems).map((bundleGroup, groupIndex) => (
+              renderToolBundleGroup(bundleId, bundleGroup, groupIndex)
+            ))}
+          </div>
+        ) : null}
       </article>
     );
   };
@@ -5887,6 +6182,7 @@ export function App() {
       <article
         className={messageClassName(item)}
         key={`${turn.id}-${item.id}`}
+        data-message-key={messageRefKey}
         ref={(element) => {
           if (navigationKey) {
             setPromptMessageElement(navigationKey, element);
@@ -5910,7 +6206,7 @@ export function App() {
             renderMath={itemKindValue === "agent"}
           />
         )}
-        {item.aggregatedOutput ? <DeferredToolOutput text={item.aggregatedOutput} /> : null}
+        {item.aggregatedOutput ? <DeferredToolOutput text={item.aggregatedOutput} deferred={item.outputDeferred === true} threadId={selectedThread?.id} itemId={item.id} projectId={selectedProject?.id} /> : null}
         {!isUserMessage ? <MessageImagePreviews item={item} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /> : null}
         {isUserMessage ? (
           <div className="v2UserMessageActions" aria-label="用户消息操作">
@@ -6230,7 +6526,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           <div>
             <div className="brandTitleRow">
               <strong>Codex Web</strong>
-              <span className="brandMarker">260803</span>
+                <span className="brandMarker">260707</span>
             </div>
             <span className={`statusDot ${socketStatus}`}>{socketStatus}</span>
           </div>
@@ -6816,11 +7112,24 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </div>
         ) : null}
 
-        <div className="workspace" style={{ gridTemplateColumns: threadListCollapsed ? "0px 0px minmax(0, 1fr)" : `${threadListWidth}px 8px minmax(0, 1fr)` }}>
+        {migrationStatus ? (
+          <div className={`migrationStatusToast ${migrationStatus.kind}`} role="status" aria-live="polite">
+            <span className="migrationStatusIcon" aria-hidden="true" />
+            <span>{migrationStatus.message}</span>
+            {migrationStatus.kind !== "running" ? (
+              <button type="button" onClick={() => setMigrationStatus(null)} title="关闭迁移结果" aria-label="关闭迁移结果">×</button>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className="workspace" style={{ gridTemplateColumns: threadListCollapsed ? "56px 0px minmax(0, 1fr)" : `${threadListWidth}px 8px minmax(0, 1fr)` }}>
           <nav className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
             <div className="listHeader">
               <span>项目</span>
               <span className="listHeaderActions">
+                <button className="iconButton v2SidebarSearchButton" type="button" onClick={() => setGlobalSearchOpen(true)} title="搜索会话和消息" aria-label="搜索会话和消息">
+                  <Search size={15} />
+                </button>
                 <button className="iconButton" type="button" onClick={() => void refreshThreads(selectedProjectIdRef.current, threadSearch)} title="Refresh threads">
                   <RefreshCcw size={15} />
                 </button>
@@ -7022,7 +7331,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     ? "当前会话运行中；完成后可切换下一轮模型"
                     : `仅影响${selectedThread ? "当前会话后续轮次" : "这次新会话"}：${selectedModelProfile.model} / ${selectedModelProfile.effort}`}
                 >
-                  {modelProfiles.filter((profile) => profile.id !== "gpt-5.6-sol:ultra").map((profile) => (
+                  {modelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => (
                     <option key={profile.id} value={profile.id}>
                       {profile.label}
                     </option>
@@ -7091,6 +7400,16 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     autoFollowMessagesRef.current = false;
                     setShowScrollToBottom(true);
                   }
+                  if (event.deltaY > 0 && manualMessageScrollLockRef.current) {
+                    window.requestAnimationFrame(() => {
+                      const element = messagesRef.current;
+                      if (element && element.scrollHeight - element.scrollTop - element.clientHeight < 2) {
+                        manualMessageScrollLockRef.current = false;
+                        autoFollowMessagesRef.current = true;
+                        setShowScrollToBottom(false);
+                      }
+                    });
+                  }
                 }}
                 onScroll={updateMessageScrollState}
                 onMouseUp={(event) => {
@@ -7125,6 +7444,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   if (output) {
                     output.textContent = expanded ? output.fullToolOutput ?? "" : output.previewToolOutput ?? "";
                   }
+                  toolCard.dispatchEvent(new CustomEvent("codex:tool-expanded", { detail: { expanded } }));
                 }}
               >
                 {selectedThread && threadHistory?.hasOlder ? (
@@ -7188,7 +7508,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                             value={temporaryModelProfileId}
                             onChange={setTemporaryModelProfileId}
                             disabled={temporaryAsk.status === "starting" || temporaryAsk.status === "running"}
-                            options={modelProfiles.map((profile) => ({ value: profile.id, label: profile.label, detail: `${profile.model} · 推理 ${profile.effort}` }))}
+                            options={modelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => ({ value: profile.id, label: profile.label, detail: `${profile.model} · 推理 ${profile.effort}` }))}
                           />
                           <PolishedSelect<SandboxMode>
                             className="temporaryPolicySelect"
@@ -7240,11 +7560,24 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   const activeTrailingToolIndexes = new Set<number>();
                   if (isActiveTurn) {
                     for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex -= 1) {
-                      if (itemKind(items[itemIndex]) !== "tool") {
-                        break;
-                      }
+                      if (itemKind(items[itemIndex]) !== "tool") break;
                       activeTrailingToolIndexes.add(itemIndex);
                     }
+                  }
+                  const persistedTurnItemsById = new Map<string, ThreadItem>();
+                  const persistedToolCorrelationId = (item: ThreadItem): string => {
+                    const record = item as ThreadItem & {
+                      callId?: unknown;
+                      call_id?: unknown;
+                      toolCallId?: unknown;
+                      tool_call_id?: unknown;
+                    };
+                    return safeText(record.callId ?? record.call_id ?? record.toolCallId ?? record.tool_call_id).trim();
+                  };
+                  for (const item of items ?? []) {
+                    if (item.id) persistedTurnItemsById.set(item.id, item);
+                    const correlationId = persistedToolCorrelationId(item);
+                    if (correlationId) persistedTurnItemsById.set(correlationId, item);
                   }
                   const activeTrailingToolItems: ThreadItem[] = [];
                   const renderedUserItems: React.ReactNode[] = [];
@@ -7254,7 +7587,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     if (pendingToolGroup.length === 0) {
                       return indexBase;
                     }
-                    const bundleId = `${turn.id}-toolbundle-${indexBase}`;
+                    const bundleId = `${turn.id}-history-toolbundle-${indexBase}`;
                     const isLiveRunningTurn = Boolean(selectedActiveTurnId && turn.id === selectedActiveTurnId);
                     const isBundleComplete = !isLiveRunningTurn || pendingToolGroup.every((toolItem) => safeText(toolItem.type).toLowerCase() !== "toolcall" || toolItem.completed !== false);
                     renderedHistoryItems.push(
@@ -7270,9 +7603,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   let toolGroupIndex = 0;
                   for (const [itemIndex, item] of items.entries()) {
                     const kind = itemKind(item);
-                    // A recovery/history read can contain an incomplete copy of
-                    // the same agent item. Keep the live copy authoritative until
-                    // the turn completes so subsequent deltas remain visible.
+                    // Match codex2: preserve persisted message/tool order and
+                    // only let the live copy replace its matching agent item.
                     if (kind === "agent" && item.id && activeLiveAgentItemIds.has(item.id)) {
                       continue;
                     }
@@ -7347,39 +7679,49 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     : [];
 
                   const renderedHistoryTurnItems = renderedHistoryItems.flatMap((item) => (item ? [item] : []));
-                  const toRunningToolItem = (entry: Extract<LiveTimelineEntry, { kind: "tool" }>): ThreadItem => ({
+                  const toRunningToolItem = (entry: Extract<LiveTimelineEntry, { kind: "tool" }>): ThreadItem => {
+                    const persistedToolItem = persistedTurnItemsById.get(entry.id);
+                    return ({
+                      ...persistedToolItem,
                       id: entry.id,
                       type: "toolCall",
-                      tool: entry.tool,
-                      input: entry.input,
-                      output: entry.output,
+                      tool: entry.tool || persistedToolItem?.tool,
+                      input: entry.input || persistedToolItem?.input,
+                      output: entry.output || persistedToolItem?.output,
+                      aggregatedOutput: entry.output || persistedToolItem?.aggregatedOutput,
                       completed: entry.completed
                     } as ThreadItem);
+                  };
                   const runningTurnLiveToolEntries = activeTurnLiveItems.filter(
                     (entry): entry is Extract<LiveTimelineEntry, { kind: "tool" }> => entry.kind === "tool"
                   );
                   const runningToolEntriesById = new Map(runningTurnLiveToolEntries.map((entry) => [entry.id, entry]));
-                  const consumedLiveToolIds = new Set<string>();
-                  const mergedTrailingToolItems = activeTrailingToolItems.map((persistedToolItem) => {
-                    const liveEntry = persistedToolItem.id ? runningToolEntriesById.get(persistedToolItem.id) : undefined;
-                    if (!liveEntry) return persistedToolItem;
-                    consumedLiveToolIds.add(liveEntry.id);
+                  const mergedTrailingToolItemsById = new Map<string, ThreadItem>();
+                  const unmatchedTrailingToolItems: ThreadItem[] = [];
+                  for (const persistedToolItem of activeTrailingToolItems) {
+                    const persistedToolId = persistedToolCorrelationId(persistedToolItem) || persistedToolItem.id || "";
+                    const liveEntry = persistedToolId ? runningToolEntriesById.get(persistedToolId) : undefined;
+                    if (!liveEntry) {
+                      unmatchedTrailingToolItems.push(persistedToolItem);
+                      continue;
+                    }
                     const liveToolItem = toRunningToolItem(liveEntry);
-                    return {
+                    mergedTrailingToolItemsById.set(liveEntry.id, {
                       ...persistedToolItem,
                       ...liveToolItem,
                       input: liveToolItem.input || persistedToolItem.input,
-                      output: liveToolItem.output || persistedToolItem.output
-                    };
-                  });
+                      output: liveToolItem.output || persistedToolItem.output,
+                      aggregatedOutput: liveToolItem.aggregatedOutput || persistedToolItem.aggregatedOutput
+                    });
+                  }
                   const runningTurnTimelineItems: React.ReactNode[] = [];
-                  const runningToolGroup: ThreadItem[] = [...mergedTrailingToolItems];
+                  const runningToolGroup: ThreadItem[] = [];
                   let runningToolGroupIndex = toolGroupIndex;
                   const flushRunningToolGroup = () => {
                     if (runningToolGroup.length === 0) return;
                     const bundleItems = [...runningToolGroup];
                     runningTurnTimelineItems.push(renderPersistedToolBundle(
-                      `${turn.id}-toolbundle-${runningToolGroupIndex}`,
+                      `${turn.id}-live-toolbundle-${runningToolGroupIndex}`,
                       bundleItems,
                       bundleItems.every((item) => item.completed !== false)
                     ));
@@ -7388,13 +7730,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   };
                   for (const entry of activeTurnLiveItems) {
                     if (entry.kind === "tool") {
-                      if (!consumedLiveToolIds.has(entry.id)) runningToolGroup.push(toRunningToolItem(entry));
+                      runningToolGroup.push(mergedTrailingToolItemsById.get(entry.id) ?? toRunningToolItem(entry));
                       continue;
                     }
                     flushRunningToolGroup();
                     const renderedEntry = renderLiveTimelineEntry(entry);
                     if (renderedEntry) runningTurnTimelineItems.push(renderedEntry);
                   }
+                  runningToolGroup.push(...unmatchedTrailingToolItems);
                   flushRunningToolGroup();
                   const runningTurnThinking = selectedActiveTurnId && selectedActiveTurnId === turn.id
                     ? [<div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>]
@@ -7416,7 +7759,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 <div className="conversationLiveTail" key={`tail:${selectedThread?.id ?? "new"}`}>
                   {conversationLocalMessageLayout.beforePending.map(renderLocalMessage)}
                   {timelinePendingUserMessages.map(renderPendingUserMessage)}
-                  {!selectedActiveTurnId && currentPendingTurnStart ? <div className="v2ThinkingLine v2PendingThinkingLine">正在思考</div> : null}
                   {!selectedThread ? unmatchedLiveTimeline.map(renderLiveTimelineEntry) : null}
                   {conversationLocalMessageLayout.tail.map(renderLocalMessage)}
                   {heldPendingUserMessages.map((entry) => renderPendingUserMessage(entry))}
@@ -7520,7 +7862,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     onChange={(profileId) => void changeConversationModelProfile(profileId)}
                     disabled={savingThreadModel || conversationRunState === "running"}
                     title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
-                    options={modelProfiles.filter((profile) => profile.id !== "gpt-5.6-sol:ultra").map((profile) => ({
+                    options={modelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => ({
                       value: profile.id,
                       label: profile.label,
                       detail: `${profile.model} · 推理 ${profile.effort}`

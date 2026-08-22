@@ -23,6 +23,7 @@ import type {
 } from "./types";
 
 const defaultUserId = "admin";
+export const THREAD_READ_MAX_LIMIT = 240;
 
 let currentUserId = localStorage.getItem("codex-web-user-id") || defaultUserId;
 
@@ -138,11 +139,27 @@ export function exportThreadRecord(
   });
 }
 
-export function migrateSessionsFrom4090(): Promise<{ data: SessionMigrationResult; message?: string }> {
-  return request("/api/handoff/from-4090-left", {
+export interface SessionMigrationJob {
+  id: string;
+  status: "running" | "completed" | "failed";
+  phase: "connecting" | "transferring" | "extracting" | "importing" | "completed" | "failed";
+  bytesTransferred: number;
+  startedAt: string;
+  updatedAt: string;
+  result?: SessionMigrationResult;
+  message?: string;
+  error?: string;
+}
+
+export function migrateSessionsFromLittleRight(): Promise<{ data: SessionMigrationJob }> {
+  return request("/api/handoff/from-little-right", {
     method: "POST",
     body: JSON.stringify({})
   });
+}
+
+export function readSessionMigrationFromLittleRight(jobId: string): Promise<{ data: SessionMigrationJob }> {
+  return request(`/api/handoff/from-little-right/status/${encodeURIComponent(jobId)}`);
 }
 
 export function listProjects(): Promise<{
@@ -232,7 +249,7 @@ export function updateThreadOrder(projectId: string, threadIds: string[]): Promi
   });
 }
 
-export function readThread(threadId: string, projectId?: string, options?: { before?: number; limit?: number }): Promise<ThreadReadResponse> {
+export function readThread(threadId: string, projectId?: string, options?: { before?: number; cursor?: string; limit?: number }): Promise<ThreadReadResponse> {
   const params = new URLSearchParams();
   if (projectId) {
     params.set("projectId", projectId);
@@ -240,11 +257,27 @@ export function readThread(threadId: string, projectId?: string, options?: { bef
   if (typeof options?.before === "number") {
     params.set("before", String(Math.max(0, Math.floor(options.before))));
   }
+  if (options?.cursor) {
+    params.set("cursor", options.cursor);
+  }
   if (typeof options?.limit === "number") {
-    params.set("limit", String(Math.max(1, Math.floor(options.limit))));
+    params.set("limit", String(Math.min(THREAD_READ_MAX_LIMIT, Math.max(1, Math.floor(options.limit)))));
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return request(`/api/threads/${threadId}${suffix}`);
+}
+
+export function readThreadItemOutput(threadId: string, itemId: string, projectId?: string): Promise<{ data: { output: string; bytes: number } }> {
+  const params = new URLSearchParams();
+  if (projectId) params.set("projectId", projectId);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request(`/api/threads/${encodeURIComponent(threadId)}/items/${encodeURIComponent(itemId)}/output${suffix}`);
+}
+
+export function locateThreadItem(threadId: string, itemId: string, projectId?: string): Promise<{ data: { ordinal: number; turnId: string; cursor: string } }> {
+  const params = new URLSearchParams({ itemId });
+  if (projectId) params.set("projectId", projectId);
+  return request(`/api/threads/${encodeURIComponent(threadId)}/position?${params.toString()}`);
 }
 
 export function uploadProjectFiles(projectId: string, files: FileList | File[]): Promise<{ data: ProjectFile[] }> {

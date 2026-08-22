@@ -5,9 +5,10 @@ import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const host = "0.0.0.0";
-const port = 4574;
+const port = Number(process.env.CODEX_V2_PORT ?? 4574);
 const upstreamHost = "127.0.0.1";
-const upstreamPort = 4573;
+const upstreamPort = Number(process.env.CODEX_V2_UPSTREAM_PORT ?? 4573);
+const localTestCookie = process.env.CODEX_V2_TEST_COOKIE ?? "";
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
 
 const mime = new Map([
@@ -29,6 +30,10 @@ function hasSessionCookie(request) {
   return /(?:^|;\s*)codex_remote_session=/.test(request.headers.cookie ?? "");
 }
 
+function isLoopback(request) {
+  return request.socket.remoteAddress === "127.0.0.1" || request.socket.remoteAddress === "::1" || request.socket.remoteAddress === "::ffff:127.0.0.1";
+}
+
 function isPublicPath(requestUrl) {
   const pathname = new URL(requestUrl ?? "/", "http://localhost").pathname;
   return pathname === "/login" || pathname === "/api/auth/login";
@@ -36,7 +41,7 @@ function isPublicPath(requestUrl) {
 
 function requireAuthorization(request, response) {
   const remoteAddress = request.socket.remoteAddress;
-  if (remoteAddress === "127.0.0.1" || remoteAddress === "::1" || remoteAddress === "::ffff:127.0.0.1") return true;
+  if (isLoopback(request)) return true;
   if (request.headers.authorization || hasSessionCookie(request) || isPublicPath(request.url)) return true;
   if (new URL(request.url ?? "/", "http://localhost").pathname === "/") {
     response.writeHead(302, { Location: "/login", "Cache-Control": "no-store" });
@@ -52,12 +57,16 @@ function requireAuthorization(request, response) {
 }
 
 function proxyHttp(request, response) {
+  const headers = { ...request.headers, host: `${upstreamHost}:${upstreamPort}` };
+  if (!headers.cookie && localTestCookie && (request.socket.remoteAddress === "127.0.0.1" || request.socket.remoteAddress === "::1" || request.socket.remoteAddress === "::ffff:127.0.0.1")) {
+    headers.cookie = localTestCookie;
+  }
   const upstream = http.request({
     host: upstreamHost,
     port: upstreamPort,
     method: request.method,
     path: request.url,
-    headers: { ...request.headers, host: `${upstreamHost}:${upstreamPort}` }
+    headers
   }, (upstreamResponse) => {
     response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
     upstreamResponse.pipe(response);
@@ -104,7 +113,7 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.on("upgrade", (request, socket, head) => {
-  if (!request.headers.authorization && !hasSessionCookie(request)) {
+  if (!request.headers.authorization && !hasSessionCookie(request) && !(localTestCookie && isLoopback(request))) {
     socket.end("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"Codex Web V2\"\r\n\r\n");
     return;
   }
@@ -112,15 +121,21 @@ server.on("upgrade", (request, socket, head) => {
     let handshake = `${request.method} ${request.url} HTTP/${request.httpVersion}\r\n`;
     for (let index = 0; index < request.rawHeaders.length; index += 2) {
       const name = request.rawHeaders[index];
-      const value = request.rawHeaders[index + 1];
+      let value = request.rawHeaders[index + 1];
+      if (name.toLowerCase() === "cookie" && !value && localTestCookie) value = localTestCookie;
       handshake += `${name}: ${name.toLowerCase() === "host" ? `${upstreamHost}:${upstreamPort}` : value}\r\n`;
     }
+    if (!request.headers.cookie && localTestCookie) handshake += `Cookie: ${localTestCookie}\r\n`;
     upstream.write(`${handshake}\r\n`);
     if (head.length) upstream.write(head);
     socket.pipe(upstream).pipe(socket);
   });
   upstream.on("error", () => socket.destroy());
+  upstream.on("end", () => socket.end());
+  upstream.on("close", () => socket.destroy());
   socket.on("error", () => upstream.destroy());
+  socket.on("end", () => upstream.end());
+  socket.on("close", () => upstream.destroy());
 });
 
 server.listen(port, host, () => {
