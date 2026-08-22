@@ -138,11 +138,27 @@ export function exportThreadRecord(
   });
 }
 
-export function migrateSessionsFrom4090(): Promise<{ data: SessionMigrationResult; message?: string }> {
+export function migrateSessionsFrom4090(): Promise<{ data: SessionMigrationJob }> {
   return request("/api/handoff/from-4090-left", {
     method: "POST",
     body: JSON.stringify({})
   });
+}
+
+export interface SessionMigrationJob {
+  id: string;
+  status: "running" | "completed" | "failed";
+  phase: "connecting" | "transferring" | "extracting" | "importing" | "completed" | "failed";
+  bytesTransferred: number;
+  startedAt: string;
+  updatedAt: string;
+  result?: SessionMigrationResult;
+  message?: string;
+  error?: string;
+}
+
+export function readSessionMigrationFrom4090(jobId: string): Promise<{ data: SessionMigrationJob }> {
+  return request(`/api/handoff/from-4090-left/status/${encodeURIComponent(jobId)}`);
 }
 
 export function listProjects(): Promise<{

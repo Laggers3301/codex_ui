@@ -41,6 +41,7 @@ import {
   listThreads,
   listUsers,
   migrateSessionsFrom4090,
+  readSessionMigrationFrom4090,
   previewProjectFile,
   readCodexLeaderboard,
   readCodexQuota,
@@ -3913,15 +3914,23 @@ export function App() {
     }
   }
 
-  async function migrateAllSessionsFromLittleRight() {
+  async function migrateAllSessionsFrom4090Left() {
     if (migratingSessions) {
       return;
     }
     setMigratingSessions(true);
     setError("");
     try {
-      const response = await migrateSessionsFrom4090();
-      const result = response.data;
+      const started = await migrateSessionsFrom4090();
+      let job = started.data;
+      while (job.status === "running") {
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 1_000));
+        job = (await readSessionMigrationFrom4090(job.id)).data;
+      }
+      if (job.status === "failed" || !job.result) {
+        throw new Error(job.error || "迁移任务未返回结果。");
+      }
+      const result = job.result;
       await refreshProjects();
       if (result.projectId) {
         const projectId = result.projectId;
@@ -3936,7 +3945,7 @@ export function App() {
       }
       const skipped = result.skippedThreadIds.length ? `；${result.skippedThreadIds.length} 个源端记录文件缺失，未迁移` : "";
       addLocalMessage(
-          response.message ?? `已从 little right 导入 ${result.importedThreadIds.length} 个新会话，已存在 ${result.alreadyPresentThreadIds.length} 个。${skipped}`,
+          job.message ?? `已从 4090-left 导入 ${result.importedThreadIds.length} 个新会话，已存在 ${result.alreadyPresentThreadIds.length} 个。${skipped}`,
         "Codex Web · 会话迁移"
       );
     } catch (caught) {
@@ -6334,12 +6343,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           <button
             className="iconTextButton full"
             type="button"
-            onClick={() => void migrateAllSessionsFromLittleRight()}
+            onClick={() => void migrateAllSessionsFrom4090Left()}
             disabled={migratingSessions}
-            title="仅导入 little right 上当前用户的新会话；已有会话跳过，不覆盖本地记录。"
+            title="仅导入 4090-left 上当前用户的新会话；已有会话跳过，不覆盖本地记录。"
           >
             <Archive size={15} />
-            {migratingSessions ? "导入中…" : "导入 little right 会话"}
+            {migratingSessions ? "导入中…" : "导入 4090-left 会话"}
           </button>
           <p className="creatorHint">只导入新会话，已有记录自动跳过，不会覆盖本地内容。</p>
         </div>
