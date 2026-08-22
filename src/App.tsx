@@ -74,6 +74,7 @@ import type {
   CodexSkill,
   DirectoryListResponse,
   LiveStateSnapshot,
+  LiveAgentMessage,
   LiveToolItem,
   LocalSendSettings,
   ModelProfile,
@@ -207,12 +208,13 @@ interface LiveDeltaEntry {
   text: string;
   startedAt: string;
   sequence?: number;
+  sourceItemId?: string;
 }
 
 interface LiveToolEntry extends LiveToolItem {}
 
 type LiveTimelineEntry =
-  | { id: string; kind: "agent"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; text: string }
+  | { id: string; kind: "agent"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; text: string; sourceItemId?: string }
   | { id: string; kind: "tool"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; tool: string; input: string; output: string; completed: boolean };
 
 interface PendingUserMessage {
@@ -844,6 +846,22 @@ function threadHasUserText(thread: ThreadSummary, text: string): boolean {
 function threadItemKey(item: ThreadItem, fallbackIndex: number): string {
   const id = safeText(item.id);
   return id ? `id:${id}` : `fallback:${safeText(item.type)}:${itemText(item).slice(0, 160)}:${fallbackIndex}`;
+}
+
+function liveAgentTextAfterPersisted(persistedValue: string, liveValue: string): string {
+  const persisted = stripInterruptArtifacts(persistedValue);
+  const live = stripInterruptArtifacts(liveValue);
+  if (!persisted) return live;
+  if (!live || persisted.includes(live)) return "";
+  if (live.startsWith(persisted)) return live.slice(persisted.length);
+
+  const maxOverlap = Math.min(persisted.length, live.length, 4096);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    if (persisted.endsWith(live.slice(0, overlap))) {
+      return live.slice(overlap);
+    }
+  }
+  return live;
 }
 
 function dedupeThreadListById(threads: ThreadSummary[]): ThreadSummary[] {
@@ -2259,13 +2277,26 @@ function safeLiveSnapshotItems<T>(value: T[] | null | undefined): T[] {
     : [];
 }
 
-function liveDeltasFromSnapshot(snapshot: LiveStateSnapshot): Record<string, LiveDeltaEntry> {
+function liveDeltasFromSnapshot(
+  snapshot: LiveStateSnapshot,
+  activeTurns = activeTurnsFromSnapshot(snapshot)
+): Record<string, LiveDeltaEntry> {
   return Object.fromEntries(
     safeLiveSnapshotItems(snapshot.agentMessages)
       .filter((message) => message.itemId && message.text && !message.completed)
       .map((message) => [
         message.itemId,
-        { threadId: message.threadId, turnId: message.turnId, text: message.text, startedAt: message.startedAt ?? message.updatedAt, sequence: message.sequence }
+        {
+          threadId: message.threadId,
+          // A recovered live snapshot can retain an old item turnId after a
+          // queued prompt has moved on. The active turn is authoritative while
+          // it is running; completed history will retain the final order.
+          turnId: message.turnId ?? (message.threadId ? activeTurns[message.threadId] ?? null : null),
+          text: message.text,
+          startedAt: message.startedAt ?? message.updatedAt,
+          sequence: message.sequence,
+          sourceItemId: message.sourceItemId
+        }
       ])
   );
 }
@@ -2648,6 +2679,7 @@ export function App() {
   const [localMessages, setLocalMessages] = useState<LocalMessage[]>([]);
   const [handledLocationFileTarget, setHandledLocationFileTarget] = useState(false);
   const [activeTurnsByThread, setActiveTurnsByThread] = useState<Record<string, string>>({});
+  const activeTurnsByThreadRef = useRef<Record<string, string>>({});
   const [interruptingTurns, setInterruptingTurns] = useState<Record<string, true>>({});
   const [queuedInterruptPrompts, setQueuedInterruptPrompts] = useState<Record<string, true>>({});
   const [unreadResultThreads, setUnreadResultThreads] = useState<Record<string, true>>({});
@@ -2722,10 +2754,10 @@ export function App() {
     }
   }
 
-  function liveTimelineSequence(kind: "agent" | "tool", itemId: string): number {
+  function liveTimelineSequence(kind: "agent" | "tool", itemId: string, moveToTail = false): number {
     const key = `${kind}:${itemId}`;
     const existing = liveTimelineOrderRef.current.get(key);
-    if (existing !== undefined) {
+    if (existing !== undefined && (!moveToTail || existing === liveTimelineSequenceRef.current)) {
       return existing;
     }
     const sequence = ++liveTimelineSequenceRef.current;
@@ -2752,8 +2784,8 @@ export function App() {
       for (const [itemId, entry] of pending) {
         const existing = next[itemId];
         next[itemId] = {
-          threadId: existing?.threadId ?? entry.threadId,
-          turnId: existing?.turnId ?? entry.turnId,
+          threadId: entry.threadId ?? existing?.threadId ?? null,
+          turnId: entry.turnId ?? existing?.turnId ?? null,
           text: `${existing?.text ?? ""}${entry.text}`,
           startedAt: existing?.startedAt ?? entry.startedAt
         };
@@ -2763,11 +2795,14 @@ export function App() {
   }
 
   function enqueueLiveDelta(itemId: string, entry: LiveDeltaEntry): void {
-    liveTimelineSequence("agent", itemId);
+    // Codex may resume the same agent item after one or more tool calls. Its
+    // next delta is a new timeline segment and must follow those tools instead
+    // of retaining the item's original position near the start of the turn.
+    liveTimelineSequence("agent", itemId, true);
     const existing = pendingLiveDeltasRef.current.get(itemId);
     pendingLiveDeltasRef.current.set(itemId, {
-      threadId: existing?.threadId ?? entry.threadId,
-      turnId: existing?.turnId ?? entry.turnId,
+      threadId: entry.threadId ?? existing?.threadId ?? null,
+      turnId: entry.turnId ?? existing?.turnId ?? null,
       text: `${existing?.text ?? ""}${entry.text}`,
       startedAt: existing?.startedAt ?? entry.startedAt
     });
@@ -5488,9 +5523,11 @@ export function App() {
       window.clearTimeout(liveDeltaFlushTimerRef.current);
       liveDeltaFlushTimerRef.current = null;
     }
-    setLiveDeltas(liveDeltasFromSnapshot(snapshot));
+    const activeTurns = activeTurnsFromSnapshot(snapshot);
+    activeTurnsByThreadRef.current = activeTurns;
+    setLiveDeltas(liveDeltasFromSnapshot(snapshot, activeTurns));
     setLiveTools(liveToolsFromSnapshot(snapshot));
-    setActiveTurnsByThread(activeTurnsFromSnapshot(snapshot));
+    setActiveTurnsByThread(activeTurns);
     turnThreadIdsRef.current.clear();
     for (const turn of safeLiveSnapshotItems(snapshot.activeTurns)) {
       if (turn.threadId && turn.turnId) {
@@ -5574,6 +5611,29 @@ export function App() {
       return;
     }
 
+    if (message.type === "live.agent") {
+      const item = message.data as LiveAgentMessage | undefined;
+      if (item?.itemId) {
+        markLiveEvent(item.threadId);
+        if (typeof item.sequence === "number") {
+          liveTimelineOrderRef.current.set(`agent:${item.itemId}`, item.sequence);
+          liveTimelineSequenceRef.current = Math.max(liveTimelineSequenceRef.current, item.sequence);
+        }
+        setLiveDeltas((current) => ({
+          ...current,
+          [item.itemId]: {
+            threadId: item.threadId,
+            turnId: item.turnId,
+            text: item.text,
+            startedAt: item.startedAt,
+            sequence: item.sequence,
+            sourceItemId: item.sourceItemId
+          }
+        }));
+      }
+      return;
+    }
+
     if (message.type === "terminal.output") {
       const data = message.data as { processId?: string; text?: string; stream?: string } | undefined;
       if (data?.processId && data.text) {
@@ -5607,6 +5667,7 @@ export function App() {
         }
         if (turnId && threadId) {
           turnThreadIdsRef.current.set(turnId, threadId);
+          activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [threadId]: turnId };
           setActiveTurnsByThread((current) => ({ ...current, [threadId]: turnId }));
         }
         return;
@@ -5779,6 +5840,7 @@ export function App() {
             : entry
           ));
         }
+        activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [promptThreadId]: acknowledgedTurnId };
         setActiveTurnsByThread((current) => ({ ...current, [promptThreadId]: acknowledgedTurnId }));
         if (message.requestId && interruptQueuedForPrompt) {
           clearQueuedInterrupt(message.requestId);
@@ -5835,15 +5897,23 @@ export function App() {
         if (!itemId) {
           return;
         }
-        const turnId = notificationTurnId(params);
-        const threadId = notificationThreadId(params) ?? (turnId ? turnThreadIdsRef.current.get(turnId) ?? null : null);
+        const reportedTurnId = notificationTurnId(params);
+        const reportedThreadId = notificationThreadId(params);
+        const selectedThreadId = selectedThreadRef.current?.id ?? null;
+        const inferredThreadId = reportedTurnId ? turnThreadIdsRef.current.get(reportedTurnId) ?? null : null;
+        const threadId = reportedThreadId ?? inferredThreadId ?? selectedThreadId;
+        const fallbackActiveTurnId = threadId ? activeTurnsByThreadRef.current[threadId] ?? null : null;
+        // A queued prompt can emit turn/started and its first text delta in the
+        // same React batch. In that window activeTurnsByThread still points at
+        // the previous turn, while the notification already carries the new
+        // authoritative turn id. Never replace an explicit event association
+        // with state from the previous render.
+        const turnId = reportedTurnId ?? fallbackActiveTurnId;
         markLiveEvent(threadId);
-        enqueueLiveDelta(itemId, {
-          threadId,
-          turnId,
-          text: visibleDelta,
-          startedAt: new Date().toISOString()
-        });
+        // The server emits a normalized live.agent event immediately after
+        // this raw notification. It carries the authoritative segment id and
+        // sequence, so rendering the raw delta here would create a second,
+        // incorrectly ordered copy.
       }
       if (notification.method === "turn/started") {
         const turnId = notificationTurnId(params);
@@ -5851,6 +5921,7 @@ export function App() {
         if (threadId && turnId) {
           markLiveEvent(threadId);
           turnThreadIdsRef.current.set(turnId, threadId);
+          activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [threadId]: turnId };
           setActiveTurnsByThread((current) => ({ ...current, [threadId]: turnId }));
         }
       }
@@ -7553,17 +7624,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   const activeTurnLiveItems = selectedActiveTurnId && selectedActiveTurnId === turn.id
                     ? (liveTimelineByTurn.get(turn.id) ?? [])
                     : [];
-                  const isActiveTurn = Boolean(selectedActiveTurnId && selectedActiveTurnId === turn.id);
-                  const activeLiveAgentItemIds = new Set(
-                    activeTurnLiveItems.filter((entry) => entry.kind === "agent").map((entry) => entry.id)
-                  );
-                  const activeTrailingToolIndexes = new Set<number>();
-                  if (isActiveTurn) {
-                    for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex -= 1) {
-                      if (itemKind(items[itemIndex]) !== "tool") break;
-                      activeTrailingToolIndexes.add(itemIndex);
-                    }
-                  }
                   const persistedTurnItemsById = new Map<string, ThreadItem>();
                   const persistedToolCorrelationId = (item: ThreadItem): string => {
                     const record = item as ThreadItem & {
@@ -7579,7 +7639,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     const correlationId = persistedToolCorrelationId(item);
                     if (correlationId) persistedTurnItemsById.set(correlationId, item);
                   }
-                  const activeTrailingToolItems: ThreadItem[] = [];
+                  const runningToolEntriesById = new Map(
+                    activeTurnLiveItems
+                      .filter((entry): entry is Extract<LiveTimelineEntry, { kind: "tool" }> => entry.kind === "tool")
+                      .map((entry) => [entry.id, entry])
+                  );
+                  const consumedLiveToolItemIds = new Set<string>();
                   const renderedUserItems: React.ReactNode[] = [];
                   const renderedHistoryItems: React.ReactNode[] = [];
                   const pendingToolGroup: ThreadItem[] = [];
@@ -7601,28 +7666,33 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     return indexBase + 1;
                   };
                   let toolGroupIndex = 0;
-                  for (const [itemIndex, item] of items.entries()) {
+                  for (const item of items) {
                     const kind = itemKind(item);
-                    // Match codex2: preserve persisted message/tool order and
-                    // only let the live copy replace its matching agent item.
-                    if (kind === "agent" && item.id && activeLiveAgentItemIds.has(item.id)) {
-                      continue;
-                    }
                     if (kind === "tool") {
-                    if (activeTrailingToolIndexes.has(itemIndex)) {
-                      activeTrailingToolItems.push(item);
-                      continue;
-                    }
-                    const itemRefText = itemText(item);
-                    const hasRenderableItemContent = Boolean(item.command) ||
-                      Boolean(safeText(item.output).trim()) ||
-                      Boolean(safeText(item.input).trim()) ||
-                      Boolean(safeText(item.tool).trim()) ||
-                        (Array.isArray((item as { changes?: unknown[] }).changes) && ((item as { changes?: unknown[] }).changes ?? []).length > 0) ||
-                        Boolean(item.aggregatedOutput) ||
+                      const persistedToolId = persistedToolCorrelationId(item) || item.id || "";
+                      const liveToolEntry = persistedToolId ? runningToolEntriesById.get(persistedToolId) : undefined;
+                      const itemForRender = liveToolEntry
+                        ? ({
+                            ...item,
+                            type: "toolCall",
+                            tool: liveToolEntry.tool || item.tool,
+                            input: liveToolEntry.input || item.input,
+                            output: liveToolEntry.output || item.output,
+                            aggregatedOutput: liveToolEntry.output || item.aggregatedOutput,
+                            completed: liveToolEntry.completed
+                          } as ThreadItem)
+                        : item;
+                      if (liveToolEntry) consumedLiveToolItemIds.add(liveToolEntry.id);
+                      const itemRefText = itemText(itemForRender);
+                      const hasRenderableItemContent = Boolean(itemForRender.command) ||
+                        Boolean(safeText(itemForRender.output).trim()) ||
+                        Boolean(safeText(itemForRender.input).trim()) ||
+                        Boolean(safeText(itemForRender.tool).trim()) ||
+                        (Array.isArray((itemForRender as { changes?: unknown[] }).changes) && ((itemForRender as { changes?: unknown[] }).changes ?? []).length > 0) ||
+                        Boolean(itemForRender.aggregatedOutput) ||
                         Boolean(stripInterruptArtifacts(itemRefText).trim());
                       if (hasRenderableItemContent) {
-                        pendingToolGroup.push(item);
+                        pendingToolGroup.push(itemForRender);
                         continue;
                       }
                     }
@@ -7655,8 +7725,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       renderedHistoryItems.push(renderedItem);
                     }
                   }
-                  flushToolGroup(toolGroupIndex);
-
                   const turnAgentText = items
                     .filter((item) => itemKind(item) === "agent")
                     .map((item) => stripInterruptArtifacts(itemText(item)).trim())
@@ -7692,52 +7760,45 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       completed: entry.completed
                     } as ThreadItem);
                   };
-                  const runningTurnLiveToolEntries = activeTurnLiveItems.filter(
-                    (entry): entry is Extract<LiveTimelineEntry, { kind: "tool" }> => entry.kind === "tool"
-                  );
-                  const runningToolEntriesById = new Map(runningTurnLiveToolEntries.map((entry) => [entry.id, entry]));
-                  const mergedTrailingToolItemsById = new Map<string, ThreadItem>();
-                  const unmatchedTrailingToolItems: ThreadItem[] = [];
-                  for (const persistedToolItem of activeTrailingToolItems) {
-                    const persistedToolId = persistedToolCorrelationId(persistedToolItem) || persistedToolItem.id || "";
-                    const liveEntry = persistedToolId ? runningToolEntriesById.get(persistedToolId) : undefined;
-                    if (!liveEntry) {
-                      unmatchedTrailingToolItems.push(persistedToolItem);
-                      continue;
-                    }
-                    const liveToolItem = toRunningToolItem(liveEntry);
-                    mergedTrailingToolItemsById.set(liveEntry.id, {
-                      ...persistedToolItem,
-                      ...liveToolItem,
-                      input: liveToolItem.input || persistedToolItem.input,
-                      output: liveToolItem.output || persistedToolItem.output,
-                      aggregatedOutput: liveToolItem.aggregatedOutput || persistedToolItem.aggregatedOutput
-                    });
-                  }
                   const runningTurnTimelineItems: React.ReactNode[] = [];
-                  const runningToolGroup: ThreadItem[] = [];
+                  const runningToolGroup: ThreadItem[] = [...pendingToolGroup];
+                  let runningToolGroupContainsHistory = pendingToolGroup.length > 0;
+                  pendingToolGroup.length = 0;
                   let runningToolGroupIndex = toolGroupIndex;
                   const flushRunningToolGroup = () => {
                     if (runningToolGroup.length === 0) return;
                     const bundleItems = [...runningToolGroup];
                     runningTurnTimelineItems.push(renderPersistedToolBundle(
-                      `${turn.id}-live-toolbundle-${runningToolGroupIndex}`,
+                      `${turn.id}-${runningToolGroupContainsHistory ? "history" : "live"}-toolbundle-${runningToolGroupIndex}`,
                       bundleItems,
                       bundleItems.every((item) => item.completed !== false)
                     ));
                     runningToolGroup.length = 0;
+                    runningToolGroupContainsHistory = false;
                     runningToolGroupIndex += 1;
                   };
                   for (const entry of activeTurnLiveItems) {
                     if (entry.kind === "tool") {
-                      runningToolGroup.push(mergedTrailingToolItemsById.get(entry.id) ?? toRunningToolItem(entry));
+                      if (!consumedLiveToolItemIds.has(entry.id)) {
+                        runningToolGroup.push(toRunningToolItem(entry));
+                      }
+                      continue;
+                    }
+                    const persistedAgentItem = persistedTurnItemsById.get(entry.sourceItemId ?? entry.id);
+                    const visibleAgentText = liveAgentTextAfterPersisted(
+                      persistedAgentItem ? itemText(persistedAgentItem) : turnAgentText,
+                      entry.text
+                    );
+                    if (!stripInterruptArtifacts(visibleAgentText).trim()) {
                       continue;
                     }
                     flushRunningToolGroup();
-                    const renderedEntry = renderLiveTimelineEntry(entry);
+                    const renderedEntry = renderLiveTimelineEntry({
+                      ...entry,
+                      text: visibleAgentText
+                    });
                     if (renderedEntry) runningTurnTimelineItems.push(renderedEntry);
                   }
-                  runningToolGroup.push(...unmatchedTrailingToolItems);
                   flushRunningToolGroup();
                   const runningTurnThinking = selectedActiveTurnId && selectedActiveTurnId === turn.id
                     ? [<div className="v2ThinkingLine" key={`${turn.id}-thinking-status`}>正在思考</div>]
