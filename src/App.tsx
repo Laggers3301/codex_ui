@@ -3626,7 +3626,7 @@ export function App() {
         timer = null;
         const latestLiveAt = lastLiveEventAtRef.current[threadId] ?? 0;
         const silenceMs = Date.now() - latestLiveAt;
-        if (socketStatus === "open") {
+        if (socketStatus === "open" && silenceMs >= 8_000) {
           try {
             codexSocket.send({ type: "live.state", requestId: `live-${requestToken()}` });
           } catch {
@@ -5532,7 +5532,6 @@ export function App() {
     for (const turn of safeLiveSnapshotItems(snapshot.activeTurns)) {
       if (turn.threadId && turn.turnId) {
         turnThreadIdsRef.current.set(turn.turnId, turn.threadId);
-        markLiveEvent(turn.threadId);
       }
     }
   }
@@ -5556,12 +5555,12 @@ export function App() {
     const hasPendingForThread = pendingUserMessagesRef.current.some((entry) => (
       entry.threadId === thread.id && entry.keepAtBottomUntil > now
     ));
-    const isPending = hasPendingForThread || thread.status === "starting" || isRunning;
+    const isPending = hasPendingForThread || thread.status === "starting";
     if (!isRunning && !isPending) {
       return;
     }
     const localActiveTurn = activeTurnsByThread[thread.id];
-    if (isRunning && localActiveTurn === activeTurnFromSnapshot && !isPending) {
+    if (isRunning && localActiveTurn === activeTurnFromSnapshot) {
       return;
     }
     const projectId = threadProjectIdsRef.current.get(thread.id) ?? selectedProjectIdRef.current;
