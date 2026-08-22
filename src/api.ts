@@ -232,7 +232,7 @@ export function updateThreadOrder(projectId: string, threadIds: string[]): Promi
   });
 }
 
-export function readThread(threadId: string, projectId?: string, options?: { before?: number; limit?: number }): Promise<ThreadReadResponse> {
+export function readThread(threadId: string, projectId?: string, options?: { before?: number; cursor?: string; limit?: number }): Promise<ThreadReadResponse> {
   const params = new URLSearchParams();
   if (projectId) {
     params.set("projectId", projectId);
@@ -240,11 +240,27 @@ export function readThread(threadId: string, projectId?: string, options?: { bef
   if (typeof options?.before === "number") {
     params.set("before", String(Math.max(0, Math.floor(options.before))));
   }
+  if (options?.cursor) {
+    params.set("cursor", options.cursor);
+  }
   if (typeof options?.limit === "number") {
     params.set("limit", String(Math.max(1, Math.floor(options.limit))));
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return request(`/api/threads/${threadId}${suffix}`);
+}
+
+export function readThreadItemOutput(threadId: string, itemId: string, projectId?: string): Promise<{ data: { output: string; bytes: number } }> {
+  const params = new URLSearchParams();
+  if (projectId) params.set("projectId", projectId);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request(`/api/threads/${encodeURIComponent(threadId)}/items/${encodeURIComponent(itemId)}/output${suffix}`);
+}
+
+export function locateThreadItem(threadId: string, itemId: string, projectId?: string): Promise<{ data: { ordinal: number; turnId: string; cursor: string } }> {
+  const params = new URLSearchParams({ itemId });
+  if (projectId) params.set("projectId", projectId);
+  return request(`/api/threads/${encodeURIComponent(threadId)}/position?${params.toString()}`);
 }
 
 export function uploadProjectFiles(projectId: string, files: FileList | File[]): Promise<{ data: ProjectFile[] }> {

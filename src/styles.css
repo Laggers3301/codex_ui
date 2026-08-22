@@ -19,6 +19,40 @@
   --ink: #101214;
 }
 
+/* Stable turn virtualization keeps history prepends anchored without remounting the conversation. */
+.virtualConversationSizer {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}
+
+.virtualConversationRow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  contain: layout style;
+}
+
+.virtualConversationFlow,
+.virtualConversationFlowRow {
+  width: 100%;
+  min-width: 0;
+}
+
+.virtualConversationFlowRow {
+  contain: layout style;
+}
+
+.conversationTurnRow,
+.conversationLiveTail {
+  display: flow-root;
+  width: 100%;
+  min-width: 0;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -7924,4 +7958,38 @@ textarea:focus {
     background: #393b38 !important;
     color: #fff;
   }
+}
+
+.messages.virtualConversationFlowMode {
+  overflow-anchor: auto;
+}
+
+.messages.virtualConversationVirtualMode {
+  overflow-anchor: none;
+}
+
+
+/* Desktop collapsed sidebar: keep a single usable icon rail instead of a zero-width grid column with a floating restore control. */
+@media (min-width: 721px) {
+  :root { --v2-collapsed-sidebar-width: 56px; }
+  .topbar { padding-left: calc(var(--v2-sidebar-width, 280px) + 16px); transition: padding-left 160ms ease; }
+  .errorBanner { margin-left: calc(var(--v2-sidebar-width, 280px) + 12px); transition: margin-left 160ms ease; }
+  .threadList .listHeader .panelCollapseButton { display: none !important; }
+  body:has(.threadList.collapsed) .topbar { padding-left: calc(var(--v2-collapsed-sidebar-width) + 16px); }
+  body:has(.threadList.collapsed) .errorBanner { margin-left: calc(var(--v2-collapsed-sidebar-width) + 12px); }
+  body:has(.threadList.collapsed) .v2ProjectDock, body:has(.threadList.collapsed) .v2AccountDock { display: block !important; width: var(--v2-collapsed-sidebar-width) !important; }
+  body:has(.threadList.collapsed) .v2ProjectDock { height: 140px !important; padding: 13px 8px 0 !important; }
+  body:has(.threadList.collapsed) .v2BrandRow { display: flex; justify-content: flex-start; min-height: 32px; padding-left: 8px; }
+  body:has(.threadList.collapsed) .v2BrandRow > strong, body:has(.threadList.collapsed) .v2BuildBadge, body:has(.threadList.collapsed) .v2PrimaryNav button > strong, body:has(.threadList.collapsed) .v2AccountTrigger strong { display: none !important; }
+  body:has(.threadList.collapsed) .v2PrimaryNav { margin-top: 6px; }
+  body:has(.threadList.collapsed) .v2PrimaryNav button { grid-template-columns: 1fr; justify-items: start; min-height: 30px; padding: 3px 8px; }
+  body:has(.threadList.collapsed) .v2PrimaryNav button > span { place-self: center start; }
+  body:has(.threadList.collapsed) .v2AccountDock { padding: 7px 8px; }
+  body:has(.threadList.collapsed) .v2AccountTrigger { justify-content: flex-start; padding: 0 8px; }
+  body:has(.threadList.collapsed) .workspace > .threadList { display: flex !important; grid-column: 1; grid-row: 1; padding: 0 !important; }
+  body:has(.threadList.collapsed) .workspace > .threadList > * { visibility: hidden; pointer-events: none; }
+  body:has(.threadList.collapsed) .workspace > .conversation { grid-column: 3; grid-row: 1; }
+  .v2SidebarToggle { display: grid; width: 29px; height: 29px; place-items: center; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #aeb1ab; font-size: 22px; line-height: 1; }
+  .v2SidebarToggle:hover { background: rgba(255, 255, 255, 0.06); color: #f1f2ee; }
+  .threadListRestoreButton { display: none !important; }
 }

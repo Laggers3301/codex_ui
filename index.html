@@ -94,7 +94,7 @@
       })();
     </script>
     <div class="v2ProjectDock" id="v2ProjectDock">
-      <div class="v2BrandRow"><strong>Codex</strong><span class="v2BuildBadge">260803</span><button class="v2BrandSearch" id="v2BrandSearch" type="button" title="搜索对话">⌕</button></div>
+      <div class="v2BrandRow"><strong>Codex</strong><span class="v2BuildBadge">260803</span><button class="v2SidebarToggle" id="v2SidebarToggle" type="button" title="折叠侧边栏" aria-label="折叠侧边栏">‹</button></div>
       <div class="v2PrimaryNav">
         <button id="v2NewConversation" type="button"><span class="v2NewThreadGlyph" aria-hidden="true"></span><strong>新对话</strong></button>
         <button id="v2OpenPlugins" type="button"><span class="v2PluginGlyph" aria-hidden="true"></span><strong>插件</strong></button>
@@ -134,8 +134,13 @@
         const projectOptions = document.getElementById("v2ProjectOptions");
         const plusMenu = document.getElementById("v2PlusMenu");
 
-        document.getElementById("v2BrandSearch").addEventListener("click", () => {
-          window.dispatchEvent(new Event("v2:open-thread-search"));
+        const sidebarToggle = document.getElementById("v2SidebarToggle");
+        sidebarToggle.addEventListener("click", () => {
+          const threadList = document.querySelector(".threadList");
+          const target = threadList?.classList.contains("collapsed")
+            ? document.querySelector(".threadListRestoreButton")
+            : document.querySelector(".threadList .panelCollapseButton");
+          target?.click();
         });
         document.getElementById("v2NewConversation").addEventListener("click", () => {
           document.querySelector(".newThreadButton")?.click();
@@ -199,6 +204,10 @@
         function installShellBridges() {
           const threadList = document.querySelector(".threadList");
           if (threadList) {
+            const collapsed = threadList.classList.contains("collapsed");
+            sidebarToggle.textContent = collapsed ? "›" : "‹";
+            sidebarToggle.title = collapsed ? "展开侧边栏" : "折叠侧边栏";
+            sidebarToggle.setAttribute("aria-label", sidebarToggle.title);
             const applySidebarWidth = (width) => {
               // During conversation switches the grid briefly reports 0px.
               // Do not persist that transient layout state into the fixed V2 dock.
