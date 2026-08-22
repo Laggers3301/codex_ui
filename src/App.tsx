@@ -7430,7 +7430,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       output: entry.output,
                       completed: entry.completed
                     } as ThreadItem);
-                  };
                   const runningTurnTimelineItems: React.ReactNode[] = [];
                   const runningToolGroup: ThreadItem[] = [...pendingToolGroup];
                   let runningToolGroupContainsHistory = pendingToolGroup.length > 0;
