@@ -300,6 +300,7 @@ export interface CodexNotification {
 
 export interface LiveAgentMessage {
   itemId: string;
+  sourceItemId?: string;
   threadId: string | null;
   turnId: string | null;
   text: string;
