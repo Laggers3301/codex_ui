@@ -1,6 +1,7 @@
 import fs from "node:fs";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import path from "node:path";
+import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 import type { MultipartFile } from "@fastify/multipart";
@@ -13,16 +14,48 @@ import { DEFAULT_USER_ID, type ProjectStore, type ThreadPresentation } from "./d
 import { listBrowsableDirectories } from "./directoryBrowser.js";
 import { ensureProjectDirectory, PathPolicyError, resolveProjectFilePath, resolveProjectPath } from "./pathPolicy.js";
 import { findThreadJsonlPathById, paginateThreadPayload, readThreadFromJsonl, readThreadSummaryFromJsonl, threadJsonlMatchesSearch, threadJsonlPathFromError } from "./threadFallback.js";
+import { locateIndexedThreadItem, readIndexedThreadItem, readIndexedThreadPage, searchIndexedThreads, warmThreadIndex } from "./threadEventIndex.js";
 import { listAllCodexThreads, THREAD_LIST_PAGE_SIZE } from "./threadList.js";
+import { importStagedUserHandoff, type ImportedUserHandoff } from "./userHandoff.js";
 
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
-// Default Codex cwd per logged-in user. Keep it inside the selected project
-// root unless an operator explicitly configures a different workspace root.
-const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.projectRoot, "users");
+// Default Codex cwd per logged-in user. This prevents generated artifacts from
+// accumulating in /home/ls while retaining historical shared-home projects.
+const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? "/home/ls/codex_zerotier_remote/users";
 const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
 const maxThreadHistoryPageSize = 240;
+const handoffInFlightUsers = new Set<string>();
+type HandoffJobPhase = "connecting" | "transferring" | "extracting" | "importing" | "completed" | "failed";
+type HandoffImportResult = Awaited<ReturnType<typeof importStagedUserHandoff>>;
+interface HandoffJob {
+  id: string;
+  userId: string;
+  status: "running" | "completed" | "failed";
+  phase: HandoffJobPhase;
+  bytesTransferred: number;
+  startedAt: string;
+  updatedAt: string;
+  result?: HandoffImportResult;
+  message?: string;
+  error?: string;
+}
+const handoffJobs = new Map<string, HandoffJob>();
+const handoffJobIdsByUser = new Map<string, string>();
+const handoffSourceSchema = z.object({
+  sourceHost: z.string().trim().max(255).optional(),
+  sourceUser: z.string().trim().max(64).optional(),
+  sourceAppDir: z.string().trim().max(512).optional(),
+  sourceLabel: z.string().trim().max(96).optional()
+});
+
+interface HandoffSourceSettings {
+  host: string;
+  user: string;
+  appDir: string;
+  label: string;
+}
 
 const textExtensions = new Set([
   ".c",
@@ -125,12 +158,15 @@ const sendLocalFileSchema = z.object({
 const threadExportSchema = z.object({
   format: z.enum(["markdown", "json"]).optional().default("markdown"),
   sendLocal: z.boolean().optional().default(false),
+  outputPath: z.string().max(2048).optional(),
   destinationPath: z.string().max(2048).optional()
 });
 
 const threadReadQuerySchema = z.object({
   projectId: z.string().optional(),
   before: z.coerce.number().int().min(0).optional().default(0),
+  cursor: z.string().max(512).optional(),
+  fresh: z.enum(["1", "true"]).optional().transform((value) => value === "1" || value === "true"),
   limit: z.coerce.number().int().min(1).max(maxThreadHistoryPageSize).optional().default(defaultThreadHistoryPageSize)
 });
 
@@ -302,7 +338,7 @@ type PublicCodexQuota = {
 // All Web users share the same locally logged-in Codex account.  Polling quota
 // from every browser without a short shared cache would create redundant MCP
 // requests and can itself make the quota display slow or unreliable.
-const codexQuotaCacheTtlMs = 10_000;
+const codexQuotaCacheTtlMs = 180_000;
 let codexQuotaCache: { data: PublicCodexQuota; expiresAt: number } | null = null;
 let codexQuotaRefreshInFlight: Promise<PublicCodexQuota> | null = null;
 
@@ -549,6 +585,8 @@ type PublicLeaderboardUserUsage = PublicTokenBreakdown & {
 type PublicLeaderboardScope = {
   totalTokens: number;
   resetAt: number | null;
+  resetWindowMins: number | null;
+  startAt: number | null;
   quotaUsedPercent: number | null;
   users: PublicLeaderboardUserUsage[];
 };
@@ -568,7 +606,7 @@ type AggregateBucket = {
   totals: TokenAccumulator;
 };
 
-const leaderboardCacheTtlMs = 10_000;
+const leaderboardCacheTtlMs = 60_000;
 let leaderboardCache: { data: PublicCodexLeaderboard; expiresAt: number; resetAt: number | null } | null = null;
 let leaderboardRefreshInFlight: Promise<PublicCodexLeaderboard> | null = null;
 
@@ -682,7 +720,7 @@ function recordUsage(
 
 function finalizeLeaderboardScope(
   source: Map<string, AggregateBucket>,
-  options: { totalQuotaUsedPercent: number | null; resetAt: number | null }
+  options: { totalQuotaUsedPercent: number | null; resetAt: number | null; resetWindowMins: number | null; startAt?: number | null }
 ): PublicLeaderboardScope {
   const totalTokens = Array.from(source.values()).reduce((sum, entry) => sum + entry.totals.totalTokens, 0);
   const users = Array.from(source.entries())
@@ -712,9 +750,32 @@ function finalizeLeaderboardScope(
   return {
     totalTokens,
     resetAt: options.resetAt,
+    resetWindowMins: options.resetWindowMins,
+    startAt: options.startAt !== undefined
+      ? options.startAt
+      : options.resetAt !== null && options.resetWindowMins !== null && options.resetWindowMins > 0
+        ? options.resetAt - options.resetWindowMins * 60
+        : null,
     quotaUsedPercent: options.totalQuotaUsedPercent,
     users
   };
+}
+
+function sharedNumericValue(values: Array<number | null>): number | null {
+  const normalized = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  if (!normalized.length) {
+    return null;
+  }
+  const first = normalized[0];
+  return normalized.every((value) => value === first) ? first : null;
+}
+
+function numericBoundary(values: Array<number | null>, direction: "min" | "max"): number | null {
+  const normalized = values.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  if (!normalized.length) {
+    return null;
+  }
+  return direction === "min" ? Math.min(...normalized) : Math.max(...normalized);
 }
 
 function mergeLeaderboardScopes(scopes: PublicLeaderboardScope[], accountLabels: string[]): PublicLeaderboardScope {
@@ -748,7 +809,15 @@ function mergeLeaderboardScopes(scopes: PublicLeaderboardScope[], accountLabels:
   }
   // Separate Codex accounts have separate rate-limit windows, so a merged
   // board deliberately has no misleading single quota percentage/reset time.
-  return finalizeLeaderboardScope(buckets, { totalQuotaUsedPercent: null, resetAt: null });
+  return finalizeLeaderboardScope(
+    buckets,
+    {
+      totalQuotaUsedPercent: null,
+      resetAt: numericBoundary(scopes.map((scope) => scope.resetAt), "max"),
+      resetWindowMins: sharedNumericValue(scopes.map((scope) => scope.resetWindowMins)),
+      startAt: numericBoundary(scopes.map((scope) => scope.startAt), "min")
+    }
+  );
 }
 
 async function mergePeerLeaderboards(local: PublicCodexLeaderboard): Promise<PublicCodexLeaderboard> {
@@ -791,14 +860,16 @@ async function mergePeerLeaderboards(local: PublicCodexLeaderboard): Promise<Pub
 }
 
 function readCodexLeaderboard(currentQuota: PublicCodexQuota, store: ProjectStore): PublicCodexLeaderboard {
-  const sessionsRoot = path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? process.cwd(), ".codex"), "sessions");
+  const sessionsRoot = path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/ls", ".codex"), "sessions");
   const files = walkJsonlFiles(sessionsRoot);
   const currentResetAt = currentQuota.rateLimits?.primary?.resetsAt ?? null;
+  const currentResetWindowMins = currentQuota.rateLimits?.primary?.windowDurationMins ?? null;
   const currentQuotaUsedPercent = currentQuota.rateLimits?.primary?.usedPercent ?? null;
   const lifetime = new Map<string, AggregateBucket>();
   const currentCycle = new Map<string, AggregateBucket>();
   const errors: string[] = [];
   const ownerUserCache = new Map<string, string | null>();
+  let lifetimeStartAt: number | null = null;
 
   const resolveSessionOwner = (sessionId: string): string | null => {
     if (ownerUserCache.has(sessionId)) {
@@ -843,6 +914,12 @@ function readCodexLeaderboard(currentQuota: PublicCodexQuota, store: ProjectStor
         if (type !== "event_msg" || stringOrNull(payload.type) !== "token_count") {
           continue;
         }
+        const recordTimestamp = stringOrNull(record.timestamp);
+        const parsedTimestampMs = recordTimestamp ? Date.parse(recordTimestamp) : Number.NaN;
+        if (Number.isFinite(parsedTimestampMs)) {
+          const parsedTimestamp = Math.floor(parsedTimestampMs / 1000);
+          lifetimeStartAt = lifetimeStartAt === null ? parsedTimestamp : Math.min(lifetimeStartAt, parsedTimestamp);
+        }
         if (!userId) {
           userId = resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd)) ?? "unknown";
         }
@@ -873,11 +950,14 @@ function readCodexLeaderboard(currentQuota: PublicCodexQuota, store: ProjectStor
   return {
     currentCycle: finalizeLeaderboardScope(currentCycle, {
       totalQuotaUsedPercent: currentQuotaUsedPercent,
-      resetAt: currentResetAt
+      resetAt: currentResetAt,
+      resetWindowMins: currentResetWindowMins
     }),
     lifetime: finalizeLeaderboardScope(lifetime, {
       totalQuotaUsedPercent: null,
-      resetAt: null
+      resetAt: null,
+      resetWindowMins: null,
+      startAt: lifetimeStartAt
     }),
     updatedAt: new Date().toISOString(),
     errors
@@ -961,28 +1041,8 @@ function timestampSegment(date = new Date()): string {
   ].join("_");
 }
 
-function ensureProjectArtifactRoot(projectRoot: string): string {
-  const artifactRoot = path.join(projectRoot, ".codex-web");
-  fs.mkdirSync(artifactRoot, { recursive: true, mode: 0o700 });
-  const ignorePath = path.join(artifactRoot, ".gitignore");
-  try {
-    // Protect uploaded files and exported conversation records from a normal
-    // `git add .` in the selected project without modifying user files that
-    // already provide their own nested ignore rules.
-    fs.writeFileSync(ignorePath, "uploads/\nexports/\n", { flag: "wx", mode: 0o600 });
-  } catch (error) {
-    if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) {
-      throw error;
-    }
-  }
-  return artifactRoot;
-}
-
-function uploadBatchDirectory(projectRoot: string, username: string): string {
-  // Keep user uploads under the selected project. This lets the normal file
-  // policy protect previews, raw downloads and SSH delivery without allowing
-  // arbitrary reads from a shared temporary directory.
-  return path.join(ensureProjectArtifactRoot(projectRoot), "uploads", safeFolderSegment(username, "anonymous"), timestampSegment());
+function uploadBatchDirectory(username: string): string {
+  return path.join(uploadRoot, safeFolderSegment(username, "anonymous"), timestampSegment());
 }
 
 function uniqueUploadTarget(projectRoot: string, batchDirectory: string, filename: string): { filePath: string; relativePath: string } {
@@ -995,7 +1055,10 @@ function uniqueUploadTarget(projectRoot: string, batchDirectory: string, filenam
     if (!candidate.startsWith(`${root}${path.sep}`)) {
       throw new Error("Invalid upload filename.");
     }
-    const target = resolveProjectFilePath(projectRoot, candidate, { mustExist: false });
+    const target = resolveProjectFilePath(projectRoot, candidate, {
+      mustExist: false,
+      allowOutsideRoot: true
+    });
     if (!fs.existsSync(target.filePath)) {
       return target;
     }
@@ -1060,8 +1123,10 @@ function settingsForCurrentAccessDevice(
   const savedHost = cleanSshScalar(settings.sshHost, "当前访问设备 SSH 地址");
   const savedUser = cleanSshScalar(settings.sshUser, "SSH 用户");
   const savedDestinationPath = cleanSshScalar(settings.destinationPath, "访问设备保存目录");
-  // A user-provided SSH address or hostname is deliberate. It wins over the
-  // browser source IP, which is only a convenience fallback for an empty host.
+  // A user-provided SSH address is deliberate (often a ZeroTier address or a
+  // hostname).  It must win over the browser source IP so saved settings are
+  // actually used for every transfer.  The source IP remains a convenience
+  // fallback only when the user intentionally leaves the setting blank.
   const detected = savedHost ? "" : cleanSshScalar(requestClientHost(request), "当前访问设备 IP");
   return {
     ...settings,
@@ -1174,10 +1239,121 @@ async function sendFileToLocalViaSsh(settings: ReturnType<ProjectStore["getLocal
   };
 }
 
-function projectExportOutputPath(projectRoot: string): string {
-  // Keep transcript exports in the same ignored, project-contained artifact
-  // area as uploads. This preserves preview and SSH delivery boundaries.
-  return path.join(ensureProjectArtifactRoot(projectRoot), "exports");
+function handoffSourceSettings(overrides: Partial<HandoffSourceSettings> = {}) {
+  const host = cleanSshScalar(overrides.host ?? serverConfig.handoffSourceHost, "迁移主机");
+  const user = cleanSshScalar(overrides.user ?? serverConfig.handoffSourceUser, "SSH 用户");
+  const appDir = cleanSshScalar(overrides.appDir ?? serverConfig.handoffSourceAppDir, "应用目录");
+  const label = cleanSshScalar(overrides.label ?? serverConfig.handoffSourceLabel, "迁移源");
+  if (!host) {
+    throw new Error("会话迁移尚未配置源主机连接。");
+  }
+  if (host.startsWith("-") || /\s/.test(host) || !user || user.startsWith("-") || /[\s@]/.test(user)) {
+    throw new Error("迁移 SSH 配置无效。");
+  }
+  if (!path.isAbsolute(appDir) || /[\0\r\n]/.test(appDir)) {
+    throw new Error("迁移应用目录无效。");
+  }
+  return { host, user, appDir, label };
+}
+
+function parseHandoffSourceFromBody(rawBody: unknown): HandoffSourceSettings {
+  const parsed = handoffSourceSchema.parse(rawBody ?? {});
+  return {
+    host: parsed.sourceHost ?? serverConfig.handoffSourceHost,
+    user: parsed.sourceUser ?? serverConfig.handoffSourceUser,
+    appDir: parsed.sourceAppDir ?? serverConfig.handoffSourceAppDir,
+    label: parsed.sourceLabel ?? serverConfig.handoffSourceLabel
+  };
+}
+
+function safeTarEntry(entry: string): boolean {
+  const normalized = entry.replace(/\\/g, "/");
+  if (!normalized || normalized.startsWith("/") || normalized.split("/").some((part) => part === "..")) {
+    return false;
+  }
+  return normalized === "manifest.json" || normalized === "sessions" || normalized.startsWith("sessions/");
+}
+
+async function extractHandoffArchive(archivePath: string, destination: string): Promise<void> {
+  const listed = await execFileAsync("tar", ["-tzf", archivePath], { timeout: 60_000, maxBuffer: 2 * 1024 * 1024 });
+  const entries = String(listed.stdout).split(/\r?\n/).filter(Boolean);
+  if (!entries.includes("manifest.json") || entries.some((entry) => !safeTarEntry(entry))) {
+    throw new Error("4090-left 返回了不安全的迁移包。");
+  }
+  await fs.promises.mkdir(destination, { recursive: true, mode: 0o700 });
+  await execFileAsync(
+    "tar",
+    ["--no-same-owner", "--no-same-permissions", "-xzf", archivePath, "-C", destination],
+    { timeout: 120_000, maxBuffer: 2 * 1024 * 1024 }
+  );
+}
+
+async function receiveHandoffArchiveFromSource(
+  userId: string,
+  source: HandoffSourceSettings,
+  onProgress?: (bytes: number) => void
+): Promise<{ workDir: string; archivePath: string }> {
+  const workRoot = path.join(serverConfig.dataDir, "handoffs");
+  fs.mkdirSync(workRoot, { recursive: true, mode: 0o700 });
+  const workDir = fs.mkdtempSync(path.join(workRoot, "from-handoff-"));
+  const archivePath = path.join(workDir, "handoff.tar.gz");
+  const output = fs.createWriteStream(archivePath, { flags: "wx", mode: 0o600 });
+  const sourceScript = path.join(source.appDir, "scripts", "export-user-sessions.sh");
+  const remoteCommand = `CODEX_WEB_INSTANCE_LABEL=${shellQuote(source.label)} ${shellQuote(sourceScript)} ${shellQuote(userId)}`;
+  const child = spawn(
+    "ssh",
+    ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", `${source.user}@${source.host}`, remoteCommand],
+    { stdio: ["ignore", "pipe", "pipe"] }
+  );
+  let stderr = "";
+  child.stderr.on("data", (chunk: Buffer) => {
+    if (stderr.length < 16_384) {
+      stderr += chunk.toString("utf8").slice(0, 16_384 - stderr.length);
+    }
+  });
+  let bytes = 0;
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      bytes += chunk.length;
+      onProgress?.(bytes);
+      if (bytes > serverConfig.handoffMaxBytes) {
+        callback(new Error(`迁移包超过限制（${Math.floor(serverConfig.handoffMaxBytes / 1024 / 1024)} MB）。`));
+        return;
+      }
+      callback(null, chunk);
+    }
+  });
+  const closed = new Promise<number | null>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  try {
+    const [exitCode] = await Promise.all([closed, pipeline(child.stdout, limiter, output)]);
+    if (exitCode !== 0) {
+      throw new Error(`会话导出失败：${stderr.trim() || `ssh exit ${exitCode ?? "unknown"}`}`);
+    }
+    if (bytes === 0) {
+      throw new Error("未返回迁移包。");
+    }
+    return { workDir, archivePath };
+  } catch (error) {
+    child.kill("SIGTERM");
+    fs.rmSync(workDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function handoffResultMessage(result: ImportedUserHandoff): string {
+  return `已从 ${result.sourceLabel} 迁移 ${result.importedThreadIds.length} 个会话，已存在 ${result.alreadyPresentThreadIds.length} 个；源端可迁移会话 ${result.sourceSessionCount} 个。`;
+}
+
+
+function validateServerOutputPath(value: string | undefined, settings: ReturnType<ProjectStore["getLocalSendSettings"]>): string {
+  const outputPath = cleanSshScalar(value?.trim() || settings.outputPath || "/tmp/codex_remote_exports", "4090-left 临时中转目录");
+  if (!outputPath) {
+    throw new Error("请先在设置里填写 4090-left 临时中转目录。");
+  }
+  return resolveProjectPath(expandHomePath(outputPath), serverConfig.projectRoot, { allowOutsideRoot: true });
 }
 
 function exportFileName(thread: Record<string, unknown>, threadId: string, format: "markdown" | "json"): string {
@@ -1275,6 +1451,9 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 
 function errorStatus(error: unknown): number {
   if (error instanceof PathPolicyError || error instanceof z.ZodError) {
+    if (error instanceof PathPolicyError && error.message === "File does not exist.") {
+      return 404;
+    }
     return 400;
   }
   return 500;
@@ -1392,10 +1571,7 @@ function resolvedThreadModelPresentation(
 }
 
 function sortThreadsForUser(store: ProjectStore, userId: string, items: unknown[]): unknown[] {
-  const preferences = store.getThreadPresentation(
-    userId,
-    items.map(threadIdFromListItem).filter((threadId): threadId is string => Boolean(threadId))
-  );
+  const preferences = store.getThreadPresentation(userId, items.map(threadIdFromListItem).filter((threadId): threadId is string => Boolean(threadId)));
   return items
     .map((item, index) => {
       const threadId = threadIdFromListItem(item);
@@ -1406,6 +1582,7 @@ function sortThreadsForUser(store: ProjectStore, userId: string, items: unknown[
         item: threadId
           ? {
               ...record,
+              name: presentation?.displayName ?? record.name,
               pinned: presentation?.pinned === true,
               configuredModel: modelPresentation?.model ?? null,
               configuredReasoningEffort: modelPresentation?.reasoningEffort ?? null
@@ -1543,41 +1720,67 @@ async function threadMatchesSearch(bridge: CodexBridge, item: unknown, query: st
 }
 
 async function searchOwnedThreadList(bridge: CodexBridge, ownedThreadIds: Set<string>, searchTerm: string): Promise<unknown[]> {
-  const threadIds = [...ownedThreadIds];
+  const targets: Array<{ threadId: string; filePath: string }> = [];
+  const missing: string[] = [];
+  for (const threadId of ownedThreadIds) {
+    const filePath = await findThreadJsonlPathById(threadId);
+    if (filePath) targets.push({ threadId, filePath });
+    else missing.push(threadId);
+  }
+  const indexedMatches = await searchIndexedThreads(targets, searchTerm, 80);
+  const bestMatchByThread = new Map<string, typeof indexedMatches[number]>();
+  for (const match of indexedMatches) {
+    if (!bestMatchByThread.has(match.threadId)) bestMatchByThread.set(match.threadId, match);
+  }
+  const pathByThread = new Map(targets.map((target) => [target.threadId, target.filePath]));
   const matches: unknown[] = [];
-  let nextIndex = 0;
-  // Local JSONL scanning is I/O-bound. A small bounded pool is responsive for
-  // several users while avoiding a burst of full-file reads on the server.
-  const workerCount = Math.min(3, threadIds.length);
-  const worker = async () => {
-    for (;;) {
-      const index = nextIndex++;
-      if (index >= threadIds.length) {
-        return;
-      }
-      const threadId = threadIds[index];
-      const fallbackPath = await findThreadJsonlPathById(threadId);
-      if (fallbackPath) {
-        if (await threadJsonlMatchesSearch(fallbackPath, searchTerm)) {
-          try {
-            matches.push(await readThreadSummaryFromJsonl(fallbackPath, threadId));
-          } catch {
-            // Keep searching remaining owned sessions if one historical file is unreadable.
-          }
-        }
-        continue;
-      }
-      const fullThread = await readOwnedThreadForList(bridge, threadId);
-      if (fullThread && itemMatchesSearch(fullThread, searchTerm)) {
-        matches.push(listItemSummaryFromThread(fullThread));
-      }
+  for (const [threadId, match] of bestMatchByThread) {
+    const filePath = pathByThread.get(threadId);
+    if (!filePath) continue;
+    try {
+      matches.push({
+        ...await readThreadSummaryFromJsonl(filePath, threadId),
+        searchMatch: match
+      });
+    } catch {
+      // A damaged historical file must not prevent other search results.
     }
-  };
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  }
+  for (const threadId of missing) {
+    const fullThread = await readOwnedThreadForList(bridge, threadId);
+    if (fullThread && itemMatchesSearch(fullThread, searchTerm)) matches.push(listItemSummaryFromThread(fullThread));
+  }
   return matches.sort((left, right) => listItemUpdatedAt(right) - listItemUpdatedAt(left));
 }
 
-async function filterOwnedThreadList(bridge: CodexBridge, items: unknown[], ownedThreadIds: Set<string>, searchTerm: string): Promise<unknown[]> {
+let backgroundIndexWarmPromise: Promise<void> | null = null;
+function warmOwnedThreadIndexes(ownedThreadIds: Set<string>): void {
+  if (backgroundIndexWarmPromise) return;
+  backgroundIndexWarmPromise = (async () => {
+    const targets: Array<{ threadId: string; filePath: string }> = [];
+    for (const threadId of ownedThreadIds) {
+      const filePath = await findThreadJsonlPathById(threadId);
+      if (filePath) targets.push({ threadId, filePath });
+    }
+    let next = 0;
+    const worker = async () => {
+      for (;;) {
+        const target = targets[next++];
+        if (!target) return;
+        await warmThreadIndex(target.filePath, target.threadId);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(2, targets.length) }, () => worker()));
+  })().catch(() => undefined).finally(() => { backgroundIndexWarmPromise = null; });
+}
+
+async function filterOwnedThreadList(
+  bridge: CodexBridge,
+  items: unknown[],
+  ownedThreadIds: Set<string>,
+  searchTerm: string,
+  hydrateMissing = true
+): Promise<unknown[]> {
   const byId = new Map<string, unknown>();
   for (const item of items) {
     const threadId = threadIdFromListItem(item);
@@ -1591,8 +1794,8 @@ async function filterOwnedThreadList(bridge: CodexBridge, items: unknown[], owne
       continue;
     }
     const fullThread = await readOwnedThreadForList(bridge, threadId);
-    // Ownership is the access boundary. A legacy session can retain an old cwd
-    // after the user's default workspace is moved.
+    // Ownership is the access boundary. A legacy session may retain /home/ls as
+    // its historical cwd after the user's default workspace is moved.
     if (fullThread) {
       byId.set(threadId, listItemSummaryFromThread(fullThread));
     }
@@ -1620,7 +1823,7 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
   fs.mkdirSync(rootPath, { recursive: true, mode: 0o700 });
 
   // List the personal workspace first: a newly opened page selects it by
-  // default. Existing projects (including historical conversations)
+  // default. Existing projects (including historical /home/ls conversations)
   // are deliberately retained below it.
   const workspace = store.getProjectByRootPath(rootPath, userId) ?? store.createProject({
     name: "我的工作区",
@@ -1631,7 +1834,85 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
   return [workspace, ...otherProjects];
 }
 
+const deferredToolOutputPreviewBytes = 4 * 1024;
+
+function deferLargeToolOutputs(threadValue: unknown): void {
+  const thread = asRecord(threadValue);
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  for (const turnValue of turns) {
+    const turn = asRecord(turnValue);
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    for (const itemValue of items) {
+      const item = asRecord(itemValue);
+      let deferredBytes = 0;
+      for (const field of ["aggregatedOutput", "output"] as const) {
+        const output = item[field];
+        if (typeof output !== "string") continue;
+        const outputBytes = Buffer.byteLength(output);
+        if (outputBytes <= deferredToolOutputPreviewBytes) continue;
+        const preview = output.slice(0, deferredToolOutputPreviewBytes);
+        item[field] = `${preview}\n\n[完整工具输出 ${outputBytes.toLocaleString("en-US")} bytes，展开后按需加载]`;
+        deferredBytes = Math.max(deferredBytes, outputBytes);
+      }
+      if (deferredBytes > 0) {
+        item.outputDeferred = true;
+        item.outputBytes = deferredBytes;
+      }
+    }
+  }
+}
+
 export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore): void {
+  const publicHandoffJob = (job: HandoffJob) => ({
+    id: job.id,
+    status: job.status,
+    phase: job.phase,
+    bytesTransferred: job.bytesTransferred,
+    startedAt: job.startedAt,
+    updatedAt: job.updatedAt,
+    result: job.result,
+    message: job.message,
+    error: job.error
+  });
+
+  const runHandoffJob = async (job: HandoffJob) => {
+    let workDir: string | null = null;
+    try {
+      const source = handoffSourceSettings();
+      job.phase = "connecting";
+      job.updatedAt = new Date().toISOString();
+      const received = await receiveHandoffArchiveFromSource(job.userId, source, (bytes) => {
+        job.phase = "transferring";
+        job.bytesTransferred = bytes;
+        job.updatedAt = new Date().toISOString();
+      });
+      workDir = received.workDir;
+      job.phase = "extracting";
+      job.updatedAt = new Date().toISOString();
+      const extractedDirectory = path.join(workDir, "extracted");
+      await extractHandoffArchive(received.archivePath, extractedDirectory);
+      job.phase = "importing";
+      job.updatedAt = new Date().toISOString();
+      const result = await importStagedUserHandoff(store, job.userId, extractedDirectory, serverConfig.projectRoot);
+      if (result.sourceSessionCount === 0) {
+        throw new Error(`${source.label} 上没有用户「${job.userId}」的可迁移会话。`);
+      }
+      job.result = result;
+      job.status = "completed";
+      job.phase = "completed";
+      job.message = handoffResultMessage(result);
+    } catch (error) {
+      job.status = "failed";
+      job.phase = "failed";
+      job.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      job.updatedAt = new Date().toISOString();
+      if (workDir) await fs.promises.rm(workDir, { recursive: true, force: true });
+      handoffInFlightUsers.delete(job.userId);
+      if (handoffJobIdsByUser.get(job.userId) === job.id) handoffJobIdsByUser.delete(job.userId);
+    }
+  };
+
   app.get("/api/health", async (request) => ({
     ok: true,
     codexPendingApprovals: bridge.getPendingServerRequests().length,
@@ -1660,7 +1941,10 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     try {
       reply.header("Cache-Control", "no-store");
       const quota = await readCachedCodexQuota(bridge, request.query.refresh === "true");
-    return { data: await readCachedCodexLeaderboard(quota, store, request.query.refresh === "true", request.query.local !== "true") };
+      // Never merge peer boards into the normal endpoint. A peer can expose
+      // historical JSONL records for the same login, which is useful for an
+      // audit but misleading as a current-service quota view.
+      return { data: await readCachedCodexLeaderboard(quota, store, request.query.refresh === "true", false) };
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -1727,6 +2011,71 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       return { data };
     } catch (error) {
       return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post("/api/handoff/from-4090-left", async (request, reply) => {
+    const userId = userIdFromRequest(request, store);
+    const existingJobId = handoffJobIdsByUser.get(userId);
+    const existingJob = existingJobId ? handoffJobs.get(existingJobId) : undefined;
+    if (existingJob?.status === "running") return reply.code(202).send({ data: publicHandoffJob(existingJob) });
+    const now = new Date().toISOString();
+    const job: HandoffJob = {
+      id: `handoff-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`,
+      userId,
+      status: "running",
+      phase: "connecting",
+      bytesTransferred: 0,
+      startedAt: now,
+      updatedAt: now
+    };
+    handoffJobs.set(job.id, job);
+    handoffJobIdsByUser.set(userId, job.id);
+    handoffInFlightUsers.add(userId);
+    void runHandoffJob(job);
+    return reply.code(202).send({ data: publicHandoffJob(job) });
+  });
+
+  app.get<{ Params: { jobId: string } }>("/api/handoff/from-4090-left/status/:jobId", async (request, reply) => {
+    const userId = userIdFromRequest(request, store);
+    const job = handoffJobs.get(request.params.jobId);
+    if (!job || job.userId !== userId) {
+      return reply.code(404).send({ error: "迁移任务不存在或已过期。" });
+    }
+    return { data: publicHandoffJob(job) };
+  });
+
+  app.post("/api/handoff/from-source", async (request, reply) => {
+    const userId = userIdFromRequest(request, store);
+    if (handoffInFlightUsers.has(userId)) {
+      return reply.code(409).send({ error: "该用户的会话迁移正在进行，请等待完成。" });
+    }
+    handoffInFlightUsers.add(userId);
+    let workDir: string | null = null;
+    try {
+      const source = parseHandoffSourceFromBody(request.body);
+      const received = await receiveHandoffArchiveFromSource(userId, handoffSourceSettings(source));
+      workDir = received.workDir;
+      const extractedDirectory = path.join(workDir, "extracted");
+      await extractHandoffArchive(received.archivePath, extractedDirectory);
+      const data = await importStagedUserHandoff(store, userId, extractedDirectory, serverConfig.projectRoot);
+      if (data.sourceSessionCount === 0) {
+        return reply.code(404).send({
+          error: `${source.label} 上没有用户「${userId}」的可迁移会话，无法迁移。`,
+          data
+        });
+      }
+      return { data, message: handoffResultMessage(data) };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const conflict = /目标端.*(其他用户|内容不同|不是普通文件)|正在进行/.test(message);
+      const unavailable = /尚未配置|ssh exit|会话导出失败|未返回迁移包/.test(message);
+      return reply.code(conflict ? 409 : unavailable ? 502 : 500).send({ error: message });
+    } finally {
+      handoffInFlightUsers.delete(userId);
+      if (workDir) {
+        fs.rmSync(workDir, { recursive: true, force: true });
+      }
     }
   });
 
@@ -1840,7 +2189,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
     try {
       const target = resolveProjectFilePath(project.rootPath, request.query.path, {
-        allowOutsideRoot: serverConfig.allowOutsideProjectRoot
+        allowOutsideRoot: serverConfig.allowOutsideProjectRoot,
+        allowLegacyUploadRoots: [uploadRoot]
       });
       const stat = fs.statSync(target.filePath);
       if (!stat.isFile()) {
@@ -1881,7 +2231,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
     try {
       const target = resolveProjectFilePath(project.rootPath, request.query.path, {
-        allowOutsideRoot: serverConfig.allowOutsideProjectRoot
+        allowOutsideRoot: serverConfig.allowOutsideProjectRoot,
+        allowLegacyUploadRoots: [uploadRoot]
       });
       const stat = fs.statSync(target.filePath);
       if (!stat.isFile()) {
@@ -1938,7 +2289,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
     try {
       const saved = [];
-      const batchDirectory = uploadBatchDirectory(project.rootPath, userId);
+      const batchDirectory = uploadBatchDirectory(userId);
       for await (const part of request.files({ limits: { fileSize: 64 * 1024 * 1024, files: 12 } })) {
         const file = await saveMultipartFile(project.rootPath, batchDirectory, part);
         saved.push({
@@ -1956,7 +2307,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     }
   });
 
-  app.get<{ Params: { id: string }; Querystring: { archived?: string; search?: string } }>(
+  app.get<{ Params: { id: string }; Querystring: { archived?: string; search?: string; fast?: string } }>(
     "/api/projects/:id/threads",
     async (request, reply) => {
       const project = store.getProject(request.params.id, userIdFromRequest(request, store));
@@ -1981,6 +2332,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
             backwardsCursor: null
           };
         }
+        const fast = request.query.fast !== "false";
+        warmOwnedThreadIndexes(ownedThreadIds);
         const result = await listAllCodexThreads(bridge, {
           // Query global summaries, then strictly filter by per-user ownership.
           // This includes historical sessions whose cwd predates the workspace move.
@@ -1990,8 +2343,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           archived: request.query.archived === "true",
           // Empty string forces app-server to scan and repair JSONL metadata; null can miss recent cwd-matched threads.
           // We do fuzzy matching after ownership filtering so app-server search cannot hide owned threads unexpectedly.
-          searchTerm: "",
-          useStateDbOnly: false
+          searchTerm: fast ? null : "",
+          useStateDbOnly: fast
         });
         const data = await filterOwnedThreadList(bridge, result.data, ownedThreadIds, "");
         return {
@@ -2130,7 +2483,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
       const thread = asRecord(asRecord(result).thread);
       const settings = store.getLocalSendSettings(userId);
-      const outputRoot = projectExportOutputPath(project.rootPath);
+      const outputRoot = validateServerOutputPath(input.outputPath, settings);
       const outputDir = path.join(outputRoot, safeFolderSegment(userId, "user"));
       fs.mkdirSync(outputDir, { recursive: true, mode: 0o700 });
 
@@ -2139,7 +2492,9 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const rendered = renderThreadExport(thread, { name: project.name, rootPath: project.rootPath }, request.params.threadId, input.format);
       fs.writeFileSync(filePath, rendered.content, { mode: 0o600 });
       const stat = fs.statSync(filePath);
-      const target = resolveProjectFilePath(project.rootPath, filePath);
+      const target = resolveProjectFilePath(project.rootPath, filePath, {
+        allowOutsideRoot: serverConfig.allowOutsideProjectRoot
+      });
       const sentLocal = input.sendLocal
         ? await sendFileToLocalViaSsh(settingsForCurrentAccessDevice(settings, request, userId), target.filePath, input.destinationPath)
         : undefined;
@@ -2170,8 +2525,9 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     }
   });
 
-  app.get<{ Params: { threadId: string }; Querystring: { projectId?: string; before?: string; limit?: string } }>("/api/threads/:threadId", async (request, reply) => {
+  app.get<{ Params: { threadId: string }; Querystring: { projectId?: string; before?: string; cursor?: string; fresh?: string; limit?: string } }>("/api/threads/:threadId", async (request, reply) => {
     try {
+      reply.header("Cache-Control", "no-store");
       const userId = userIdFromRequest(request, store);
       const input = threadReadQuerySchema.parse(request.query ?? {});
       const project = input.projectId ? store.getProject(input.projectId, userId) : null;
@@ -2191,7 +2547,17 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       // app-server queue. Prefer it for every existing session, not only huge ones.
       const fallbackPath = await findThreadJsonlPathById(request.params.threadId);
       if (fallbackPath) {
-        result = await readThreadFromJsonl(fallbackPath, request.params.threadId);
+        const indexedPage = await readIndexedThreadPage(fallbackPath, request.params.threadId, {
+          before: input.before,
+          cursor: input.cursor,
+          limit: input.limit,
+          backgroundRefresh: !input.fresh && input.before === 0 && !input.cursor
+        });
+        result = { thread: indexedPage.thread };
+        result = sanitizeThreadPayloadForClient(result);
+        const clientThread = asRecord(result).thread;
+        deferLargeToolOutputs(clientThread);
+        return { thread: clientThread, history: indexedPage.history };
       } else {
         result = await bridge.request("thread/read", {
           threadId: request.params.threadId,
@@ -2212,6 +2578,48 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           configuredReasoningEffort: modelPresentation.reasoningEffort
         }
       };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { threadId: string }; Querystring: { projectId?: string; itemId?: string } }>("/api/threads/:threadId/position", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = request.query.projectId ? store.getProject(request.query.projectId, userId) : null;
+      if (request.query.projectId && !project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project && isUserWorkspaceProject(project, userId) ? undefined : project?.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const itemId = request.query.itemId?.trim();
+      if (!itemId) return reply.code(400).send({ error: "itemId is required." });
+      const filePath = await findThreadJsonlPathById(request.params.threadId);
+      if (!filePath) return reply.code(404).send({ error: "Thread history file not found." });
+      await warmThreadIndex(filePath, request.params.threadId);
+      const position = locateIndexedThreadItem(request.params.threadId, itemId);
+      return position ? { data: position } : reply.code(404).send({ error: "Message was not found in the thread index." });
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { threadId: string; itemId: string }; Querystring: { projectId?: string } }>("/api/threads/:threadId/items/:itemId/output", async (request, reply) => {
+    try {
+      reply.header("Cache-Control", "private, max-age=300");
+      const userId = userIdFromRequest(request, store);
+      const project = request.query.projectId ? store.getProject(request.query.projectId, userId) : null;
+      if (request.query.projectId && !project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project && isUserWorkspaceProject(project, userId) ? undefined : project?.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const filePath = await findThreadJsonlPathById(request.params.threadId);
+      if (!filePath) return reply.code(404).send({ error: "Thread history file not found." });
+      const item = await readIndexedThreadItem(filePath, request.params.threadId, request.params.itemId);
+      if (!item) return reply.code(404).send({ error: "Tool output was not found in the thread index." });
+      const output = typeof item.aggregatedOutput === "string"
+        ? item.aggregatedOutput
+        : typeof item.output === "string" ? item.output : "";
+      return { data: { output, bytes: Buffer.byteLength(output) } };
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
     }

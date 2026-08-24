@@ -1,0 +1,16 @@
+{
+  "accounts": [
+    {
+      "id": "260803",
+      "label": "260803",
+      "codexHome": "/home/ls/codex_zerotier_remote/runtime/account-pool/260803"
+    },
+    {
+      "id": "260707",
+      "label": "260707",
+      "codexHome": "/home/ls/codex_zerotier_remote/runtime/account-pool/260707"
+    }
+  ],
+  "stateFile": "/home/ls/codex_zerotier_remote/users/gyj/account-pool-4575/data/account-pool-state.json",
+  "quotaCacheMs": 30000
+}

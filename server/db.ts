@@ -36,6 +36,7 @@ type UserSettingsRow = {
   local_send_path: string;
   local_ssh_identity_file: string;
   local_output_path: string;
+  codex_execution_mode?: string;
   created_at?: string;
   updated_at: string;
 };
@@ -49,6 +50,8 @@ type ThreadOwnerRow = {
   manual_order: number | null;
   model_override: string | null;
   reasoning_effort_override: string | null;
+  display_name: string | null;
+  display_name_updated_at: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -70,9 +73,13 @@ export interface ThreadOwner {
   manualOrder: number | null;
   modelOverride: string | null;
   reasoningEffortOverride: ReasoningEffort | null;
+  displayName: string | null;
+  displayNameUpdatedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
+
+export type CodexExecutionMode = "shared" | "dedicated";
 
 export interface ThreadPresentation {
   threadId: string;
@@ -80,6 +87,7 @@ export interface ThreadPresentation {
   manualOrder: number | null;
   model: string | null;
   reasoningEffort: ReasoningEffort | null;
+  displayName: string | null;
 }
 
 export interface UnusedThread {
@@ -114,15 +122,6 @@ function toUser(row: UserRow): UserProfile {
   };
 }
 
-const defaultProjectExportPath = ".codex-web/exports";
-
-function projectRelativeExportPath(value: string | null | undefined): string {
-  const candidate = value?.trim() || defaultProjectExportPath;
-  return path.isAbsolute(candidate) || candidate.startsWith("~") || candidate.split(/[\\/]/).includes("..")
-    ? defaultProjectExportPath
-    : candidate;
-}
-
 function emptyLocalSendSettings(): LocalSendSettings {
   return {
     sshHost: "",
@@ -130,7 +129,7 @@ function emptyLocalSendSettings(): LocalSendSettings {
     sshUser: "",
     destinationPath: "",
     identityFile: "",
-    outputPath: defaultProjectExportPath,
+    outputPath: "/tmp/codex_remote_exports",
     updatedAt: null
   };
 }
@@ -145,7 +144,7 @@ function toLocalSendSettings(row: UserSettingsRow | undefined): LocalSendSetting
     sshUser: row.local_ssh_user ?? "",
     destinationPath: row.local_send_path ?? "",
     identityFile: row.local_ssh_identity_file ?? "",
-    outputPath: projectRelativeExportPath(row.local_output_path),
+    outputPath: row.local_output_path ?? "/tmp/codex_remote_exports",
     updatedAt: row.updated_at ?? null
   };
 }
@@ -160,6 +159,8 @@ function toThreadOwner(row: ThreadOwnerRow): ThreadOwner {
     manualOrder: typeof row.manual_order === "number" ? row.manual_order : null,
     modelOverride: row.model_override?.trim() || null,
     reasoningEffortOverride: toReasoningEffort(row.reasoning_effort_override),
+    displayName: row.display_name?.trim() || null,
+    displayNameUpdatedAt: row.display_name_updated_at || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -307,6 +308,44 @@ export class ProjectStore {
     return this.getLocalSendSettings(userId);
   }
 
+  /**
+   * A user who has once been assigned a dedicated Codex service must never
+   * silently fall back to the shared service if that assignment disappears.
+   * The bridge router updates this marker only after it sees an explicit,
+   * administrator-controlled dedicated target.
+   */
+  getCodexExecutionMode(userId = DEFAULT_USER_ID): CodexExecutionMode {
+    const row = this.db
+      .prepare("SELECT codex_execution_mode FROM user_settings WHERE user_id = ?")
+      .get(userId) as { codex_execution_mode?: string } | undefined;
+    return row?.codex_execution_mode === "dedicated" ? "dedicated" : "shared";
+  }
+
+  setCodexExecutionMode(userId: string, mode: CodexExecutionMode): void {
+    const cleanUserId = userId.trim();
+    if (!cleanUserId) {
+      throw new Error("User id is required for Codex execution routing.");
+    }
+    this.ensureUser(cleanUserId, cleanUserId);
+    const now = new Date().toISOString();
+    const existing = this.db
+      .prepare("SELECT created_at FROM user_settings WHERE user_id = ?")
+      .get(cleanUserId) as { created_at?: string } | undefined;
+    const createdAt = existing?.created_at || now;
+    this.db
+      .prepare(
+        `INSERT INTO user_settings (
+          user_id, local_ssh_host, local_ssh_port, local_ssh_user,
+          local_send_path, local_ssh_identity_file, local_output_path,
+          codex_execution_mode, created_at, updated_at
+        ) VALUES (?, '', 22, '', '', '', '/tmp/codex_remote_exports', ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          codex_execution_mode = excluded.codex_execution_mode,
+          updated_at = excluded.updated_at`
+      )
+      .run(cleanUserId, mode, createdAt, now);
+  }
+
   listProjects(userId = DEFAULT_USER_ID): Project[] {
     const rows = this.db
       .prepare("SELECT * FROM projects WHERE user_id = ? ORDER BY updated_at DESC, name ASC")
@@ -452,6 +491,8 @@ export class ProjectStore {
       manualOrder,
       modelOverride,
       reasoningEffortOverride,
+      displayName: null,
+      displayNameUpdatedAt: null,
       createdAt: now,
       updatedAt: now
     };
@@ -473,6 +514,18 @@ export class ProjectStore {
     return row ? toThreadOwner(row) : null;
   }
 
+  moveThreadOwnerToProject(threadId: string, userId: string, projectId: string, rootPath: string): ThreadOwner | null {
+    const cleanThreadId = threadId.trim();
+    const owner = this.getThreadOwner(cleanThreadId);
+    if (!owner || owner.userId !== userId || !projectId.trim() || !rootPath.trim()) {
+      return null;
+    }
+    this.db.prepare(
+      "UPDATE thread_owners SET project_id = ?, root_path = ?, updated_at = ? WHERE thread_id = ? AND user_id = ?"
+    ).run(projectId, path.resolve(rootPath), new Date().toISOString(), cleanThreadId, userId);
+    return this.getThreadOwner(cleanThreadId);
+  }
+
   getThreadPresentation(userId: string, threadIds: Iterable<string>): Map<string, ThreadPresentation> {
     const cleanUserId = userId.trim();
     const ids = [...new Set([...threadIds].map((threadId) => threadId.trim()).filter(Boolean))];
@@ -482,7 +535,7 @@ export class ProjectStore {
     const placeholders = ids.map(() => "?").join(", ");
     const rows = this.db
       .prepare(
-        `SELECT thread_id, is_pinned, manual_order, model_override, reasoning_effort_override
+        `SELECT thread_id, is_pinned, manual_order, model_override, reasoning_effort_override, display_name
          FROM thread_owners
          WHERE user_id = ? AND thread_id IN (${placeholders})`
       )
@@ -492,14 +545,28 @@ export class ProjectStore {
         manual_order: number | null;
         model_override: string | null;
         reasoning_effort_override: string | null;
+        display_name: string | null;
       }>;
     return new Map(rows.map((row) => [row.thread_id, {
       threadId: row.thread_id,
       pinned: Boolean(row.is_pinned),
       manualOrder: typeof row.manual_order === "number" ? row.manual_order : null,
       model: row.model_override?.trim() || null,
-      reasoningEffort: toReasoningEffort(row.reasoning_effort_override)
+      reasoningEffort: toReasoningEffort(row.reasoning_effort_override),
+      displayName: row.display_name?.trim() || null
     }]));
+  }
+
+  updateThreadDisplayName(threadId: string, userId: string, displayName: string): ThreadPresentation | null {
+    const cleanThreadId = threadId.trim();
+    const cleanUserId = userId.trim();
+    const cleanDisplayName = displayName.trim().slice(0, 512);
+    if (!cleanThreadId || !cleanUserId || !cleanDisplayName) return null;
+    const now = new Date().toISOString();
+    const result = this.db.prepare(
+      "UPDATE thread_owners SET display_name = ?, display_name_updated_at = ?, updated_at = ? WHERE thread_id = ? AND user_id = ?"
+    ).run(cleanDisplayName, now, now, cleanThreadId, cleanUserId);
+    return result.changes > 0 ? this.getThreadPresentation(cleanUserId, [cleanThreadId]).get(cleanThreadId) ?? null : null;
   }
 
   setThreadPinned(threadId: string, userId: string, pinned: boolean): ThreadPresentation | null {
@@ -555,6 +622,31 @@ export class ProjectStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  /**
+   * Return only threads that are still visible to the given user.  This is the
+   * export boundary for cross-host handoff: deleted threads and every other
+   * user's data must never enter a handoff archive.
+   */
+  listVisibleThreadOwnersForUser(userId: string): ThreadOwner[] {
+    const cleanUserId = userId.trim();
+    if (!cleanUserId) {
+      return [];
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT thread_owners.*
+         FROM thread_owners
+         LEFT JOIN unuse
+           ON unuse.thread_id = thread_owners.thread_id
+          AND unuse.user_id = thread_owners.user_id
+         WHERE thread_owners.user_id = ?
+           AND unuse.thread_id IS NULL
+         ORDER BY thread_owners.updated_at DESC, thread_owners.thread_id ASC`
+      )
+      .all(cleanUserId) as ThreadOwnerRow[];
+    return rows.map(toThreadOwner);
   }
 
   userCanAccessThread(threadId: string, userId: string, projectId?: string): boolean {
@@ -729,7 +821,8 @@ export class ProjectStore {
         local_ssh_user TEXT NOT NULL DEFAULT '',
         local_send_path TEXT NOT NULL DEFAULT '',
         local_ssh_identity_file TEXT NOT NULL DEFAULT '',
-        local_output_path TEXT NOT NULL DEFAULT '.codex-web/exports',
+        local_output_path TEXT NOT NULL DEFAULT '/tmp/codex_remote_exports',
+        codex_execution_mode TEXT NOT NULL DEFAULT 'shared',
         created_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -748,7 +841,8 @@ export class ProjectStore {
     addColumn("local_ssh_user", "ALTER TABLE user_settings ADD COLUMN local_ssh_user TEXT NOT NULL DEFAULT ''");
     addColumn("local_send_path", "ALTER TABLE user_settings ADD COLUMN local_send_path TEXT NOT NULL DEFAULT ''");
     addColumn("local_ssh_identity_file", "ALTER TABLE user_settings ADD COLUMN local_ssh_identity_file TEXT NOT NULL DEFAULT ''");
-    addColumn("local_output_path", "ALTER TABLE user_settings ADD COLUMN local_output_path TEXT NOT NULL DEFAULT '.codex-web/exports'");
+    addColumn("local_output_path", "ALTER TABLE user_settings ADD COLUMN local_output_path TEXT NOT NULL DEFAULT '/tmp/codex_remote_exports'");
+    addColumn("codex_execution_mode", "ALTER TABLE user_settings ADD COLUMN codex_execution_mode TEXT NOT NULL DEFAULT 'shared'");
     addColumn("created_at", "ALTER TABLE user_settings ADD COLUMN created_at TEXT NOT NULL DEFAULT ''");
 
     const finalColumns = this.db.prepare("PRAGMA table_info(user_settings)").all() as Array<{ name: string }>;
@@ -776,6 +870,8 @@ export class ProjectStore {
         manual_order INTEGER,
         model_override TEXT,
         reasoning_effort_override TEXT,
+        display_name TEXT,
+        display_name_updated_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -796,6 +892,12 @@ export class ProjectStore {
     }
     if (!hasColumn("reasoning_effort_override")) {
       this.db.exec("ALTER TABLE thread_owners ADD COLUMN reasoning_effort_override TEXT");
+    }
+    if (!hasColumn("display_name")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN display_name TEXT");
+    }
+    if (!hasColumn("display_name_updated_at")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN display_name_updated_at TEXT");
     }
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_thread_owners_user_pinned_order ON thread_owners(user_id, is_pinned, manual_order)");
   }
@@ -845,10 +947,7 @@ export class ProjectStore {
     this.db.exec(`
       UPDATE projects
       SET
-        default_model = CASE
-          WHEN default_model = '' OR default_model = 'gpt-5.5' THEN '${defaults.model}'
-          ELSE default_model
-        END,
+        default_model = CASE WHEN default_model = '' THEN '${defaults.model}' ELSE default_model END,
         default_reasoning_effort = CASE
           WHEN default_reasoning_effort IS NULL OR default_reasoning_effort = '' THEN '${defaults.reasoningEffort}'
           ELSE default_reasoning_effort

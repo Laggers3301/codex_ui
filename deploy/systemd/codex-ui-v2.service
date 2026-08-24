@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Web V2 frontend proxy
+After=network-online.target codex-account-pool-4576.service
+Wants=network-online.target codex-account-pool-4576.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ls/codex_zerotier_remote/users/gyj/codex-web-v2
+ExecStart=/home/ls/tools/node-v25.6.1-linux-x64/bin/node /home/ls/codex_zerotier_remote/users/gyj/codex-web-v2/v2-server.mjs
+Restart=always
+RestartSec=2
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target

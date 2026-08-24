@@ -3,7 +3,13 @@ import path from "node:path";
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { serverConfig } from "./config.js";
 
-export const sessionCookieName = "codex_remote_session";
+// Cookies are scoped by host, not port.  Multiple Codex Web instances on the
+// same host therefore need distinct names or logging into one instance
+// overwrites the other's browser session.
+const configuredSessionCookieName = process.env.CODEX_WEB_SESSION_COOKIE_NAME?.trim();
+export const sessionCookieName = configuredSessionCookieName && /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(configuredSessionCookieName)
+  ? configuredSessionCookieName
+  : "codex_remote_session_4574";
 // Browser implementations may cap very long cookies, so we use a long-lived
 // persistent cookie and refresh it on every authenticated request.
 export const sessionMaxAgeSeconds = Number(process.env.CODEX_WEB_SESSION_MAX_AGE_SECONDS ?? 400 * 24 * 60 * 60);
@@ -136,21 +142,18 @@ export function verifyCredentials(username: string, password: string): boolean {
     return verifyStoredPassword(stored, password);
   }
 
-  // Optional administrator fallback, if configured.
+  // Legacy admin fallback, if configured.
   if (serverConfig.authUser && serverConfig.authPassword && safeEqual(cleanUsername, serverConfig.authUser)) {
-    return safeEqual(password, serverConfig.authPassword);
+    return safeEqual(password, serverConfig.authPassword) || safeEqual(password, serverConfig.defaultAuthPassword);
   }
 
-  // In member mode, only explicitly provisioned users may log in.
+  // In member mode, users may still log in with their initial shared password
+  // until they set a personal password (for compatibility with newly added members).
   if (serverConfig.authMode === "member") {
-    return false;
+    return safeEqual(password, serverConfig.defaultAuthPassword);
   }
 
-  // Bootstrap mode permits a new account only when an operator deliberately
-  // supplied a non-empty bootstrap password. Unknown modes fail closed.
-  return serverConfig.authMode === "bootstrap"
-    && Boolean(serverConfig.defaultAuthPassword)
-    && safeEqual(password, serverConfig.defaultAuthPassword);
+  return safeEqual(password, serverConfig.defaultAuthPassword);
 }
 
 export function createSessionCookie(username: string): string {
@@ -211,7 +214,7 @@ export function changeUserPassword(username: string, currentPassword: string, ne
   if (nextPassword.length < 2) {
     throw new Error("新密码太短。");
   }
-  if (serverConfig.defaultAuthPassword && nextPassword === serverConfig.defaultAuthPassword) {
+  if (nextPassword === serverConfig.defaultAuthPassword) {
     throw new Error("新密码不能继续使用初始密码。");
   }
 

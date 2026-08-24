@@ -3,9 +3,10 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import zlib from "node:zlib";
 import multipart from "@fastify/multipart";
+import compress from "@fastify/compress";
 import Fastify from "fastify";
 import { CodexBridge } from "./codexBridge.js";
-import { authEnabled, authenticatedUserFromHeaders, changeUserPassword, clearSessionCookie, createSessionCookie, verifyCredentials } from "./auth.js";
+import { authenticatedUserFromHeaders, changeUserPassword, clearSessionCookie, createSessionCookie, verifyCredentials } from "./auth.js";
 import { serverConfig } from "./config.js";
 import { ProjectStore } from "./db.js";
 import { registerRoutes } from "./routes.js";
@@ -47,6 +48,7 @@ function gzipVariant(filePath: string): string {
 }
 
 const app = Fastify({ logger: true });
+await app.register(compress, { global: true, threshold: 1024 });
 
 function requestPath(url: string | undefined): string {
   return new URL(url ?? "/", "http://localhost").pathname;
@@ -144,11 +146,8 @@ function authLayout(title: string, body: string): string {
 }
 
 app.get("/login", async (_request, reply) => {
-  if (!authEnabled()) {
-    return reply.redirect("/", 302);
-  }
-  const page = authLayout("登录 Codex Remote", `<h1>登录 Codex Remote</h1>
-    <p>请使用管理员为你配置的用户名和密码登录。</p>
+  const page = authLayout("登录 Codex Remote 260803", `<h1>登录 Codex Remote 260803</h1>
+    <p>加入 ZeroTier 网络后，用自己的姓名登录。初始密码是 <code>ls</code>，登录后可以修改密码。</p>
     <form id="form">
       <label>用户名 / 姓名</label>
       <input name="username" autocomplete="username" required autofocus />
@@ -182,7 +181,7 @@ app.post("/api/auth/login", async (request, reply) => {
   const username = typeof body?.username === "string" ? body.username.trim() : "";
   const password = typeof body?.password === "string" ? body.password : "";
   if (!username || !verifyCredentials(username, password)) {
-    return reply.code(401).send({ error: "用户名或密码不正确。" });
+    return reply.code(401).send({ error: "用户名或密码不正确。首次登录请使用自己的姓名和初始密码 ls。" });
   }
   return reply.header("Set-Cookie", createSessionCookie(username)).send({ ok: true, username });
 });
@@ -222,14 +221,11 @@ app.post("/api/auth/change-password", async (request, reply) => {
 });
 
 app.get("/change-password", async (request, reply) => {
-  if (!authEnabled()) {
-    return reply.redirect("/", 302);
-  }
   const username = authenticatedUserFromHeaders(request.headers) ?? "";
   const safeUsername = escapeHtml(username);
-  const page = authLayout("修改 Codex Remote 密码", `<h1>修改密码</h1>
+  const page = authLayout("修改 Codex Remote 260803 密码", `<h1>修改密码 · 260803</h1>
     <p>当前登录用户：<code>${safeUsername}</code></p>
-    <p>修改后请用新密码重新登录。</p>
+    <p>初始密码是 <code>ls</code>。修改后请用新密码重新登录。</p>
     <form id="form">
       <label>当前密码</label>
       <input name="currentPassword" type="password" autocomplete="current-password" required />

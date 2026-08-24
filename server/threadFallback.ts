@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -35,8 +36,8 @@ function recordFromUnknown(value: unknown): JsonObject {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
 }
 
-const codexSessionsRoot = path.join(os.homedir(), ".codex", "sessions");
-const sessionPathIndexTtlMs = 15_000;
+const codexSessionsRoot = path.join(process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"), "sessions");
+const sessionPathIndexTtlMs = 60_000;
 let cachedSessionPathIndex: { root: string; expiresAt: number; paths: Map<string, string> } | null = null;
 let buildingSessionPathIndex: Promise<Map<string, string>> | null = null;
 
@@ -90,6 +91,30 @@ function commandTextFromArguments(argumentsJson: unknown): string {
   return JSON.stringify(args, null, 2);
 }
 
+function toolInputText(input: unknown): string {
+  if (typeof input === "string") {
+    return input;
+  }
+  if (input === null || input === undefined) {
+    return "";
+  }
+  return JSON.stringify(input, null, 2);
+}
+
+function toolOutputText(output: unknown): string {
+  if (typeof output === "string") {
+    return output;
+  }
+  const content = textFromContent(output);
+  if (content.trim()) {
+    return content;
+  }
+  if (output === null || output === undefined) {
+    return "";
+  }
+  return JSON.stringify(output, null, 2);
+}
+
 function normalizedSearchTerms(query: string): string[] {
   return query
     .trim()
@@ -116,8 +141,11 @@ function searchTextFromPayload(record: JsonlRecord): string {
     if (payload.type === "function_call") {
       return `${String(payload.name ?? "")}\n${commandTextFromArguments(payload.arguments)}`;
     }
-    if (payload.type === "function_call_output") {
-      return typeof payload.output === "string" ? payload.output : JSON.stringify(payload.output ?? "");
+    if (payload.type === "custom_tool_call") {
+      return `${String(payload.name ?? "")}\n${toolInputText(payload.input)}`;
+    }
+    if (payload.type === "function_call_output" || payload.type === "custom_tool_call_output") {
+      return toolOutputText(payload.output);
     }
     if (payload.type === "reasoning" && Array.isArray(payload.summary)) {
       return payload.summary.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join("\n");
@@ -193,9 +221,9 @@ function appendResponseItem(turn: FallbackTurn, payload: JsonObject, nextId: () 
     return;
   }
 
-  if (itemType === "function_call") {
+  if (itemType === "function_call" || itemType === "custom_tool_call") {
     const id = typeof payload.id === "string" ? payload.id : nextId();
-    const command = commandTextFromArguments(payload.arguments);
+    const command = itemType === "custom_tool_call" ? toolInputText(payload.input) : commandTextFromArguments(payload.arguments);
     turn.items.push({
       type: "toolCall",
       id,
@@ -206,12 +234,12 @@ function appendResponseItem(turn: FallbackTurn, payload: JsonObject, nextId: () 
     return;
   }
 
-  if (itemType === "function_call_output") {
+  if (itemType === "function_call_output" || itemType === "custom_tool_call_output") {
     const callId = typeof payload.call_id === "string" ? payload.call_id : nextId();
-    const output = typeof payload.output === "string" ? payload.output : JSON.stringify(payload.output ?? "", null, 2);
+    const output = toolOutputText(payload.output);
     turn.items.push({
       type: "toolCallOutput",
-      id: `${callId}-output-${turn.items.length + 1}`,
+      id: `${callId}-output`,
       text: callId,
       aggregatedOutput: output
     });
@@ -497,24 +525,131 @@ export async function readThreadSummaryFromJsonl(
   };
 }
 
+type ParsedThreadJsonl = { thread: JsonObject; truncated?: boolean };
+type ThreadJsonlReadOptions = {
+  tailBytes?: number;
+  startOffset?: number;
+  endOffset?: number;
+  syntheticTurnId?: string;
+};
+
+const parsedThreadCacheLimit = 24;
+const cachedParsedThreads = new Map<string, {
+  filePath: string;
+  signature: string;
+  value: Promise<ParsedThreadJsonl>;
+}>();
+
 export async function readThreadFromJsonl(
   filePath: string,
   threadId: string,
-  sessionsRoot = codexSessionsRoot
-): Promise<{ thread: JsonObject }> {
+  sessionsRoot = codexSessionsRoot,
+  options: ThreadJsonlReadOptions = {}
+): Promise<ParsedThreadJsonl> {
   if (!isSafeCodexSessionPath(filePath, sessionsRoot)) {
     throw new Error("Refusing to read a thread outside the Codex sessions directory.");
   }
 
-  const raw = await fs.readFile(filePath, "utf8");
+  if (options.tailBytes || options.startOffset !== undefined || options.endOffset !== undefined) {
+    return parseThreadFromJsonl(filePath, threadId, sessionsRoot, options);
+  }
+
+  const stat = await fs.stat(filePath);
+  const signature = `${stat.size}:${stat.mtimeMs}`;
+  const cached = cachedParsedThreads.get(filePath);
+  if (cached?.signature === signature) {
+    // Refresh recency so repeated A/B conversation switching stays hot.
+    cachedParsedThreads.delete(filePath);
+    cachedParsedThreads.set(filePath, cached);
+    return cached.value;
+  }
+
+  const value = parseThreadFromJsonl(filePath, threadId, sessionsRoot);
+  cachedParsedThreads.set(filePath, { filePath, signature, value });
+  while (cachedParsedThreads.size > parsedThreadCacheLimit) {
+    const oldestPath = cachedParsedThreads.keys().next().value;
+    if (!oldestPath) {
+      break;
+    }
+    cachedParsedThreads.delete(oldestPath);
+  }
+  try {
+    return await value;
+  } catch (error) {
+    if (cachedParsedThreads.get(filePath)?.value === value) {
+      cachedParsedThreads.delete(filePath);
+    }
+    throw error;
+  }
+}
+
+async function parseThreadFromJsonl(
+  filePath: string,
+  threadId: string,
+  sessionsRoot = codexSessionsRoot,
+  options: ThreadJsonlReadOptions = {}
+): Promise<{ thread: JsonObject; truncated?: boolean }> {
+  if (!isSafeCodexSessionPath(filePath, sessionsRoot)) {
+    throw new Error("Refusing to read a thread outside the Codex sessions directory.");
+  }
+
+  const fileStat = await fs.stat(filePath);
+  const tailBytes = Math.max(0, Math.floor(options.tailBytes ?? 0));
+  let raw: string;
+  let truncated = false;
+  if (typeof options.startOffset === "number") {
+    const startOffset = Math.max(0, Math.min(fileStat.size, Math.floor(options.startOffset)));
+    const endOffset = Math.max(startOffset, Math.min(fileStat.size, Math.floor(options.endOffset ?? fileStat.size)));
+    const handle = await fs.open(filePath, "r");
+    try {
+      const headBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, fileStat.size));
+      const bodyBuffer = Buffer.allocUnsafe(endOffset - startOffset);
+      await handle.read(headBuffer, 0, headBuffer.length, 0);
+      if (bodyBuffer.length) await handle.read(bodyBuffer, 0, bodyBuffer.length, startOffset);
+      const firstLineEnd = headBuffer.indexOf(10);
+      const firstLine = headBuffer.subarray(0, firstLineEnd >= 0 ? firstLineEnd : headBuffer.length).toString("utf8").trimEnd();
+      const syntheticTurn = options.syntheticTurnId
+        ? `${JSON.stringify({ type: "turn_context", payload: { turn_id: options.syntheticTurnId } })}\n`
+        : "";
+      raw = `${firstLine}\n${syntheticTurn}${bodyBuffer.toString("utf8")}`;
+      truncated = startOffset > 0 || endOffset < fileStat.size;
+    } finally {
+      await handle.close();
+    }
+  } else if (tailBytes > 0 && fileStat.size > tailBytes) {
+    const handle = await fs.open(filePath, "r");
+    try {
+      const headBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, fileStat.size));
+      const tailStart = Math.max(0, fileStat.size - tailBytes);
+      const tailBuffer = Buffer.allocUnsafe(fileStat.size - tailStart);
+      await handle.read(headBuffer, 0, headBuffer.length, 0);
+      await handle.read(tailBuffer, 0, tailBuffer.length, tailStart);
+      const headText = headBuffer.toString("utf8");
+      const firstLineEnd = headText.indexOf("\n");
+      const firstLine = headText.slice(0, firstLineEnd >= 0 ? firstLineEnd : headText.length).trimEnd();
+      const tailText = tailBuffer.toString("utf8");
+      const firstCompleteLine = tailText.indexOf("\n");
+      if (!firstLine || firstCompleteLine < 0) {
+        raw = await fs.readFile(filePath, "utf8");
+      } else {
+        raw = `${firstLine}\n${tailText.slice(firstCompleteLine + 1)}`;
+        truncated = true;
+      }
+    } finally {
+      await handle.close();
+    }
+  } else {
+    raw = await fs.readFile(filePath, "utf8");
+  }
   const turns = new Map<string, FallbackTurn>();
   let metadata: JsonObject | null = null;
   let currentTurnId: string | null = null;
   let itemCount = 0;
+  let currentRecordFallbackId = "";
   let preview = "";
   let updatedAt = 0;
 
-  const nextId = () => `fallback-item-${++itemCount}`;
+  const nextId = () => currentRecordFallbackId || `fallback-item-${++itemCount}`;
   const ensureTurn = (turnId: string): FallbackTurn => {
     let turn = turns.get(turnId);
     if (!turn) {
@@ -538,6 +673,7 @@ export async function readThreadFromJsonl(
       continue;
     }
 
+    currentRecordFallbackId = `fallback-item-${createHash("sha256").update(line).digest("hex").slice(0, 24)}`;
     const record = JSON.parse(line) as JsonlRecord;
     const payload = record.payload ?? {};
     updatedAt = Math.max(updatedAt, secondsFromIso(record.timestamp) ?? 0);
