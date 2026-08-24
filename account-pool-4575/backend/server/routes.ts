@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
@@ -161,6 +162,11 @@ const threadExportSchema = z.object({
   sendLocal: z.boolean().optional().default(false),
   outputPath: z.string().max(2048).optional(),
   destinationPath: z.string().max(2048).optional()
+});
+
+const threadBranchSchema = z.object({
+  turnId: z.string().trim().min(1).max(256),
+  prompt: z.string().trim().min(1).max(24_000)
 });
 
 const threadReadQuerySchema = z.object({
@@ -607,9 +613,39 @@ type AggregateBucket = {
   totals: TokenAccumulator;
 };
 
+type LeaderboardFileUsage = TokenAccumulator & {
+  userId: string;
+  sessionId: string;
+  model: string;
+  effort: string | null;
+  resetAt: number | null;
+};
+
+type LeaderboardFileSummary = {
+  size: number;
+  mtimeMs: number;
+  startAt: number | null;
+  usage: LeaderboardFileUsage[];
+};
+
+type LeaderboardFileCachePayload = {
+  version: 1;
+  files: Record<string, LeaderboardFileSummary>;
+};
+
+type LeaderboardAccountSource = {
+  id: string;
+  label: string;
+  sessionsRoot: string;
+  quota: PublicCodexQuota;
+};
+
 const leaderboardCacheTtlMs = 60_000;
-let leaderboardCache: { data: PublicCodexLeaderboard; expiresAt: number; resetAt: number | null } | null = null;
+const leaderboardFileCachePath = path.join(serverConfig.dataDir, "leaderboard-file-cache.json");
+let leaderboardCache: { data: PublicCodexLeaderboard; expiresAt: number; resetKey: string } | null = null;
 let leaderboardRefreshInFlight: Promise<PublicCodexLeaderboard> | null = null;
+let leaderboardFileCacheLoaded = false;
+const leaderboardFileCache = new Map<string, LeaderboardFileSummary>();
 
 function emptyTokenAccumulator(): TokenAccumulator {
   return {
@@ -636,6 +672,35 @@ function round2(value: number | null): number | null {
     return null;
   }
   return Math.round(value * 100) / 100;
+}
+
+function loadLeaderboardFileCache(): void {
+  if (leaderboardFileCacheLoaded) return;
+  leaderboardFileCacheLoaded = true;
+  try {
+    const payload = JSON.parse(fs.readFileSync(leaderboardFileCachePath, "utf8")) as LeaderboardFileCachePayload;
+    if (payload.version !== 1 || !payload.files || typeof payload.files !== "object") return;
+    for (const [filePath, summary] of Object.entries(payload.files)) {
+      if (summary && Number.isFinite(summary.size) && Number.isFinite(summary.mtimeMs) && Array.isArray(summary.usage)) {
+        leaderboardFileCache.set(filePath, summary);
+      }
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`Unable to read leaderboard cache: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+function persistLeaderboardFileCache(): void {
+  fs.mkdirSync(path.dirname(leaderboardFileCachePath), { recursive: true, mode: 0o700 });
+  const temporary = `${leaderboardFileCachePath}.${process.pid}.tmp`;
+  const payload: LeaderboardFileCachePayload = {
+    version: 1,
+    files: Object.fromEntries(leaderboardFileCache)
+  };
+  fs.writeFileSync(temporary, JSON.stringify(payload), { mode: 0o600 });
+  fs.renameSync(temporary, leaderboardFileCachePath);
 }
 
 function walkJsonlFiles(root: string): string[] {
@@ -779,14 +844,19 @@ function numericBoundary(values: Array<number | null>, direction: "min" | "max")
   return direction === "min" ? Math.min(...normalized) : Math.max(...normalized);
 }
 
-function mergeLeaderboardScopes(scopes: PublicLeaderboardScope[], accountLabels: string[]): PublicLeaderboardScope {
+function mergeLeaderboardScopes(
+  scopes: PublicLeaderboardScope[],
+  accountLabels: string[],
+  separateAccounts = true,
+  combinedQuotaUsedPercent: number | null = null
+): PublicLeaderboardScope {
   const buckets = new Map<string, AggregateBucket>();
   for (const [scopeIndex, scope] of scopes.entries()) {
     const accountLabel = accountLabels[scopeIndex] || `账号 ${scopeIndex + 1}`;
     for (const user of scope.users) {
       // The same Web login can use both purchased Codex accounts.  Keep those
       // rows separate instead of silently folding account two into account one.
-      const displayUserId = `${user.userId} · ${accountLabel}`;
+      const displayUserId = separateAccounts ? `${user.userId} · ${accountLabel}` : user.userId;
       const bucket = aggregateBucketFor(buckets, displayUserId);
       // A peer can only observe a count, not individual session IDs.  Use
       // synthetic IDs so the displayed count remains additive across hosts.
@@ -813,12 +883,30 @@ function mergeLeaderboardScopes(scopes: PublicLeaderboardScope[], accountLabels:
   return finalizeLeaderboardScope(
     buckets,
     {
-      totalQuotaUsedPercent: null,
+      totalQuotaUsedPercent: combinedQuotaUsedPercent,
       resetAt: numericBoundary(scopes.map((scope) => scope.resetAt), "max"),
       resetWindowMins: sharedNumericValue(scopes.map((scope) => scope.resetWindowMins)),
       startAt: numericBoundary(scopes.map((scope) => scope.startAt), "min")
     }
   );
+}
+
+function mergeAccountLeaderboards(boards: PublicCodexLeaderboard[]): PublicCodexLeaderboard {
+  return {
+    currentCycle: mergeLeaderboardScopes(
+      boards.map((board) => board.currentCycle),
+      boards.map((_, index) => `账号 ${index + 1}`),
+      false,
+      boards.reduce((sum, board) => sum + (board.currentCycle.quotaUsedPercent ?? 0), 0)
+    ),
+    lifetime: mergeLeaderboardScopes(
+      boards.map((board) => board.lifetime),
+      boards.map((_, index) => `账号 ${index + 1}`),
+      false
+    ),
+    updatedAt: new Date().toISOString(),
+    errors: boards.flatMap((board) => board.errors)
+  };
 }
 
 async function mergePeerLeaderboards(local: PublicCodexLeaderboard): Promise<PublicCodexLeaderboard> {
@@ -860,9 +948,86 @@ async function mergePeerLeaderboards(local: PublicCodexLeaderboard): Promise<Pub
   };
 }
 
-function readCodexLeaderboard(currentQuota: PublicCodexQuota, store: ProjectStore): PublicCodexLeaderboard {
-  const sessionsRoot = path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/ls", ".codex"), "sessions");
-  const files = walkJsonlFiles(sessionsRoot);
+async function summarizeLeaderboardFile(
+  filePath: string,
+  store: ProjectStore,
+  resolveSessionOwner: (sessionId: string) => string | null
+): Promise<LeaderboardFileSummary> {
+  const stat = fs.statSync(filePath);
+  const usageByKey = new Map<string, LeaderboardFileUsage>();
+  let sessionId = path.basename(filePath, ".jsonl");
+  let userId: string | null = null;
+  let model = "unknown";
+  let effort: string | null = null;
+  let startAt: number | null = null;
+  const input = fs.createReadStream(filePath, { encoding: "utf8", highWaterMark: 256 * 1024 });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+
+  for await (const line of lines) {
+    if (!line.trim()) continue;
+    let record: Record<string, unknown>;
+    try {
+      record = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const type = stringOrNull(record.type);
+    const payload = asRecord(record.payload);
+    if (type === "session_meta") {
+      sessionId = stringOrNull(payload.session_id) ?? stringOrNull(payload.id) ?? sessionId;
+      userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd));
+      continue;
+    }
+    if (type === "turn_context") {
+      userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd));
+      model = stringOrNull(payload.model) ?? model;
+      effort = stringOrNull(payload.effort)
+        ?? stringOrNull(asRecord(asRecord(payload.collaboration_mode).settings).reasoning_effort)
+        ?? effort;
+      continue;
+    }
+    if (type !== "event_msg" || stringOrNull(payload.type) !== "token_count") continue;
+
+    const recordTimestamp = stringOrNull(record.timestamp);
+    const parsedTimestampMs = recordTimestamp ? Date.parse(recordTimestamp) : Number.NaN;
+    if (Number.isFinite(parsedTimestampMs)) {
+      const parsedTimestamp = Math.floor(parsedTimestampMs / 1000);
+      startAt = startAt === null ? parsedTimestamp : Math.min(startAt, parsedTimestamp);
+    }
+    if (!userId) {
+      userId = resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd)) ?? "unknown";
+    }
+    const info = asRecord(payload.info);
+    const usageRecord = asRecord(info.last_token_usage);
+    const fallbackUsageRecord = asRecord(info.total_token_usage);
+    const usageSource = Object.keys(usageRecord).length ? usageRecord : fallbackUsageRecord;
+    const usage: TokenAccumulator = {
+      inputTokens: countField(usageSource, "inputTokens", "input_tokens"),
+      cachedInputTokens: countField(usageSource, "cachedInputTokens", "cached_input_tokens"),
+      cacheWriteInputTokens: countField(usageSource, "cacheWriteInputTokens", "cache_write_input_tokens"),
+      outputTokens: countField(usageSource, "outputTokens", "output_tokens"),
+      reasoningOutputTokens: countField(usageSource, "reasoningOutputTokens", "reasoning_output_tokens"),
+      totalTokens: countField(usageSource, "totalTokens", "total_tokens")
+    };
+    if (!usage.totalTokens) continue;
+    const primary = asRecord(asRecord(payload.rate_limits).primary);
+    const resetAt = safeCount(primary.resets_at) ?? safeCount(primary.resetsAt);
+    const key = JSON.stringify([userId, sessionId, model, effort, resetAt]);
+    const existing = usageByKey.get(key);
+    if (existing) {
+      addTokenAccumulator(existing, usage);
+    } else {
+      usageByKey.set(key, { userId, sessionId, model, effort, resetAt, ...usage });
+    }
+  }
+
+  return { size: stat.size, mtimeMs: stat.mtimeMs, startAt, usage: Array.from(usageByKey.values()) };
+}
+
+async function readCodexLeaderboard(source: LeaderboardAccountSource, store: ProjectStore): Promise<PublicCodexLeaderboard> {
+  loadLeaderboardFileCache();
+  const files = walkJsonlFiles(source.sessionsRoot);
+  const currentQuota = source.quota;
   const currentResetAt = currentQuota.rateLimits?.primary?.resetsAt ?? null;
   const currentResetWindowMins = currentQuota.rateLimits?.primary?.windowDurationMins ?? null;
   const currentQuotaUsedPercent = currentQuota.rateLimits?.primary?.usedPercent ?? null;
@@ -882,71 +1047,38 @@ function readCodexLeaderboard(currentQuota: PublicCodexQuota, store: ProjectStor
     return userId;
   };
 
+  let cacheChanged = false;
+  const liveFiles = new Set(files);
   for (const filePath of files) {
     try {
-      const lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
-      let sessionId = path.basename(filePath, ".jsonl");
-      let userId: string | null = null;
-      let model = "unknown";
-      let effort: string | null = null;
-      for (const line of lines) {
-        if (!line.trim()) {
-          continue;
-        }
-        let record: Record<string, unknown>;
-        try {
-          record = JSON.parse(line) as Record<string, unknown>;
-        } catch {
-          continue;
-        }
-        const type = stringOrNull(record.type);
-        const payload = asRecord(record.payload);
-        if (type === "session_meta") {
-          sessionId = stringOrNull(payload.session_id) ?? stringOrNull(payload.id) ?? sessionId;
-          userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd));
-          continue;
-        }
-        if (type === "turn_context") {
-          userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd));
-          model = stringOrNull(payload.model) ?? model;
-          effort = stringOrNull(payload.effort) ?? stringOrNull(asRecord(payload.collaboration_mode).settings && asRecord(asRecord(payload.collaboration_mode).settings).reasoning_effort) ?? effort;
-          continue;
-        }
-        if (type !== "event_msg" || stringOrNull(payload.type) !== "token_count") {
-          continue;
-        }
-        const recordTimestamp = stringOrNull(record.timestamp);
-        const parsedTimestampMs = recordTimestamp ? Date.parse(recordTimestamp) : Number.NaN;
-        if (Number.isFinite(parsedTimestampMs)) {
-          const parsedTimestamp = Math.floor(parsedTimestampMs / 1000);
-          lifetimeStartAt = lifetimeStartAt === null ? parsedTimestamp : Math.min(lifetimeStartAt, parsedTimestamp);
-        }
-        if (!userId) {
-          userId = resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd)) ?? "unknown";
-        }
-        const info = asRecord(payload.info);
-        const usageRecord = asRecord(info.last_token_usage);
-        const fallbackUsageRecord = asRecord(info.total_token_usage);
-        const usageSource = Object.keys(usageRecord).length ? usageRecord : fallbackUsageRecord;
-        const usage: TokenAccumulator = {
-          inputTokens: countField(usageSource, "inputTokens", "input_tokens"),
-          cachedInputTokens: countField(usageSource, "cachedInputTokens", "cached_input_tokens"),
-          cacheWriteInputTokens: countField(usageSource, "cacheWriteInputTokens", "cache_write_input_tokens"),
-          outputTokens: countField(usageSource, "outputTokens", "output_tokens"),
-          reasoningOutputTokens: countField(usageSource, "reasoningOutputTokens", "reasoning_output_tokens"),
-          totalTokens: countField(usageSource, "totalTokens", "total_tokens")
-        };
-        recordUsage(lifetime, userId, sessionId, model, effort, usage);
-        const primary = asRecord(asRecord(payload.rate_limits).primary);
-        const resetAt = safeCount(primary.resets_at) ?? safeCount(primary.resetsAt);
-        if (currentResetAt !== null && resetAt === currentResetAt) {
-          recordUsage(currentCycle, userId, sessionId, model, effort, usage);
+      const stat = fs.statSync(filePath);
+      let summary = leaderboardFileCache.get(filePath);
+      if (!summary || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs) {
+        summary = await summarizeLeaderboardFile(filePath, store, resolveSessionOwner);
+        leaderboardFileCache.set(filePath, summary);
+        cacheChanged = true;
+      }
+      if (summary.startAt !== null) {
+        lifetimeStartAt = lifetimeStartAt === null ? summary.startAt : Math.min(lifetimeStartAt, summary.startAt);
+      }
+      for (const entry of summary.usage) {
+        recordUsage(lifetime, entry.userId, entry.sessionId, entry.model, entry.effort, entry);
+        if (currentResetAt !== null && entry.resetAt === currentResetAt) {
+          recordUsage(currentCycle, entry.userId, entry.sessionId, entry.model, entry.effort, entry);
         }
       }
     } catch (error) {
       errors.push(`${path.basename(filePath)}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+
+  for (const cachedPath of leaderboardFileCache.keys()) {
+    if (cachedPath.startsWith(`${source.sessionsRoot}${path.sep}`) && !liveFiles.has(cachedPath)) {
+      leaderboardFileCache.delete(cachedPath);
+      cacheChanged = true;
+    }
+  }
+  if (cacheChanged) persistLeaderboardFileCache();
 
   return {
     currentCycle: finalizeLeaderboardScope(currentCycle, {
@@ -966,36 +1098,52 @@ function readCodexLeaderboard(currentQuota: PublicCodexQuota, store: ProjectStor
 }
 
 async function readCachedCodexLeaderboard(
-  currentQuota: PublicCodexQuota,
+  sources: LeaderboardAccountSource[],
   store: ProjectStore,
   forceRefresh = false,
   includePeers = true
 ): Promise<PublicCodexLeaderboard> {
   const now = Date.now();
-  const resetAt = currentQuota.rateLimits?.primary?.resetsAt ?? null;
-  if (includePeers && !forceRefresh && leaderboardCache && leaderboardCache.expiresAt > now && leaderboardCache.resetAt === resetAt) {
+  const resetKey = sources.map((source) => `${source.id}:${source.quota.rateLimits?.primary?.resetsAt ?? "none"}`).join("|");
+  if (!forceRefresh && leaderboardCache && leaderboardCache.expiresAt > now && leaderboardCache.resetKey === resetKey) {
     return leaderboardCache.data;
   }
-  if (includePeers && leaderboardRefreshInFlight) {
+  if (leaderboardRefreshInFlight) {
     return leaderboardRefreshInFlight;
   }
-  const refresh = Promise.resolve(readCodexLeaderboard(currentQuota, store))
+  const refresh = (async () => {
+    const boards: PublicCodexLeaderboard[] = [];
+    for (const source of sources) boards.push(await readCodexLeaderboard(source, store));
+    return boards.length === 1 ? boards[0] : mergeAccountLeaderboards(boards);
+  })()
     .then((local) => includePeers ? mergePeerLeaderboards(local) : local)
     .then((data) => {
-      if (includePeers) {
-        leaderboardCache = { data, expiresAt: Date.now() + leaderboardCacheTtlMs, resetAt };
-      }
+      leaderboardCache = { data, expiresAt: Date.now() + leaderboardCacheTtlMs, resetKey };
       return data;
     })
     .finally(() => {
-      if (includePeers) {
-        leaderboardRefreshInFlight = null;
-      }
+      leaderboardRefreshInFlight = null;
     });
-  if (includePeers) {
-    leaderboardRefreshInFlight = refresh;
-  }
+  leaderboardRefreshInFlight = refresh;
   return refresh;
+}
+
+async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: boolean): Promise<LeaderboardAccountSource[]> {
+  if (isAccountPoolBridge(bridge)) {
+    const snapshots = await bridge.refreshAccountData(forceRefresh);
+    return snapshots.map((entry) => ({
+      id: entry.id,
+      label: entry.label,
+      sessionsRoot: path.join(entry.codexHome, "sessions"),
+      quota: sanitizeCodexQuota(entry.account, entry.limits, entry.usage, entry.errors)
+    }));
+  }
+  return [{
+    id: serverConfig.leaderboardAccountLabel,
+    label: serverConfig.leaderboardAccountLabel,
+    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/ls", ".codex"), "sessions"),
+    quota: await readCachedCodexQuota(bridge, forceRefresh)
+  }];
 }
 
 function fileKind(filePath: string): "markdown" | "text" | "image" | "pdf" | "binary" {
@@ -1544,6 +1692,61 @@ function searchableTextFromValue(value: unknown, depth = 0): string {
   return "";
 }
 
+/**
+ * Cross-account threads cannot share the native Codex session file.  This
+ * creates a bounded, visible-history handoff instead: user and agent messages
+ * through the chosen completed turn, without hidden reasoning or huge tool
+ * output.  The target account receives it as the first prompt of a new thread.
+ */
+function crossAccountBranchContext(threadValue: unknown, boundaryTurnId: string): string {
+  const thread = asRecord(threadValue);
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  const sections: string[] = [];
+  let foundBoundary = false;
+  for (const turnValue of turns) {
+    const turn = asRecord(turnValue);
+    const turnId = stringOrNull(turn.id);
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    const lines: string[] = [];
+    for (const itemValue of items) {
+      const item = asRecord(itemValue);
+      const type = String(item.type ?? "").toLowerCase();
+      const role = String(item.role ?? "").toLowerCase();
+      const isUser = role === "user" || type.includes("user");
+      const isAgent = role === "assistant" || role === "agent" || type.includes("agentmessage") || type === "assistantmessage";
+      if (!isUser && !isAgent) continue;
+      const text = [item.text, item.message, item.content, item.value]
+        .map((value) => searchableTextFromValue(value))
+        .find((value) => value.trim())
+        ?.replace(/\s+/g, " ").trim() ?? "";
+      if (text) lines.push(`${isUser ? "用户" : "Codex"}：${text.slice(0, 8_000)}`);
+    }
+    if (lines.length) sections.push(lines.join("\n"));
+    if (turnId === boundaryTurnId) {
+      foundBoundary = true;
+      break;
+    }
+  }
+  if (!foundBoundary) {
+    throw new Error("选择的回答不在当前会话历史中，请刷新后重试。");
+  }
+  const joined = sections.join("\n\n").trim();
+  if (!joined) {
+    throw new Error("该节点之前没有可用于续接的可见对话内容。");
+  }
+  const maximumCharacters = 36_000;
+  if (joined.length <= maximumCharacters) return joined;
+  // Preserve the opening goal and the newest decisions when a thread is large.
+  return `${joined.slice(0, 7_000)}\n\n[中间较早的对话已省略]\n\n${joined.slice(-(maximumCharacters - 7_000))}`;
+}
+
+function branchTitle(sourceName: string, prompt: string): string {
+  const cleanPrompt = prompt.replace(/\s+/g, " ").trim();
+  const segment = (cleanPrompt.split(/[\r\n。！？!?；;]/, 1)[0] ?? cleanPrompt).trim();
+  const suffix = Array.from(segment).slice(0, /[\u4e00-\u9fff]/.test(segment) ? 20 : 36).join("").trim() || "分支";
+  return `${sourceName || "会话"} · ${suffix}`.slice(0, 160);
+}
+
 function itemMatchesSearch(item: unknown, query: string): boolean {
   if (!query) {
     return true;
@@ -2018,11 +2221,12 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
   app.get<{ Querystring: { refresh?: string; local?: string } }>("/api/codex/leaderboard", async (request, reply) => {
     try {
       reply.header("Cache-Control", "no-store");
-      const quota = await readCachedCodexQuota(bridge, request.query.refresh === "true");
+      const forceRefresh = request.query.refresh === "true";
+      const sources = await leaderboardAccountSources(bridge, forceRefresh);
       // Never merge peer boards into the normal endpoint. A peer can expose
       // historical JSONL records for the same login, which is useful for an
       // audit but misleading as a current-service quota view.
-      return { data: await readCachedCodexLeaderboard(quota, store, request.query.refresh === "true", false) };
+      return { data: await readCachedCodexLeaderboard(sources, store, forceRefresh, false) };
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -2530,6 +2734,88 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       return reply.code(404).send({ error: "Thread not found." });
     }
     return { ok: true, data: unusedThread };
+  });
+
+  app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/branch", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const input = threadBranchSchema.parse(request.body ?? {});
+      const source = await bridge.request("thread/read", { threadId: request.params.threadId, includeTurns: true }, 60_000);
+      const sourceThread = asRecord(asRecord(source).thread);
+      const context = crossAccountBranchContext(sourceThread, input.turnId);
+      const owner = store.getThreadOwner(request.params.threadId);
+      const presentation = store.getThreadPresentation(userId, [request.params.threadId]).get(request.params.threadId);
+      const model = presentation?.model ?? owner?.modelOverride ?? project.defaultModel;
+      const reasoningEffort = presentation?.reasoningEffort ?? owner?.reasoningEffortOverride ?? project.defaultReasoningEffort;
+
+      // No thread id is supplied here: AccountPoolBridge deliberately chooses
+      // the healthiest account with the most remaining quota for the branch.
+      const started = await bridge.request("thread/start", {
+        cwd: project.rootPath,
+        model,
+        approvalPolicy: project.defaultApprovalPolicy,
+        sandbox: project.defaultSandbox,
+        threadSource: "user"
+      }, 60_000);
+      const createdThread = asRecord(asRecord(started).thread);
+      const createdThreadId = stringOrNull(createdThread.id);
+      if (!createdThreadId) throw new Error("Codex did not return a branch thread id.");
+
+      store.registerThreadOwner({
+        threadId: createdThreadId,
+        userId,
+        projectId: project.id,
+        rootPath: project.rootPath,
+        model,
+        reasoningEffort
+      });
+      const name = branchTitle(stringOrNull(sourceThread.name) ?? stringOrNull(sourceThread.preview) ?? "会话", input.prompt);
+      store.updateThreadDisplayName(createdThreadId, userId, name);
+      createdThread.name = name;
+      createdThread.title = name;
+      void bridge.request("thread/name/set", { threadId: createdThreadId, name }).catch((error) => {
+        console.warn("Native Codex branch title failed", error);
+      });
+
+      const continuationPrompt = [
+        "你正在接续另一个 Codex 会话的分支。以下是截至分支节点的可见历史摘要；把它作为背景，不要复述整段历史。隐藏思考、工具执行状态和未展示内容不会被继承。",
+        "【分支上下文】",
+        context,
+        "【当前分支任务】",
+        input.prompt
+      ].join("\n\n");
+      const turn = await bridge.request("turn/start", {
+        threadId: createdThreadId,
+        input: [{ type: "text", text: continuationPrompt, text_elements: [] }],
+        cwd: project.rootPath,
+        approvalPolicy: project.defaultApprovalPolicy,
+        sandboxPolicy: project.defaultSandbox === "danger-full-access"
+          ? { type: "dangerFullAccess" }
+          : project.defaultSandbox === "read-only"
+            ? { type: "readOnly", networkAccess: false }
+            : { type: "workspaceWrite", writableRoots: [project.rootPath], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
+        model,
+        effort: reasoningEffort
+      }, 60_000);
+      store.touchThreadOwner(createdThreadId);
+      const targetAccount = isAccountPoolBridge(bridge) ? bridge.getKnownThreadAccount(createdThreadId) : null;
+      return {
+        data: {
+          thread: createdThread,
+          turn,
+          sourceThreadId: request.params.threadId,
+          sourceTurnId: input.turnId,
+          targetAccount
+        }
+      };
+    } catch (error) {
+      return reply.code(errorStatus(error) === 500 ? 502 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/export", async (request, reply) => {

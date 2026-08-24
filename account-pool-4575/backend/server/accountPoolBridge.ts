@@ -26,6 +26,7 @@ interface PersistedPoolState {
 export interface AccountPoolRawSnapshot {
   id: string;
   label: string;
+  codexHome: string;
   health: "ready" | "degraded" | "starting";
   selectedForNewThreads: boolean;
   assignedThreadCount: number;
@@ -456,6 +457,7 @@ export class AccountPoolBridge extends EventEmitter {
     return this.accounts.map((account) => ({
       id: account.id,
       label: account.label,
+      codexHome: account.codexHome,
       health: account.health,
       selectedForNewThreads: account.id === selected,
       assignedThreadCount: this.assignedThreadCount(account.id),

@@ -5485,6 +5485,51 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
   stroke-width: 1.35;
 }
 
+.settingsDialog.branchDialog {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(520px, calc(100vw - 40px));
+  min-width: min(420px, calc(100vw - 40px));
+  max-height: min(620px, calc(100vh - 40px));
+  overflow: hidden;
+  resize: none;
+}
+
+.branchDialog .dialogHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 15px 17px;
+  border-bottom: 1px solid #353734;
+  background: #252625;
+}
+
+.branchDialog .dialogHeader h2 { margin: 0; color: #eceee9; font-size: 16px; font-weight: 560; }
+.branchDialog .dialogHeader p,
+.branchDialogNotice { margin: 4px 0 0; color: #969993; font-size: 12px; line-height: 1.45; }
+.branchDialog .iconButton { background: #333532; color: #d8dad5; }
+.branchDialog .iconButton:hover { background: #41433f; }
+
+.branchDialogBody { display: grid; gap: 12px; padding: 14px; background: #202120; }
+.branchDialogBody p { margin: 0; }
+.branchDialogBody label { display: grid; gap: 6px; color: #babdb7; font-size: 12px; font-weight: 500; }
+.branchDialogBody textarea {
+  min-height: 96px;
+  resize: vertical;
+  border: 1px solid #40423e;
+  border-radius: 9px;
+  padding: 9px 10px;
+  background: #292a29;
+  color: #e2e4df;
+  font: 400 13px/20px inherit;
+}
+.branchDialogBody textarea:focus { border-color: #60635d; outline: none; box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.035); }
+.branchDialog .dialogActions { margin: 0; border-top: 1px solid #353734; padding: 12px 14px 14px; background: #202120; }
+.branchDialog .dialogActions .iconTextButton { min-height: 33px; border: 1px solid #424440; border-radius: 9px; background: #2c2d2c; color: #d9dbd6; font-weight: 400; }
+.branchDialog .dialogActions .iconTextButton:hover { background: #383a37; }
+.branchDialog .dialogActions .iconTextButton.primary { border-color: #5f625d; background: #e0e2dd; color: #202120; }
+.branchDialog .dialogActions .iconTextButton.primary:hover { background: #f0f1ed; }
+
 .messageItem.kind-agent:has(+ .messageItem.kind-tool),
 .messageItem.kind-reasoning:has(+ .messageItem.kind-tool),
 .messageItem.kind-system:has(+ .messageItem.kind-tool) {
@@ -7389,6 +7434,124 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .temporaryAskComposer .v2ModelPicker { margin-left:auto; }
 .temporaryAskComposer .temporaryPolicySelect { flex:0 1 auto; }
 .temporaryAskComposer .sendButton { align-self:flex-end; flex:0 0 auto; margin:0 0 1px 7px; }
+
+/* Final branch-dialog token pass.  This comes after legacy dialog skins so its
+   typography, dividers and controls cannot inherit the older cream/orange UI. */
+.settingsDialog.branchDialog {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(480px, calc(100vw - 32px));
+  min-width: min(360px, calc(100vw - 32px));
+  max-height: min(560px, calc(100vh - 32px));
+  overflow: hidden;
+  resize: none;
+  border: 1px solid rgba(255, 255, 255, 0.09) !important;
+  border-radius: 14px;
+  background: #202120 !important;
+  color: #e8e9e5;
+  box-shadow: 0 26px 72px rgba(0, 0, 0, 0.52);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "Microsoft YaHei UI", "Noto Sans SC", sans-serif;
+}
+
+.branchDialog .dialogHeader {
+  min-height: 62px;
+  padding: 13px 14px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: #242524;
+}
+
+.branchDialog .dialogHeader h2 {
+  color: #eceee9;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 21px;
+}
+
+.branchDialog .dialogHeader p,
+.branchDialogNotice {
+  color: #9a9d97;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 18px;
+}
+
+.branchDialog .iconButton {
+  width: 29px;
+  height: 29px;
+  border-radius: 8px;
+  background: #30312f;
+  color: #b9bcb5;
+}
+
+.branchDialogBody {
+  gap: 13px;
+  padding: 14px;
+  background: #202120;
+}
+
+.branchDialogNotice {
+  padding: 8px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.branchDialogBody label {
+  gap: 7px;
+  color: #d5d7d1;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 18px;
+}
+
+.branchDialogBody textarea {
+  min-height: 94px;
+  border: 1px solid rgba(255, 255, 255, 0.085);
+  border-radius: 9px;
+  padding: 9px 10px;
+  background: #282927;
+  color: #e5e7e1;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
+}
+
+.branchDialogBody textarea::placeholder { color: #7f827c; }
+.branchDialogBody textarea:focus { border-color: rgba(224, 226, 221, 0.38); box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.035); }
+
+.settingsDialog.branchDialog .dialogActions {
+  min-height: 0 !important;
+  padding: 8px 14px !important;
+  align-items: center;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: #202120;
+}
+
+.settingsDialog.branchDialog .dialogActions .iconTextButton {
+  box-sizing: border-box;
+  height: 32px !important;
+  min-height: 32px !important;
+  padding: 0 11px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  background: #2b2c2a;
+  color: #cfd1cb;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 18px;
+}
+
+.branchDialog .dialogActions .iconTextButton.primary {
+  border-color: transparent;
+  background: #e5e7e1;
+  color: #1e201e;
+}
+
+.branchDialog .dialogActions .iconTextButton svg { width: 14px; height: 14px; stroke-width: 1.5; }
 
 /* Borderless surface language: separate controls with tone, radius and shadow. */
 .topbar .controls button,

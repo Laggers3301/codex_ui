@@ -31,6 +31,7 @@ import remarkMath from "remark-math";
 import type { PluggableList } from "unified";
 import {
   createProject,
+  branchThread,
   deleteProject,
   deleteThread,
   exportThreadRecord,
@@ -306,6 +307,7 @@ type LeaderboardRefreshResult = {
 };
 
 const quotaAutoRefreshMs = 180_000;
+const leaderboardAutoRefreshMs = 60_000;
 const sentPromptBottomHoldMs = 5_000;
 // A leading slash is common in filesystem paths. Only reserve the commands
 // that this UI actually implements; everything else must reach Codex verbatim.
@@ -2697,6 +2699,9 @@ export function App() {
   const [renamingThread, setRenamingThread] = useState<ThreadSummary | null>(null);
   const [threadRenameDraft, setThreadRenameDraft] = useState("");
   const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
+  const [branchDialog, setBranchDialog] = useState<{ threadId: string; turnId: string; sourceName: string } | null>(null);
+  const [branchPrompt, setBranchPrompt] = useState("");
+  const [branchingThread, setBranchingThread] = useState(false);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>(fallbackModelProfiles);
   const [newThreadModelProfileId, setNewThreadModelProfileId] = useState(defaultModelProfileId);
   const [savingThreadModel, setSavingThreadModel] = useState(false);
@@ -3422,6 +3427,68 @@ export function App() {
     setRenamingThread(thread);
   }
 
+  function openBranchDialog(turn: Turn) {
+    if (!selectedThread?.id || !selectedProject?.id) {
+      setError("请先打开一个已保存的会话后再创建分支。");
+      return;
+    }
+    setError("");
+    setBranchPrompt("");
+    setBranchDialog({
+      threadId: selectedThread.id,
+      turnId: turn.id,
+      sourceName: selectedThread.name ?? selectedThread.preview ?? "当前会话"
+    });
+  }
+
+  async function createCrossAccountBranch() {
+    const dialog = branchDialog;
+    const project = selectedProject;
+    const nextPrompt = branchPrompt.trim();
+    if (!dialog || !project || !nextPrompt) return;
+    setBranchingThread(true);
+    setError("");
+    try {
+      const response = await branchThread(project.id, dialog.threadId, { turnId: dialog.turnId, prompt: nextPrompt });
+      const rawThread = response.data.thread;
+      const normalizedThread = sanitizeThreadForRender({
+        ...rawThread,
+        pinned: false,
+        configuredModel: rawThread.configuredModel ?? selectedThread?.configuredModel ?? project.defaultModel,
+        configuredReasoningEffort: rawThread.configuredReasoningEffort ?? selectedThread?.configuredReasoningEffort ?? project.defaultReasoningEffort,
+        turns: rawThread.turns ?? []
+      });
+      threadProjectIdsRef.current.set(normalizedThread.id, project.id);
+      setThreads((current) => {
+        const next = current.filter((thread) => thread.id !== normalizedThread.id);
+        next.unshift(normalizedThread);
+        threadsRef.current = next;
+        return next;
+      });
+      newThreadDraftModeRef.current = false;
+      selectedThreadRef.current = normalizedThread;
+      setSelectedThread(normalizedThread);
+      setThreadHistory(null);
+      const newTurnId = response.data.turn?.turn?.id;
+      if (newTurnId) {
+        turnThreadIdsRef.current.set(newTurnId, normalizedThread.id);
+        activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [normalizedThread.id]: newTurnId };
+        setActiveTurnsByThread((current) => ({ ...current, [normalizedThread.id]: newTurnId }));
+      }
+      setBranchDialog(null);
+      setBranchPrompt("");
+      const accountLabel = response.data.targetAccount?.label ? `，已路由至额度较高的账号 ${response.data.targetAccount.label}` : "";
+      addLocalMessage(`已从“${dialog.sourceName}”创建跨账号续接分支${accountLabel}。原会话保持不变；该分支仅携带所选回答之前的可见对话上下文。`, "Codex Web · 分支续接");
+      void openThread(normalizedThread.id, project.id, threadViewTokenRef.current, { skipCache: true, requireFresh: true });
+      void refreshThreads(project.id);
+      void refreshQuota(false, { background: true, force: true });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBranchingThread(false);
+    }
+  }
+
   async function copyThreadSessionId(thread: ThreadSummary) {
     const sessionId = (thread.sessionId || thread.id).trim();
     setThreadContextMenu(null);
@@ -3800,7 +3867,7 @@ export function App() {
           void refreshLeaderboard(false, false);
         }
         scheduleNext();
-      }, quotaAutoRefreshMs);
+      }, leaderboardAutoRefreshMs);
     };
 
     const refreshWhenVisible = () => {
@@ -4088,6 +4155,10 @@ export function App() {
   async function refreshLeaderboard(showDialog = true, force = false): Promise<CodexLeaderboard | null> {
     if (showDialog) {
       setLeaderboardOpen(true);
+      const cachedAt = leaderboard?.updatedAt ? Date.parse(leaderboard.updatedAt) : Number.NaN;
+      if (Number.isFinite(cachedAt) && Date.now() - cachedAt > 5 * 60_000) {
+        setLeaderboard(null);
+      }
     }
     setLeaderboardLoading(true);
 
@@ -7110,6 +7181,50 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         </div>
       ) : null}
 
+      {branchDialog ? (
+        <div className="modalBackdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !branchingThread) setBranchDialog(null);
+        }}>
+          <section className="settingsDialog branchDialog" role="dialog" aria-modal="true" aria-labelledby="branch-dialog-title">
+            <div className="dialogHeader">
+              <div>
+                <h2 id="branch-dialog-title">分支到新会话</h2>
+                <p>保留当前回答之前的可见上下文，并自动选择剩余额度更多的账号。</p>
+              </div>
+              <button className="iconButton" type="button" onClick={() => setBranchDialog(null)} disabled={branchingThread} title="关闭">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="branchDialogBody">
+              <p className="branchDialogNotice">原会话不会变更。隐藏 Thinking、工具运行状态及未展示内容不会跨账号复制。</p>
+              <label>
+                <span>在分支中继续做什么？</span>
+                <textarea
+                  autoFocus
+                  value={branchPrompt}
+                  onChange={(event) => setBranchPrompt(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                      event.preventDefault();
+                      void createCrossAccountBranch();
+                    }
+                  }}
+                  placeholder="例如：不要改原方案，换一种架构继续实现"
+                  disabled={branchingThread}
+                />
+              </label>
+            </div>
+            <div className="dialogActions">
+              <button className="iconTextButton" type="button" onClick={() => setBranchDialog(null)} disabled={branchingThread}>取消</button>
+              <button className="iconTextButton primary" type="button" onClick={() => void createCrossAccountBranch()} disabled={!branchPrompt.trim() || branchingThread}>
+                <GitBranch size={15} />
+                {branchingThread ? "正在创建…" : "创建分支并发送"}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
       {settingsOpen ? (
         <div className="modalScrim" role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title">
           <section className="settingsDialog">
@@ -7286,7 +7401,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <button
               className="leaderboardButton"
               type="button"
-              onClick={() => void refreshLeaderboard(true, false)}
+              onClick={() => void refreshLeaderboard(true, true)}
               disabled={leaderboardLoading}
               title="查看当前周期和历史累计 token 排行榜"
             >
@@ -7880,6 +7995,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         <div className="v2AgentMessageActions v2TurnCopyAction" key={`${turn.id}-copy-all`} aria-label="本轮回答操作">
                           <button type="button" title="复制本次回答全部文字" aria-label="复制本次回答全部文字" onClick={() => void copyPlainText(turnAgentText)}>
                             <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
+                          </button>
+                          <button type="button" title="从此回答分支到新会话" aria-label="从此回答分支到新会话" onClick={() => openBranchDialog(turn)}>
+                            <GitBranch size={15} />
                           </button>
                         </div>
                       ]

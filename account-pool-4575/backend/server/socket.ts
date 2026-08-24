@@ -66,6 +66,25 @@ function textInput(prompt: string) {
   return [{ type: "text", text: prompt, text_elements: [] }];
 }
 
+/**
+ * Give a new conversation a useful label without opening another Codex turn.
+ * The source question remains untouched; this only creates a compact display
+ * name and is also written to the native Codex thread via thread/name/set.
+ */
+function titleFromFirstPrompt(prompt: string): string {
+  const cleaned = prompt
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/\[[^\]]+\]\([^)]*\)/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[#>*\-\d.\s]+/, "")
+    .trim();
+  const firstClause = (cleaned.split(/[\r\n。！？!?；;]/, 1)[0] ?? cleaned).trim();
+  const characters = Array.from(firstClause || cleaned);
+  const limit = /[\u4e00-\u9fff]/.test(firstClause) ? 24 : 48;
+  const title = characters.slice(0, limit).join("").trim().replace(/[，、,:：\-–—]+$/, "");
+  return title || "新对话";
+}
+
 function sandboxPolicy(project: Project, mode = project.defaultSandbox) {
   if (mode === "danger-full-access") {
     return { type: "dangerFullAccess" };
@@ -526,6 +545,17 @@ async function handleClientMessage(
               rootPath: project.rootPath,
               model,
               reasoningEffort
+            });
+            const autoTitle = titleFromFirstPrompt(prompt);
+            store.updateThreadDisplayName(threadId, sessionUserId, autoTitle);
+            const createdThread = (thread as { thread?: { name?: string; title?: string } }).thread;
+            if (createdThread) {
+              createdThread.name = autoTitle;
+              createdThread.title = autoTitle;
+            }
+            // Native title persistence must never delay the first answer.
+            void bridge.request("thread/name/set", { threadId, name: autoTitle }).catch((error) => {
+              console.warn("Native Codex automatic thread title failed", error);
             });
             const turn = await bridge.request("turn/start", {
               threadId,

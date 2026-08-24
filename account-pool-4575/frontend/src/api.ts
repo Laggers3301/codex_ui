@@ -20,6 +20,7 @@ import type {
   ThreadPresentation,
   ThreadListResponse,
   ThreadReadResponse,
+  ThreadSummary,
   UserProfile
 } from "./types";
 
@@ -231,6 +232,17 @@ export function listThreads(projectId: string, search?: string): Promise<ThreadL
 
 export function deleteThread(projectId: string, threadId: string): Promise<{ ok: boolean }> {
   return request(`/api/projects/${projectId}/threads/${threadId}`, { method: "DELETE" });
+}
+
+export function branchThread(
+  projectId: string,
+  threadId: string,
+  input: { turnId: string; prompt: string }
+): Promise<{ data: { thread: ThreadSummary; turn: { turn?: { id?: string } }; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null } }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/branch`, {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
 }
 
 export function updateThreadPresentation(projectId: string, threadId: string, input: { pinned: boolean }): Promise<{ data: ThreadPresentation }> {
