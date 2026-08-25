@@ -8,3 +8,11 @@ dist/
 *.jpg
 *.jpeg
 index.html.before-*
+data/
+runtime/
+account-pool.json
+leaderboard-file-cache.json
+member-passwords.json
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

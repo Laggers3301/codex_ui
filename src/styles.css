@@ -19,6 +19,17 @@
   --ink: #101214;
 }
 
+/* Match the native Codex text-selection treatment sampled from the app UI. */
+::selection {
+  background: #384c5e;
+  color: #dfdfdf;
+}
+
+::-moz-selection {
+  background: #384c5e;
+  color: #dfdfdf;
+}
+
 /* Stable turn virtualization keeps history prepends anchored without remounting the conversation. */
 .virtualConversationSizer {
   position: relative;
@@ -1706,6 +1717,13 @@ label input {
 .userMessageContent.collapsed {
   max-height: 280px;
   overflow: hidden;
+}
+
+/* The generic code-block rule caps every <pre> at 260px. Long plain-text user
+   prompts use a <pre> too, so explicitly remove that inner cap after the user
+   chooses “展开更多”; only the collapsed state is allowed to limit height. */
+.userMessageContent:not(.collapsed) > .userMessagePreformatted {
+  max-height: none;
 }
 
 .userMessageContent.collapsed::after {
@@ -4003,7 +4021,42 @@ pre,
   flex-direction: column;
   gap: 2px;
   overflow-y: auto;
+  padding-right: 2px;
+  scrollbar-width: thin;
   scrollbar-color: #454744 transparent;
+  scrollbar-gutter: stable;
+}
+
+.v2WorkspaceTree::-webkit-scrollbar {
+  width: 6px;
+}
+
+.v2WorkspaceTree::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.v2WorkspaceTree::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #454744;
+}
+
+.v2WorkspaceTree::-webkit-scrollbar-thumb:hover {
+  background: #5a5d58;
+}
+
+/* Keep the resize hit target without reserving or painting an outside rail. */
+.workspace > .threadListResizeHandle {
+  width: 8px;
+  min-width: 8px;
+  margin-left: -4px;
+  background: transparent !important;
+}
+
+.workspace > .threadListResizeHandle::after,
+.workspace > .threadListResizeHandle:hover::after,
+.workspace > .threadListResizeHandle:active::after {
+  background: transparent !important;
+  opacity: 0 !important;
 }
 
 .v2WorkspaceGroup {
@@ -4078,26 +4131,16 @@ pre,
 }
 
 .v2WorkspaceFolderGlyph {
-  position: relative;
   display: block;
-  width: 17px;
-  height: 13px;
-  border: 1.4px solid currentColor;
-  border-radius: 2.5px;
-  opacity: 0.86;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  color: #cdd0ca;
+  opacity: 0.94;
 }
 
 .v2WorkspaceFolderGlyph::before {
-  content: "";
-  position: absolute;
-  top: -4px;
-  left: 1px;
-  width: 7px;
-  height: 4px;
-  border: 1.4px solid currentColor;
-  border-bottom: 0;
-  border-radius: 2px 2px 0 0;
-  background: #1a1b1a;
+  content: none;
 }
 
 .v2WorkspaceChevron {
@@ -5453,6 +5496,51 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
   stroke-width: 1.35;
 }
 
+.settingsDialog.branchDialog {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(520px, calc(100vw - 40px));
+  min-width: min(420px, calc(100vw - 40px));
+  max-height: min(620px, calc(100vh - 40px));
+  overflow: hidden;
+  resize: none;
+}
+
+.branchDialog .dialogHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 15px 17px;
+  border-bottom: 1px solid #353734;
+  background: #252625;
+}
+
+.branchDialog .dialogHeader h2 { margin: 0; color: #eceee9; font-size: 16px; font-weight: 560; }
+.branchDialog .dialogHeader p,
+.branchDialogNotice { margin: 4px 0 0; color: #969993; font-size: 12px; line-height: 1.45; }
+.branchDialog .iconButton { background: #333532; color: #d8dad5; }
+.branchDialog .iconButton:hover { background: #41433f; }
+
+.branchDialogBody { display: grid; gap: 12px; padding: 14px; background: #202120; }
+.branchDialogBody p { margin: 0; }
+.branchDialogBody label { display: grid; gap: 6px; color: #babdb7; font-size: 12px; font-weight: 500; }
+.branchDialogBody textarea {
+  min-height: 96px;
+  resize: vertical;
+  border: 1px solid #40423e;
+  border-radius: 9px;
+  padding: 9px 10px;
+  background: #292a29;
+  color: #e2e4df;
+  font: 400 13px/20px inherit;
+}
+.branchDialogBody textarea:focus { border-color: #60635d; outline: none; box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.035); }
+.branchDialog .dialogActions { margin: 0; border-top: 1px solid #353734; padding: 12px 14px 14px; background: #202120; }
+.branchDialog .dialogActions .iconTextButton { min-height: 33px; border: 1px solid #424440; border-radius: 9px; background: #2c2d2c; color: #d9dbd6; font-weight: 400; }
+.branchDialog .dialogActions .iconTextButton:hover { background: #383a37; }
+.branchDialog .dialogActions .iconTextButton.primary { border-color: #5f625d; background: #e0e2dd; color: #202120; }
+.branchDialog .dialogActions .iconTextButton.primary:hover { background: #f0f1ed; }
+
 .messageItem.kind-agent:has(+ .messageItem.kind-tool),
 .messageItem.kind-reasoning:has(+ .messageItem.kind-tool),
 .messageItem.kind-system:has(+ .messageItem.kind-tool) {
@@ -5487,83 +5575,33 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
 .v2PrimaryNav button > .v2NewThreadGlyph,
 .v2PrimaryNav button > .v2PluginGlyph,
 .v2PrimaryNav button > .v2NewWorkspaceGlyph {
-  position: relative;
   display: block !important;
-  width: 17px !important;
-  height: 17px !important;
+  width: 18px !important;
+  height: 18px !important;
   place-self: center start;
-  color: #c7cac4;
-  font-size: 0 !important;
-  line-height: 0 !important;
-  opacity: 0.86;
+  color: #cdd0ca;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.94;
 }
 
-.v2NewThreadGlyph::before {
-  content: "";
-  position: absolute;
-  left: 1px;
-  bottom: 1px;
-  width: 12px;
-  height: 12px;
-  border: 1.4px solid currentColor;
-  border-radius: 3px;
-}
-
-.v2NewThreadGlyph::after {
-  content: "";
-  position: absolute;
-  top: 3px;
-  right: 0;
-  width: 8px;
-  height: 2px;
-  border-top: 1.4px solid currentColor;
-  border-bottom: 1.4px solid #1f201f;
-  transform: rotate(-45deg);
-}
-
-.v2PluginGlyph::before {
-  content: "";
-  position: absolute;
-  inset: 1px;
-  border: 1.4px solid currentColor;
-  border-radius: 50%;
-}
-
-.v2PluginGlyph::after {
-  content: "";
-  position: absolute;
-  top: 6px;
-  left: 6px;
-  width: 5px;
-  height: 5px;
-  border: 1.4px solid currentColor;
-  border-radius: 50%;
-  box-sizing: border-box;
-}
-
-.v2NewWorkspaceGlyph::before {
-  content: "";
-  position: absolute;
-  bottom: 1px;
-  left: 0;
-  width: 15px;
-  height: 11px;
-  border: 1.4px solid currentColor;
-  border-radius: 2.5px;
-}
-
+.v2NewThreadGlyph::before,
+.v2NewThreadGlyph::after,
+.v2PluginGlyph::before,
+.v2PluginGlyph::after,
+.v2NewWorkspaceGlyph::before,
 .v2NewWorkspaceGlyph::after {
-  content: "+";
-  position: absolute;
-  top: -3px;
-  right: -1px;
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: #1b1c1b;
-  color: #d7d9d4;
-  font: 400 13px/9px "Segoe UI Variable", sans-serif;
-  text-align: center;
+  content: none;
+}
+
+.threadList .listHeaderActions svg,
+.v2WorkspaceFolderButton .projectRenameButton > svg,
+.v2WorkspaceFolderButton .projectDeleteButton > svg,
+.v2WorkspaceThreads .newThreadButton > svg {
+  stroke-width: 2.2;
 }
 
 /* Pending attachments render exactly like their persisted message counterparts. */
@@ -6162,6 +6200,20 @@ body:has(.globalSearchScrim) .v2AccountDock {
   animation: v2-menu-enter 120ms cubic-bezier(0.2, 0, 0, 1) both;
 }
 
+.quotaPopover.closing {
+  pointer-events: none;
+  animation: quota-popover-exit 150ms cubic-bezier(.4, 0, 1, 1) both;
+}
+
+.quotaPopover::before {
+  content: "";
+  position: absolute;
+  right: 0;
+  bottom: 100%;
+  width: 100%;
+  height: 10px;
+}
+
 .quotaPopover header {
   display: flex;
   align-items: baseline;
@@ -6178,6 +6230,59 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .quotaPopoverRows > div { display: grid; grid-template-columns: 64px minmax(0, 1fr); align-items: start; gap: 10px; }
 .quotaPopoverRows span { color: #969993; font-size: 14px !important; }
 .quotaPopoverRows strong { overflow-wrap: anywhere; color: #d7d9d4; font-size: 14px !important; font-weight: 400; line-height: 20px; white-space: normal; }
+
+.accountPoolPopover {
+  width: min(350px, calc(100vw - 24px));
+  padding-top: 8px;
+  border-color: #41433f;
+  background: rgba(38, 39, 38, .98);
+  box-shadow: 0 20px 58px rgba(0, 0, 0, .54);
+}
+.accountPoolTabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 0 3px;
+  border-bottom: 0;
+}
+.accountPoolTab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 92px;
+  max-width: 126px;
+  padding: 5px 8px;
+  min-height: 38px;
+  border: 1px solid rgba(235, 238, 231, .12);
+  border-radius: 9px;
+  background: rgba(235, 238, 231, .065);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035);
+  color: #d0d3cc;
+  text-align: left;
+  cursor: pointer;
+  transition: background 150ms ease, border-color 150ms ease, box-shadow 150ms ease, color 150ms ease;
+}
+.accountPoolTab:hover { border-color: rgba(235, 238, 231, .22); background: rgba(235, 238, 231, .105); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06); color: #f0f2ed; }
+.accountPoolTab.active {
+  border-color: rgba(235, 238, 231, .20);
+  background: rgba(235, 238, 231, .075);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .045);
+}
+.accountPoolTab.current::after { content: ""; position: absolute; top: 5px; right: 5px; width: 5px; height: 5px; border-radius: 50%; background: #63d999; box-shadow: 0 0 0 3px rgba(99, 217, 153, .11); }
+.accountPoolTab.degraded { opacity: .58; }
+.accountPoolTab span { overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.accountPoolTab strong { font-size: 13px; }
+.accountPoolSelectedMeta { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 12px; margin-top: 10px; padding: 10px 2px 0; border: 0 !important; border-top: 1px solid #393b37 !important; color: #a8aba4; font-size: 12px; }
+.accountHealthDot { width: 7px; height: 7px; border-radius: 999px; background: #8f938b; }
+.accountHealthDot.ready { background: #5fd08a; box-shadow: 0 0 0 3px rgba(95, 208, 138, .12); }
+.accountHealthDot.degraded { background: #f06f65; }
+
+@keyframes quota-popover-exit {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to { opacity: 0; transform: translateY(5px) scale(.985); }
+}
 
 /* Keep the composer inside the readable content width while allowing popovers above it. */
 .composer {
@@ -7341,6 +7446,124 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .temporaryAskComposer .temporaryPolicySelect { flex:0 1 auto; }
 .temporaryAskComposer .sendButton { align-self:flex-end; flex:0 0 auto; margin:0 0 1px 7px; }
 
+/* Final branch-dialog token pass.  This comes after legacy dialog skins so its
+   typography, dividers and controls cannot inherit the older cream/orange UI. */
+.settingsDialog.branchDialog {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(480px, calc(100vw - 32px));
+  min-width: min(360px, calc(100vw - 32px));
+  max-height: min(560px, calc(100vh - 32px));
+  overflow: hidden;
+  resize: none;
+  border: 1px solid rgba(255, 255, 255, 0.09) !important;
+  border-radius: 14px;
+  background: #202120 !important;
+  color: #e8e9e5;
+  box-shadow: 0 26px 72px rgba(0, 0, 0, 0.52);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "Microsoft YaHei UI", "Noto Sans SC", sans-serif;
+}
+
+.branchDialog .dialogHeader {
+  min-height: 62px;
+  padding: 13px 14px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: #242524;
+}
+
+.branchDialog .dialogHeader h2 {
+  color: #eceee9;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 21px;
+}
+
+.branchDialog .dialogHeader p,
+.branchDialogNotice {
+  color: #9a9d97;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 18px;
+}
+
+.branchDialog .iconButton {
+  width: 29px;
+  height: 29px;
+  border-radius: 8px;
+  background: #30312f;
+  color: #b9bcb5;
+}
+
+.branchDialogBody {
+  gap: 13px;
+  padding: 14px;
+  background: #202120;
+}
+
+.branchDialogNotice {
+  padding: 8px 9px;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.branchDialogBody label {
+  gap: 7px;
+  color: #d5d7d1;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 18px;
+}
+
+.branchDialogBody textarea {
+  min-height: 94px;
+  border: 1px solid rgba(255, 255, 255, 0.085);
+  border-radius: 9px;
+  padding: 9px 10px;
+  background: #282927;
+  color: #e5e7e1;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 20px;
+}
+
+.branchDialogBody textarea::placeholder { color: #7f827c; }
+.branchDialogBody textarea:focus { border-color: rgba(224, 226, 221, 0.38); box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.035); }
+
+.settingsDialog.branchDialog .dialogActions {
+  min-height: 0 !important;
+  padding: 8px 14px !important;
+  align-items: center;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  background: #202120;
+}
+
+.settingsDialog.branchDialog .dialogActions .iconTextButton {
+  box-sizing: border-box;
+  height: 32px !important;
+  min-height: 32px !important;
+  padding: 0 11px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  background: #2b2c2a;
+  color: #cfd1cb;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 18px;
+}
+
+.branchDialog .dialogActions .iconTextButton.primary {
+  border-color: transparent;
+  background: #e5e7e1;
+  color: #1e201e;
+}
+
+.branchDialog .dialogActions .iconTextButton svg { width: 14px; height: 14px; stroke-width: 1.5; }
+
 /* Borderless surface language: separate controls with tone, radius and shadow. */
 .topbar .controls button,
 .topbar .controls select,
@@ -7733,6 +7956,15 @@ textarea:focus {
     border-radius: 10px !important;
     font-size: 12px !important;
     line-height: 18px !important;
+  }
+
+  .topbar .quotaPopover {
+    position: fixed;
+    top: 81px;
+    right: max(10px, env(safe-area-inset-right));
+    left: max(10px, env(safe-area-inset-left));
+    width: auto;
+    max-width: none;
   }
 
   .topbarPolicySelect .polishedSelectTrigger > span:first-child {

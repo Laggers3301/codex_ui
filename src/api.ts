@@ -1,5 +1,6 @@
 import type {
   ApprovalPolicy,
+  CodexAccountPool,
   CodexLeaderboard,
   CodexQuota,
   CodexSkillsResponse,
@@ -19,10 +20,12 @@ import type {
   ThreadPresentation,
   ThreadListResponse,
   ThreadReadResponse,
+  ThreadSummary,
   UserProfile
 } from "./types";
 
 const defaultUserId = "admin";
+export const THREAD_READ_MAX_LIMIT = 240;
 
 let currentUserId = localStorage.getItem("codex-web-user-id") || defaultUserId;
 
@@ -73,6 +76,14 @@ export function listModels(): Promise<{ data: ModelProfile[]; defaultModel: stri
 export function readCodexQuota(refresh = false): Promise<{ data: CodexQuota }> {
   const suffix = refresh ? "?refresh=true" : "";
   return request(`/api/codex/quota${suffix}`, { cache: "no-store" });
+}
+
+export function readCodexAccountPool(refresh = false, threadId?: string | null): Promise<{ data: CodexAccountPool }> {
+  const params = new URLSearchParams();
+  if (refresh) params.set("refresh", "true");
+  if (threadId?.trim()) params.set("threadId", threadId.trim());
+  const suffix = params.size ? `?${params.toString()}` : "";
+  return request(`/api/codex/account-pool${suffix}`, { cache: "no-store" });
 }
 
 export function readCodexLeaderboard(refresh = false): Promise<{ data: CodexLeaderboard }> {
@@ -138,13 +149,6 @@ export function exportThreadRecord(
   });
 }
 
-export function migrateSessionsFrom4090(): Promise<{ data: SessionMigrationJob }> {
-  return request("/api/handoff/from-4090-left", {
-    method: "POST",
-    body: JSON.stringify({})
-  });
-}
-
 export interface SessionMigrationJob {
   id: string;
   status: "running" | "completed" | "failed";
@@ -155,6 +159,13 @@ export interface SessionMigrationJob {
   result?: SessionMigrationResult;
   message?: string;
   error?: string;
+}
+
+export function migrateSessionsFrom4090(): Promise<{ data: SessionMigrationJob }> {
+  return request("/api/handoff/from-4090-left", {
+    method: "POST",
+    body: JSON.stringify({})
+  });
 }
 
 export function readSessionMigrationFrom4090(jobId: string): Promise<{ data: SessionMigrationJob }> {
@@ -223,6 +234,17 @@ export function deleteThread(projectId: string, threadId: string): Promise<{ ok:
   return request(`/api/projects/${projectId}/threads/${threadId}`, { method: "DELETE" });
 }
 
+export function branchThread(
+  projectId: string,
+  threadId: string,
+  input: { turnId: string; prompt: string }
+): Promise<{ data: { thread: ThreadSummary; turn: { turn?: { id?: string } }; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null } }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/branch`, {
+    method: "POST",
+    body: JSON.stringify(input)
+  });
+}
+
 export function updateThreadPresentation(projectId: string, threadId: string, input: { pinned: boolean }): Promise<{ data: ThreadPresentation }> {
   return request(`/api/projects/${projectId}/threads/${threadId}/presentation`, {
     method: "PATCH",
@@ -248,7 +270,7 @@ export function updateThreadOrder(projectId: string, threadIds: string[]): Promi
   });
 }
 
-export function readThread(threadId: string, projectId?: string, options?: { before?: number; cursor?: string; limit?: number }): Promise<ThreadReadResponse> {
+export function readThread(threadId: string, projectId?: string, options?: { before?: number; cursor?: string; fresh?: boolean; limit?: number }): Promise<ThreadReadResponse> {
   const params = new URLSearchParams();
   if (projectId) {
     params.set("projectId", projectId);
@@ -259,8 +281,11 @@ export function readThread(threadId: string, projectId?: string, options?: { bef
   if (options?.cursor) {
     params.set("cursor", options.cursor);
   }
+  if (options?.fresh) {
+    params.set("fresh", "1");
+  }
   if (typeof options?.limit === "number") {
-    params.set("limit", String(Math.max(1, Math.floor(options.limit))));
+    params.set("limit", String(Math.min(THREAD_READ_MAX_LIMIT, Math.max(1, Math.floor(options.limit)))));
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return request(`/api/threads/${threadId}${suffix}`);

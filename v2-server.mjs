@@ -5,10 +5,11 @@ import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const host = "0.0.0.0";
-const port = 4574;
+const port = Number(process.env.CODEX_V2_PORT ?? 4575);
 const upstreamHost = "127.0.0.1";
-const upstreamPort = 4573;
+const upstreamPort = Number(process.env.CODEX_V2_UPSTREAM_PORT ?? 4576);
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
+const sessionCookieName = process.env.CODEX_V2_SESSION_COOKIE_NAME?.trim() || "codex_remote_session_4575";
 
 const mime = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -26,7 +27,7 @@ const mime = new Map([
 ]);
 
 function hasSessionCookie(request) {
-  return /(?:^|;\s*)codex_remote_session=/.test(request.headers.cookie ?? "");
+  return (request.headers.cookie ?? "").split(";").some((item) => item.trim().startsWith(`${sessionCookieName}=`));
 }
 
 function isPublicPath(requestUrl) {

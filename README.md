@@ -1,15 +1,25 @@
-# Codex UI 260810
+# Codex UI with multi-account pool
 
-A Codex-style V2 web UI for an existing Codex Web backend. It provides the dark Codex-inspired workspace tree, real-time tool timeline, compact tool previews, file uploads, image previews, quota popover, leaderboard, settings, workspace directory picker, and a port `4574` static UI/proxy.
+A Codex-style V2 web UI and optional multi-account Codex backend. It provides the dark workspace tree, real-time tool timeline, file uploads, quota balancing, sticky thread-to-account routing, cross-account branching, and current-cycle/lifetime token leaderboards.
 
 ## What this repository contains
 
 - React/Vite V2 UI source in `src/`.
+- Multi-account backend source in `server/`.
+- Maintenance, migration, and smoke-test utilities in `scripts/`.
+- A credential-free account-pool template in `account-pool.example.json`.
 - Sidebar and DOM bridge shell in `index.html`.
 - Port `4574` static server and proxy in `v2-server.mjs`.
 - Backend performance patch in `patches/codex-remote-routes.patch`.
 
-It intentionally excludes user sessions, uploaded files, browser storage, build output, credentials, and `node_modules`.
+It intentionally excludes user sessions, uploaded files, browser storage, build output, SQLite state, account-pool state, credentials, generated leaderboard indexes, and `node_modules`.
+
+## Multi-account behavior
+
+- New threads select the healthy account with the highest remaining quota.
+- Existing threads remain pinned to their original account to preserve context and prompt-cache continuity.
+- The leaderboard reads each account's own reset window and merges users after per-account attribution.
+- JSONL usage is streamed line-by-line and cached per file, so large session archives do not exhaust the Node heap. The first index build scans the archive once; later refreshes process only changed files.
 
 ## Prerequisites
 
@@ -45,4 +55,3 @@ npm run build
 ```
 
 The proxy reads `dist/` directly, so static UI changes do not require restarting the `codex-ui-v2` process.
-

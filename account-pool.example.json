@@ -1,0 +1,16 @@
+{
+  "accounts": [
+    {
+      "id": "account-1",
+      "label": "260707",
+      "codexHome": "/absolute/path/to/account-1/codex-home"
+    },
+    {
+      "id": "account-2",
+      "label": "260803",
+      "codexHome": "/absolute/path/to/account-2/codex-home"
+    }
+  ],
+  "stateFile": "/absolute/path/to/private-data/account-pool-state.json",
+  "quotaCacheMs": 30000
+}

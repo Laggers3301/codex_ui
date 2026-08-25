@@ -3,7 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Codex Web Console 260803</title>
+    <link rel="icon" type="image/svg+xml" href="/chatgpt-favicon.svg?v=20260824" />
+    <title>Codex Web Console</title>
     <script type="module" src="/src/main.tsx"></script>
   </head>
   <body>
@@ -94,11 +95,11 @@
       })();
     </script>
     <div class="v2ProjectDock" id="v2ProjectDock">
-      <div class="v2BrandRow"><strong>Codex</strong><span class="v2BuildBadge">260803</span><button class="v2SidebarToggle" id="v2SidebarToggle" type="button" title="折叠侧边栏" aria-label="折叠侧边栏">‹</button></div>
+      <div class="v2BrandRow"><strong>Codex</strong><button class="v2SidebarToggle" id="v2SidebarToggle" type="button" title="折叠侧边栏" aria-label="折叠侧边栏">‹</button></div>
       <div class="v2PrimaryNav">
-        <button id="v2NewConversation" type="button"><span class="v2NewThreadGlyph" aria-hidden="true"></span><strong>新对话</strong></button>
-        <button id="v2OpenPlugins" type="button"><span class="v2PluginGlyph" aria-hidden="true"></span><strong>插件</strong></button>
-        <button id="v2NewWorkspace" type="button"><span class="v2NewWorkspaceGlyph" aria-hidden="true"></span><strong>新建工作区</strong></button>
+        <button id="v2NewConversation" type="button"><svg class="v2NavGlyph v2NewThreadGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"></path></svg><strong>新对话</strong></button>
+        <button id="v2OpenPlugins" type="button"><svg class="v2NavGlyph v2PluginGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 22v-5"></path><path d="M9 8V2"></path><path d="M15 8V2"></path><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"></path></svg><strong>插件</strong></button>
+        <button id="v2NewWorkspace" type="button"><svg class="v2NavGlyph v2NewWorkspaceGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 10v6"></path><path d="M9 13h6"></path><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></svg><strong>新建工作区</strong></button>
       </div>
       <button class="v2ProjectTrigger" id="v2ProjectTrigger" type="button" aria-expanded="false">
         <span class="v2FolderIcon"></span>
@@ -273,8 +274,20 @@
           if (action === "quota") clickExisting(".quotaButton", /额度|剩余用量/);
           if (action === "leaderboard") clickExisting(".leaderboardButton", /排行榜/);
           if (action === "skills") clickExisting(".skillsButton", /Skills|技能|插件/);
-          if (action === "migration") clickExisting(".handoffButton", /迁移 4090-left|迁移会话/);
+          if (action === "migration") window.dispatchEvent(new CustomEvent("codex:migrate-4090-left"));
           plusMenu.hidden = true;
+        });
+
+        window.addEventListener("codex:migration-status", (event) => {
+          const button = plusMenu.querySelector('[data-action="migration"]');
+          if (!button) return;
+          const status = event.detail || {};
+          const running = status.kind === "running";
+          button.disabled = running;
+          const title = button.querySelector("strong");
+          const detail = button.querySelector("small");
+          if (title) title.textContent = running ? "正在迁移 4090-left 会话…" : "迁移 4090-left 会话";
+          if (detail) detail.textContent = status.message || "重新补充并覆盖已有会话";
         });
 
         const accountButtons = document.querySelectorAll(".v2AccountMenu button");

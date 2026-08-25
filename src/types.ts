@@ -47,6 +47,26 @@ export interface CodexQuota {
   updatedAt: string;
 }
 
+export interface CodexAccountPoolAccount {
+  id: string;
+  label: string;
+  health: "ready" | "degraded" | "starting";
+  selectedForNewThreads: boolean;
+  assignedThreadCount: number;
+  activeRequests: number;
+  lastError: string | null;
+  lastCheckedAt: string | null;
+  quota: CodexQuota;
+}
+
+export interface CodexAccountPool {
+  strategy: "single-account" | "highest-remaining-sticky-thread";
+  currentThreadAccountId?: string | null;
+  currentThreadAccountLabel?: string | null;
+  accounts: CodexAccountPoolAccount[];
+  updatedAt: string;
+}
+
 export interface CodexTokenBreakdown {
   inputTokens: number;
   cachedInputTokens: number;
@@ -300,12 +320,12 @@ export interface CodexNotification {
 
 export interface LiveAgentMessage {
   itemId: string;
-  sequence: number;
   sourceItemId?: string;
   threadId: string | null;
   turnId: string | null;
   text: string;
   completed: boolean;
+  sequence?: number;
   startedAt: string;
   updatedAt: string;
 }
@@ -326,6 +346,7 @@ export interface LiveToolItem {
   input: string;
   output: string;
   completed: boolean;
+  sequence?: number;
   startedAt: string;
   updatedAt: string;
 }

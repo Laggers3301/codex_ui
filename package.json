@@ -13,6 +13,7 @@
     "generate:codex-schema": "node scripts/generate-codex-schema.mjs"
   },
   "dependencies": {
+    "@fastify/compress": "^9.2.0",
     "@fastify/multipart": "^10.0.0",
     "@tanstack/react-virtual": "^3.14.10",
     "@vitejs/plugin-react": "^5.0.0",

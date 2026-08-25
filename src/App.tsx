@@ -6,6 +6,7 @@ import {
   Bot,
   Copy,
   FileText,
+  Folder,
   FolderOpen,
   GitBranch,
   MessageSquare,
@@ -16,6 +17,7 @@ import {
   Send,
   Settings2,
   Square,
+  SquarePen,
   Trophy,
   Trash2,
   Upload,
@@ -29,6 +31,7 @@ import remarkMath from "remark-math";
 import type { PluggableList } from "unified";
 import {
   createProject,
+  branchThread,
   deleteProject,
   deleteThread,
   exportThreadRecord,
@@ -40,17 +43,21 @@ import {
   listProjects,
   listThreads,
   listUsers,
+  locateThreadItem,
   migrateSessionsFrom4090,
   readSessionMigrationFrom4090,
   previewProjectFile,
+  readCodexAccountPool,
   readCodexLeaderboard,
   readCodexQuota,
   readLocalSendSettings,
   readThread,
+  readThreadItemOutput,
   selectDirectory,
   sendProjectFileToLocal,
   setApiUserId,
   testLocalSendSettings,
+  THREAD_READ_MAX_LIMIT,
   updateLocalSendSettings,
   updateProject,
   updateThreadModelProfile,
@@ -61,6 +68,8 @@ import {
 import { codexSocket } from "./codexSocket";
 import type {
   ApprovalPolicy,
+  CodexAccountPool,
+  CodexAccountPoolAccount,
   CodexNotification,
   CodexLeaderboard,
   CodexLeaderboardScope,
@@ -125,6 +134,7 @@ type GlobalSearchResult = {
     itemId?: string;
     query: string;
     snippet: string;
+    cursor?: string;
   };
 };
 type GlobalSearchMatch = NonNullable<GlobalSearchResult["match"]>;
@@ -260,8 +270,10 @@ interface ThreadContextMenu {
 
 interface ThreadLoadOptions {
   before?: number;
+  cursor?: string;
   appendOlder?: boolean;
   skipCache?: boolean;
+  requireFresh?: boolean;
 }
 
 interface ContinuationPrompt {
@@ -280,6 +292,7 @@ interface PromptNavigationItem {
 
 type QuotaRefreshResult = {
   quota: CodexQuota | null;
+  pool: CodexAccountPool | null;
   error: string | null;
 };
 
@@ -294,6 +307,7 @@ type LeaderboardRefreshResult = {
 };
 
 const quotaAutoRefreshMs = 180_000;
+const leaderboardAutoRefreshMs = 60_000;
 const sentPromptBottomHoldMs = 5_000;
 // A leading slash is common in filesystem paths. Only reserve the commands
 // that this UI actually implements; everything else must reach Codex verbatim.
@@ -463,8 +477,23 @@ type DeferredToolOutputElement = HTMLPreElement & {
   previewToolOutput?: string;
 };
 
-const DeferredToolOutput = memo(function DeferredToolOutput({ text }: { text: string }) {
-  const output = useMemo(() => displayOutputText(text), [text]);
+const DeferredToolOutput = memo(function DeferredToolOutput({
+  text,
+  deferred = false,
+  threadId,
+  itemId,
+  projectId
+}: {
+  text: string;
+  deferred?: boolean;
+  threadId?: string;
+  itemId?: string;
+  projectId?: string;
+}) {
+  const [loadedOutput, setLoadedOutput] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState("");
+  const loadingRef = useRef(false);
+  const output = useMemo(() => displayOutputText(loadedOutput ?? text), [loadedOutput, text]);
   const preview = useMemo(() => {
     const lines = output.split(/\r?\n/).filter((line) => line.trim()).slice(0, 2).join("\n");
     return lines.length > 420 ? `${lines.slice(0, 420)}...` : lines;
@@ -472,14 +501,46 @@ const DeferredToolOutput = memo(function DeferredToolOutput({ text }: { text: st
   const outputRef = useRef<DeferredToolOutputElement>(null);
 
   useEffect(() => {
+    setLoadedOutput(null);
+    setLoadError("");
+    loadingRef.current = false;
+  }, [deferred, itemId, projectId, text, threadId]);
+
+  const loadFullOutput = useCallback(async () => {
+    if (!deferred || !threadId || !itemId || loadingRef.current || loadedOutput !== null) return;
+    loadingRef.current = true;
+    setLoadError("");
+    try {
+      const response = await readThreadItemOutput(threadId, itemId, projectId);
+      setLoadedOutput(response.data.output);
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : String(error));
+    } finally {
+      loadingRef.current = false;
+    }
+  }, [deferred, itemId, loadedOutput, projectId, threadId]);
+
+  useEffect(() => {
+    const element = outputRef.current;
+    const toolCard = element?.closest<HTMLElement>(".messageItem.kind-tool");
+    if (!toolCard) return;
+    const handleExpanded = () => {
+      if (toolCard.classList.contains("toolExpanded")) void loadFullOutput();
+    };
+    toolCard.addEventListener("codex:tool-expanded", handleExpanded);
+    if (toolCard.classList.contains("toolExpanded")) void loadFullOutput();
+    return () => toolCard.removeEventListener("codex:tool-expanded", handleExpanded);
+  }, [loadFullOutput]);
+
+  useEffect(() => {
     const element = outputRef.current;
     if (!element) {
       return;
     }
-    element.fullToolOutput = output;
+    element.fullToolOutput = `${output}${loadError ? `\n\n完整输出加载失败：${loadError}` : ""}`;
     element.previewToolOutput = preview;
     element.textContent = element.closest(".toolExpanded") ? output : preview;
-  }, [output, preview]);
+  }, [loadError, output, preview]);
 
   return <pre ref={outputRef} className="outputBlock" data-deferred-tool-output>{preview}</pre>;
 });
@@ -887,7 +948,6 @@ const fallbackModelProfiles: ModelProfile[] = [
   { id: "gpt-5.6-sol:high", label: "GPT-5.6-Sol high", model: "gpt-5.6-sol", effort: "high" },
   { id: "gpt-5.6-sol:medium", label: "GPT-5.6-Sol medium", model: "gpt-5.6-sol", effort: "medium" },
   { id: "gpt-5.6-sol:low", label: "GPT-5.6-Sol low", model: "gpt-5.6-sol", effort: "low" },
-  { id: "gpt-5.6-terra:ultra", label: "GPT-5.6-Terra ultra", model: "gpt-5.6-terra", effort: "ultra" },
   { id: "gpt-5.6-terra:max", label: "GPT-5.6-Terra max", model: "gpt-5.6-terra", effort: "max" },
   { id: "gpt-5.6-terra:xhigh", label: "GPT-5.6-Terra xhigh", model: "gpt-5.6-terra", effort: "xhigh" },
   { id: "gpt-5.6-terra:high", label: "GPT-5.6-Terra high", model: "gpt-5.6-terra", effort: "high" },
@@ -1271,6 +1331,21 @@ const MarkdownMessage = memo(function MarkdownMessage({
           </a>
         );
       },
+      input({ type, checked, ...props }) {
+        if (type === "checkbox") {
+          return (
+            <input
+              {...props}
+              type="checkbox"
+              checked={checked}
+              readOnly
+              className={`messageTodoCheckbox${props.className ? ` ${props.className}` : ""}`}
+              onChange={() => {}}
+            />
+          );
+        }
+        return <input type={type} {...props} />;
+      },
       table({ children, ...props }) {
         return (
           <div className="markdownTableWrap">
@@ -1355,6 +1430,62 @@ const MarkdownMessage = memo(function MarkdownMessage({
   );
 });
 
+function stableStreamingMarkdownPrefix(text: string): string {
+  const reserveLength = 360;
+  const targetEnd = text.length - reserveLength;
+  if (targetEnd <= 0) return "";
+  const paragraphEnd = text.lastIndexOf("\n\n", targetEnd);
+  if (paragraphEnd >= 0) return text.slice(0, paragraphEnd + 2);
+  const lineEnd = text.lastIndexOf("\n", targetEnd);
+  return lineEnd >= 0 ? text.slice(0, lineEnd + 1) : "";
+}
+
+const LiveAgentStreamMessage = memo(function LiveAgentStreamMessage({
+  text,
+  projectId,
+  onOpenFileLink
+}: {
+  text: string;
+  projectId?: string;
+  onOpenFileLink?: (target: string) => void;
+}) {
+  const latestTextRef = useRef(text);
+  const commitTimerRef = useRef<number | null>(null);
+  const [committedPrefix, setCommittedPrefix] = useState("");
+  latestTextRef.current = text;
+
+  useEffect(() => {
+    if (commitTimerRef.current !== null) return;
+    commitTimerRef.current = window.setTimeout(() => {
+      commitTimerRef.current = null;
+      const nextPrefix = stableStreamingMarkdownPrefix(latestTextRef.current);
+      setCommittedPrefix((current) => current === nextPrefix ? current : nextPrefix);
+    }, 180);
+  }, [text]);
+
+  useEffect(() => () => {
+    if (commitTimerRef.current !== null) window.clearTimeout(commitTimerRef.current);
+  }, []);
+
+  const stablePrefix = text.startsWith(committedPrefix) ? committedPrefix : "";
+  const stableBlocks = useMemo(
+    () => stablePrefix.split(/\n{2,}/).filter((block) => block.trim()),
+    [stablePrefix]
+  );
+  const liveTail = text.slice(stablePrefix.length);
+
+  return (
+    <div className="liveAgentStreamMessage">
+      {stableBlocks.map((block, index) => (
+        <MarkdownMessage key={index} text={block} projectId={projectId} onOpenFileLink={onOpenFileLink} renderMath />
+      ))}
+      {liveTail ? (
+        <MarkdownMessage text={liveTail} projectId={projectId} onOpenFileLink={onOpenFileLink} renderMath />
+      ) : null}
+    </div>
+  );
+});
+
 const userMessageCollapseMaxLines = 12;
 const userMessageCollapseMaxCharacters = 900;
 const userMessagePlainTextThreshold = 4_000;
@@ -1432,6 +1563,7 @@ const CollapsibleUserMessage = memo(function CollapsibleUserMessage({
         <button
           className={`userMessageToggle ${expanded ? "expanded" : ""}`}
           type="button"
+          aria-expanded={expanded}
           onClick={() => setExpanded((current) => !current)}
         >
           <span>{expanded ? "收起内容" : "展开更多"}</span>
@@ -1779,6 +1911,12 @@ function modelProfileById(id: string, profiles: ModelProfile[]): ModelProfile {
   return profiles.find((profile) => profile.id === id) ?? profiles[0] ?? fallbackModelProfiles[0];
 }
 
+function isUltraModelProfile(profile: ModelProfile): boolean {
+  return String(profile.effort).toLowerCase() === "ultra"
+    || profile.id.toLowerCase().includes("ultra")
+    || profile.label.toLowerCase().includes("ultra");
+}
+
 function modelProfileIdFor(model: string, effort: ReasoningEffort, profiles: ModelProfile[]): string {
   return profiles.find((profile) => profile.model === model && profile.effort === effort)?.id ?? profiles[0]?.id ?? defaultModelProfileId;
 }
@@ -1905,7 +2043,13 @@ function rateLimitSnapshotText(snapshot: CodexRateLimitSnapshot | null | undefin
   return parts.join("；") || "-";
 }
 
-function quotaSummaryLabel(quota: CodexQuota | null): string {
+function quotaSummaryLabel(quota: CodexQuota | null, pool: CodexAccountPool | null): string {
+  if (pool?.accounts.length) {
+    const totalRemaining = pool.accounts.reduce((sum, account) => {
+      return sum + (remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent) ?? 0);
+    }, 0);
+    return `总额度 ${percentText(totalRemaining)}%`;
+  }
   const primary = remainingQuotaPercent(quota?.rateLimits?.primary?.usedPercent);
   const secondary = remainingQuotaPercent(quota?.rateLimits?.secondary?.usedPercent);
   if (primary === null) {
@@ -1945,7 +2089,7 @@ function quotaMarkdown(quota: CodexQuota): string {
   return lines.join("\n");
 }
 
-function QuotaPopover({ quota, loading }: { quota: CodexQuota | null; loading: boolean }) {
+function AccountQuotaDetails({ quota }: { quota: CodexQuota }) {
   const primary = quota?.rateLimits?.primary ?? null;
   const secondary = quota?.rateLimits?.secondary ?? null;
   const weekly = weeklyRateWindow(primary, secondary);
@@ -1963,10 +2107,7 @@ function QuotaPopover({ quota, loading }: { quota: CodexQuota | null; loading: b
     return windows.length ? windows : [{ key, label: name, text: rateLimitSnapshotText(limit) }];
   });
   return (
-    <section className="quotaPopover" role="status" aria-label="Codex 额度详情">
-      <header><strong>Codex 额度</strong><span>{loading ? "更新中" : quota?.account?.planType ?? quota?.rateLimits?.planType ?? ""}</span></header>
-      {quota ? (
-        <div className="quotaPopoverRows">
+    <div className="quotaPopoverRows">
           <div><span>主额度</span><strong>{rateWindowText(primary)}</strong></div>
           <div><span>次额度</span><strong>{rateWindowText(secondary)}</strong></div>
           <div><span>每日建议额度上限</span><strong>{rateWindowDailyLimitLabel(weekly)}</strong></div>
@@ -1975,8 +2116,62 @@ function QuotaPopover({ quota, loading }: { quota: CodexQuota | null; loading: b
           ))}
           <div><span>总token</span><strong>{formatNumber(quota.usage?.summary?.lifetimeTokens)}</strong></div>
           <div><span>重置额度</span><strong>{formatNumber(quota.resetCredits?.availableCount)}</strong></div>
-        </div>
-      ) : <p>{loading ? "正在读取额度…" : "暂未读取到额度"}</p>}
+    </div>
+  );
+}
+
+function accountRemainingLabel(account: CodexAccountPoolAccount): string {
+  const remaining = remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent);
+  return remaining === null ? "--" : `${percentText(remaining)}%`;
+}
+
+function QuotaPopover({ quota, pool, loading, closing }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean }) {
+  const defaultAccount = pool?.accounts.find((entry) => entry.selectedForNewThreads) ?? pool?.accounts[0] ?? null;
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(defaultAccount?.id ?? null);
+  const selectedAccount = pool?.accounts.find((entry) => entry.id === selectedAccountId) ?? defaultAccount;
+  const currentThreadAccount = pool?.accounts.find((entry) => entry.id === pool.currentThreadAccountId) ?? null;
+  const selectedQuota = selectedAccount?.quota ?? quota;
+  return (
+    <section className={`quotaPopover accountPoolPopover ${closing ? "closing" : ""}`} role="status" aria-label="Codex 多账号额度详情">
+      {pool && pool.accounts.length ? (
+        <>
+          <div className="accountPoolTabs" role="tablist" aria-label="Codex 账号额度">
+            {pool.accounts.map((account) => (
+              <button
+                className={`accountPoolTab ${account.id === selectedAccount?.id ? "active" : ""} ${account.health !== "ready" ? "degraded" : ""} ${account.id === currentThreadAccount?.id ? "current" : ""}`}
+                data-account-id={account.id}
+                type="button"
+                role="tab"
+                aria-selected={account.id === selectedAccount?.id}
+                title={account.selectedForNewThreads ? `${account.label} 将承接下一个新会话` : `${account.label} 已有会话保持粘性`}
+                key={account.id}
+                onClick={() => setSelectedAccountId(account.id)}
+              >
+                <span>{account.label}</span>
+                <strong>{accountRemainingLabel(account)}</strong>
+              </button>
+            ))}
+          </div>
+          {selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
+          {selectedAccount ? (
+            <div className="accountPoolSelectedMeta">
+              {currentThreadAccount ? (
+                <>
+                  <span className={`accountHealthDot ${currentThreadAccount.health}`} />
+                  <span>当前会话 · {pool?.currentThreadAccountLabel ?? currentThreadAccount.label}</span>
+                  <span>该账号已分配 {currentThreadAccount.assignedThreadCount} 个会话</span>
+                </>
+              ) : (
+                <>
+                  <span className={`accountHealthDot ${defaultAccount?.health ?? "starting"}`} />
+                  <span>新会话将分配至 · {defaultAccount?.label ?? "--"}</span>
+                  <span>按剩余额度自动均衡</span>
+                </>
+              )}
+            </div>
+          ) : null}
+        </>
+      ) : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>{loading ? "正在读取额度…" : "暂未读取到额度"}</p>}
     </section>
   );
 }
@@ -2429,6 +2624,7 @@ export function App() {
   const autoFollowMessagesRef = useRef(true);
   const manualMessageScrollLockRef = useRef(false);
   const lastMessageScrollTopRef = useRef(0);
+  const searchNavigationLockUntilRef = useRef(0);
   const threadViewTokenRef = useRef(0);
   const initializedProjectIdRef = useRef("");
   const threadPageCacheRef = useRef(new Map<string, { thread: ThreadSummary; history: ThreadHistoryPage; cachedAt: number }>());
@@ -2447,6 +2643,7 @@ export function App() {
   const interruptTimeoutsRef = useRef(new Map<string, number>());
   const newThreadDraftModeRef = useRef(true);
   const quotaRefreshInFlightRef = useRef<Promise<QuotaRefreshResult> | null>(null);
+  const quotaPopoverCloseTimerRef = useRef<number | null>(null);
   const leaderboardRefreshInFlightRef = useRef<Promise<LeaderboardRefreshResult> | null>(null);
   const threadSearchRequestRef = useRef(0);
   const globalSearchRequestRef = useRef(0);
@@ -2502,6 +2699,9 @@ export function App() {
   const [renamingThread, setRenamingThread] = useState<ThreadSummary | null>(null);
   const [threadRenameDraft, setThreadRenameDraft] = useState("");
   const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
+  const [branchDialog, setBranchDialog] = useState<{ threadId: string; turnId: string; sourceName: string } | null>(null);
+  const [branchPrompt, setBranchPrompt] = useState("");
+  const [branchingThread, setBranchingThread] = useState(false);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>(fallbackModelProfiles);
   const [newThreadModelProfileId, setNewThreadModelProfileId] = useState(defaultModelProfileId);
   const [savingThreadModel, setSavingThreadModel] = useState(false);
@@ -2511,6 +2711,7 @@ export function App() {
   const [liveDeltas, setLiveDeltas] = useState<Record<string, LiveDeltaEntry>>({});
   const [liveTools, setLiveTools] = useState<Record<string, LiveToolEntry>>({});
   const [expandedToolBundles, setExpandedToolBundles] = useState<Record<string, true>>({});
+  const [expandedToolEntries, setExpandedToolEntries] = useState<Record<string, true>>({});
   const [pendingUserMessages, setPendingUserMessages] = useState<PendingUserMessage[]>([]);
   const [promptBottomHoldNow, setPromptBottomHoldNow] = useState(() => Date.now());
   const [uploadedFiles, setUploadedFiles] = useState<ComposerUpload[]>([]);
@@ -2534,10 +2735,14 @@ export function App() {
   const [exportSendLocal, setExportSendLocal] = useState(false);
   const [exportingThread, setExportingThread] = useState(false);
   const [migratingSessions, setMigratingSessions] = useState(false);
+  const [migrationStatus, setMigrationStatus] = useState<{ kind: "running" | "success" | "error"; message: string } | null>(null);
   const [sendingLocalFile, setSendingLocalFile] = useState(false);
   const [quota, setQuota] = useState<CodexQuota | null>(null);
+  const [accountPool, setAccountPool] = useState<CodexAccountPool | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(false);
   const [quotaPopoverOpen, setQuotaPopoverOpen] = useState(false);
+  const [quotaPopoverClosing, setQuotaPopoverClosing] = useState(false);
+  const [quotaPopoverPinned, setQuotaPopoverPinned] = useState(false);
   const [leaderboard, setLeaderboard] = useState<CodexLeaderboard | null>(() => storedJson<CodexLeaderboard | null>(`codex.v2.leaderboard.${getApiUserId()}`, null));
   const [leaderboardOpen, setLeaderboardOpen] = useState(false);
   const [leaderboardLoading, setLeaderboardLoading] = useState(false);
@@ -2677,7 +2882,7 @@ export function App() {
       startedAt: existing?.startedAt ?? entry.startedAt
     });
     if (liveDeltaFlushTimerRef.current === null) {
-      liveDeltaFlushTimerRef.current = window.setTimeout(flushPendingLiveDeltas, 40);
+      liveDeltaFlushTimerRef.current = window.setTimeout(flushPendingLiveDeltas, 24);
     }
   }
 
@@ -2820,6 +3025,15 @@ export function App() {
     if (!element) {
       return;
     }
+    const currentScrollTop = element.scrollTop;
+    const previousScrollTop = lastMessageScrollTopRef.current;
+    const userMovedUp = currentScrollTop + 1 < previousScrollTop;
+    const userMovedDown = currentScrollTop > previousScrollTop + 1;
+    lastMessageScrollTopRef.current = currentScrollTop;
+    if (userMovedUp && Date.now() >= searchNavigationLockUntilRef.current) {
+      manualMessageScrollLockRef.current = true;
+      autoFollowMessagesRef.current = false;
+    }
     // The conversation is vertical-only. Some WebKit/Safari trackpad gestures can
     // leave a scrollable message container with a non-zero horizontal offset when
     // a long path/image exists; visually this looks like a huge blank white block.
@@ -2827,14 +3041,13 @@ export function App() {
     if (element.scrollLeft !== 0) {
       element.scrollLeft = 0;
     }
-    const currentScrollTop = element.scrollTop;
-    const previousScrollTop = lastMessageScrollTopRef.current;
-    const userMovedUp = currentScrollTop + 1 < previousScrollTop;
-    const userMovedDown = currentScrollTop > previousScrollTop + 1;
-    lastMessageScrollTopRef.current = currentScrollTop;
-    if (userMovedUp) {
+    // Safari/WebKit can occasionally leave a composited scroll layer blank while
+    if (Date.now() < searchNavigationLockUntilRef.current) {
       manualMessageScrollLockRef.current = true;
       autoFollowMessagesRef.current = false;
+      setShowScrollToBottom(true);
+      schedulePromptNavigationActiveUpdate();
+      return;
     }
     const bottomGap = element.scrollHeight - element.scrollTop - element.clientHeight;
     const nearBottom = bottomGap < 96;
@@ -2848,6 +3061,7 @@ export function App() {
   }
 
   function scrollMessagesToBottom(behavior: ScrollBehavior = "smooth") {
+    searchNavigationLockUntilRef.current = 0;
     manualMessageScrollLockRef.current = false;
     autoFollowMessagesRef.current = true;
     setShowScrollToBottom(false);
@@ -2930,9 +3144,8 @@ export function App() {
       return false;
     }
 
-    const resolvedMatch = (match.turnId && match.itemId)
-      ? match
-      : findSearchMatchInThread(selected, match.query, match.projectId) ?? null;
+    const resolvedMatch = findSearchMatchInThread(selected, match.query, match.projectId)
+      ?? ((match.turnId && match.itemId) ? match : null);
     if (!resolvedMatch) {
       if (attempt < 8 && threadHistoryRef.current?.hasOlder && threadHistoryRef.current?.nextBefore && selectedProjectIdRef.current) {
         await openThread(match.threadId, selectedProjectIdRef.current, threadViewTokenRef.current, {
@@ -2949,13 +3162,41 @@ export function App() {
     const key = messageElementKey(selected.id, resolvedMatch.turnId ?? "", resolvedMatch.itemId ?? "");
     const target = messageElementsRef.current.get(key);
     if (target && container) {
-      const top = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
-      container.scrollTo({ top: Math.max(0, top - 28), left: 0, behavior: "smooth" });
+      searchNavigationLockUntilRef.current = Date.now() + 5_000;
+      manualMessageScrollLockRef.current = true;
       autoFollowMessagesRef.current = false;
       setShowScrollToBottom(true);
+      const positionTarget = () => {
+        const top = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+        container.scrollTo({ top: Math.max(0, top - 28), left: 0, behavior: "auto" });
+      };
+      positionTarget();
+      window.requestAnimationFrame(() => window.requestAnimationFrame(positionTarget));
       flashMessageElement(target, resolvedMatch.snippet);
       setGlobalSearchJumpNoticeWithFade(`已定位到：${resolvedMatch.snippet}`);
       return true;
+    }
+
+    if (attempt < 3 && resolvedMatch.turnId && conversationVirtualRef.current?.scrollToKey(`turn:${resolvedMatch.turnId}`, "start")) {
+      searchNavigationLockUntilRef.current = Date.now() + 5_000;
+      manualMessageScrollLockRef.current = true;
+      autoFollowMessagesRef.current = false;
+      setShowScrollToBottom(true);
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve())));
+      return revealGlobalSearchMatch({ ...match, itemId: undefined }, attempt + 1);
+    }
+
+    if (attempt === 0 && match.itemId && selectedProjectIdRef.current) {
+      try {
+        const position = await locateThreadItem(selected.id, match.itemId, selectedProjectIdRef.current);
+        await openThread(selected.id, selectedProjectIdRef.current, threadViewTokenRef.current, {
+          cursor: position.data.cursor,
+          skipCache: true
+        });
+        return revealGlobalSearchMatch({ ...match, turnId: position.data.turnId }, attempt + 1);
+      } catch {
+        // Legacy sessions continue through the compatible page walk below.
+      }
     }
 
     if (attempt < 8 && match.query !== "" && threadHistoryRef.current?.hasOlder && threadHistoryRef.current?.nextBefore && selectedProjectIdRef.current) {
@@ -2972,10 +3213,16 @@ export function App() {
       const fallbackKey = messageElementKey(selected.id, fallbackMatch.turnId ?? "", fallbackMatch.itemId ?? "");
       const fallbackTarget = messageElementsRef.current.get(fallbackKey);
       if (fallbackTarget && container) {
-        const top = fallbackTarget.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
-        container.scrollTo({ top: Math.max(0, top - 28), left: 0, behavior: "smooth" });
+        searchNavigationLockUntilRef.current = Date.now() + 5_000;
+        manualMessageScrollLockRef.current = true;
         autoFollowMessagesRef.current = false;
         setShowScrollToBottom(true);
+        const positionTarget = () => {
+          const top = fallbackTarget.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+          container.scrollTo({ top: Math.max(0, top - 28), left: 0, behavior: "auto" });
+        };
+        positionTarget();
+        window.requestAnimationFrame(() => window.requestAnimationFrame(positionTarget));
         flashMessageElement(fallbackTarget, fallbackMatch.snippet);
         setGlobalSearchJumpNoticeWithFade(`已定位到：${fallbackMatch.snippet}`);
         return true;
@@ -3024,10 +3271,12 @@ export function App() {
     if (!container || !target) {
       return;
     }
-    const targetTop = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
-    container.scrollTo({ top: Math.max(0, targetTop - 18), left: 0, behavior: "smooth" });
+    searchNavigationLockUntilRef.current = Date.now() + 5_000;
+    manualMessageScrollLockRef.current = true;
     autoFollowMessagesRef.current = false;
     setShowScrollToBottom(true);
+    const targetTop = target.getBoundingClientRect().top - container.getBoundingClientRect().top + container.scrollTop;
+    container.scrollTo({ top: Math.max(0, targetTop - 18), left: 0, behavior: "auto" });
     setActivePromptNavigationKey(key);
   }
 
@@ -3072,6 +3321,11 @@ export function App() {
   function selectThread(threadId: string) {
     const viewToken = ++threadViewTokenRef.current;
     const projectId = selectedProjectIdRef.current;
+    try {
+      codexSocket.send({ type: "live.state", requestId: `live-${requestToken()}` });
+    } catch {
+      // Reconnection requests the authoritative live snapshot again.
+    }
     newThreadDraftModeRef.current = false;
     if (selectedProjectIdRef.current) {
       threadProjectIdsRef.current.set(threadId, selectedProjectIdRef.current);
@@ -3079,14 +3333,21 @@ export function App() {
     setThreadContextMenu(null);
     setError("");
     const cachedView = projectId ? threadViewCacheRef.current.get(`${projectId}:${threadId}`) : undefined;
-    if (cachedView?.history?.totalItems === 0) {
+    const cachedHistory = cachedView?.history;
+    const cachedViewIsUsable = Boolean(
+      cachedView
+      && cachedHistory
+      && cachedHistory.totalItems > 0
+      && (!cachedHistory.hasOlder || Boolean(cachedHistory.nextCursor || cachedHistory.nextBefore > 0))
+    );
+    if (cachedView && !cachedViewIsUsable) {
       threadViewCacheRef.current.delete(`${projectId}:${threadId}`);
     }
-    if (cachedView && (cachedView.history?.totalItems ?? 1) > 0) {
+    if (cachedView && cachedHistory && cachedViewIsUsable) {
       const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(cachedView.thread), modelProfiles));
       selectedThreadRef.current = nextThread;
       setSelectedThread(nextThread);
-      setThreadHistory(cachedView.history);
+      setThreadHistory(cachedHistory);
     } else {
       setThreadHistory(null);
     }
@@ -3113,7 +3374,6 @@ export function App() {
         }
         const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, response.thread, modelProfiles));
         threadPageCacheRef.current.set(cacheKey, { thread: nextThread, history: response.history, cachedAt: Date.now() });
-        threadViewCacheRef.current.set(cacheKey, { thread: nextThread, history: response.history });
       })
       .catch(() => undefined)
       .finally(() => {
@@ -3165,6 +3425,68 @@ export function App() {
     setError("");
     setThreadRenameDraft(thread.name ?? thread.preview ?? "");
     setRenamingThread(thread);
+  }
+
+  function openBranchDialog(turn: Turn) {
+    if (!selectedThread?.id || !selectedProject?.id) {
+      setError("请先打开一个已保存的会话后再创建分支。");
+      return;
+    }
+    setError("");
+    setBranchPrompt("");
+    setBranchDialog({
+      threadId: selectedThread.id,
+      turnId: turn.id,
+      sourceName: selectedThread.name ?? selectedThread.preview ?? "当前会话"
+    });
+  }
+
+  async function createCrossAccountBranch() {
+    const dialog = branchDialog;
+    const project = selectedProject;
+    const nextPrompt = branchPrompt.trim();
+    if (!dialog || !project || !nextPrompt) return;
+    setBranchingThread(true);
+    setError("");
+    try {
+      const response = await branchThread(project.id, dialog.threadId, { turnId: dialog.turnId, prompt: nextPrompt });
+      const rawThread = response.data.thread;
+      const normalizedThread = sanitizeThreadForRender({
+        ...rawThread,
+        pinned: false,
+        configuredModel: rawThread.configuredModel ?? selectedThread?.configuredModel ?? project.defaultModel,
+        configuredReasoningEffort: rawThread.configuredReasoningEffort ?? selectedThread?.configuredReasoningEffort ?? project.defaultReasoningEffort,
+        turns: rawThread.turns ?? []
+      });
+      threadProjectIdsRef.current.set(normalizedThread.id, project.id);
+      setThreads((current) => {
+        const next = current.filter((thread) => thread.id !== normalizedThread.id);
+        next.unshift(normalizedThread);
+        threadsRef.current = next;
+        return next;
+      });
+      newThreadDraftModeRef.current = false;
+      selectedThreadRef.current = normalizedThread;
+      setSelectedThread(normalizedThread);
+      setThreadHistory(null);
+      const newTurnId = response.data.turn?.turn?.id;
+      if (newTurnId) {
+        turnThreadIdsRef.current.set(newTurnId, normalizedThread.id);
+        activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [normalizedThread.id]: newTurnId };
+        setActiveTurnsByThread((current) => ({ ...current, [normalizedThread.id]: newTurnId }));
+      }
+      setBranchDialog(null);
+      setBranchPrompt("");
+      const accountLabel = response.data.targetAccount?.label ? `，已路由至额度较高的账号 ${response.data.targetAccount.label}` : "";
+      addLocalMessage(`已从“${dialog.sourceName}”创建跨账号续接分支${accountLabel}。原会话保持不变；该分支仅携带所选回答之前的可见对话上下文。`, "Codex Web · 分支续接");
+      void openThread(normalizedThread.id, project.id, threadViewTokenRef.current, { skipCache: true, requireFresh: true });
+      void refreshThreads(project.id);
+      void refreshQuota(false, { background: true, force: true });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBranchingThread(false);
+    }
   }
 
   async function copyThreadSessionId(thread: ThreadSummary) {
@@ -3436,9 +3758,7 @@ export function App() {
       if (stopped) {
         return;
       }
-      const lastLiveAt = lastLiveEventAtRef.current[threadId] ?? Date.now();
-      const silenceMs = Date.now() - lastLiveAt;
-      const delay = socketStatus !== "open" ? 0 : Math.max(250, 8_000 - silenceMs);
+      const delay = socketStatus === "open" ? 2_000 : 500;
       timer = window.setTimeout(async () => {
         timer = null;
         const latestLiveAt = lastLiveEventAtRef.current[threadId] ?? 0;
@@ -3547,7 +3867,7 @@ export function App() {
           void refreshLeaderboard(false, false);
         }
         scheduleNext();
-      }, quotaAutoRefreshMs);
+      }, leaderboardAutoRefreshMs);
     };
 
     const refreshWhenVisible = () => {
@@ -3696,7 +4016,10 @@ export function App() {
         const normalizedQuery = normalizeSearchQuery(query);
         return response.data.map((thread) => {
           const titleMatch = `${thread.name ?? ""} ${thread.preview ?? ""}`.toLocaleLowerCase().includes(normalizedQuery);
-          const match = findSearchMatchInThread(thread, normalizedQuery, project.id);
+          const indexedMatch = thread.searchMatch
+            ? { ...thread.searchMatch, projectId: project.id, threadId: thread.id }
+            : null;
+          const match = indexedMatch ?? findSearchMatchInThread(thread, normalizedQuery, project.id);
           const snippetSource = `${thread.name ?? ""} ${thread.preview ?? ""}`.trim() || thread.id;
           return {
             project,
@@ -3743,7 +4066,7 @@ export function App() {
   async function refreshModels() {
     try {
       const response = await listModels();
-      const visibleProfiles = response.data.filter((profile) => !(profile.model === "gpt-5.6-sol" && profile.effort === "ultra"));
+      const visibleProfiles = response.data.filter((profile) => !isUltraModelProfile(profile));
       const nextProfiles = visibleProfiles.length ? visibleProfiles : fallbackModelProfiles;
       setModelProfiles(nextProfiles);
       setNewThreadModelProfileId((current) => (
@@ -3794,13 +4117,17 @@ export function App() {
 
     let refresh = quotaRefreshInFlightRef.current;
     if (!refresh) {
-      refresh = readCodexQuota(options.force === true)
+      refresh = readCodexAccountPool(options.force === true, selectedThread?.id)
         .then((response): QuotaRefreshResult => {
-          setQuota(response.data);
-          return { quota: response.data, error: null };
+          const selected = response.data.accounts.find((entry) => entry.selectedForNewThreads) ?? response.data.accounts[0] ?? null;
+          const nextQuota = selected?.quota ?? null;
+          setAccountPool(response.data);
+          setQuota(nextQuota);
+          return { quota: nextQuota, pool: response.data, error: null };
         })
         .catch((caught): QuotaRefreshResult => ({
           quota: null,
+          pool: null,
           error: caught instanceof Error ? caught.message : String(caught)
         }))
         .finally(() => {
@@ -3828,6 +4155,10 @@ export function App() {
   async function refreshLeaderboard(showDialog = true, force = false): Promise<CodexLeaderboard | null> {
     if (showDialog) {
       setLeaderboardOpen(true);
+      const cachedAt = leaderboard?.updatedAt ? Date.parse(leaderboard.updatedAt) : Number.NaN;
+      if (Number.isFinite(cachedAt) && Date.now() - cachedAt > 5 * 60_000) {
+        setLeaderboard(null);
+      }
     }
     setLeaderboardLoading(true);
 
@@ -3918,12 +4249,28 @@ export function App() {
     if (migratingSessions) {
       return;
     }
+    const publishStatus = (kind: "running" | "success" | "error", message: string) => {
+      setMigrationStatus({ kind, message });
+      window.dispatchEvent(new CustomEvent("codex:migration-status", { detail: { kind, message } }));
+    };
     setMigratingSessions(true);
     setError("");
+    publishStatus("running", "正在从 codex1 导出并传输当前用户会话，请勿重复点击…");
     try {
       const started = await migrateSessionsFrom4090();
       let job = started.data;
       while (job.status === "running") {
+        const transferred = job.bytesTransferred > 0
+          ? `，已传输 ${(job.bytesTransferred / (1024 * 1024)).toFixed(1)} MB`
+          : "";
+        const phaseText = job.phase === "connecting"
+          ? "正在连接 codex1"
+          : job.phase === "transferring"
+            ? `正在导出并传输会话${transferred}`
+            : job.phase === "extracting"
+              ? "传输完成，正在校验并解压"
+              : "正在写入当前账号的会话索引";
+        publishStatus("running", `${phaseText}，请勿重复点击…`);
         await new Promise<void>((resolve) => window.setTimeout(resolve, 1_000));
         job = (await readSessionMigrationFrom4090(job.id)).data;
       }
@@ -3944,16 +4291,28 @@ export function App() {
         await refreshThreads(projectId, "");
       }
       const skipped = result.skippedThreadIds.length ? `；${result.skippedThreadIds.length} 个源端记录文件缺失，未迁移` : "";
+      const resultMessage = job.message ?? `已从 codex1 导入 ${result.importedThreadIds.length} 个新会话，已存在 ${result.alreadyPresentThreadIds.length} 个。${skipped}`;
+      publishStatus("success", resultMessage);
       addLocalMessage(
-          job.message ?? `已从 4090-left 导入 ${result.importedThreadIds.length} 个新会话，已存在 ${result.alreadyPresentThreadIds.length} 个。${skipped}`,
+        resultMessage,
         "Codex Web · 会话迁移"
       );
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      const message = caught instanceof Error ? caught.message : String(caught);
+      publishStatus("error", `迁移失败：${message}`);
+      setError(message);
     } finally {
       setMigratingSessions(false);
     }
   }
+
+  useEffect(() => {
+    const requestMigration = () => {
+      if (!migratingSessions) void migrateAllSessionsFrom4090Left();
+    };
+    window.addEventListener("codex:migrate-4090-left", requestMigration);
+    return () => window.removeEventListener("codex:migrate-4090-left", requestMigration);
+  }, [migratingSessions]);
 
   async function refreshUsers() {
     try {
@@ -4025,36 +4384,90 @@ export function App() {
     }
     if (!options.appendOlder && !options.skipCache) {
       const cached = threadPageCacheRef.current.get(`${projectId}:${threadId}`);
-      if (cached && cached.history.totalItems === 0) {
+      const cachedHistoryIsUsable = Boolean(
+        cached
+        && cached.history.totalItems > 0
+        && (cached.history.returnedItems >= 128 || !cached.history.hasOlder)
+        && (!cached.history.hasOlder || Boolean(cached.history.nextCursor || cached.history.nextBefore > 0))
+      );
+      if (cached && !cachedHistoryIsUsable) {
         threadPageCacheRef.current.delete(`${projectId}:${threadId}`);
-      } else if (cached && Date.now() - cached.cachedAt < 30_000 && (cached.history.returnedItems >= 128 || !cached.history.hasOlder)) {
-        const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(cached.thread), modelProfiles));
+      } else if (cached && cachedHistoryIsUsable && Date.now() - cached.cachedAt < 30_000) {
+        const current = selectedThreadRef.current;
+        const currentHistory = current?.id === cached.thread.id ? threadHistoryRef.current : null;
+        const preserveLoadedHistory = Boolean(current && currentHistory && currentHistory.nextBefore > cached.history.nextBefore);
+        const cachedThread = preserveLoadedHistory && current
+          ? mergeThreadHistoryPages(current, cached.thread)
+          : cached.thread;
+        const nextHistory = preserveLoadedHistory && currentHistory
+          ? {
+              ...currentHistory,
+              totalItems: cached.history.totalItems,
+              nextBefore: Math.min(
+                cached.history.totalItems,
+                currentHistory.nextBefore + Math.max(0, cached.history.totalItems - currentHistory.totalItems)
+              ),
+              indexState: cached.history.indexState
+            }
+          : cached.history;
+        const nextThread = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(cachedThread), modelProfiles));
         selectedThreadRef.current = nextThread;
         setSelectedThread(nextThread);
-        setThreadHistory(cached.history);
+        threadHistoryRef.current = nextHistory;
+        setThreadHistory(nextHistory);
+        threadViewCacheRef.current.set(`${projectId}:${threadId}`, { thread: nextThread, history: nextHistory });
         return nextThread;
       }
     }
     try {
       const response = await readThread(threadId, projectId, {
         before: options.before,
+        cursor: options.cursor,
+        fresh: options.requireFresh,
         limit: options.appendOlder ? 160 : 128
       });
       if (viewToken !== threadViewTokenRef.current) {
         return null;
       }
       const current = selectedThreadRef.current;
+      const currentHistory = current?.id === response.thread.id ? threadHistoryRef.current : null;
+      const preserveLoadedHistory = Boolean(
+        !options.appendOlder
+        && current
+        && currentHistory
+        && response.history
+        && currentHistory.nextBefore > response.history.nextBefore
+      );
       const mergedThread = options.appendOlder && current?.id === response.thread.id
         ? mergeThreadHistoryPages(response.thread, current)
-        : response.thread;
+        : preserveLoadedHistory && current
+          ? mergeThreadHistoryPages(current, response.thread)
+          : response.thread;
+      const nextHistory = preserveLoadedHistory && currentHistory && response.history
+        ? {
+            ...currentHistory,
+            totalItems: response.history.totalItems,
+            nextBefore: Math.min(
+              response.history.totalItems,
+              currentHistory.nextBefore + Math.max(0, response.history.totalItems - currentHistory.totalItems)
+            ),
+            indexState: response.history.indexState
+          }
+        : response.history ?? null;
+      const latestThreadWithStoredModel = sanitizeThreadForRender(applyStoredThreadModelProfile(
+        selectedUserId,
+        applyThreadListName(response.thread),
+        modelProfiles
+      ));
       const nextThreadWithStoredModel = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, applyThreadListName(mergedThread), modelProfiles));
       selectedThreadRef.current = nextThreadWithStoredModel;
       setSelectedThread(nextThreadWithStoredModel);
-      setThreadHistory(response.history ?? null);
-      if (!options.appendOlder) {
+      threadHistoryRef.current = nextHistory;
+      setThreadHistory(nextHistory);
+      if (nextHistory) {
         const cacheKey = `${projectId}:${nextThreadWithStoredModel.id}`;
         threadViewCacheRef.current.delete(cacheKey);
-        threadViewCacheRef.current.set(cacheKey, { thread: nextThreadWithStoredModel, history: response.history ?? null });
+        threadViewCacheRef.current.set(cacheKey, { thread: nextThreadWithStoredModel, history: nextHistory });
         while (threadViewCacheRef.current.size > 12) {
           const oldestKey = threadViewCacheRef.current.keys().next().value;
           if (!oldestKey) {
@@ -4065,7 +4478,7 @@ export function App() {
       }
       if (!options.appendOlder && response.history) {
         threadPageCacheRef.current.set(`${projectId}:${threadId}`, {
-          thread: nextThreadWithStoredModel,
+          thread: latestThreadWithStoredModel,
           history: response.history,
           cachedAt: Date.now()
         });
@@ -4095,7 +4508,10 @@ export function App() {
     setGlobalSearchOpen(false);
     setGlobalSearchQuery("");
     const match = result.match ?? null;
-    const selected = await openThread(result.thread.id, result.project.id, viewToken);
+    const selected = await openThread(result.thread.id, result.project.id, viewToken, match?.cursor ? {
+      cursor: match.cursor,
+      skipCache: true
+    } : {});
     if (!selected || selected.id !== result.thread.id) {
       return;
     }
@@ -4126,6 +4542,7 @@ export function App() {
     try {
       await openThread(thread.id, projectId, threadViewTokenRef.current, {
         before: history.nextBefore,
+        cursor: history.nextCursor ?? undefined,
         appendOlder: true
       });
     } finally {
@@ -4662,7 +5079,8 @@ export function App() {
       void openThread(threadId, projectId, threadViewTokenRef.current);
     }
 
-    const candidates = generatedFileCandidatesFromThread(response.thread, project.rootPath);
+    const candidates = generatedFileCandidatesFromThread(response.thread, project.rootPath)
+      .filter((candidate) => !afterTurnId || candidate.turnId === afterTurnId);
     let nextIndex = 0;
     const transferOne = async () => {
       for (;;) {
@@ -4690,8 +5108,16 @@ export function App() {
             }
           );
         } catch (caught) {
+          const failureMessage = caught instanceof Error ? caught.message : String(caught);
+          // Completion is checked twice to catch delayed persistence. A missing
+          // path is a stale prose/history reference, not a user-facing transfer
+          // failure, and must not be retried or injected into the conversation.
+          autoSentGeneratedFileKeysRef.current.add(key);
+          if (/file does not exist|enoent/i.test(failureMessage)) {
+            continue;
+          }
           addLocalMessage(
-            `自动发送 ${compactFileLabel(candidate.target)} 失败：${caught instanceof Error ? caught.message : String(caught)}`,
+            `自动发送 ${compactFileLabel(candidate.target)} 失败：${failureMessage}`,
             "Codex Web · 自动发送",
             "tool",
             undefined,
@@ -5144,6 +5570,11 @@ export function App() {
           }
           return next;
         });
+        if (activeTurnsByThreadRef.current[threadId]) {
+          const next = { ...activeTurnsByThreadRef.current };
+          delete next[threadId];
+          activeTurnsByThreadRef.current = next;
+        }
       }
     }, 10_000);
     interruptTimeoutsRef.current.set(turnId, timeoutId);
@@ -5689,7 +6120,6 @@ export function App() {
           ));
         };
         const now = Date.now();
-        setPendingUserMessages((current) => current.filter((entry) => entry.threadId !== threadId || entry.keepAtBottomUntil > now));
         if (turnId) {
           setSelectedThread((current) => {
             if (!current || current.id !== threadId) {
@@ -5750,7 +6180,7 @@ export function App() {
               if (delay > 0) {
                 await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
               }
-              const persistedThread = await openThread(threadId, projectId, viewToken, { skipCache: true });
+              const persistedThread = await openThread(threadId, projectId, viewToken, { skipCache: true, requireFresh: true });
               if (hasPersistedCompletedTurn(persistedThread, turnId)) {
                 clearCompletedLiveItems();
                 return;
@@ -5759,9 +6189,8 @@ export function App() {
                 return;
               }
             }
-            if (viewToken === threadViewTokenRef.current) {
-              clearCompletedLiveItems();
-            }
+            // Keep the completed live turn visible if persistence cannot yet be
+            // confirmed. A later refresh can promote it without an empty gap.
           };
           void promotePersistedTurn();
         } else if (!isTemporaryThread) {
@@ -5797,7 +6226,7 @@ export function App() {
     stripInterruptArtifacts(entry.text) ? (
     <article className="messageItem kind-agent type-agentMessage live" key={entry.id}>
       <div className="messageMeta">Codex · agentMessage</div>
-      <MarkdownMessage text={stripInterruptArtifacts(entry.text)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} renderMath />
+      <LiveAgentStreamMessage text={stripInterruptArtifacts(entry.text)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
     </article>
     ) : null
   ) : (
@@ -5818,9 +6247,12 @@ export function App() {
     if (output) {
       output.textContent = expanded ? output.fullToolOutput ?? "" : output.previewToolOutput ?? "";
     }
+    toolCard.dispatchEvent(new CustomEvent("codex:tool-expanded", { detail: { expanded } }));
   };
 
   const renderToolBundleGroup = (bundleId: string, entries: ThreadItem[], groupIndex: number) => {
+    const entryKey = `${bundleId}:group:${groupIndex}`;
+    const expanded = Boolean(expandedToolEntries[entryKey]);
     const call = entries.find((entry) => safeText(entry.type).toLowerCase() === "toolcall") ?? entries[0];
     const toolName = safeText(call.tool).trim() || "tool";
     const inputText = safeText(call.input) || safeText(call.command);
@@ -5831,28 +6263,39 @@ export function App() {
     ].map((text) => text.replace(/\s+/g, " ").trim()).find(Boolean) ?? "";
     const hasChanges = Array.isArray(call.changes) && call.changes.length > 0;
     const outputItems = entries.filter((entry) => entry !== call);
-    const outputText = outputItems
+    const outputText = [call, ...outputItems]
       .map((entry) => {
         if (typeof entry.aggregatedOutput === "string" && entry.aggregatedOutput.trim()) return entry.aggregatedOutput;
         if (typeof entry.output === "string" && safeText(entry.output).trim()) return safeText(entry.output);
+        if (entry === call) return "";
         return itemText(entry);
       })
       .filter((text) => text.trim())
+      .filter((text, index, values) => values.indexOf(text) === index)
       .join("\n");
+    const deferredOutputItem = [call, ...outputItems].find((entry) => entry.outputDeferred === true);
     const running = call.completed === false;
     return (
       <article
-        className={`messageItem kind-tool type-toolCall toolBundleEntry${running ? " live" : ""}`}
+        className={`messageItem kind-tool type-toolCall toolBundleEntry${expanded ? " toolExpanded" : ""}${running ? " live" : ""}`}
         key={`${bundleId}-group-${groupIndex}`}
+        aria-expanded={expanded}
         onClick={(event) => {
           event.stopPropagation();
-          toggleToolCardExpanded(event.currentTarget);
+          setExpandedToolEntries((current) => {
+            if (current[entryKey]) {
+              const next = { ...current };
+              delete next[entryKey];
+              return next;
+            }
+            return { ...current, [entryKey]: true };
+          });
         }}
       >
         <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
         {inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
         {hasChanges ? <pre>{toolItemDetails(call)}</pre> : null}
-        {outputText ? <DeferredToolOutput text={displayOutputText(outputText)} /> : null}
+        {outputText ? <DeferredToolOutput text={displayOutputText(outputText)} deferred={Boolean(deferredOutputItem)} threadId={selectedThread?.id} itemId={deferredOutputItem?.id ?? call.id} projectId={selectedProject?.id} /> : null}
         {!outputText && running ? <div className="messageBody">正在执行...</div> : null}
       </article>
     );
@@ -5915,6 +6358,7 @@ export function App() {
     // The bundle shimmer must follow tool completion only, not turn completion.
     const running = hasRunningTool;
     const expanded = Boolean(expandedToolBundles[bundleId]);
+    const bundleGroups = getToolBundleGroups(bundleItems);
     return (
       <article
         className={`messageItem kind-tool type-toolCall toolBundle${expanded ? " toolExpanded" : ""}${running ? " live" : ""}${running ? " toolBundleRunning" : ""}`}
@@ -5928,16 +6372,21 @@ export function App() {
               delete next[bundleId];
               return next;
             }
+            if (bundleGroups.length === 1) {
+              setExpandedToolEntries((entries) => ({ ...entries, [`${bundleId}:group:0`]: true }));
+            }
             return { ...current, [bundleId]: true };
           });
         }}
       >
         <div className={`messageMeta toolBundleTitle${running ? " live" : ""}`}>{summarizeToolBundleTitle(bundleItems, !running)}</div>
-        <div className="toolBundleEntries">
-          {getToolBundleGroups(bundleItems).map((bundleGroup, groupIndex) => (
-            renderToolBundleGroup(bundleId, bundleGroup, groupIndex)
-          ))}
-        </div>
+        {expanded ? (
+          <div className="toolBundleEntries">
+            {bundleGroups.map((bundleGroup, groupIndex) => (
+              renderToolBundleGroup(bundleId, bundleGroup, groupIndex)
+            ))}
+          </div>
+        ) : null}
       </article>
     );
   };
@@ -5966,6 +6415,7 @@ export function App() {
       <article
         className={messageClassName(item)}
         key={`${turn.id}-${item.id}`}
+        data-message-key={messageRefKey}
         ref={(element) => {
           if (navigationKey) {
             setPromptMessageElement(navigationKey, element);
@@ -5989,7 +6439,7 @@ export function App() {
             renderMath={itemKindValue === "agent"}
           />
         )}
-        {item.aggregatedOutput ? <DeferredToolOutput text={item.aggregatedOutput} /> : null}
+        {item.aggregatedOutput ? <DeferredToolOutput text={item.aggregatedOutput} deferred={item.outputDeferred === true} threadId={selectedThread?.id} itemId={item.id} projectId={selectedProject?.id} /> : null}
         {!isUserMessage ? <MessageImagePreviews item={item} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /> : null}
         {isUserMessage ? (
           <div className="v2UserMessageActions" aria-label="用户消息操作">
@@ -6044,6 +6494,18 @@ export function App() {
     }
     return entry.threadId === selectedThread.id;
   }), [pendingUserMessages, selectedThread]);
+  const persistedSelectedTurnIds = new Set((selectedThread?.turns ?? []).map((turn) => turn.id));
+  const selectedUnpersistedLiveTurnId = selectedThread?.id
+    ? [...liveTimelineEntries].reverse().find((entry) => entry.turnId && !persistedSelectedTurnIds.has(entry.turnId))?.turnId ?? null
+    : null;
+  const selectedSnapshotTurnId = selectedThread?.id
+    ? activeTurnsByThread[selectedThread.id] ?? selectedUnpersistedLiveTurnId
+    : null;
+  const displayedTurnIds = useMemo(() => {
+    const ids = new Set((selectedThread?.turns ?? []).map((turn) => turn.id));
+    if (selectedSnapshotTurnId) ids.add(selectedSnapshotTurnId);
+    return ids;
+  }, [selectedSnapshotTurnId, selectedThread]);
   const persistedUserTurnIds = useMemo(() => new Set(
     (selectedThread?.turns ?? [])
       .filter((turn) => turnHasUserItem(turn) || Boolean(turnUserText(turn).trim()))
@@ -6051,9 +6513,8 @@ export function App() {
   ), [selectedThread]);
   const pendingUserMessagesByTurn = useMemo(() => {
     const byTurn = new Map<string, PendingUserMessage[]>();
-    const turnIds = new Set((selectedThread?.turns ?? []).map((turn) => turn.id));
     for (const entry of visiblePendingUserMessages) {
-      if (!entry.turnId || !turnIds.has(entry.turnId) || persistedUserTurnIds.has(entry.turnId)) {
+      if (!entry.turnId || !displayedTurnIds.has(entry.turnId) || persistedUserTurnIds.has(entry.turnId)) {
         continue;
       }
       const entries = byTurn.get(entry.turnId) ?? [];
@@ -6061,11 +6522,10 @@ export function App() {
       byTurn.set(entry.turnId, entries);
     }
     return byTurn;
-  }, [persistedUserTurnIds, selectedThread, visiblePendingUserMessages]);
+  }, [displayedTurnIds, persistedUserTurnIds, visiblePendingUserMessages]);
   const detachedPendingUserMessages = useMemo(() => {
-    const turnIds = new Set((selectedThread?.turns ?? []).map((turn) => turn.id));
-    return visiblePendingUserMessages.filter((entry) => !entry.turnId || !turnIds.has(entry.turnId));
-  }, [selectedThread, visiblePendingUserMessages]);
+    return visiblePendingUserMessages.filter((entry) => !entry.turnId || !displayedTurnIds.has(entry.turnId));
+  }, [displayedTurnIds, visiblePendingUserMessages]);
   const heldPendingUserMessages = useMemo(
     () => detachedPendingUserMessages.filter((entry) => entry.keepAtBottomUntil > promptBottomHoldNow),
     [detachedPendingUserMessages, promptBottomHoldNow]
@@ -6138,6 +6598,19 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
   }
   const currentPendingTurnStart = visiblePendingUserMessages[visiblePendingUserMessages.length - 1] ?? null;
   const selectedActiveTurnId = getRunningTurnIdForThread(selectedThread);
+  const displayedConversationTurns = useMemo(() => {
+    const turns = selectedThread?.turns ?? [];
+    if (!selectedSnapshotTurnId || turns.some((turn) => turn.id === selectedSnapshotTurnId)) {
+      return turns;
+    }
+    return [...turns, {
+      id: selectedSnapshotTurnId,
+      status: selectedActiveTurnId === selectedSnapshotTurnId ? "running" : "completed",
+      startedAt: null,
+      completedAt: null,
+      items: []
+    } as Turn];
+  }, [selectedActiveTurnId, selectedSnapshotTurnId, selectedThread]);
   const composerIsStopMode = Boolean(selectedActiveTurnId || currentPendingTurnStart);
   const composerHasDraft = Boolean(prompt.trim() || uploadedFiles.length);
   const composerCanSteer = Boolean(selectedActiveTurnId && composerHasDraft);
@@ -6309,7 +6782,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           <div>
             <div className="brandTitleRow">
               <strong>Codex Web</strong>
-              <span className="brandMarker">260803</span>
             </div>
             <span className={`statusDot ${socketStatus}`}>{socketStatus}</span>
           </div>
@@ -6345,10 +6817,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             type="button"
             onClick={() => void migrateAllSessionsFrom4090Left()}
             disabled={migratingSessions}
-            title="仅导入 4090-left 上当前用户的新会话；已有会话跳过，不覆盖本地记录。"
+            title="仅导入 codex1 上当前用户的新会话；已有会话跳过，不覆盖本地记录。"
           >
             <Archive size={15} />
-            {migratingSessions ? "导入中…" : "导入 4090-left 会话"}
+            {migratingSessions ? "导入中…" : "导入 codex1 会话"}
           </button>
           <p className="creatorHint">只导入新会话，已有记录自动跳过，不会覆盖本地内容。</p>
         </div>
@@ -6709,6 +7181,50 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         </div>
       ) : null}
 
+      {branchDialog ? (
+        <div className="modalBackdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !branchingThread) setBranchDialog(null);
+        }}>
+          <section className="settingsDialog branchDialog" role="dialog" aria-modal="true" aria-labelledby="branch-dialog-title">
+            <div className="dialogHeader">
+              <div>
+                <h2 id="branch-dialog-title">分支到新会话</h2>
+                <p>保留当前回答之前的可见上下文，并自动选择剩余额度更多的账号。</p>
+              </div>
+              <button className="iconButton" type="button" onClick={() => setBranchDialog(null)} disabled={branchingThread} title="关闭">
+                <X size={18} />
+              </button>
+            </div>
+            <div className="branchDialogBody">
+              <p className="branchDialogNotice">原会话不会变更。隐藏 Thinking、工具运行状态及未展示内容不会跨账号复制。</p>
+              <label>
+                <span>在分支中继续做什么？</span>
+                <textarea
+                  autoFocus
+                  value={branchPrompt}
+                  onChange={(event) => setBranchPrompt(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                      event.preventDefault();
+                      void createCrossAccountBranch();
+                    }
+                  }}
+                  placeholder="例如：不要改原方案，换一种架构继续实现"
+                  disabled={branchingThread}
+                />
+              </label>
+            </div>
+            <div className="dialogActions">
+              <button className="iconTextButton" type="button" onClick={() => setBranchDialog(null)} disabled={branchingThread}>取消</button>
+              <button className="iconTextButton primary" type="button" onClick={() => void createCrossAccountBranch()} disabled={!branchPrompt.trim() || branchingThread}>
+                <GitBranch size={15} />
+                {branchingThread ? "正在创建…" : "创建分支并发送"}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
       {settingsOpen ? (
         <div className="modalScrim" role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title">
           <section className="settingsDialog">
@@ -6840,26 +7356,52 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <div
               className="quotaPopoverAnchor"
               onMouseEnter={() => {
+                if (quotaPopoverCloseTimerRef.current !== null) {
+                  window.clearTimeout(quotaPopoverCloseTimerRef.current);
+                  quotaPopoverCloseTimerRef.current = null;
+                }
+                setQuotaPopoverClosing(false);
                 setQuotaPopoverOpen(true);
                 void refreshQuota(false, { background: true });
               }}
-              onMouseLeave={() => setQuotaPopoverOpen(false)}
+              onMouseLeave={() => {
+                if (quotaPopoverPinned) return;
+                setQuotaPopoverClosing(true);
+                if (quotaPopoverCloseTimerRef.current !== null) window.clearTimeout(quotaPopoverCloseTimerRef.current);
+                quotaPopoverCloseTimerRef.current = window.setTimeout(() => {
+                  setQuotaPopoverOpen(false);
+                  setQuotaPopoverClosing(false);
+                  quotaPopoverCloseTimerRef.current = null;
+                }, 150);
+              }}
             >
               <button
                 className="quotaButton v2QuotaTopButton"
                 type="button"
-                onClick={() => void refreshQuota(false, { force: true })}
+                onClick={() => {
+                  setQuotaPopoverPinned((current) => {
+                    const next = !current;
+                    if (quotaPopoverCloseTimerRef.current !== null) {
+                      window.clearTimeout(quotaPopoverCloseTimerRef.current);
+                      quotaPopoverCloseTimerRef.current = null;
+                    }
+                    setQuotaPopoverClosing(false);
+                    setQuotaPopoverOpen(next);
+                    return next;
+                  });
+                  void refreshQuota(false, { force: true, background: true });
+                }}
                 disabled={quotaLoading}
-                title="悬停查看额度详情"
+                title="悬停查看；点击可固定或收起额度详情"
               >
-                {quotaLoading ? "额度..." : quotaSummaryLabel(quota)}
+                {quotaLoading ? "额度..." : quotaSummaryLabel(quota, accountPool)}
               </button>
-              {quotaPopoverOpen ? <QuotaPopover quota={quota} loading={quotaLoading} /> : null}
+              {quotaPopoverOpen ? <QuotaPopover quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverClosing} /> : null}
             </div>
             <button
               className="leaderboardButton"
               type="button"
-              onClick={() => void refreshLeaderboard(true, false)}
+              onClick={() => void refreshLeaderboard(true, true)}
               disabled={leaderboardLoading}
               title="查看当前周期和历史累计 token 排行榜"
             >
@@ -6895,16 +7437,26 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </div>
         ) : null}
 
-        <div className="workspace" style={{ gridTemplateColumns: threadListCollapsed ? "56px 0px minmax(0, 1fr)" : `${threadListWidth}px 8px minmax(0, 1fr)` }}>
+        {migrationStatus ? (
+          <div className={`migrationStatusToast ${migrationStatus.kind}`} role="status" aria-live="polite">
+            <span className="migrationStatusIcon" aria-hidden="true" />
+            <span>{migrationStatus.message}</span>
+            {migrationStatus.kind !== "running" ? (
+              <button type="button" onClick={() => setMigrationStatus(null)} title="关闭迁移结果" aria-label="关闭迁移结果">×</button>
+            ) : null}
+          </div>
+        ) : null}
+
+        <div className="workspace" style={{ gridTemplateColumns: threadListCollapsed ? "56px 0px minmax(0, 1fr)" : `${threadListWidth}px 0px minmax(0, 1fr)` }}>
           <nav className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
             <div className="listHeader">
               <span>项目</span>
               <span className="listHeaderActions">
-                <button className="iconButton v2SidebarSearchButton" type="button" onClick={() => setGlobalSearchOpen(true)} title="Search conversations and messages" aria-label="Search conversations and messages">
-                  <Search size={15} />
+                <button className="iconButton v2SidebarSearchButton" type="button" onClick={() => setGlobalSearchOpen(true)} title="搜索会话和消息" aria-label="搜索会话和消息">
+                  <Search size={17} strokeWidth={2.2} />
                 </button>
                 <button className="iconButton" type="button" onClick={() => void refreshThreads(selectedProjectIdRef.current, threadSearch)} title="Refresh threads">
-                  <RefreshCcw size={15} />
+                  <RefreshCcw size={17} strokeWidth={2.2} />
                 </button>
                 <button
                   className="panelCollapseButton"
@@ -6941,7 +7493,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       }}
                       title={project.rootPath}
                     >
-                      <span className="v2WorkspaceFolderGlyph" aria-hidden="true" />
+                      <Folder className="v2WorkspaceFolderGlyph" size={18} strokeWidth={2.2} aria-hidden="true" />
                       <strong>{project.name}</strong>
                       <button
                         className="projectRenameButton"
@@ -6954,7 +7506,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         title="重命名工作区"
                         aria-label="重命名工作区"
                       >
-                        <PencilLine size={14} />
+                        <PencilLine size={16} strokeWidth={2.2} />
                       </button>
                       <button
                         className={`projectDeleteButton ${pendingDeleteProjectId === project.id ? "confirm" : ""}`}
@@ -6966,7 +7518,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         }}
                         title={pendingDeleteProjectId === project.id ? `确认移除 ${project.name}` : `移除 ${project.name}`}
                       >
-                        {pendingDeleteProjectId === project.id ? "确认" : <Trash2 size={15} />}
+                        {pendingDeleteProjectId === project.id ? "确认" : <Trash2 size={16} strokeWidth={2.2} />}
                       </button>
                     </div>
                     {projectSelected ? <div className="v2WorkspaceThreads">
@@ -6984,7 +7536,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               className="newThreadButton"
               onClick={() => resetToNewThread(true)}
             >
-              <MessageSquare size={15} />
+              <SquarePen size={17} strokeWidth={2.2} />
               新建会话
             </button>
               {threads.map((thread) => (
@@ -7104,7 +7656,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     ? "当前会话运行中；完成后可切换下一轮模型"
                     : `仅影响${selectedThread ? "当前会话后续轮次" : "这次新会话"}：${selectedModelProfile.model} / ${selectedModelProfile.effort}`}
                 >
-                  {modelProfiles.filter((profile) => profile.id !== "gpt-5.6-sol:ultra").map((profile) => (
+                  {modelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => (
                     <option key={profile.id} value={profile.id}>
                       {profile.label}
                     </option>
@@ -7173,6 +7725,16 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     autoFollowMessagesRef.current = false;
                     setShowScrollToBottom(true);
                   }
+                  if (event.deltaY > 0 && manualMessageScrollLockRef.current) {
+                    window.requestAnimationFrame(() => {
+                      const element = messagesRef.current;
+                      if (element && element.scrollHeight - element.scrollTop - element.clientHeight < 2) {
+                        manualMessageScrollLockRef.current = false;
+                        autoFollowMessagesRef.current = true;
+                        setShowScrollToBottom(false);
+                      }
+                    });
+                  }
                 }}
                 onScroll={updateMessageScrollState}
                 onMouseUp={(event) => {
@@ -7207,6 +7769,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   if (output) {
                     output.textContent = expanded ? output.fullToolOutput ?? "" : output.previewToolOutput ?? "";
                   }
+                  toolCard.dispatchEvent(new CustomEvent("codex:tool-expanded", { detail: { expanded } }));
                 }}
               >
                 {selectedThread && threadHistory?.hasOlder ? (
@@ -7270,7 +7833,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                             value={temporaryModelProfileId}
                             onChange={setTemporaryModelProfileId}
                             disabled={temporaryAsk.status === "starting" || temporaryAsk.status === "running"}
-                            options={modelProfiles.map((profile) => ({ value: profile.id, label: profile.label, detail: `${profile.model} · 推理 ${profile.effort}` }))}
+                            options={modelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => ({ value: profile.id, label: profile.label, detail: `${profile.model} · 推理 ${profile.effort}` }))}
                           />
                           <PolishedSelect<SandboxMode>
                             className="temporaryPolicySelect"
@@ -7300,7 +7863,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     </section>
                   </div>
                 ), document.body) : null}
-                {(selectedThread?.turns ?? []).map((turn) => {
+                {displayedConversationTurns.map((turn) => {
                   const syntheticUserText = turnHasUserItem(turn) ? "" : turnUserText(turn);
                   const syntheticUserItem: ThreadItem | null = syntheticUserText.trim()
                     ? {
@@ -7343,7 +7906,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     if (pendingToolGroup.length === 0) {
                       return indexBase;
                     }
-                    const bundleId = `${turn.id}-toolbundle-${indexBase}`;
+                    const bundleId = `${turn.id}-history-toolbundle-${indexBase}`;
                     const isLiveRunningTurn = Boolean(selectedActiveTurnId && turn.id === selectedActiveTurnId);
                     const isBundleComplete = !isLiveRunningTurn || pendingToolGroup.every((toolItem) => safeText(toolItem.type).toLowerCase() !== "toolcall" || toolItem.completed !== false);
                     renderedHistoryItems.push(
@@ -7433,19 +7996,27 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           <button type="button" title="复制本次回答全部文字" aria-label="复制本次回答全部文字" onClick={() => void copyPlainText(turnAgentText)}>
                             <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
                           </button>
+                          <button type="button" title="从此回答分支到新会话" aria-label="从此回答分支到新会话" onClick={() => openBranchDialog(turn)}>
+                            <GitBranch size={15} />
+                          </button>
                         </div>
                       ]
                     : [];
 
                   const renderedHistoryTurnItems = renderedHistoryItems.flatMap((item) => (item ? [item] : []));
-                  const toRunningToolItem = (entry: Extract<LiveTimelineEntry, { kind: "tool" }>): ThreadItem => ({
+                  const toRunningToolItem = (entry: Extract<LiveTimelineEntry, { kind: "tool" }>): ThreadItem => {
+                    const persistedToolItem = persistedTurnItemsById.get(entry.id);
+                    return ({
+                      ...persistedToolItem,
                       id: entry.id,
                       type: "toolCall",
-                      tool: entry.tool,
-                      input: entry.input,
-                      output: entry.output,
+                      tool: entry.tool || persistedToolItem?.tool,
+                      input: entry.input || persistedToolItem?.input,
+                      output: entry.output || persistedToolItem?.output,
+                      aggregatedOutput: entry.output || persistedToolItem?.aggregatedOutput,
                       completed: entry.completed
                     } as ThreadItem);
+                  };
                   const runningTurnTimelineItems: React.ReactNode[] = [];
                   const runningToolGroup: ThreadItem[] = [...pendingToolGroup];
                   let runningToolGroupContainsHistory = pendingToolGroup.length > 0;
@@ -7609,7 +8180,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     onChange={(profileId) => void changeConversationModelProfile(profileId)}
                     disabled={savingThreadModel || conversationRunState === "running"}
                     title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
-                    options={modelProfiles.filter((profile) => profile.id !== "gpt-5.6-sol:ultra").map((profile) => ({
+                    options={modelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => ({
                       value: profile.id,
                       label: profile.label,
                       detail: `${profile.model} · 推理 ${profile.effort}`
