@@ -731,6 +731,7 @@ type LeaderboardFileSummary = {
   mtimeMs: number;
   startAt: number | null;
   usage: LeaderboardFileUsage[];
+  granularity?: "day" | "event";
 };
 
 type LeaderboardFileCachePayload = {
@@ -741,9 +742,22 @@ type LeaderboardFileCachePayload = {
 type LeaderboardAccountSource = {
   id: string;
   label: string;
+  kind: "codex-account" | "api-provider";
   sessionsRoot: string;
   quota: PublicCodexQuota;
 };
+
+type LeaderboardCycleWindow = {
+  startAt: number;
+  resetAt: number | null;
+  resetWindowMins: number | null;
+};
+
+// Quota snapshots from parallel Codex processes can differ by seconds (and
+// occasionally a few minutes) while still referring to the same weekly cycle.
+// Do not use the JSONL timestamp alone for GPT: imported rollouts may stamp
+// old usage with the import time, making historical tokens look current.
+const leaderboardResetDriftSeconds = 5 * 60;
 
 export type PublicTrackedQuotaDayAccount = {
   accountId: string;
@@ -953,18 +967,43 @@ function countField(record: Record<string, unknown>, camel: string, snake: strin
   return safeCount(record[camel]) ?? safeCount(record[snake]) ?? 0;
 }
 
-function userIdFromSessionCwd(cwd: string | null): string | null {
+export function userIdFromSessionCwd(
+  cwd: string | null,
+  isKnownUser?: (userId: string) => boolean,
+  workspaceRoot = userWorkspaceRoot
+): string | null {
   if (!cwd) {
     return null;
   }
-  const normalizedRoot = path.resolve(userWorkspaceRoot);
+  const normalizedRoot = path.resolve(workspaceRoot);
   const normalizedCwd = path.resolve(cwd);
-  if (!normalizedCwd.startsWith(`${normalizedRoot}${path.sep}`)) {
-    return null;
+  if (normalizedCwd.startsWith(`${normalizedRoot}${path.sep}`)) {
+    const [firstSegment] = path.relative(normalizedRoot, normalizedCwd).split(path.sep);
+    return firstSegment?.trim() || null;
   }
-  const relative = path.relative(normalizedRoot, normalizedCwd);
-  const [firstSegment] = relative.split(path.sep);
-  return firstSegment?.trim() || null;
+  // Some existing users run Codex directly in /home/ls/<login> rather than
+  // the managed users root. Only trust this layout for a registered login.
+  const homeRoot = path.dirname(path.dirname(normalizedRoot));
+  if (isKnownUser && normalizedCwd.startsWith(`${homeRoot}${path.sep}`)) {
+    const [firstSegment] = path.relative(homeRoot, normalizedCwd).split(path.sep);
+    if (firstSegment && isKnownUser(firstSegment)) return firstSegment;
+  }
+  return null;
+}
+
+function sessionCwdFromFileStart(filePath: string): string | null {
+  const buffer = Buffer.alloc(64 * 1024);
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    const firstLine = buffer.toString("utf8", 0, bytes).split("\n", 1)[0];
+    const record = JSON.parse(firstLine) as { type?: string; payload?: { cwd?: unknown } };
+    return record.type === "session_meta" ? stringOrNull(record.payload?.cwd) : null;
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function aggregateBucketFor(map: Map<string, AggregateBucket>, userId: string): AggregateBucket {
@@ -1116,14 +1155,59 @@ function mergeLeaderboardScopes(
   );
 }
 
-function mergeAccountLeaderboards(boards: PublicCodexLeaderboard[]): PublicCodexLeaderboard {
+/** API plans have no Codex quota reset; rank them over the same visible GPT window. */
+export function apiLeaderboardCycleWindow(
+  cycles: Array<{ resetAt: number | null; resetWindowMins: number | null }>,
+  nowSeconds: number
+): LeaderboardCycleWindow {
+  const valid = cycles.flatMap(({ resetAt, resetWindowMins }) =>
+    resetAt !== null && resetWindowMins !== null && resetWindowMins > 0
+      ? [{ startAt: resetAt - resetWindowMins * 60, resetAt }]
+      : []
+  );
+  return valid.length
+    ? {
+        startAt: Math.min(...valid.map((cycle) => cycle.startAt)),
+        resetAt: Math.max(...valid.map((cycle) => cycle.resetAt)),
+        resetWindowMins: null
+      }
+    : { startAt: nowSeconds - 7 * 24 * 60 * 60, resetAt: null, resetWindowMins: null };
+}
+
+export function usageInLeaderboardCycle(
+  usage: { resetAt: number | null; occurredAt?: number | null },
+  sourceKind: LeaderboardAccountSource["kind"],
+  window: LeaderboardCycleWindow
+): boolean {
+  if (sourceKind !== "api-provider") {
+    return window.resetAt !== null && usage.resetAt !== null
+      && Math.abs(usage.resetAt - window.resetAt) <= leaderboardResetDriftSeconds;
+  }
+  return usage.occurredAt !== null && usage.occurredAt !== undefined
+    && usage.occurredAt >= window.startAt
+    && (window.resetAt === null || usage.occurredAt < window.resetAt);
+}
+
+export function mergeAccountLeaderboards(boards: PublicCodexLeaderboard[], sources: LeaderboardAccountSource[]): PublicCodexLeaderboard {
+  const codexBoards = boards.filter((_, index) => sources[index]?.kind !== "api-provider");
+  const quotaByUser = new Map<string, number>();
+  for (const board of codexBoards) {
+    for (const user of board.currentCycle.users) {
+      if (user.quotaPercent !== null) quotaByUser.set(user.userId, (quotaByUser.get(user.userId) ?? 0) + user.quotaPercent);
+    }
+  }
+  const currentCycle = mergeLeaderboardScopes(
+    boards.map((board) => board.currentCycle),
+    boards.map((_, index) => `账号 ${index + 1}`),
+    false,
+    codexBoards.some((board) => board.currentCycle.quotaUsedPercent !== null)
+      ? codexBoards.reduce((sum, board) => sum + (board.currentCycle.quotaUsedPercent ?? 0), 0)
+      : null
+  );
+  // API tokens affect token rank/share, never a user's estimated GPT quota.
+  currentCycle.users = currentCycle.users.map((user) => ({ ...user, quotaPercent: quotaByUser.get(user.userId) ?? null }));
   return {
-    currentCycle: mergeLeaderboardScopes(
-      boards.map((board) => board.currentCycle),
-      boards.map((_, index) => `账号 ${index + 1}`),
-      false,
-      boards.reduce((sum, board) => sum + (board.currentCycle.quotaUsedPercent ?? 0), 0)
-    ),
+    currentCycle,
     lifetime: mergeLeaderboardScopes(
       boards.map((board) => board.lifetime),
       boards.map((_, index) => `账号 ${index + 1}`),
@@ -1176,7 +1260,8 @@ async function mergePeerLeaderboards(local: PublicCodexLeaderboard): Promise<Pub
 async function summarizeLeaderboardFile(
   filePath: string,
   store: ProjectStore,
-  resolveSessionOwner: (sessionId: string) => string | null
+  resolveSessionOwner: (sessionId: string) => string | null,
+  preciseTimestamps = false
 ): Promise<LeaderboardFileSummary> {
   const stat = fs.statSync(filePath);
   const usageByKey = new Map<string, LeaderboardFileUsage>();
@@ -1185,6 +1270,12 @@ async function summarizeLeaderboardFile(
   let model = "unknown";
   let effort: string | null = null;
   let startAt: number | null = null;
+  let tokenEventIndex = 0;
+  const knownUsers = new Map<string, boolean>();
+  const isKnownUser = (id: string): boolean => {
+    if (!knownUsers.has(id)) knownUsers.set(id, store.getUser(id) !== null);
+    return knownUsers.get(id)!;
+  };
   const input = fs.createReadStream(filePath, { encoding: "utf8", highWaterMark: 256 * 1024 });
   const lines = createInterface({ input, crlfDelay: Infinity });
 
@@ -1200,11 +1291,11 @@ async function summarizeLeaderboardFile(
     const payload = asRecord(record.payload);
     if (type === "session_meta") {
       sessionId = stringOrNull(payload.session_id) ?? stringOrNull(payload.id) ?? sessionId;
-      userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd));
+      userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd), isKnownUser);
       continue;
     }
     if (type === "turn_context") {
-      userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd));
+      userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd), isKnownUser);
       model = stringOrNull(payload.model) ?? model;
       effort = stringOrNull(payload.effort)
         ?? stringOrNull(asRecord(asRecord(payload.collaboration_mode).settings).reasoning_effort)
@@ -1222,7 +1313,7 @@ async function summarizeLeaderboardFile(
       startAt = startAt === null ? parsedTimestamp : Math.min(startAt, parsedTimestamp);
     }
     if (!userId) {
-      userId = resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd)) ?? "unknown";
+      userId = resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd), isKnownUser) ?? "unknown";
     }
     const info = asRecord(payload.info);
     const usageRecord = asRecord(info.last_token_usage);
@@ -1239,7 +1330,7 @@ async function summarizeLeaderboardFile(
     if (!usage.totalTokens) continue;
     const primary = asRecord(asRecord(payload.rate_limits).primary);
     const resetAt = safeCount(primary.resets_at) ?? safeCount(primary.resetsAt);
-    const key = JSON.stringify([userId, sessionId, model, effort, resetAt, dayKey]);
+    const key = JSON.stringify([userId, sessionId, model, effort, resetAt, dayKey, preciseTimestamps ? tokenEventIndex++ : null]);
     const existing = usageByKey.get(key);
     if (existing) {
       addTokenAccumulator(existing, usage);
@@ -1253,19 +1344,31 @@ async function summarizeLeaderboardFile(
     }
   }
 
-  return { size: stat.size, mtimeMs: stat.mtimeMs, startAt, usage: Array.from(usageByKey.values()) };
+  return { size: stat.size, mtimeMs: stat.mtimeMs, startAt, usage: Array.from(usageByKey.values()), granularity: preciseTimestamps ? "event" : "day" };
 }
 
-async function readCodexLeaderboard(source: LeaderboardAccountSource, store: ProjectStore): Promise<PublicCodexLeaderboard> {
+async function readCodexLeaderboard(
+  source: LeaderboardAccountSource,
+  store: ProjectStore,
+  apiCycleWindow?: LeaderboardCycleWindow,
+  requireDailyBreakdown = false
+): Promise<PublicCodexLeaderboard> {
   loadLeaderboardFileCache();
   const files = walkJsonlFiles(source.sessionsRoot);
   const currentQuota = source.quota;
-  const currentResetAt = currentQuota.rateLimits?.primary?.resetsAt ?? null;
-  const currentResetWindowMins = currentQuota.rateLimits?.primary?.windowDurationMins ?? null;
-  const currentQuotaUsedPercent = currentQuota.rateLimits?.primary?.usedPercent ?? null;
-  const currentCycleStartAt = currentResetAt !== null && currentResetWindowMins !== null && currentResetWindowMins > 0
-    ? currentResetAt - currentResetWindowMins * 60
-    : null;
+  const currentResetAt = source.kind === "api-provider" ? apiCycleWindow?.resetAt ?? null : currentQuota.rateLimits?.primary?.resetsAt ?? null;
+  const currentResetWindowMins = source.kind === "api-provider" ? null : currentQuota.rateLimits?.primary?.windowDurationMins ?? null;
+  const currentQuotaUsedPercent = source.kind === "api-provider" ? null : currentQuota.rateLimits?.primary?.usedPercent ?? null;
+  const currentCycleStartAt = source.kind === "api-provider"
+    ? apiCycleWindow?.startAt ?? Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60
+    : currentResetAt !== null && currentResetWindowMins !== null && currentResetWindowMins > 0
+      ? currentResetAt - currentResetWindowMins * 60
+      : null;
+  const cycleWindow = currentCycleStartAt === null ? null : {
+    startAt: currentCycleStartAt,
+    resetAt: currentResetAt,
+    resetWindowMins: currentResetWindowMins
+  };
   const lifetime = new Map<string, AggregateBucket>();
   const currentCycle = new Map<string, AggregateBucket>();
   const errors: string[] = [];
@@ -1288,24 +1391,35 @@ async function readCodexLeaderboard(source: LeaderboardAccountSource, store: Pro
     try {
       const stat = fs.statSync(filePath);
       let summary = leaderboardFileCache.get(filePath);
-      const needsCurrentCycleDailyBreakdown = Boolean(
+      const needsCurrentCycleDailyBreakdown = requireDailyBreakdown && Boolean(
         summary
         && currentCycleStartAt !== null
         && stat.mtimeMs >= currentCycleStartAt * 1000
         && summary.usage.some((entry) => entry.dayKey === undefined)
       );
-      if (!summary || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs || needsCurrentCycleDailyBreakdown) {
-        summary = await summarizeLeaderboardFile(filePath, store, resolveSessionOwner);
+      const needsEventTimestamps = source.kind === "api-provider" && summary?.granularity !== "event";
+      if (!summary || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs || needsCurrentCycleDailyBreakdown || needsEventTimestamps) {
+        summary = await summarizeLeaderboardFile(filePath, store, resolveSessionOwner, source.kind === "api-provider");
         leaderboardFileCache.set(filePath, summary);
         cacheChanged = true;
+      }
+      if (summary.usage.some((entry) => entry.userId === "unknown")) {
+        const cwdUser = userIdFromSessionCwd(sessionCwdFromFileStart(filePath), (id) => store.getUser(id) !== null);
+        if (cwdUser) {
+          for (const entry of summary.usage) {
+            if (entry.userId === "unknown") entry.userId = cwdUser;
+          }
+          cacheChanged = true;
+        }
       }
       if (summary.startAt !== null) {
         lifetimeStartAt = lifetimeStartAt === null ? summary.startAt : Math.min(lifetimeStartAt, summary.startAt);
       }
       for (const entry of summary.usage) {
-        recordUsage(lifetime, entry.userId, entry.sessionId, entry.model, entry.effort, entry);
-        if (currentResetAt !== null && entry.resetAt === currentResetAt) {
-          recordUsage(currentCycle, entry.userId, entry.sessionId, entry.model, entry.effort, entry);
+        const owner = resolveSessionOwner(entry.sessionId) ?? entry.userId;
+        recordUsage(lifetime, owner, entry.sessionId, entry.model, entry.effort, entry);
+        if (cycleWindow && usageInLeaderboardCycle(entry, source.kind, cycleWindow)) {
+          recordUsage(currentCycle, owner, entry.sessionId, entry.model, entry.effort, entry);
         }
       }
     } catch (error) {
@@ -1325,7 +1439,8 @@ async function readCodexLeaderboard(source: LeaderboardAccountSource, store: Pro
     currentCycle: finalizeLeaderboardScope(currentCycle, {
       totalQuotaUsedPercent: currentQuotaUsedPercent,
       resetAt: currentResetAt,
-      resetWindowMins: currentResetWindowMins
+      resetWindowMins: currentResetWindowMins,
+      startAt: currentCycleStartAt
     }),
     lifetime: finalizeLeaderboardScope(lifetime, {
       totalQuotaUsedPercent: null,
@@ -1353,9 +1468,16 @@ async function readCachedCodexLeaderboard(
     return leaderboardRefreshInFlight;
   }
   const refresh = (async () => {
+    const apiCycleWindow = apiLeaderboardCycleWindow(
+      sources.filter((source) => source.kind !== "api-provider").map((source) => ({
+        resetAt: source.quota.rateLimits?.primary?.resetsAt ?? null,
+        resetWindowMins: source.quota.rateLimits?.primary?.windowDurationMins ?? null
+      })),
+      Math.floor(Date.now() / 1000)
+    );
     const boards: PublicCodexLeaderboard[] = [];
-    for (const source of sources) boards.push(await readCodexLeaderboard(source, store));
-    return boards.length === 1 ? boards[0] : mergeAccountLeaderboards(boards);
+    for (const source of sources) boards.push(await readCodexLeaderboard(source, store, apiCycleWindow));
+    return boards.length === 1 ? boards[0] : mergeAccountLeaderboards(boards, sources);
   })()
     .then((local) => includePeers ? mergePeerLeaderboards(local) : local)
     .then((data) => {
@@ -1375,6 +1497,7 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
     return snapshots.map((entry) => ({
       id: entry.id,
       label: entry.label,
+      kind: entry.kind,
       sessionsRoot: path.join(entry.codexHome, "sessions"),
       quota: sanitizeCodexQuota(entry.account, entry.limits, entry.usage, entry.errors)
     }));
@@ -1382,6 +1505,7 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
   return [{
     id: serverConfig.leaderboardAccountLabel,
     label: serverConfig.leaderboardAccountLabel,
+    kind: "codex-account",
     sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/ls", ".codex"), "sessions"),
     quota: await readCachedCodexQuota(bridge, forceRefresh)
   }];
@@ -1418,7 +1542,7 @@ async function buildTrackedQuotaUsage(
   })();
 
   for (const source of sources) {
-    const board = await readCodexLeaderboard(source, store);
+    const board = await readCodexLeaderboard(source, store, undefined, true);
     errors.push(...board.errors.map((error) => `${source.label}: ${error}`));
     const cycle = board.currentCycle;
     const accountUsedPercent = cycle.quotaUsedPercent;
@@ -2822,7 +2946,12 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     try {
       reply.header("Cache-Control", "no-store");
       const forceRefresh = request.query.refresh === "true";
-      const sources = await leaderboardAccountSources(bridge, forceRefresh);
+      if (!forceRefresh && leaderboardCache && leaderboardCache.expiresAt > Date.now()) {
+        return { data: leaderboardCache.data };
+      }
+      // A token refresh must not wait for every provider's auth/quota probes.
+      // The quota bridge refreshes its own cached snapshot independently.
+      const sources = await leaderboardAccountSources(bridge, false);
       // Never merge peer boards into the normal endpoint. A peer can expose
       // historical JSONL records for the same login, which is useful for an
       // audit but misleading as a current-service quota view.

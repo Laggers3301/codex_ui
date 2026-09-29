@@ -48,7 +48,7 @@ import {
 import ReactMarkdown, { type Components } from "react-markdown";
 import { coalesceToolOutputs, collapseCodeModeWrappers, latestUserTimelineIndex, liveTimelineItems, mergeTimelineItems } from "./conversationTimeline";
 import { ToolReveal } from "./ToolReveal";
-import { parseQuestionTool, type ToolQuestion } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, type ToolQuestion } from "./questionTool";
 import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
@@ -985,7 +985,10 @@ function normalizedToken(value: unknown): string {
 
 function itemKind(item: ThreadItem): MessageKind {
   const token = `${normalizedToken(item.role)} ${normalizedToken(item.type)} ${normalizedToken(item.tool)}`;
-  if (token.includes("user")) {
+  // A tool named request_user_input is still a tool, not a user message.
+  const role = normalizedToken(item.role);
+  const type = normalizedToken(item.type);
+  if (role === "user" || type === "user" || type === "usermessage") {
     return "user";
   }
   if (token.includes("reasoning") || token.includes("thinking")) {
@@ -1205,17 +1208,48 @@ function TurnFileChangesCard({ changes, onReview, onFile }: {
   </div>;
 }
 
-function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuestion[]; onChoose?: (answer: string) => void }) {
-  return <div className="toolQuestionCard" aria-label="向用户提出的选择题">
+function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuestion[]; onChoose: (answer: string) => Promise<boolean> }) {
+  const [answers, setAnswers] = useState<(string | null)[]>(() => questions.map(() => null));
+  const [customAnswers, setCustomAnswers] = useState<string[]>(() => questions.map(() => ""));
+  const [submitting, setSubmitting] = useState(false);
+  const selectOption = async (questionIndex: number, option: string) => {
+    if (submitting) return;
+    const next = [...answers];
+    next[questionIndex] = option;
+    setAnswers(next);
+    if (next.some((answer) => answer === null)) return;
+    setSubmitting(true);
+    const reply = questions.length === 1 ? option : questions.map((question, index) => `${question.title}：${next[index]}`).join("\n");
+    if (!await onChoose(reply)) setSubmitting(false);
+  };
+  return <div className={`toolQuestionCard${submitting ? " submitting" : ""}`} aria-label="向用户提出的选择题">
     {questions.map((question, index) => <section className="toolQuestionBlock" key={`${index}:${question.title}`}>
       <div className="toolQuestionHeading"><span className="toolQuestionTag">选择题 {questions.length > 1 ? index + 1 : ""}</span><span>{question.title}</span></div>
       <div className="toolQuestionOptions">
-        {question.options.map((option, optionIndex) => <button type="button" className="toolQuestionOption" key={`${optionIndex}:${option}`} onClick={(event) => { event.stopPropagation(); onChoose?.(option); }} title="填入输入框，确认后发送">
+        {question.options.map((option, optionIndex) => <button type="button" className={`toolQuestionOption${answers[index] === option ? " selected" : ""}`} key={`${optionIndex}:${option}`} disabled={submitting} aria-pressed={answers[index] === option} onClick={(event) => { event.stopPropagation(); void selectOption(index, option); }} title="选择并发送答案">
           <span className="toolQuestionOptionNumber">{optionIndex + 1}</span><span>{option}</span>
         </button>)}
+        <div className="toolQuestionOther">
+          <input
+            type="text"
+            value={customAnswers[index] ?? ""}
+            onChange={(event) => setCustomAnswers((current) => current.map((value, position) => position === index ? event.target.value : value))}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+                event.preventDefault();
+                const answer = customAnswers[index]?.trim();
+                if (answer) void selectOption(index, answer);
+              }
+            }}
+            disabled={submitting}
+            aria-label={`自行输入答案：${question.title}`}
+            placeholder="其他想法，自行输入…"
+          />
+          <button type="button" disabled={submitting || !customAnswers[index]?.trim()} onClick={(event) => { event.stopPropagation(); void selectOption(index, customAnswers[index].trim()); }} aria-label="发送自定义答案" title="发送自定义答案"><Send size={15} /></button>
+        </div>
       </div>
     </section>)}
-    <p className="toolQuestionHint">选择后会填入输入框，由你确认发送；也可以直接输入自己的回答。</p>
+    <p className="toolQuestionHint">{submitting ? "正在发送答案…" : questions.length > 1 ? "选完所有问题后会自动发送；也可以在输入框输入自己的回答。" : "点击选项后自动发送；也可以在输入框输入自己的回答。"}</p>
   </div>;
 }
 
@@ -3323,19 +3357,19 @@ function leaderboardMarkdown(leaderboard: CodexLeaderboard, users: UserProfile[]
       lines.push("- 暂无本地 token_count 记录。");
       return lines;
     }
-    for (const user of scope.users.slice(0, 12)) {
+    for (const user of scope.users) {
       const name = userDisplayName(user.userId, users);
       const quotaPart = user.quotaPercent === null ? "" : `，约吃掉总额度 ${percentText(user.quotaPercent)}%`;
       lines.push(`- ${name}：${formatNumber(user.totalTokens)} token，占本榜 ${percentText(user.sharePercent)}%${quotaPart}`);
       lines.push(`  输入 ${formatNumber(user.inputTokens)} / 输出 ${formatNumber(user.outputTokens)} / reasoning ${formatNumber(user.reasoningOutputTokens)} / 会话 ${user.sessionCount}`);
       if (user.models.length) {
-        lines.push(`  模型：${user.models.slice(0, 4).map((model) => `${model.model}${model.effort ? ` ${model.effort}` : ""} ${formatNumber(model.totalTokens)}`).join("；")}`);
+        lines.push(`  模型：${user.models.map((model) => `${model.model}${model.effort ? ` ${model.effort}` : ""} ${formatNumber(model.totalTokens)}`).join("；")}`);
       }
     }
     return lines;
   };
   const lines = [
-    "**Codex Token 排行榜**",
+    "**模型 Token 排行榜**",
     ...section("当前周期", leaderboard.currentCycle),
     "",
     ...section("历史累计", leaderboard.lifetime)
@@ -3381,7 +3415,7 @@ function LeaderboardScopeView({ title, scope, users }: { title: string; scope: C
                 </div>
                 {user.models.length ? (
                   <div className="leaderboardModels">
-                    {user.models.slice(0, 4).map((model) => (
+                    {user.models.map((model) => (
                       <span key={`${model.model}-${model.effort ?? "default"}`}>
                         {model.model}{model.effort ? ` ${model.effort}` : ""} · {formatNumber(model.totalTokens)}
                       </span>
@@ -4105,6 +4139,8 @@ export function App() {
   const [socketStatus, setSocketStatus] = useState<"connecting" | "open" | "closed">("closed");
   const [liveDeltas, setLiveDeltas] = useState<Record<string, LiveDeltaEntry>>({});
   const [liveTools, setLiveTools] = useState<Record<string, LiveToolEntry>>({});
+  const [answeredQuestionItems, setAnsweredQuestionItems] = useState<Record<string, true>>({});
+  const submittingQuestionItemsRef = useRef(new Set<string>());
   const [expandedToolBundles, setExpandedToolBundles] = useState<Record<string, true>>({});
   const [expandedToolEntries, setExpandedToolEntries] = useState<Record<string, true>>({});
   const [pendingUserMessages, setPendingUserMessages] = useState<PendingUserMessage[]>([]);
@@ -6418,10 +6454,6 @@ export function App() {
   async function refreshLeaderboard(showDialog = true, force = false): Promise<CodexLeaderboard | null> {
     if (showDialog) {
       setLeaderboardOpen(true);
-      const cachedAt = leaderboard?.updatedAt ? Date.parse(leaderboard.updatedAt) : Number.NaN;
-      if (Number.isFinite(cachedAt) && Date.now() - cachedAt > 5 * 60_000) {
-        setLeaderboard(null);
-      }
     }
     setLeaderboardLoading(true);
 
@@ -8172,22 +8204,27 @@ export function App() {
     }
   }
 
-  async function sendPrompt(mode: "queue" | "steer" = "queue") {
-    const promptText = prompt.trim();
-    if (uploadingFiles || editingLastPrompt || editingCommitRef.current || !selectedProject || (!promptText && !uploadedFiles.length)) {
-      return;
+  async function sendPrompt(mode: "queue" | "steer" = "queue", questionAnswer?: string): Promise<boolean> {
+    const isQuestionAnswer = questionAnswer !== undefined;
+    const promptText = (questionAnswer ?? prompt).trim();
+    if ((!isQuestionAnswer && uploadingFiles) || editingLastPrompt || editingCommitRef.current || !selectedProject || (!promptText && (isQuestionAnswer || !uploadedFiles.length))) {
+      return false;
     }
-    if (!editingPromptDraft && await handleSlashCommand(promptText)) {
-      return;
+    if (isQuestionAnswer && editingPromptDraft) {
+      setError("请先完成或取消当前提问的编辑，再回答选择题。");
+      return false;
     }
-    if (planMode && selectedActiveTurnId) {
+    if (!isQuestionAnswer && !editingPromptDraft && await handleSlashCommand(promptText)) {
+      return true;
+    }
+    if (planMode && selectedActiveTurnId && !isQuestionAnswer) {
       setError("计划模式请等当前轮次结束后发送；如需排队或立即纠偏，请先关闭计划模式。");
-      return;
+      return false;
     }
     if (editingPromptDraft) {
       if (selectedThread?.id !== editingPromptDraft.threadId || selectedActiveTurnId) {
         setError("原会话仍在运行或已切换，请停止回答并重新打开会话后再发送。");
-        return;
+        return false;
       }
       editingCommitRef.current = true;
       setEditingLastPrompt(true);
@@ -8209,13 +8246,14 @@ export function App() {
       } catch (caught) {
         setDepartingTurnId(null);
         setError(`撤回原提问失败，草稿和附件仍保留：${caught instanceof Error ? caught.message : String(caught)}`);
-        return;
+        return false;
       } finally {
         editingCommitRef.current = false;
         setEditingLastPrompt(false);
       }
     }
-    const promptUploads = [...uploadedFiles];
+    const promptUploads = isQuestionAnswer ? [] : [...uploadedFiles];
+    const skillNames = isQuestionAnswer ? [] : selectedSkills.map((skill) => skill.name);
     const sentPromptText = promptWithUploadedFiles(promptText, promptUploads);
     const visibleText = visiblePromptText(promptText, promptUploads);
     if (selectedThread && selectedActiveTurnId && mode === "queue") {
@@ -8227,17 +8265,20 @@ export function App() {
           projectId: selectedProject.id,
           threadId: selectedThread.id,
           prompt: sentPromptText,
-          skillNames: selectedSkills.map((skill) => skill.name)
+          skillNames
         });
         pendingQueuedPromptsRef.current.set(requestId, { threadId: selectedThread.id, text: promptText, uploads: promptUploads });
-        setQueuedSubmissions((current) => [...current, { id: `pending:${requestId}`, input: [{ type: "text", text: sentPromptText }, ...selectedSkills.map((skill) => ({ type: "skill", name: skill.name }))], clientUserMessageId: requestId }]);
-        setPrompt("");
-        setUploadedFiles([]);
-        setSelectedSkillNames([]);
+        setQueuedSubmissions((current) => [...current, { id: `pending:${requestId}`, input: [{ type: "text", text: sentPromptText }, ...skillNames.map((skill) => ({ type: "skill", name: skill }))], clientUserMessageId: requestId }]);
+        if (!isQuestionAnswer) {
+          setPrompt("");
+          setUploadedFiles([]);
+          setSelectedSkillNames([]);
+        }
+        return true;
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : String(caught));
+        return false;
       }
-      return;
     }
     const requestId = `thread-${requestToken()}`;
     const requestViewToken = threadViewTokenRef.current;
@@ -8261,7 +8302,7 @@ export function App() {
           threadId: selectedThread.id,
           expectedTurnId: selectedActiveTurnId,
           prompt: sentPromptText,
-          skillNames: selectedSkills.map((skill) => skill.name)
+          skillNames
         }
       : selectedThread
       ? {
@@ -8271,7 +8312,7 @@ export function App() {
           projectId: selectedProject.id,
           threadId: selectedThread.id,
           prompt: sentPromptText,
-          skillNames: selectedSkills.map((skill) => skill.name),
+          skillNames,
           model: selectedModelProfile.model,
           reasoningEffort: selectedModelProfile.effort,
           collaborationMode: planMode ? "plan" : "default",
@@ -8285,7 +8326,7 @@ export function App() {
           userId: selectedUserId,
           projectId: selectedProject.id,
           prompt: sentPromptText,
-          skillNames: selectedSkills.map((skill) => skill.name),
+          skillNames,
           model: selectedModelProfile.model,
           reasoningEffort: selectedModelProfile.effort,
           collaborationMode: planMode ? "plan" : "default",
@@ -8318,12 +8359,43 @@ export function App() {
         }
       ]);
       releasePendingPromptBottomHold(requestId, keepAtBottomUntil);
-      setPrompt("");
-      setUploadedFiles([]);
-      setSelectedSkillNames([]);
+      if (!isQuestionAnswer) {
+        setPrompt("");
+        setUploadedFiles([]);
+        setSelectedSkillNames([]);
+      }
+      return true;
     } catch (caught) {
       promptRequestContextsRef.current.delete(requestId);
       setError(caught instanceof Error ? caught.message : String(caught));
+      return false;
+    }
+  }
+
+  function questionIsAnswered(itemId: string, turnId?: string, visibleItems?: ThreadItem[]): boolean {
+    const threadId = selectedThread?.id;
+    if (!threadId) return false;
+    if (answeredQuestionItems[`${threadId}:${itemId}`]) return true;
+    if (visibleItems && questionHasLaterUserMessage(visibleItems, itemId)) return true;
+    const turns = selectedThread.turns;
+    const turnIndex = turns.findIndex((turn) => turn.id === turnId || (turn.items ?? []).some((item) => item.id === itemId));
+    if (turnIndex < 0) return false;
+    if (questionHasLaterUserMessage(turns[turnIndex].items ?? [], itemId)) return true;
+    return turns.slice(turnIndex + 1).some((turn) => turnHasUserItem(turn) || Boolean(turnUserText(turn)));
+  }
+
+  async function chooseToolQuestion(itemId: string, answer: string): Promise<boolean> {
+    const threadId = selectedThread?.id;
+    if (!threadId || !selectedProject || !answer.trim()) return false;
+    const key = `${threadId}:${itemId}`;
+    if (submittingQuestionItemsRef.current.has(key) || questionIsAnswered(itemId)) return false;
+    submittingQuestionItemsRef.current.add(key);
+    try {
+      const accepted = await sendPrompt(selectedActiveTurnId ? "steer" : "queue", answer);
+      if (accepted) setAnsweredQuestionItems((current) => ({ ...current, [key]: true }));
+      return accepted;
+    } finally {
+      submittingQuestionItemsRef.current.delete(key);
     }
   }
 
@@ -9287,10 +9359,11 @@ export function App() {
     }
     const liveToolItem: ThreadItem = { id: entry.id, type: "toolCall", tool: entry.tool, input: entry.input };
     const liveQuestions = parseQuestionTool(safeText(entry.tool), entry.input);
+    if (liveQuestions && questionIsAnswered(entry.id, entry.turnId ?? undefined)) return null;
     return (
       <article className="messageItem kind-tool type-toolCall live" key={entry.id}>
         <div className="messageMeta">{entry.completed ? "工具输出" : "调用工具"} · {entry.tool}</div>
-        {liveQuestions ? <ToolQuestionCard questions={liveQuestions} onChoose={(answer) => { setPrompt((current) => [current.trim(), answer].filter(Boolean).join("\n")); window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".composerRichInput")?.focus()); }} /> : entry.input ? <pre>{safeText(entry.input)}</pre> : null}
+        {liveQuestions ? <ToolQuestionCard questions={liveQuestions} onChoose={(answer) => chooseToolQuestion(entry.id, answer)} /> : entry.input ? <pre>{safeText(entry.input)}</pre> : null}
         <MessageImagePreviews item={liveToolItem} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
         {!liveQuestions && entry.output ? <pre className="outputBlock">{displayOutputText(entry.output)}</pre> : entry.completed || liveQuestions ? null : <div className="messageBody">正在执行...</div>}
       </article>
@@ -9367,7 +9440,8 @@ export function App() {
     const call = entries.find((entry) => safeText(entry.type).toLowerCase() === "toolcall") ?? entries[0];
     const toolName = safeText(call.tool).trim() || (safeText(call.type).toLowerCase() === "filechange" ? "文件变更" : "tool");
     const inputText = safeText(call.input) || safeText(call.command);
-    const questions = parseQuestionTool(toolName, call.input);
+    const questions = parseQuestionToolItem(call);
+    if (questions && questionIsAnswered(call.id, contextTurnId)) return null;
     const toolSummary = questions?.map((question) => question.title).join(" · ") || ([
       ...(Array.isArray(call.summary) ? call.summary.map(safeText) : []),
       safeText(call.command),
@@ -9407,7 +9481,7 @@ export function App() {
       >
         <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
         <ToolReveal open={expanded}>
-        {questions ? <ToolQuestionCard questions={questions} onChoose={(answer) => { setPrompt((current) => [current.trim(), answer].filter(Boolean).join("\n")); window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".composerRichInput")?.focus()); }} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
+        {questions ? <ToolQuestionCard questions={questions} onChoose={(answer) => chooseToolQuestion(call.id, answer)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
         <MessageImagePreviews item={call} projectId={contextProjectId} onOpenFileLink={openFilePreview} />
         {hasChanges ? <button className="openDiffReviewButton" type="button" onClick={(event) => { event.stopPropagation(); openDiffReview(call.changes ?? [], "本轮文件变更", contextTurnId, call.id, contextThreadId); }}><FileText size={14} /> 查看变更 · {call.changes?.length ?? 0} 个文件</button> : null}
         {!questions && outputText ? <DeferredToolOutput text={displayOutputText(outputText)} deferred={Boolean(deferredOutputItem)} threadId={contextThreadId} itemId={String(deferredOutputItem?.outputItemId ?? deferredOutputItem?.id ?? call.id)} projectId={contextProjectId} /> : null}
@@ -10499,11 +10573,11 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             setLeaderboardOpen(false);
           }
         }}>
-          <section className="settingsDialog leaderboardDialog" role="dialog" aria-modal="true" aria-label="Codex Token 排行榜">
+          <section className="settingsDialog leaderboardDialog" role="dialog" aria-modal="true" aria-label="模型 Token 排行榜">
             <div className="dialogHeader">
               <div>
                 <h2>Token 排行榜</h2>
-                <p>按本机 Codex 会话记录统计。</p>
+                <p>按本机会话 token_count 统计，包含 API 模型；不等同供应商账单。</p>
               </div>
               <button className="iconButton" type="button" onClick={() => setLeaderboardOpen(false)} title="关闭">
                 <X size={18} />
@@ -10517,7 +10591,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <LeaderboardScopeView title="当前周期" scope={leaderboard.currentCycle} users={users} />
                   <LeaderboardScopeView title="历史累计" scope={leaderboard.lifetime} users={users} />
                   {leaderboard.errors.length ? <p className="leaderboardWarning">读取警告：{leaderboard.errors.join("；")}</p> : null}
-                  <p className="leaderboardUpdated">更新于 {new Date(leaderboard.updatedAt).toLocaleString()}</p>
+                  <p className="leaderboardUpdated">{leaderboardLoading ? "正在更新 · " : ""}更新于 {new Date(leaderboard.updatedAt).toLocaleString()}</p>
                 </>
               ) : (
                 <div className="emptyState">还没有排行榜数据。</div>
@@ -10904,12 +10978,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <button
               className="leaderboardButton"
               type="button"
-              onClick={() => void refreshLeaderboard(true, true)}
-              disabled={leaderboardLoading}
+              onClick={() => {
+                setLeaderboardOpen(true);
+                void refreshLeaderboard(false, false);
+              }}
               title="查看当前周期和历史累计 token 排行榜"
             >
               <Trophy size={14} />
-              {leaderboardLoading ? "排行榜..." : "排行榜"}
+              排行榜
             </button>
             <PolishedSelect<SandboxMode>
               className="topbarPolicySelect"
@@ -11755,6 +11831,16 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   let toolGroupIndex = 0;
                   for (const [itemIndex, item] of items.entries()) {
                     const kind = itemKind(item);
+                    const inlineQuestions = kind === "tool" ? parseQuestionToolItem(item) : null;
+                    if (inlineQuestions) {
+                      toolGroupIndex = flushToolGroup(toolGroupIndex);
+                      if (!questionIsAnswered(item.id, turn.id, items)) renderedHistoryItems.push(
+                        <article className="messageItem kind-question" key={`${turn.id}-${item.id}-question`}>
+                          <ToolQuestionCard questions={inlineQuestions} onChoose={(answer) => chooseToolQuestion(item.id, answer)} />
+                        </article>
+                      );
+                      continue;
+                    }
                     if (kind === "tool" || kind === "reasoning") {
                       const itemForRender = item;
                       const itemRefText = kind === "reasoning" ? reasoningItemDisplayText(itemForRender) : itemText(itemForRender);

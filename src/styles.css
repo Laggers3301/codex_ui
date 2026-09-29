@@ -7415,7 +7415,17 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .toolQuestionOptions { display: grid; gap: 7px; margin-top: 12px; }
 .toolQuestionOption { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; padding: 9px 11px; text-align: left; border: 1px solid var(--line); border-radius: 11px; background: color-mix(in srgb, var(--panel-strong) 68%, var(--bg)); color: var(--text); font-size: 13px; line-height: 1.45; transition: background .22s cubic-bezier(.2,.8,.2,1), border-color .22s cubic-bezier(.2,.8,.2,1), transform .22s cubic-bezier(.2,.8,.2,1); }
 .toolQuestionOption:hover, .toolQuestionOption:focus-visible { background: color-mix(in srgb, var(--teal) 11%, var(--panel-strong)); border-color: color-mix(in srgb, var(--teal) 48%, var(--line)); transform: translateY(-1px); outline: none; }
+.toolQuestionOption.selected { background: color-mix(in srgb, var(--teal) 13%, var(--panel-strong)); border-color: color-mix(in srgb, var(--teal) 48%, var(--line)); }
+.toolQuestionOption:disabled { cursor: default; opacity: .72; }
 .toolQuestionOptionNumber { display: grid; place-items: center; flex: 0 0 24px; height: 24px; border-radius: 7px; background: color-mix(in srgb, var(--teal) 13%, transparent); color: var(--teal); font-size: 12px; font-weight: 600; }
+.toolQuestionOther { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 5px 4px 11px; border: 1px solid var(--line); border-radius: 11px; background: color-mix(in srgb, var(--panel-strong) 68%, var(--bg)); transition: border-color .22s cubic-bezier(.2,.8,.2,1), background .22s cubic-bezier(.2,.8,.2,1); }
+.toolQuestionOther:focus-within { border-color: color-mix(in srgb, var(--teal) 48%, var(--line)); background: color-mix(in srgb, var(--teal) 7%, var(--panel-strong)); }
+.toolQuestionOther input { flex: 1 1 auto; min-width: 0; padding: 5px 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; font-size: 13px; line-height: 1.45; }
+.toolQuestionOther input::placeholder { color: var(--muted); opacity: 1; }
+.toolQuestionOther button { display: grid; place-items: center; flex: 0 0 28px; height: 28px; border: 0; border-radius: 8px; background: color-mix(in srgb, var(--teal) 15%, transparent); color: var(--teal); cursor: pointer; }
+.toolQuestionOther button:hover:not(:disabled), .toolQuestionOther button:focus-visible { background: color-mix(in srgb, var(--teal) 25%, transparent); outline: none; }
+.toolQuestionOther button:disabled { opacity: .42; cursor: default; }
+.toolQuestionCard.submitting { opacity: .7; transform: scale(.995); transition: opacity .18s ease-out, transform .18s ease-out; }
 .toolQuestionHint { margin: 10px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
 
 .toolBundleEntry .messageMeta {
