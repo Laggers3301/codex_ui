@@ -44,7 +44,8 @@ import { advanceTrackedQuotaLedger, type TrackedQuotaLedgerAccount } from "./tra
 
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
-// Keep each logged-in user's workspace under the configured private data root.
+// Default Codex cwd per logged-in user. This prevents generated artifacts from
+// accumulating in /home/ls while retaining historical shared-home projects.
 const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
@@ -302,7 +303,7 @@ function profilesForModel(model: { slug: string; displayName: string; priority: 
   // compatibility, but do not advertise it as a selectable UI profile.
   return efforts.filter((effort) => effort !== "ultra").map((effort) => ({
     id: `${model.slug}:${effort}`,
-    label: `${model.displayName} ${effortLabels[effort]}`,
+    label: `${model.displayName} ${effort}`,
     model: model.slug,
     effort,
     displayName: model.displayName,
@@ -372,6 +373,13 @@ function listModelProfiles(): PublicModelProfile[] {
       env: process.env
     });
     const profiles = modelProfilesFromCatalog(JSON.parse(stdout));
+    for (const catalogPath of (process.env.CODEX_WEB_EXTRA_MODEL_CATALOGS ?? "").split(path.delimiter).filter(Boolean)) {
+      try {
+        profiles.push(...modelProfilesFromCatalog(JSON.parse(fs.readFileSync(catalogPath, "utf8"))));
+      } catch (error) {
+        console.warn(`Unable to read extra model catalog ${catalogPath}:`, error);
+      }
+    }
     modelCatalogCache = { expiresAt: now + 5 * 60 * 1000, data: profiles.length ? profiles : fallbackModelProfiles() };
   } catch {
     modelCatalogCache = { expiresAt: now + 60 * 1000, data: fallbackModelProfiles() };
@@ -1374,7 +1382,7 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
   return [{
     id: serverConfig.leaderboardAccountLabel,
     label: serverConfig.leaderboardAccountLabel,
-    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? process.cwd(), ".codex"), "sessions"),
+    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/ls", ".codex"), "sessions"),
     quota: await readCachedCodexQuota(bridge, forceRefresh)
   }];
 }
@@ -2531,7 +2539,7 @@ async function filterOwnedThreadList(
       continue;
     }
     const fullThread = await readOwnedThreadForList(bridge, threadId);
-    // Ownership is the access boundary. A legacy session may retain an older cwd as
+    // Ownership is the access boundary. A legacy session may retain /home/ls as
     // its historical cwd after the user's default workspace is moved.
     if (fullThread) {
       byId.set(threadId, listItemSummaryFromThread(fullThread));
@@ -2556,7 +2564,7 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
   fs.mkdirSync(rootPath, { recursive: true, mode: 0o700 });
 
   // List the personal workspace first: a newly opened page selects it by
-  // default. Existing projects (including historical shared-home conversations)
+  // default. Existing projects (including historical /home/ls conversations)
   // are deliberately retained below it.
   const workspace = store.getProjectByRootPath(rootPath, userId) ?? store.createProject({
     name: "我的工作区",
@@ -2793,6 +2801,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           accounts: snapshots.map((entry) => ({
             id: entry.id,
             label: entry.label,
+            kind: entry.kind,
             health: entry.health,
             selectedForNewThreads: entry.selectedForNewThreads,
             assignedThreadCount: entry.assignedThreadCount,
@@ -3560,6 +3569,10 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const supported = listModelProfiles().some((profile) => profile.model === input.model && profile.effort === input.reasoningEffort);
       if (!supported) {
         return reply.code(400).send({ error: "Selected model profile is not available." });
+      }
+      const poolBridge = isAccountPoolBridge(bridge) ? bridge : null;
+      if (poolBridge && !poolBridge.canThreadUseModel(request.params.threadId, input.model)) {
+        return reply.code(409).send({ error: "这个会话绑定了原供应商运行时，不能直接切换到其他供应商。请从上一轮回答创建分支后再选择新模型。" });
       }
       const data = store.setThreadModelConfig(request.params.threadId, userId, input.model, input.reasoningEffort);
       if (!data) {

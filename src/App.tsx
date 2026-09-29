@@ -9,6 +9,7 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import { BubbleMenu } from "@tiptap/react/menus";
 import StarterKit from "@tiptap/starter-kit";
 import { toggleComposerList } from "./composerList";
+import { classifyProviderFailure, type ProviderFailureNotice } from "./providerFailure";
 import { exhaustedAccountSuggestion, type ExhaustedAccountSuggestion } from "./accountExhaustion";
 import "katex/dist/katex.min.css";
 import {
@@ -19,6 +20,7 @@ import {
   Copy,
   FileText,
   Folder,
+  FolderPlus,
   FolderOpen,
   GitBranch,
   Lightbulb,
@@ -389,6 +391,106 @@ function PolishedSelect<T extends string>({
   );
 }
 
+type ModelPickerSection = "root" | "gpt" | "domestic" | "doubao" | "deepseek" | "kimi" | "mimo" | "glm" | "minimax";
+const domesticModelGroups: Array<{ key: ModelPickerSection; label: string }> = [
+  { key: "doubao", label: "Doubao" },
+  { key: "deepseek", label: "DeepSeek" },
+  { key: "kimi", label: "Kimi" },
+  { key: "mimo", label: "MiMo" },
+  { key: "glm", label: "GLM" },
+  { key: "minimax", label: "MiniMax" }
+];
+
+function modelPickerGroup(model: string): ModelPickerSection {
+  if (model.startsWith("gpt-")) return "gpt";
+  if (model.startsWith("doubao-") || model === "ark-code-latest") return "doubao";
+  if (model.startsWith("deepseek-")) return "deepseek";
+  if (model.startsWith("kimi-")) return "kimi";
+  if (model.startsWith("mimo-")) return "mimo";
+  if (model.startsWith("glm-")) return "glm";
+  if (model.startsWith("minimax-")) return "minimax";
+  return "domestic";
+}
+
+function ModelGroupedSelect({
+  value, profiles, onChange, disabled = false, title
+}: {
+  value: string;
+  profiles: ModelProfile[];
+  onChange: (value: string) => void;
+  disabled?: boolean;
+  title?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [branch, setBranch] = useState<"gpt" | "domestic" | null>(null);
+  const [lastBranch, setLastBranch] = useState<"gpt" | "domestic">("domestic");
+  const [provider, setProvider] = useState<ModelPickerSection | null>(null);
+  const [lastProvider, setLastProvider] = useState<ModelPickerSection>("doubao");
+  const menuPresence = useExitPresence(open);
+  const visibleProfiles = profiles.filter((profile) => !isUltraModelProfile(profile));
+  const selected = visibleProfiles.find((profile) => profile.id === value) ?? visibleProfiles[0];
+  const modelNames = [...new Set(visibleProfiles.map((profile) => profile.model))];
+  const groupCount = (group: ModelPickerSection) => modelNames.filter((model) => modelPickerGroup(model) === group).length;
+  const selectBranch = (next: "gpt" | "domestic") => {
+    setLastBranch(next);
+    setBranch(next);
+    setProvider(null);
+  };
+  const selectProvider = (next: ModelPickerSection) => {
+    setLastProvider(next);
+    setProvider(next);
+  };
+  const profileOptions = (group: ModelPickerSection) => visibleProfiles.filter((profile) => modelPickerGroup(profile.model) === group).map((profile) => (
+    <button className={`polishedSelectOption groupedModelProfile${profile.id === value ? " selected" : ""}`}
+      type="button" role="option" aria-selected={profile.id === value} key={profile.id}
+      onClick={() => { onChange(profile.id); setOpen(false); }}>
+      <span><strong>{profile.label}</strong></span>
+      <span className="polishedSelectCheck" aria-hidden="true">{profile.id === value ? "✓" : ""}</span>
+    </button>
+  ));
+  return (
+    <div className={`polishedSelect v2ModelPicker groupedModelPicker ${open ? "open" : ""}`}
+      onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false); }}>
+      <button className="polishedSelectTrigger" type="button" disabled={disabled} title={title}
+        aria-haspopup="dialog" aria-expanded={open}
+        onClick={() => { if (!open) { setBranch(null); setProvider(null); } setOpen((current) => !current); }}>
+        <span>{selected?.label ?? "选择模型"}</span>
+        <span className="polishedSelectChevron" aria-hidden="true" />
+      </button>
+      {menuPresence.present ? (
+        <div className={`polishedSelectMenu groupedModelMenu${menuPresence.closing ? " uiClosing" : ""}`}
+          role="dialog" aria-label="选择模型和推理档位" aria-hidden={menuPresence.closing} inert={menuPresence.closing}
+          onMouseDown={(event) => event.preventDefault()}>
+          <div className="groupedModelHeading">选择模型</div>
+          <div className="groupedModelRows">
+            <button className={`groupedModelRow${branch === "gpt" ? " active" : ""}`} type="button" aria-expanded={branch === "gpt"} onClick={() => selectBranch("gpt")}><span>GPT</span><ChevronRight size={15} /></button>
+            <button className={`groupedModelRow${branch === "domestic" ? " active" : ""}`} type="button" aria-expanded={branch === "domestic"} onClick={() => selectBranch("domestic")}><span>国产模型</span><ChevronRight size={15} /></button>
+          </div>
+          <div className="groupedModelCascade groupedModelSecond" data-branch={lastBranch} data-visible={Boolean(branch)} aria-hidden={!branch} inert={!branch}>
+            <button className="groupedModelBack" type="button" onClick={() => { setProvider(null); setBranch(null); }} aria-label="收起子目录">
+              <ChevronLeft size={16} /><span>{lastBranch === "gpt" ? "GPT" : "国产模型"}</span>
+            </button>
+            <div className="groupedModelRows" role={lastBranch === "gpt" ? "listbox" : undefined}>
+              {lastBranch === "gpt" ? profileOptions("gpt") : domesticModelGroups.filter((group) => groupCount(group.key) > 0).map((group) => (
+                <button className={`groupedModelRow${provider === group.key ? " active" : ""}`} type="button" key={group.key}
+                  aria-expanded={provider === group.key} onClick={() => selectProvider(group.key)}>
+                  <span>{group.label}</span><ChevronRight size={15} />
+                </button>
+              ))}
+            </div>
+            <div className="groupedModelCascade groupedModelThird" data-visible={Boolean(provider) && branch === "domestic"} aria-hidden={!provider || branch !== "domestic"} inert={!provider || branch !== "domestic"}>
+              <button className="groupedModelBack" type="button" onClick={() => setProvider(null)} aria-label="收起模型列表">
+                <ChevronLeft size={16} /><span>{domesticModelGroups.find((group) => group.key === lastProvider)?.label ?? "模型"}</span>
+              </button>
+              <div className="groupedModelRows" role="listbox">{profileOptions(lastProvider)}</div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 type LocalMessageOptions = Pick<LocalMessage, "placement" | "threadId" | "afterTurnId">;
 
 interface LiveDeltaEntry {
@@ -569,7 +671,8 @@ function mergeAccountPoolWithLastKnownGood(previous: CodexAccountPool | null, in
 }
 
 function selectedQuotaFromPool(pool: CodexAccountPool | null): CodexQuota | null {
-  return pool?.accounts.find((account) => account.selectedForNewThreads)?.quota ?? pool?.accounts[0]?.quota ?? null;
+  const accounts = pool?.accounts.filter((account) => account.kind !== "api-provider") ?? [];
+  return accounts.find((account) => account.selectedForNewThreads)?.quota ?? accounts[0]?.quota ?? null;
 }
 
 function safeText(value: unknown): string {
@@ -2275,7 +2378,8 @@ const ReasoningMessage = memo(function ReasoningMessage({
 }) {
   const displayText = useMemo(() => reasoningDisplayText(text), [text]);
   const preview = useMemo(() => reasoningPreviewText(displayText), [displayText]);
-  const expandable = displayText.includes("\n") || preview.length > 180;
+  const [expanded, setExpanded] = useState(false);
+  const expandable = Boolean(displayText);
   const summary = (
     <>
       <ReasoningGlyph />
@@ -2288,12 +2392,17 @@ const ReasoningMessage = memo(function ReasoningMessage({
     return <div className="reasoningSummaryRow">{summary}</div>;
   }
   return (
-    <details className="reasoningDisclosure">
-      <summary>{summary}</summary>
-      <div className="reasoningExpandedBody">
-        <MarkdownMessage text={displayText} projectId={projectId} onOpenFileLink={onOpenFileLink} />
+    <div className={`reasoningDisclosure${expanded ? " expanded" : ""}`}>
+      <button className="reasoningDisclosureTrigger" type="button" aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}>{summary}</button>
+      <div className="reasoningExpandedShell" aria-hidden={!expanded} inert={!expanded}>
+        <div className="reasoningExpandedClip">
+          <div className="reasoningExpandedBody">
+            <MarkdownMessage text={displayText} projectId={projectId} onOpenFileLink={onOpenFileLink} />
+          </div>
+        </div>
       </div>
-    </details>
+    </div>
   );
 });
 
@@ -3056,7 +3165,9 @@ function rateLimitSnapshotText(snapshot: CodexRateLimitSnapshot | null | undefin
 
 function quotaSummaryLabel(quota: CodexQuota | null, pool: CodexAccountPool | null): string {
   if (pool?.accounts.length) {
-    const totalRemaining = pool.accounts.reduce((sum, account) => {
+    const codexAccounts = pool.accounts.filter((account) => account.kind !== "api-provider");
+    if (!codexAccounts.length) return "外部模型";
+    const totalRemaining = codexAccounts.reduce((sum, account) => {
       return sum + (remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent) ?? 0);
     }, 0);
     return `总额度 ${percentText(totalRemaining)}%`;
@@ -3132,22 +3243,24 @@ function AccountQuotaDetails({ quota }: { quota: CodexQuota }) {
 }
 
 function accountRemainingLabel(account: CodexAccountPoolAccount): string {
+  if (account.kind === "api-provider") return account.health === "ready" ? "运行时就绪" : "待检查";
   const remaining = remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent);
   return remaining === null ? "--" : `${percentText(remaining)}%`;
 }
 
 function QuotaPopover({ quota, pool, loading, closing }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean }) {
-  const defaultAccount = pool?.accounts.find((entry) => entry.selectedForNewThreads) ?? pool?.accounts[0] ?? null;
+  const quotaAccounts = pool?.accounts.filter((entry) => entry.kind !== "api-provider") ?? [];
+  const defaultAccount = quotaAccounts.find((entry) => entry.selectedForNewThreads) ?? quotaAccounts[0] ?? null;
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(defaultAccount?.id ?? null);
-  const selectedAccount = pool?.accounts.find((entry) => entry.id === selectedAccountId) ?? defaultAccount;
-  const currentThreadAccount = pool?.accounts.find((entry) => entry.id === pool.currentThreadAccountId) ?? null;
+  const selectedAccount = quotaAccounts.find((entry) => entry.id === selectedAccountId) ?? defaultAccount;
+  const currentThreadAccount = quotaAccounts.find((entry) => entry.id === pool?.currentThreadAccountId) ?? null;
   const selectedQuota = selectedAccount?.quota ?? quota;
   return (
     <section className={`quotaPopover accountPoolPopover ${closing ? "closing" : ""}`} role="status" aria-label="Codex 多账号额度详情" aria-hidden={closing} inert={closing}>
-      {pool && pool.accounts.length ? (
+      {pool && quotaAccounts.length ? (
         <>
           <div className="accountPoolTabs" role="tablist" aria-label="Codex 账号额度">
-            {pool.accounts.map((account) => (
+            {quotaAccounts.map((account) => (
               <button
                 className={`accountPoolTab ${account.id === selectedAccount?.id ? "active" : ""} ${account.health !== "ready" ? "degraded" : ""} ${account.id === currentThreadAccount?.id ? "current" : ""} ${(remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent) ?? 100) <= 10 ? "lowQuota" : ""}`}
                 data-account-id={account.id}
@@ -3305,7 +3418,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
               <span>账号剩余 {account.accountRemainingPercent === null ? "--" : `${percentText(account.accountRemainingPercent)}%`}</span>
             </header>
             <div className="trackedQuotaMetrics">
-              <div><span>{usage.userId} 今日</span><strong>{percentText(account.todayQuotaPercent)}%</strong><small>{formatNumber(account.todayTokens)} token</small></div>
+              <div><span>lzc 今日</span><strong>{percentText(account.todayQuotaPercent)}%</strong><small>{formatNumber(account.todayTokens)} token</small></div>
               <div><span>本周期累计</span><strong>{percentText(account.userCycleQuotaPercent)}%</strong><small>{formatNumber(account.userCycleTokens)} token</small></div>
             </div>
             <p>{account.cycleStartAt && account.resetAt
@@ -3323,10 +3436,10 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
             <em>{percentText(day.quotaPercent)}%</em>
             <small>{day.accounts.map((account) => `${account.accountLabel} ${percentText(account.quotaPercent)}%`).join(" · ")}</small>
           </article>
-        )) : <div className="emptyState">当前额度周期暂无该用户的 token 记录。</div>}
+        )) : <div className="emptyState">当前额度周期暂无 lzc token 记录。</div>}
       </section>
 
-      <p className="trackedQuotaFootnote">个人百分比为估算值，并非 OpenAI 提供的个人扣额；多人共用账号时无法精确拆分。{usage.unlimitedAccountId ? `${usage.userId} 仅可使用 ${usage.unlimitedAccountId}；其他账号的旧会话只可查看。` : `每日合计达到 ${percentText(usage.dailyLimitPercent)}% 后，后端禁止 ${usage.userId} 继续发起回答，但仍可登录和查看历史。`}</p>
+      <p className="trackedQuotaFootnote">个人百分比为估算值，并非 OpenAI 提供的个人扣额；多人共用账号时无法精确拆分。{usage.unlimitedAccountId ? `lzc 仅可使用 ${usage.unlimitedAccountId}；其他账号的旧会话只可查看。` : `每日合计达到 ${percentText(usage.dailyLimitPercent)}% 后，后端禁止 lzc 继续发起回答，但仍可登录和查看历史。`}</p>
       {usage.errors.length ? <p className="leaderboardWarning">读取警告：{usage.errors.join("；")}</p> : null}
     </div>
   );
@@ -3848,7 +3961,7 @@ export function App() {
     projectGroupRectsRef.current = next;
   }, [orderedProjects]);
   const userEffectInitializedRef = useRef(false);
-  const [projectRoot, setProjectRoot] = useState("");
+  const [projectRoot, setProjectRoot] = useState("/Volumes/DevDrive/program");
   const [threadContextFeatureEnabled, setThreadContextFeatureEnabled] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(() => storedNumber(sidebarWidthStorageKey, 280, 220, 640));
   const [threadListWidth, setThreadListWidth] = useState(() => storedNumber(threadListWidthStorageKey, 260, 180, 620));
@@ -4101,6 +4214,10 @@ export function App() {
   const [hoveredPromptNavigationKey, setHoveredPromptNavigationKey] = useState<string | null>(null);
   const [departingPromptPreview, setDepartingPromptPreview] = useState<{ item: PromptNavigationItem; index: number; threadId: string | null; userId: string } | null>(null);
   const [error, setError] = useState<string>("");
+  const [providerFailure, setProviderFailure] = useState<ProviderFailureNotice | null>(null);
+  const [providerFailureOpen, setProviderFailureOpen] = useState(false);
+  const providerFailurePresence = useExitPresence(providerFailureOpen, 260);
+  const [newThreadProjectPickerOpen, setNewThreadProjectPickerOpen] = useState(false);
   const [temporaryAsk, setTemporaryAsk] = useState<TemporaryAsk | null>(null);
   const [temporaryThread, setTemporaryThread] = useState<ThreadSummary | null>(null);
   const [temporaryPrompt, setTemporaryPrompt] = useState("");
@@ -4110,6 +4227,7 @@ export function App() {
   const [temporaryCloseConfirm, setTemporaryCloseConfirm] = useState(false);
   const [temporaryCloseDontAsk, setTemporaryCloseDontAsk] = useState(() => storedBoolean("codex-web-temporary-close-dont-ask"));
   const accountMenuPresence = useExitPresence(accountMenuOpen);
+  const newThreadProjectPickerPresence = useExitPresence(newThreadProjectPickerOpen, 260);
   const archivedPresence = useExitPresence(archivedOpen, 260);
   const worktreePresence = useExitPresence(worktreeOpen, 260);
   const hooksPresence = useExitPresence(hooksOpen, 260);
@@ -4869,6 +4987,13 @@ export function App() {
       setPrompt("");
     }
     window.setTimeout(() => scrollMessagesToBottom("auto"), 0);
+  }
+
+  function startNewThreadInProject(projectId: string) {
+    if (!projects.some((project) => project.id === projectId)) return;
+    setNewThreadProjectPickerOpen(false);
+    activateWorkspaceProject(projectId);
+    resetToNewThread(true);
   }
 
   function clearThreadResult(threadId: string) {
@@ -6962,13 +7087,15 @@ export function App() {
   }
 
   async function openDirectoryBrowser(directoryPath?: string) {
+    setDirectoryBrowser(null);
     setDirectoryBrowserLoading(true);
+    setDirectoryBrowserOpen(true);
     setError("");
     try {
       const response = await listDirectories(directoryPath);
       setDirectoryBrowser(response.data);
-      setDirectoryBrowserOpen(true);
     } catch (caught) {
+      setDirectoryBrowserOpen(false);
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setDirectoryBrowserLoading(false);
@@ -8810,6 +8937,15 @@ export function App() {
         if (message.requestId) {
           promptRequestContextsRef.current.delete(message.requestId);
         }
+        const providerNotice = isPromptRequest && !isStalePromptAck
+          ? classifyProviderFailure(requestContext?.model ?? selectedModelProfile.model, errorMessage)
+          : null;
+        if (providerNotice) {
+          setProviderFailure(providerNotice);
+          setProviderFailureOpen(true);
+          setError("");
+          return;
+        }
         setError(isStalePromptAck ? `后台会话执行失败：${errorMessage}` : errorMessage);
         return;
       }
@@ -8981,6 +9117,17 @@ export function App() {
       if (notification.method === "turn/completed") {
         const turnId = notificationTurnId(params);
         const threadId = notificationThreadId(params) ?? (turnId ? turnThreadIdsRef.current.get(turnId) ?? null : null);
+        const completedTurn = params.turn && typeof params.turn === "object" ? params.turn as Record<string, unknown> : {};
+        const completedStatus = typeof completedTurn.status === "string" ? completedTurn.status : "completed";
+        if (completedStatus === "failed" && threadId && selectedThreadRef.current?.id === threadId) {
+          const model = selectedThreadRef.current.configuredModel ?? selectedModelProfile.model;
+          const providerNotice = classifyProviderFailure(model, completedTurn.error);
+          if (providerNotice) {
+            setProviderFailure(providerNotice);
+            setProviderFailureOpen(true);
+            setError("");
+          }
+        }
         flushPendingLiveDeltas();
         markLiveEvent(threadId);
         if (!threadId) {
@@ -9030,18 +9177,18 @@ export function App() {
             }
             return {
               ...current,
-              status: "completed",
+              status: completedStatus,
               turns: current.turns.map((turn) => (
-                turn.id === turnId ? { ...turn, status: "completed", completedAt: turn.completedAt || now } : turn
+                turn.id === turnId ? { ...turn, status: completedStatus, completedAt: turn.completedAt || now } : turn
               ))
             };
           });
           setThreads((current) => current.map((item) => (
             item.id !== threadId ? item : {
               ...item,
-              status: "completed",
+              status: completedStatus,
               turns: item.turns.map((turn) => (
-                turn.id === turnId ? { ...turn, status: "completed", completedAt: turn.completedAt || now } : turn
+                turn.id === turnId ? { ...turn, status: completedStatus, completedAt: turn.completedAt || now } : turn
               ))
             }
           )));
@@ -10075,6 +10222,18 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         </div>
       ) : null}
 
+      {newThreadProjectPickerPresence.present ? <div className={`workspaceFeatureScrim${newThreadProjectPickerPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={newThreadProjectPickerPresence.closing} inert={newThreadProjectPickerPresence.closing} onMouseDown={(event) => { if (event.target === event.currentTarget) setNewThreadProjectPickerOpen(false); }}>
+        <section className="workspaceFeatureDialog newThreadProjectPicker uiGlassSurface" role="dialog" aria-modal="true" aria-label="选择新对话的工作区">
+          <header><strong>选择工作区</strong><button type="button" onClick={() => setNewThreadProjectPickerOpen(false)} aria-label="关闭"><X size={17} /></button></header>
+          <div className="workspaceFeatureBody">
+            <div className="newThreadProjectList">{orderedProjects.map((project) => <button type="button" key={project.id} onClick={() => startNewThreadInProject(project.id)}>
+              <Folder size={17} strokeWidth={2.2} /><span>{project.name}</span><SquarePen size={15} strokeWidth={2.2} />
+            </button>)}</div>
+            <button className="newThreadCreateProject" type="button" onClick={() => { setNewThreadProjectPickerOpen(false); window.setTimeout(() => void chooseDirectory(), 260); }}><FolderPlus size={17} strokeWidth={2.2} />新建工作区</button>
+          </div>
+        </section>
+      </div> : null}
+
       {archivedPresence.present && archivedThreads !== null ? <div className={`workspaceFeatureScrim${archivedPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={archivedPresence.closing} inert={archivedPresence.closing} onMouseDown={(event) => { if (event.target === event.currentTarget) setArchivedOpen(false); }}>
         <section className="workspaceFeatureDialog uiGlassSurface" role="dialog" aria-modal="true" aria-label="归档会话">
           <header><strong>归档会话</strong><button type="button" onClick={() => setArchivedOpen(false)} aria-label="关闭"><X size={17} /></button></header>
@@ -10266,8 +10425,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       ) : null}
 
       {directoryBrowserPresence.present ? (
-        <div className={`modalScrim uiExitLayer${directoryBrowserPresence.closing ? " uiClosing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="directory-browser-title" aria-hidden={directoryBrowserPresence.closing} inert={directoryBrowserPresence.closing}>
-          <div className="directoryDialog">
+        <div className={`modalScrim directoryPickerScrim uiExitLayer${directoryBrowserPresence.closing ? " uiClosing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="directory-browser-title" aria-hidden={directoryBrowserPresence.closing} inert={directoryBrowserPresence.closing}>
+          <div className="directoryDialog uiGlassSurface">
             <div className="directoryDialogHeader">
               <div>
                 <h2 id="directory-browser-title">选择项目目录</h2>
@@ -10380,10 +10539,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         <div className={`modalBackdrop uiExitLayer${trackedQuotaPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={trackedQuotaPresence.closing} inert={trackedQuotaPresence.closing} onMouseDown={(event) => {
           if (event.target === event.currentTarget) setTrackedQuotaOpen(false);
         }}>
-          <section className="settingsDialog trackedQuotaDialog" role="dialog" aria-modal="true" aria-label="指定用户额度占用">
+          <section className="settingsDialog trackedQuotaDialog" role="dialog" aria-modal="true" aria-label="lzc 额度占用">
             <div className="dialogHeader">
               <div>
-                <h2>{trackedQuotaUsage?.userId ?? "指定用户"} 额度占用</h2>
+                <h2>lzc 额度占用</h2>
                 <p>各账号分别统计，并按自然日合计。</p>
               </div>
               <button className="iconButton" type="button" onClick={() => setTrackedQuotaOpen(false)} title="关闭">
@@ -10394,7 +10553,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               ? <div className="emptyState">正在核对各账号的会话记录…</div>
               : trackedQuotaUsage
                 ? <TrackedQuotaDetails usage={trackedQuotaUsage} />
-                : <div className="emptyState">暂未读取到指定用户用量。</div>}
+                : <div className="emptyState">暂未读取到 lzc 用量。</div>}
             <div className="dialogActions">
               <span className="trackedQuotaUpdated">{trackedQuotaUsage ? `更新于 ${new Date(trackedQuotaUsage.updatedAt).toLocaleString()}` : ""}</span>
               <button className="iconTextButton" type="button" onClick={() => setTrackedQuotaOpen(false)}>关闭</button>
@@ -10705,13 +10864,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               type="button"
               onClick={() => void refreshTrackedQuota(true, false)}
               disabled={trackedQuotaLoading && !trackedQuotaUsage}
-              title="查看指定用户在全部账号中的当前周期与自然日额度占用"
+              title="查看 lzc 在全部账号中的当前周期与自然日额度占用"
             >
               {trackedQuotaLoading && !trackedQuotaUsage
-                ? "读取中..."
+                ? "lzc..."
                 : trackedQuotaUsage
-                  ? `${trackedQuotaUsage.userId} ${percentText(trackedQuotaUsage.todayQuotaPercent)}%`
-                  : "指定用户用量"}
+                  ? `lzc ${percentText(trackedQuotaUsage.todayQuotaPercent)}%`
+                  : "lzc 用量"}
             </button>
             <div
               className="quotaPopoverAnchor"
@@ -10781,6 +10940,24 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </div>
         ) : null}
 
+        {providerFailurePresence.present && providerFailure ? (
+          <div className={`providerFailureNotice${providerFailurePresence.closing ? " uiClosing" : ""}`}
+            role="alertdialog" aria-label="模型请求失败" aria-hidden={providerFailurePresence.closing} inert={providerFailurePresence.closing}>
+            <strong>{providerFailure.kind === "limit" ? "供应商额度或请求频率受限" : "模型本轮请求失败"}</strong>
+            <p>{providerFailure.kind === "limit"
+              ? `${providerFailure.model} 返回了额度或限流错误，无法完成本轮回答。`
+              : `${providerFailure.model} 没有完成本轮回答；这不一定是额度问题。`}</p>
+            <div className="providerFailureActions">
+              <button type="button" onClick={() => {
+                setProviderFailureOpen(false);
+                resetToNewThread(true);
+                window.setTimeout(() => document.querySelector<HTMLButtonElement>(".composerTools .groupedModelPicker .polishedSelectTrigger")?.click(), 100);
+              }}>新对话·选模型</button>
+              <button type="button" onClick={() => setProviderFailureOpen(false)}>关闭</button>
+            </div>
+          </div>
+        ) : null}
+
 
         <div className={`workspace${diffPanelVisible || terminalVisible ? " diffPanelOpen" : ""}${diffPanelResizing ? " diffPanelResizing" : ""}`} style={{ gridTemplateColumns: `${threadListCollapsed ? 56 : threadListWidth}px 0px minmax(0, 1fr) auto` }}>
           <nav className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
@@ -10809,9 +10986,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 ><IconParkSmallArrow direction={threadListCollapsed ? "right" : "left"} /></button>
               </div>
               <div className="v2PrimaryNav">
-                <button type="button" onClick={() => resetToNewThread(true)}>
-                  <svg className="v2NavGlyph v2NewThreadGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z" /></svg>
-                  <strong>新对话</strong>
+                <button type="button" onClick={() => setNewThreadProjectPickerOpen(true)}>
+                  <svg className="v2NavGlyph v2NewThreadGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7" /><path d="M16 3h5v5" /><path d="m21 3-9 9" /></svg>
+                  <strong>新建对话</strong>
                 </button>
                 <button type="button" onClick={() => void openSkillsPicker(false)}>
                   <svg className="v2NavGlyph v2PluginGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 22v-5" /><path d="M9 8V2" /><path d="M15 8V2" /><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" /></svg>
@@ -10906,6 +11083,19 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       <Folder className="v2WorkspaceFolderGlyph" size={18} strokeWidth={2.2} aria-hidden="true" />
                       <strong>{project.name}</strong>
                       <button
+                        className="projectNewThreadButton"
+                        type="button"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          startNewThreadInProject(project.id);
+                        }}
+                        title={`在 ${project.name} 新建对话`}
+                        aria-label={`在 ${project.name} 新建对话`}
+                      >
+                        <SquarePen size={16} strokeWidth={2.2} />
+                      </button>
+                      <button
                         className="projectRenameButton"
                         type="button"
                         onClick={(event) => {
@@ -10950,17 +11140,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 placeholder="搜索会话和消息"
               />
             </div>
-            <button
-              type="button"
-              className="newThreadButton"
-              onClick={() => {
-                activateWorkspaceProject(project.id);
-                resetToNewThread(true);
-              }}
-            >
-              <SquarePen size={17} strokeWidth={2.2} />
-              新建会话
-            </button>
               {projectThreads.map((thread) => (
               (() => {
                 const threadRunning = Boolean(activeTurnsByThread[thread.id]);
@@ -11477,12 +11656,11 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         />
                         <div className="composerTools temporaryAskComposerTools">
                           <span className="temporarySelectionCount"><MessageSquare size={13} />1 个已选文本片段</span>
-                          <PolishedSelect<string>
-                            className="v2ModelPicker"
+                          <ModelGroupedSelect
                             value={temporaryModelProfileId}
                             onChange={setTemporaryModelProfileId}
                             disabled={temporaryAsk.status === "starting" || temporaryAsk.status === "running"}
-                            options={modelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => ({ value: profile.id, label: profile.label, detail: `${profile.model} · 推理 ${profile.effort}` }))}
+                            profiles={modelProfiles}
                           />
                           <PolishedSelect<SandboxMode>
                             className="temporaryPolicySelect"
@@ -11892,17 +12070,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   >
                     <span>{codexFastModeEnabled ? "Fast On" : "Fast Off"}</span>
                   </button>
-                  <PolishedSelect<string>
-                    className="v2ModelPicker"
+                  <ModelGroupedSelect
                     value={activeModelProfileId}
                     onChange={(profileId) => void changeConversationModelProfile(profileId)}
                     disabled={savingThreadModel || conversationRunState === "running"}
                     title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
-                    options={modelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => ({
-                      value: profile.id,
-                      label: profile.label,
-                      detail: `${profile.model} · 推理 ${profile.effort}`
-                    }))}
+                    profiles={modelProfiles}
                   />
                   <button
                     className="v2SendMarkdownLocalAction"
@@ -12081,7 +12254,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 ? <div className="nativeReviewResult"><div className="nativeReviewResultLabel">审查结果 · 原始意见</div><MarkdownMessage text={reviewText.replace(/^Full review comments:/m, "审查意见：")} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /></div>
                 : <div className="nativeReviewPending" role="status"><span className="nativeReviewActivity" aria-hidden="true" />{reviewTurn?.completedAt ? "本次审查没有文字结果，请查看会话记录。" : reviewProgress ? `正在审查 · ${reviewProgress}` : "正在审查；原生审查通常在完成后一次性返回意见。"}</div>;
             })() : <FileChangeReview changes={diffReview.focusPath ? diffReview.changes.filter((change) => fileChangePath(change) === diffReview.focusPath) : diffReview.changes} onComment={addInlineReviewComment} />}</div></section> : null}
-            {terminalProjectId ? <TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} onClose={() => {
+            {terminalProjectId ? <TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={Boolean(diffReview)} onClose={() => {
               setTerminalVisible(false);
               if (terminalCloseTimerRef.current !== null) window.clearTimeout(terminalCloseTimerRef.current);
               terminalCloseTimerRef.current = window.setTimeout(() => {

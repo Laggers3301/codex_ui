@@ -11,6 +11,7 @@ export interface AccountPoolEntryConfig {
   id: string;
   label: string;
   codexHome: string;
+  kind?: "codex-account" | "api-provider";
   enabled?: boolean;
 }
 
@@ -28,6 +29,7 @@ interface PersistedPoolState {
 export interface AccountPoolRawSnapshot {
   id: string;
   label: string;
+  kind: "codex-account" | "api-provider";
   codexHome: string;
   health: "ready" | "degraded" | "starting";
   selectedForNewThreads: boolean;
@@ -53,6 +55,7 @@ interface AccountRuntime {
   id: string;
   label: string;
   codexHome: string;
+  kind: "codex-account" | "api-provider";
   bridge: CodexBridge;
   health: "ready" | "degraded" | "starting";
   activeRequests: number;
@@ -245,6 +248,7 @@ export class AccountPoolBridge extends EventEmitter {
         id,
         label: safeLabel(entry.label),
         codexHome,
+        kind: entry.kind === "api-provider" ? "api-provider" : "codex-account",
         bridge,
         health: "starting",
         activeRequests: 0,
@@ -562,8 +566,13 @@ export class AccountPoolBridge extends EventEmitter {
     const threadId = threadIdFromParams(params);
     if (threadId) {
       const known = this.accountsById.get(this.threadAccounts.get(threadId) ?? "");
-      if (known) return known;
-      return this.discoverThreadAccount(threadId);
+      const account = known ?? await this.discoverThreadAccount(threadId);
+      const requestedModel = asRecord(params).model;
+      if (method === "turn/start" && typeof requestedModel === "string"
+        && account.supportedModels && !account.supportedModels.has(requestedModel)) {
+        throw new Error(`当前会话属于 ${account.label}，不能直接切换到 ${requestedModel}。请从上一轮回答创建分支，迁移到对应供应商后继续。`);
+      }
+      return account;
     }
     const processId = processIdFromParams(params);
     const processAccount = processId ? this.accountsById.get(this.processAccounts.get(processId) ?? "") : undefined;
@@ -664,6 +673,12 @@ export class AccountPoolBridge extends EventEmitter {
       this.accountRefreshInFlight = Promise.all(this.accounts.map(async (account) => {
         if (!forceRefresh && account.cache && account.cache.expiresAt > now) return;
         await this.waitForMaintenance(account);
+        if (account.kind === "api-provider") {
+          account.cache = { account: {}, limits: {}, usage: {}, errors: [], expiresAt: Date.now() + this.quotaCacheMs };
+          account.lastCheckedAt = new Date().toISOString();
+          account.lastError = null;
+          return;
+        }
         const previous = account.cache;
         // Refresh authentication first, then read quota. Running all three
         // calls in parallel races an expired access token against its refresh
@@ -704,6 +719,7 @@ export class AccountPoolBridge extends EventEmitter {
     return this.accounts.map((account) => ({
       id: account.id,
       label: account.label,
+      kind: account.kind,
       codexHome: account.codexHome,
       health: account.health,
       selectedForNewThreads: account.id === selected,
@@ -722,6 +738,11 @@ export class AccountPoolBridge extends EventEmitter {
   getKnownThreadAccount(threadId: string | undefined): { id: string; label: string } | null {
     const account = threadId ? this.accountsById.get(this.threadAccounts.get(threadId) ?? "") : undefined;
     return account ? { id: account.id, label: account.label } : null;
+  }
+
+  canThreadUseModel(threadId: string, model: string): boolean {
+    const account = this.accountsById.get(this.threadAccounts.get(threadId) ?? "");
+    return !account?.supportedModels || account.supportedModels.has(model);
   }
 
   /** Select the best current account for a branch, independently of its source. */

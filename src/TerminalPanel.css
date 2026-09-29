@@ -1,9 +1,19 @@
 .webTerminalPanel { position: relative; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; overflow: hidden; border: 0; background: var(--ui-diff-surface); opacity: 0; transform: translateY(18px); filter: blur(3px); pointer-events: none; transition: opacity .26s ease, transform .4s cubic-bezier(.16,1,.3,1), filter .26s ease; }
-.rightPanelSplit .webTerminalPanel { flex: 0 0 min(42%, 410px); min-height: 180px; border-top: 1px solid var(--ui-divider); }
+.rightPanelSplit .rightPaneDiff { min-height: 180px; }
+.rightPanelSplit .webTerminalPanel { flex: 0 1 42%; min-height: 180px; border-top: 1px solid var(--ui-divider); transition: flex-basis .38s cubic-bezier(.22,1,.36,1), opacity .26s ease, transform .4s cubic-bezier(.16,1,.3,1), filter .26s ease; }
+.rightPanelSplit .webTerminalPanel.resizing { transition: none; }
+.webTerminalSplitHandle { position: absolute; z-index: 4; top: 0; left: 9px; right: 0; height: 12px; cursor: row-resize; touch-action: none; outline: none; }
+.webTerminalSplitHandle::after { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px; background: var(--ui-divider); transition: height .18s ease, background .18s ease; }
+.webTerminalSplitHandle:hover::after,.webTerminalSplitHandle:focus-visible::after,.webTerminalPanel.resizing .webTerminalSplitHandle::after { height: 2px; background: var(--ui-content-muted); }
 .webTerminalPanel.open { opacity: 1; transform: none; filter: none; pointer-events: auto; }
 .webTerminalPanel header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 44px; padding: 8px 14px; color: var(--ui-content); font-size: 13px; }
 .webTerminalPanel header button { display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: 8px; background: transparent; color: inherit; cursor: pointer; }
 .webTerminalPanel header button:hover { background: var(--ui-hover); }
 .webTerminalCanvas { flex: 1; min-height: 0; padding: 0 10px 10px; }
 .webTerminalCanvas .xterm { height: 100%; }
+.webTerminalCommandLine { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; min-height: 39px; margin: 0 10px 10px; padding: 0 11px; border-radius: 10px; background: var(--ui-hover); color: var(--ui-content); }
+.webTerminalCommandLine > span { flex: 0 0 auto; color: var(--ui-content-muted); font-size: 19px; line-height: 1; }
+.webTerminalCommandLine input { flex: 1; width: 0; min-width: 0; padding: 7px 0; border: 0; outline: 0; background: transparent; color: inherit; font: 13px/1.4 Consolas, "Cascadia Code", monospace; }
+.webTerminalCommandLine input::placeholder { color: var(--ui-content-muted); }
+.webTerminalCommandLine:focus-within { background: var(--ui-diff-surface); box-shadow: inset 0 0 0 1px var(--ui-divider); }
 @media (prefers-reduced-motion: reduce) { .webTerminalPanel { transition-duration: .01ms; } }

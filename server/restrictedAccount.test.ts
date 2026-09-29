@@ -2,19 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
-import { describe, expect, it, vi } from "vitest";
-vi.mock("./config.js", async (importOriginal) => {
-  const original = await importOriginal<typeof import("./config.js")>();
-  return { ...original, serverConfig: { ...original.serverConfig, trackedQuotaUser: "sample-user", trackedQuotaAllowedAccountId: "sample-1234" } };
-});
+import { describe, expect, it } from "vitest";
 import { AccountPoolBridge } from "./accountPoolBridge.js";
 import type { CodexBridge } from "./codexBridge.js";
 import { ProjectStore } from "./db.js";
 import { allowedAccountForUser, assertTrackedUserQuotaAvailable } from "./routes.js";
 
-describe("dedicated account policy", () => {
-  it("allows the configured account regardless of the old 50% cap and rejects another account's thread", async () => {
-    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-restricted-account-"));
+describe("lzc dedicated account policy", () => {
+  it("allows 260901 regardless of the old 50% cap and rejects another account's thread", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-lzc-account-"));
     const oldHome = path.join(temporary, "old");
     const allowedHome = path.join(temporary, "allowed");
     fs.mkdirSync(oldHome);
@@ -22,18 +18,18 @@ describe("dedicated account policy", () => {
     const store = new ProjectStore(path.join(temporary, "store.sqlite"));
     const pool = new AccountPoolBridge({
       accounts: [
-        { id: "sample-5678", label: "sample-5678", codexHome: oldHome },
-        { id: "sample-1234", label: "sample-1234", codexHome: allowedHome }
+        { id: "260803", label: "260803", codexHome: oldHome },
+        { id: "260901", label: "260901", codexHome: allowedHome }
       ],
       stateFile: "pool-state.json"
     }, temporary, () => Object.assign(new EventEmitter(), { stop() {} }) as unknown as CodexBridge);
     try {
-      expect(allowedAccountForUser("SAMPLE-USER")).toBe("sample-1234");
-      expect(allowedAccountForUser("another-user")).toBeNull();
-      pool.assignThreadsToAccount(["old-thread"], "sample-5678");
-      pool.assignThreadsToAccount(["allowed-thread"], "sample-1234");
-      await expect(assertTrackedUserQuotaAvailable(pool as unknown as CodexBridge, store, "sample-user", "allowed-thread")).resolves.toBeUndefined();
-      await expect(assertTrackedUserQuotaAvailable(pool as unknown as CodexBridge, store, "sample-user", "old-thread")).rejects.toThrow(/只能使用 sample-1234/);
+      expect(allowedAccountForUser("LZC")).toBe("260901");
+      expect(allowedAccountForUser("gyj")).toBeNull();
+      pool.assignThreadsToAccount(["old-thread"], "260803");
+      pool.assignThreadsToAccount(["allowed-thread"], "260901");
+      await expect(assertTrackedUserQuotaAvailable(pool as unknown as CodexBridge, store, "lzc", "allowed-thread")).resolves.toBeUndefined();
+      await expect(assertTrackedUserQuotaAvailable(pool as unknown as CodexBridge, store, "lzc", "old-thread")).rejects.toThrow(/只能使用 260901/);
     } finally {
       pool.stop();
       store.close();

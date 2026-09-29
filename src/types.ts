@@ -50,6 +50,7 @@ export interface CodexQuota {
 export interface CodexAccountPoolAccount {
   id: string;
   label: string;
+  kind?: "codex-account" | "api-provider";
   health: "ready" | "degraded" | "starting";
   selectedForNewThreads: boolean;
   assignedThreadCount: number;

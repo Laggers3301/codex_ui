@@ -6,13 +6,49 @@ import { codexSocket } from "./codexSocket";
 import "@xterm/xterm/css/xterm.css";
 import "./TerminalPanel.css";
 
-export function TerminalPanel({ projectId, projectName, onClose }: { projectId: string; projectName: string; onClose: () => void }) {
+const splitStorageKey = "codex-web-terminal-split-percent";
+
+export function TerminalPanel({ projectId, projectName, split, onClose }: { projectId: string; projectName: string; split: boolean; onClose: () => void }) {
   const host = useRef<HTMLDivElement>(null);
+  const panel = useRef<HTMLElement>(null);
+  const resizing = useRef(false);
+  const previousBodyStyle = useRef({ cursor: "", userSelect: "" });
+  const [splitPercent, setSplitPercent] = useState(() => {
+    const stored = Number(window.localStorage.getItem(splitStorageKey));
+    return Number.isFinite(stored) && stored >= 20 && stored <= 75 ? stored : 42;
+  });
+  const commandInput = useRef<HTMLInputElement>(null);
+  const submitLine = useRef<(line: string) => boolean>(() => false);
+  const history = useRef<string[]>([]);
+  const historyIndex = useRef(-1);
+  const [line, setLine] = useState("");
   const [visible, setVisible] = useState(false);
   useEffect(() => {
     const timer = window.setTimeout(() => setVisible(true), 10);
-    return () => window.clearTimeout(timer);
+    commandInput.current?.focus();
+    return () => {
+      window.clearTimeout(timer);
+      if (resizing.current) {
+        document.body.style.cursor = previousBodyStyle.current.cursor;
+        document.body.style.userSelect = previousBodyStyle.current.userSelect;
+      }
+    };
   }, []);
+  const resizeTo = (clientY: number) => {
+    const bounds = panel.current?.parentElement?.getBoundingClientRect();
+    if (!bounds || bounds.height < 100) return;
+    const minimum = Math.min(180, bounds.height * .35);
+    const height = Math.max(minimum, Math.min(bounds.height - minimum - 9, bounds.bottom - clientY));
+    const next = Math.round(height / bounds.height * 1000) / 10;
+    setSplitPercent(next);
+    window.localStorage.setItem(splitStorageKey, String(next));
+  };
+  const finishResize = () => {
+    if (!resizing.current) return;
+    resizing.current = false;
+    document.body.style.cursor = previousBodyStyle.current.cursor;
+    document.body.style.userSelect = previousBodyStyle.current.userSelect;
+  };
   useEffect(() => {
     if (!host.current) return;
     const processId = `term-${crypto.randomUUID()}`;
@@ -29,9 +65,9 @@ export function TerminalPanel({ projectId, projectName, onClose }: { projectId: 
     let pendingInput = "";
     let inputTimer: number | null = null;
     let resizeTimer: number | null = null;
-    const send = (type: string, payload: Record<string, unknown> = {}) => {
-      try { codexSocket.send({ type, requestId: `${processId}-${crypto.randomUUID()}`, processId, ...payload }); }
-      catch { if (!disconnectedNoticeShown) { term.write("\r\n[连接断开，请关闭并重新打开终端]\r\n"); disconnectedNoticeShown = true; } }
+    const send = (type: string, payload: Record<string, unknown> = {}): boolean => {
+      try { codexSocket.send({ type, requestId: `${processId}-${crypto.randomUUID()}`, processId, ...payload }); return true; }
+      catch { if (!disconnectedNoticeShown) { term.write("\r\n[连接断开，请关闭并重新打开终端]\r\n"); disconnectedNoticeShown = true; } return false; }
     };
     const unsubscribe = codexSocket.subscribe(message => {
       if (message.type === "terminal.output") {
@@ -46,6 +82,11 @@ export function TerminalPanel({ projectId, projectName, onClose }: { projectId: 
       inputTimer = null;
       if (started && pendingInput) send("command.write", { data: pendingInput });
       pendingInput = "";
+    };
+    submitLine.current = (value: string) => {
+      if (!started) return false;
+      if (pendingInput) flushInput();
+      return send("command.write", { data: `${value}\r` });
     };
     const input = term.onData(data => {
       pendingInput += data;
@@ -83,11 +124,45 @@ export function TerminalPanel({ projectId, projectName, onClose }: { projectId: 
       }
     });
     start();
-    term.focus();
-    return () => { themeObserver.disconnect(); resize.disconnect(); if (inputTimer !== null) window.clearTimeout(inputTimer); if (resizeTimer !== null) window.clearTimeout(resizeTimer); input.dispose(); unsubscribe(); unsubscribeStatus(); if (started) send("command.terminate"); term.dispose(); };
+    return () => { submitLine.current = () => false; themeObserver.disconnect(); resize.disconnect(); if (inputTimer !== null) window.clearTimeout(inputTimer); if (resizeTimer !== null) window.clearTimeout(resizeTimer); input.dispose(); unsubscribe(); unsubscribeStatus(); if (started) send("command.terminate"); term.dispose(); };
   }, [projectId]);
-  return <aside className={`webTerminalPanel uiGlassSurface${visible ? " open" : ""}`} role="dialog" aria-label={`${projectName} 交互终端`}>
+  return <aside ref={panel} className={`webTerminalPanel uiGlassSurface${visible ? " open" : ""}${resizing.current ? " resizing" : ""}`} style={split ? { flexBasis: `${splitPercent}%` } : undefined} role="dialog" aria-label={`${projectName} 交互终端`}>
+    {split ? <div className="webTerminalSplitHandle" role="separator" aria-orientation="horizontal" aria-label="拖动调整终端与文件变更区域高度" aria-valuemin={20} aria-valuemax={75} aria-valuenow={Math.round(splitPercent)} tabIndex={0} onPointerDown={event => {
+      event.preventDefault();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      previousBodyStyle.current = { cursor: document.body.style.cursor, userSelect: document.body.style.userSelect };
+      document.body.style.cursor = "row-resize";
+      document.body.style.userSelect = "none";
+      resizing.current = true;
+      resizeTo(event.clientY);
+    }} onPointerMove={event => { if (resizing.current) resizeTo(event.clientY); }} onPointerUp={finishResize} onPointerCancel={finishResize} onKeyDown={event => {
+      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+      event.preventDefault();
+      setSplitPercent(current => {
+        const next = Math.max(20, Math.min(75, current + (event.key === "ArrowUp" ? 5 : -5)));
+        window.localStorage.setItem(splitStorageKey, String(next));
+        return next;
+      });
+    }} /> : null}
     <header><strong>终端 · {projectName}</strong><button type="button" onClick={() => { setVisible(false); onClose(); }} aria-label="关闭终端"><X size={17} /></button></header>
     <div ref={host} className="webTerminalCanvas" />
+    <form className="webTerminalCommandLine" onSubmit={event => {
+      event.preventDefault();
+      if (!submitLine.current(line)) return;
+      if (line.trim()) history.current.push(line);
+      historyIndex.current = -1;
+      setLine("");
+    }}>
+      <span aria-hidden="true">›</span>
+      <input ref={commandInput} aria-label="即时输入终端命令" title="本地即时输入，Enter 发送；交互程序可直接点击上方终端" autoComplete="off" autoCapitalize="off" spellCheck={false} value={line} onChange={event => { setLine(event.target.value); historyIndex.current = -1; }} onKeyDown={event => {
+        if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+        if (!history.current.length) return;
+        event.preventDefault();
+        historyIndex.current = event.key === "ArrowUp"
+          ? Math.min(history.current.length - 1, historyIndex.current + 1)
+          : Math.max(-1, historyIndex.current - 1);
+        setLine(historyIndex.current < 0 ? "" : history.current[history.current.length - 1 - historyIndex.current]);
+      }} placeholder="输入命令，Enter 发送" />
+    </form>
   </aside>;
 }

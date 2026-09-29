@@ -281,7 +281,7 @@ async function importedProjectForUser(store: ProjectStore, userId: string, sourc
   const directoryName = sourceLabel.trim().toLowerCase() === "codex1"
     ? "codex1-migrated"
     : `migrated-from-${safeUserDirectoryName(sourceLabel)}`;
-  const root = path.join(path.resolve(projectRoot), "users", safeUserDirectoryName(userId), directoryName);
+  const root = path.join(path.resolve(projectRoot), "codex_zerotier_remote", "users", safeUserDirectoryName(userId), directoryName);
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   return store.getProjectByRootPath(root, userId) ?? store.createProject({
     userId,
@@ -385,7 +385,7 @@ export async function importStagedUserHandoff(
       });
     } else if (existingOwner.userId === cleanUser) {
       // Re-running a handoff keeps the existing JSONL but converges every source
-      // session into the dedicated receiving workspace.
+      // session into the dedicated little-right workspace.
       store.moveThreadOwnerToProject(plan.entry.threadId, cleanUser, project.id, project.rootPath);
     }
     // The source export contains visible sessions only. A stale local soft-delete

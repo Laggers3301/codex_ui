@@ -104,15 +104,15 @@ describe("account-pool routing policy", () => {
     try {
       const pool = new AccountPoolBridge({
         accounts: [
-          { id: "sample-1234", label: "sample-1234", codexHome: accountA },
-          { id: "sample-5678", label: "sample-5678", codexHome: accountB }
+          { id: "260803", label: "260803", codexHome: accountA },
+          { id: "260901", label: "260901", codexHome: accountB }
         ],
         stateFile: "state.json"
       }, temporary, () => bridges[nextBridge++] as unknown as CodexBridge);
-      await pool.startThreadOnAccount("sample-5678", { model: "gpt-6-sol" });
+      await pool.startThreadOnAccount("260901", { model: "gpt-6-sol" });
       expect(bridges[0].requests).toHaveLength(0);
       expect(bridges[1].requests).toContainEqual({ method: "thread/start", params: { model: "gpt-6-sol" } });
-      expect(pool.getKnownThreadAccount("new-thread")?.id).toBe("sample-5678");
+      expect(pool.getKnownThreadAccount("new-thread")?.id).toBe("260901");
       pool.stop();
     } finally {
       fs.rmSync(temporary, { recursive: true, force: true });
@@ -139,10 +139,10 @@ describe("account-pool routing policy", () => {
 
   it("always gives a new thread to the healthy account with more remaining quota", () => {
     const selected = selectAccountCandidate([
-      candidate("sample-1234", 65, { activeRequests: 8, assignedThreadCount: 100 }),
-      candidate("sample-5678", 53)
+      candidate("260803", 65, { activeRequests: 8, assignedThreadCount: 100 }),
+      candidate("260707", 53)
     ]);
-    expect(selected.id).toBe("sample-1234");
+    expect(selected.id).toBe("260803");
   });
 
   it("routes a new thread only to an account whose catalog lists the requested model", async () => {
