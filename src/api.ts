@@ -11,6 +11,11 @@ import type {
   LocalSendTestResult,
   ThreadExportFormat,
   ThreadExportResult,
+  ThreadContextPin,
+  ThreadContextConfig,
+  ThreadContextProfile,
+  ThreadContextScope,
+  ThreadContextStatus,
   Project,
   ProjectFile,
   ProjectFilePreview,
@@ -21,6 +26,8 @@ import type {
   ThreadListResponse,
   ThreadReadResponse,
   ThreadSummary,
+  ThreadSearchMatch,
+  TrackedQuotaUsage,
   UserProfile
 } from "./types";
 
@@ -36,6 +43,18 @@ export function setApiUserId(userId: string): void {
 
 export function getApiUserId(): string {
   return currentUserId;
+}
+
+export function getPushPublicKey(): Promise<{ data: { publicKey: string } }> {
+  return request("/api/push/key");
+}
+
+export function savePushSubscription(subscription: PushSubscriptionJSON): Promise<{ ok: boolean }> {
+  return request("/api/push/subscription", { method: "POST", body: JSON.stringify(subscription) });
+}
+
+export function removePushSubscription(endpoint: string): Promise<{ ok: boolean }> {
+  return request("/api/push/subscription", { method: "DELETE", body: JSON.stringify({ endpoint }) });
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -91,6 +110,11 @@ export function readCodexLeaderboard(refresh = false): Promise<{ data: CodexLead
   return request(`/api/codex/leaderboard${suffix}`, { cache: "no-store" });
 }
 
+export function readTrackedQuotaUsage(refresh = false): Promise<{ data: TrackedQuotaUsage }> {
+  const suffix = refresh ? "?refresh=true" : "";
+  return request(`/api/codex/tracked-quota${suffix}`, { cache: "no-store" });
+}
+
 export function listCodexSkills(projectId?: string, reload = false): Promise<CodexSkillsResponse> {
   const params = new URLSearchParams();
   if (projectId) {
@@ -101,6 +125,22 @@ export function listCodexSkills(projectId?: string, reload = false): Promise<Cod
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
   return request(`/api/codex/skills${suffix}`);
+}
+
+export interface McpServerSummary {
+  name: string;
+  pluginId: string | null;
+  runtimeStatus: string | null;
+  authStatus: string;
+  toolCount: number;
+}
+
+export function readThreadMcpStatus(projectId: string, threadId: string): Promise<{
+  data: McpServerSummary[];
+  nextCursor: string | null;
+  sharedRuntimeWarning: string;
+}> {
+  return request(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/mcp-status`, { cache: "no-store" });
 }
 
 export function createUser(input: { name: string }): Promise<{ data: UserProfile }> {
@@ -127,7 +167,8 @@ export function updateLocalSendSettings(input: Partial<LocalSendSettings>): Prom
 
 export function testLocalSendSettings(): Promise<{ data: LocalSendTestResult }> {
   return request("/api/settings/local-send/test", {
-    method: "POST"
+    method: "POST",
+    body: JSON.stringify({})
   });
 }
 
@@ -177,6 +218,7 @@ export function listProjects(): Promise<{
   projectRoot: string;
   allowOutsideProjectRoot?: boolean;
   systemDirectoryPickerAvailable?: boolean;
+  threadContextFeatureEnabled?: boolean;
 }> {
   return request("/api/projects");
 }
@@ -230,6 +272,53 @@ export function listThreads(projectId: string, search?: string): Promise<ThreadL
   return request(`/api/projects/${projectId}/threads${suffix}`);
 }
 
+export function listArchivedThreads(projectId: string): Promise<ThreadListResponse> {
+  return request(`/api/projects/${projectId}/threads?archived=true&fast=false`, { cache: "no-store" });
+}
+
+export function setThreadArchived(projectId: string, threadId: string, archived: boolean): Promise<{ ok: boolean }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/${archived ? "archive" : "unarchive"}`, { method: "POST", body: "{}" });
+}
+
+export function listProjectGitRepositories(projectId: string): Promise<{ data: Array<{ rootPath: string; name: string }> }> {
+  return request(`/api/projects/${projectId}/git-repositories`);
+}
+
+export function createProjectWorktree(projectId: string, repositoryPath: string, name?: string): Promise<{ data: Project; branch: string; sourceProjectId: string; repositoryRoot: string }> {
+  return request(`/api/projects/${projectId}/worktrees`, { method: "POST", body: JSON.stringify({ repositoryPath, name }) });
+}
+
+export function listProjectHooks(projectId: string, threadId?: string): Promise<{ data: {
+  hooks: Array<{ key: string; currentHash: string | null; eventName: string; handlerType: string; source: string; pluginId: string | null; enabled: boolean; isManaged: boolean; trustStatus: string; matcher: string | null; trustable: boolean; command: string | null; userTrusted: boolean }>;
+  warnings: string[]; errors: string[]
+} }> {
+  return request(`/api/projects/${projectId}/hooks${threadId ? `?threadId=${encodeURIComponent(threadId)}` : ""}`, { cache: "no-store" });
+}
+
+export function createProjectHook(projectId: string, input: { eventName: "SessionStart" | "Stop" | "PreToolUse" | "PostToolUse"; matcher?: string; command: string }): Promise<{ ok: boolean; path: string }> {
+  return request(`/api/projects/${projectId}/hooks`, { method: "POST", body: JSON.stringify(input) });
+}
+
+export function setProjectHookTrust(projectId: string, threadId: string | undefined, key: string, currentHash: string, trusted: boolean): Promise<{ ok: boolean }> {
+  return request(`/api/projects/${projectId}/hooks/trust${threadId ? `?threadId=${encodeURIComponent(threadId)}` : ""}`, {
+    method: "POST", body: JSON.stringify({ key, currentHash, trusted })
+  });
+}
+
+export function searchThreads(query: string, options: { offset?: number; signal?: AbortSignal } = {}): Promise<{
+  data: ThreadSummary[]; total: number; nextOffset: number | null; indexing: boolean; pendingThreads?: number; generation: number; indexError?: string | null;
+}> {
+  const params = new URLSearchParams({ q: query, offset: String(options.offset ?? 0) });
+  return request(`/api/search/threads?${params}`, { signal: options.signal });
+}
+
+export function searchThreadHits(threadId: string, projectId: string, query: string): Promise<{
+  data: ThreadSearchMatch[]; total: number; indexing: boolean;
+}> {
+  const params = new URLSearchParams({ q: query, projectId });
+  return request(`/api/search/threads/${encodeURIComponent(threadId)}/hits?${params}`, { cache: "no-store" });
+}
+
 export function deleteThread(projectId: string, threadId: string): Promise<{ ok: boolean }> {
   return request(`/api/projects/${projectId}/threads/${threadId}`, { method: "DELETE" });
 }
@@ -237,17 +326,58 @@ export function deleteThread(projectId: string, threadId: string): Promise<{ ok:
 export function branchThread(
   projectId: string,
   threadId: string,
-  input: { turnId: string; prompt: string }
-): Promise<{ data: { thread: ThreadSummary; turn: { turn?: { id?: string } }; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null } }> {
+  input: { turnId: string; prompt?: string; targetProjectId?: string }
+): Promise<{ data: { thread: ThreadSummary; turn: { turn?: { id?: string } } | null; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null; branchMode: "native" | "cross-account-native" } }> {
   return request(`/api/projects/${projectId}/threads/${threadId}/branch`, {
     method: "POST",
     body: JSON.stringify(input)
   });
 }
 
+export function startThreadReview(projectId: string, threadId: string, branch?: string): Promise<{ data: { turn: { id: string }; reviewThreadId: string } }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/review`, {
+    method: "POST",
+    body: JSON.stringify(branch ? { branch } : {})
+  });
+}
+
+export function editLatestThreadTurn(projectId: string, threadId: string, turnId: string): Promise<{ data: unknown }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/edit-latest`, {
+    method: "POST",
+    body: JSON.stringify({ turnId })
+  });
+}
+
 export function updateThreadPresentation(projectId: string, threadId: string, input: { pinned: boolean }): Promise<{ data: ThreadPresentation }> {
   return request(`/api/projects/${projectId}/threads/${threadId}/presentation`, {
     method: "PATCH",
+    body: JSON.stringify(input)
+  });
+}
+
+export function readThreadContext(projectId: string, threadId: string): Promise<{ data: ThreadContextStatus }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/context`);
+}
+
+export function updateThreadContextPin(projectId: string, threadId: string, text: string): Promise<{ data: ThreadContextPin }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/context-pin`, {
+    method: "PUT",
+    body: JSON.stringify({ text })
+  });
+}
+
+export function updateThreadContextConfig(
+  projectId: string,
+  threadId: string,
+  input: {
+    profile: ThreadContextProfile;
+    contextWindow?: number | null;
+    compactTokenLimit?: number | null;
+    scope?: ThreadContextScope;
+  }
+): Promise<{ data: ThreadContextConfig }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/context-config`, {
+    method: "PUT",
     body: JSON.stringify(input)
   });
 }

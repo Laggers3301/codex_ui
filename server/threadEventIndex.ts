@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { serverConfig } from "./config.js";
+import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { readThreadFromJsonl } from "./threadFallback.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -16,6 +17,7 @@ interface FileState {
   indexedOffset: number;
   currentTurnId: string | null;
   metadataLine: string | null;
+  generation: number;
 }
 
 interface IndexedRecord {
@@ -86,6 +88,13 @@ db.exec(`
     tokenize='trigram'
   );
 `);
+db.exec("BEGIN IMMEDIATE");
+try {
+  if (!(db.prepare("PRAGMA table_info(thread_files)").all() as Array<{ name: string }>).some(column => column.name === "index_generation")) {
+    db.exec("ALTER TABLE thread_files ADD COLUMN index_generation INTEGER NOT NULL DEFAULT 0");
+  }
+  db.exec("COMMIT");
+} catch (error) { db.exec("ROLLBACK"); throw error; }
 
 const updateLocks = new Map<string, Promise<void>>();
 let writeQueue: Promise<void> = Promise.resolve();
@@ -121,10 +130,7 @@ function messageIsHidden(payload: JsonRecord): boolean {
   if (payload.role === "developer") return true;
   if (payload.role !== "user") return false;
   const text = textFromContent(payload.content).trim();
-  return text.startsWith("<environment_context>")
-    || text.startsWith("<recommended_plugins>")
-    || text.startsWith("<permissions instructions>")
-    || text.startsWith("<app-context>");
+  return isInternalUserMessageText(text);
 }
 
 function turnIdFromPayload(payload: JsonRecord, fallback: string | null): string | null {
@@ -185,7 +191,7 @@ function toolOutputDescriptor(payload: JsonRecord): { callId: string; searchText
 
 function fileState(threadId: string): FileState | null {
   const row = db.prepare(`
-    SELECT thread_id, file_path, inode, size, mtime_ms, indexed_offset, current_turn_id, metadata_line
+    SELECT thread_id, file_path, inode, size, mtime_ms, indexed_offset, current_turn_id, metadata_line, index_generation
     FROM thread_files WHERE thread_id = ?
   `).get(threadId) as Record<string, unknown> | undefined;
   if (!row) return null;
@@ -197,7 +203,8 @@ function fileState(threadId: string): FileState | null {
     mtimeMs: Number(row.mtime_ms),
     indexedOffset: Number(row.indexed_offset),
     currentTurnId: typeof row.current_turn_id === "string" ? row.current_turn_id : null,
-    metadataLine: typeof row.metadata_line === "string" ? row.metadata_line : null
+    metadataLine: typeof row.metadata_line === "string" ? row.metadata_line : null,
+    generation: Number(row.index_generation ?? 0)
   };
 }
 
@@ -217,6 +224,8 @@ function nextOrdinal(threadId: string): number {
 }
 
 function insertFts(rowid: number | bigint, threadId: string, recordId: string, searchText: string): void {
+  // Keep message rows current for rollback. New searches use the isolated
+  // message-only projection; tool/image output no longer grows this old FTS.
   db.prepare("INSERT INTO thread_records_fts(rowid, search_text, thread_id, record_id) VALUES (?, ?, ?, ?)")
     .run(rowid, searchText, threadId, recordId);
 }
@@ -255,6 +264,7 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
     || (stat.size === state.size && stat.mtimeMs !== state.mtimeMs)
     || !boundaryMatches
   ));
+  const generation = (state?.generation ?? 0) + (mustReset ? 1 : 0);
   if (mustReset) state = null;
   if (state && state.size === stat.size && state.mtimeMs === stat.mtimeMs) return;
 
@@ -275,12 +285,12 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
       if (resetPending) resetThread(threadId);
       for (const operation of operations) operation();
       db.prepare(`
-        INSERT INTO thread_files(thread_id, file_path, inode, size, mtime_ms, indexed_offset, current_turn_id, metadata_line, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO thread_files(thread_id, file_path, inode, size, mtime_ms, indexed_offset, current_turn_id, metadata_line, updated_at, index_generation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(thread_id) DO UPDATE SET
           file_path=excluded.file_path, inode=excluded.inode, size=excluded.size, mtime_ms=excluded.mtime_ms,
           indexed_offset=excluded.indexed_offset, current_turn_id=excluded.current_turn_id,
-          metadata_line=excluded.metadata_line, updated_at=excluded.updated_at
+          metadata_line=excluded.metadata_line, updated_at=excluded.updated_at, index_generation=excluded.index_generation
       `).run(
         threadId,
         filePath,
@@ -290,7 +300,8 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
         indexedOffset,
         currentTurnId,
         metadataLine,
-        Date.now()
+        Date.now(),
+        generation
       );
       db.exec("COMMIT");
       transactionStarted = false;
@@ -359,7 +370,7 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
                   INSERT OR IGNORE INTO thread_records(thread_id, ordinal, record_id, turn_id, kind, call_id, start_offset, end_offset, search_text)
                   VALUES (?, ?, ?, ?, 'image', NULL, ?, ?, ?)
                 `).run(threadId, ordinal, recordId, turnId, startOffset, lineEnd, searchText);
-                if (Number(result.changes) > 0) { insertFts(result.lastInsertRowid, threadId, recordId, searchText); ordinal += 1; }
+                if (Number(result.changes) > 0) ordinal += 1;
               });
             }
           }
@@ -378,15 +389,13 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
                     const searchText = [matching.search_text ?? "", output.searchText].filter(Boolean).join("\n").slice(0, 12 * 1024);
                     db.prepare("UPDATE thread_records SET end_offset = ?, search_text = ? WHERE rowid = ?")
                       .run(lineEnd, searchText, matching.rowid);
-                    db.prepare("DELETE FROM thread_records_fts WHERE rowid = ?").run(matching.rowid);
-                    insertFts(matching.rowid, threadId, matching.record_id ?? output.callId, searchText);
                   } else {
                     const recordId = `${output.callId}-output-${startOffset}`;
                     const result = db.prepare(`
                       INSERT OR IGNORE INTO thread_records(thread_id, ordinal, record_id, turn_id, kind, call_id, start_offset, end_offset, search_text)
                       VALUES (?, ?, ?, ?, 'tool-output', ?, ?, ?, ?)
                     `).run(threadId, ordinal, recordId, turnId, output.callId, startOffset, lineEnd, output.searchText);
-                    if (Number(result.changes) > 0) { insertFts(result.lastInsertRowid, threadId, recordId, output.searchText); ordinal += 1; }
+                    if (Number(result.changes) > 0) ordinal += 1;
                   }
                 });
               } else {
@@ -399,7 +408,10 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
                       INSERT OR IGNORE INTO thread_records(thread_id, ordinal, record_id, turn_id, kind, call_id, start_offset, end_offset, search_text)
                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     `).run(threadId, ordinal, recordId, turnId, descriptor.kind, descriptor.callId, startOffset, lineEnd, descriptor.searchText);
-                    if (Number(result.changes) > 0) { insertFts(result.lastInsertRowid, threadId, recordId, descriptor.searchText); ordinal += 1; }
+                    if (Number(result.changes) > 0) {
+                      if (descriptor.kind === "user" || descriptor.kind === "agent") insertFts(result.lastInsertRowid, threadId, recordId, descriptor.searchText);
+                      ordinal += 1;
+                    }
                   });
                 }
               }
@@ -417,23 +429,19 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
 export function warmThreadIndex(filePath: string, threadId: string): Promise<void> {
   const existing = updateLocks.get(threadId);
   if (existing) return existing;
-  const update = writeQueue.then(async () => {
+  const update = (async () => {
+    // Unchanged files never join the writer queue. A background scan of another
+    // large conversation must not delay a cursor jump into an indexed file.
     const state = fileState(threadId);
     if (state) {
       const stat = await fs.stat(filePath);
-      if (
-        state.filePath === filePath
-        && state.inode === Number(stat.ino)
-        && state.size === stat.size
-        && state.indexedOffset === stat.size
-        && state.mtimeMs === stat.mtimeMs
-      ) {
-        return;
-      }
+      if (state.filePath === filePath && state.inode === Number(stat.ino)
+        && state.size === stat.size && state.indexedOffset === stat.size && state.mtimeMs === stat.mtimeMs) return;
     }
-    await updateThreadIndex(filePath, threadId);
-  });
-  writeQueue = update.catch(() => undefined);
+    const write = writeQueue.then(() => updateThreadIndex(filePath, threadId));
+    writeQueue = write.catch(() => undefined);
+    await write;
+  })();
   void update.finally(() => updateLocks.delete(threadId)).catch(() => undefined);
   updateLocks.set(threadId, update);
   return update;
@@ -544,8 +552,8 @@ export async function readIndexedThreadItem(filePath: string, threadId: string, 
   await warmThreadIndex(filePath, threadId);
   const row = db.prepare(`
     SELECT turn_id, start_offset, end_offset FROM thread_records
-    WHERE thread_id = ? AND record_id = ? LIMIT 1
-  `).get(threadId, itemId) as { turn_id?: string; start_offset?: number; end_offset?: number } | undefined;
+    WHERE thread_id = ? AND (record_id = ? OR call_id = ?) LIMIT 1
+  `).get(threadId, itemId, itemId) as { turn_id?: string; start_offset?: number; end_offset?: number } | undefined;
   if (!row?.turn_id || row.start_offset === undefined || row.end_offset === undefined) return null;
   const parsed = await readThreadFromJsonl(filePath, threadId, undefined, {
     startOffset: Number(row.start_offset),
@@ -557,7 +565,8 @@ export async function readIndexedThreadItem(filePath: string, threadId: string, 
   for (const turnValue of turns) {
     const turn = turnValue as JsonRecord;
     const items = Array.isArray(turn.items) ? turn.items : [];
-    const item = items.find((value) => String((value as JsonRecord).id ?? "") === itemId);
+    const item = items.find((value) => (value as JsonRecord).type === "toolCallOutput" && (value as JsonRecord).callId === itemId)
+      ?? items.find((value) => String((value as JsonRecord).id ?? "") === itemId || (value as JsonRecord).callId === itemId);
     if (item && typeof item === "object") return item as JsonRecord;
   }
   return null;

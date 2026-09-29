@@ -1,8 +1,10 @@
 import fs from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { accountHistoryRoots } from "./sessionReadRoots.js";
+import { isInternalUserMessageText } from "./internalUserMessage.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -36,8 +38,14 @@ function recordFromUnknown(value: unknown): JsonObject {
 }
 
 const codexSessionsRoot = path.join(process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"), "sessions");
+let configuredAccountHistoryRoots: string[] = [];
+if (process.env.CODEX_WEB_ACCOUNT_POOL_FILE) {
+  try { configuredAccountHistoryRoots = accountHistoryRoots(JSON.parse(readFileSync(process.env.CODEX_WEB_ACCOUNT_POOL_FILE, "utf8"))); }
+  catch { /* Keep the existing explicit roots if pool configuration is unavailable. */ }
+}
 const configuredCodexSessionRoots = [...new Set([
   codexSessionsRoot,
+  ...configuredAccountHistoryRoots,
   ...(process.env.CODEX_WEB_CODEX_SESSION_ROOTS ?? "")
     .split(path.delimiter)
     .map((entry) => entry.trim())
@@ -160,7 +168,7 @@ function searchTextFromPayload(record: JsonlRecord): string {
   if (record.type === "event_msg") {
     if (payload.type === "user_message" && typeof payload.message === "string") {
       const message = payload.message.trim();
-      return message.startsWith("<environment_context>") || message.startsWith("<app-context>") ? "" : message;
+      return isInternalUserMessageText(message) ? "" : message;
     }
     if (payload.type === "image_generation_end") {
       return `${typeof payload.revised_prompt === "string" ? payload.revised_prompt : ""}\n${typeof payload.saved_path === "string" ? payload.saved_path : ""}`;
@@ -188,12 +196,18 @@ function shouldSkipMessage(payload: JsonObject): boolean {
   if (payload.role !== "user") {
     return false;
   }
-  return (
-    text.startsWith("<environment_context>") ||
-    text.startsWith("<recommended_plugins>") ||
-    text.startsWith("<permissions instructions>") ||
-    text.startsWith("<app-context>")
-  );
+  return isInternalUserMessageText(text);
+}
+
+function sessionMetadataMatchesThread(metadata: JsonObject, threadId: string): boolean {
+  return metadata.id === threadId || metadata.session_id === threadId;
+}
+
+function preferredSessionMetadata(current: JsonObject | null, candidate: JsonObject, threadId: string): JsonObject {
+  if (!current || (!sessionMetadataMatchesThread(current, threadId) && sessionMetadataMatchesThread(candidate, threadId))) {
+    return candidate;
+  }
+  return current;
 }
 
 function appendResponseItem(turn: FallbackTurn, payload: JsonObject, nextId: () => string): void {
@@ -233,6 +247,7 @@ function appendResponseItem(turn: FallbackTurn, payload: JsonObject, nextId: () 
     turn.items.push({
       type: "toolCall",
       id,
+      callId: payload.call_id,
       tool: payload.name,
       command: command || undefined,
       text: command || String(payload.name ?? "tool call")
@@ -245,7 +260,8 @@ function appendResponseItem(turn: FallbackTurn, payload: JsonObject, nextId: () 
     const output = toolOutputText(payload.output);
     turn.items.push({
       type: "toolCallOutput",
-      id: `${callId}-output-${turn.items.length + 1}`,
+      id: typeof payload.id === "string" ? payload.id : `${callId}-output`,
+      callId,
       text: callId,
       aggregatedOutput: output
     });
@@ -269,6 +285,14 @@ function sessionRoots(sessionsRoot?: string): string[] {
 function isSafeCodexSessionPath(filePath: string, sessionsRoot?: string): boolean {
   const resolved = path.resolve(filePath);
   return resolved.endsWith(".jsonl") && sessionRoots(sessionsRoot).some((root) => resolved.startsWith(`${root}${path.sep}`));
+}
+
+/** Return the configured sessions root which owns a persisted rollout. This
+ * includes disabled execution accounts whose history remains readable. */
+export function threadJsonlSessionsRoot(filePath: string, sessionsRoot?: string): string | null {
+  const resolved = path.resolve(filePath);
+  if (!resolved.endsWith(".jsonl")) return null;
+  return sessionRoots(sessionsRoot).find((root) => resolved.startsWith(`${root}${path.sep}`)) ?? null;
 }
 
 function sessionIdFromJsonlFilename(name: string): string | null {
@@ -497,12 +521,12 @@ export async function readThreadSummaryFromJsonl(
         const record = JSON.parse(line) as JsonlRecord;
         const payload = record.payload ?? {};
         if (record.type === "session_meta") {
-          metadata = payload;
+          metadata = preferredSessionMetadata(metadata, payload, threadId);
           continue;
         }
         if (!preview && record.type === "event_msg" && payload.type === "user_message" && typeof payload.message === "string") {
           const message = payload.message.trim();
-          if (!message.startsWith("<environment_context>") && !message.startsWith("<app-context>")) {
+          if (!isInternalUserMessageText(message)) {
             preview = message;
           }
         }
@@ -696,7 +720,7 @@ async function parseThreadFromJsonl(
     updatedAt = Math.max(updatedAt, secondsFromIso(record.timestamp) ?? 0);
 
     if (record.type === "session_meta") {
-      metadata = payload;
+      metadata = preferredSessionMetadata(metadata, payload, threadId);
       updatedAt = Math.max(updatedAt, secondsFromIso(payload.timestamp) ?? 0);
       continue;
     }
@@ -722,7 +746,8 @@ async function parseThreadFromJsonl(
         updatedAt = Math.max(updatedAt, turn.completedAt ?? 0);
       }
       if (payload.type === "user_message" && typeof payload.message === "string" && !preview) {
-        preview = payload.message.trim();
+        const message = payload.message.trim();
+        if (!isInternalUserMessageText(message)) preview = message;
       }
       if (payload.type === "image_generation_end" && currentTurnId) {
         const turn = ensureTurn(currentTurnId);
@@ -747,7 +772,9 @@ async function parseThreadFromJsonl(
         continue;
       }
       const turn = ensureTurn(turnId);
+      const previousLength = turn.items.length;
       appendResponseItem(turn, payload, nextId);
+      for (const item of turn.items.slice(previousLength)) item.timelineAt = record.timestamp;
       if (!preview && payload.type === "message" && payload.role === "user" && !shouldSkipMessage(payload)) {
         preview = textFromContent(payload.content).trim();
       }

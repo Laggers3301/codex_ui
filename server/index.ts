@@ -123,21 +123,22 @@ function authLayout(title: string, body: string): string {
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>${escapeHtml(title)}</title>
   <style>
     :root { color-scheme: light; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: linear-gradient(135deg,#eef2ff,#f8fafc 45%,#ecfeff); color: #111827; }
-    main { width: min(92vw, 460px); background: rgba(255,255,255,.96); border: 1px solid #e5e7eb; border-radius: 18px; padding: 30px; box-shadow: 0 18px 50px rgba(15,23,42,.12); }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; min-width: 0; min-height: 100vh; min-height: 100dvh; display: grid; place-items: safe center; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); overflow: auto; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: linear-gradient(135deg,#eef2ff,#f8fafc 45%,#ecfeff); color: #111827; }
+    main { width: min(100%, 460px); min-width: 0; background: rgba(255,255,255,.96); border: 1px solid #e5e7eb; border-radius: 18px; padding: clamp(20px, 6vw, 30px); box-shadow: 0 18px 50px rgba(15,23,42,.12); }
     h1 { margin: 0 0 8px; font-size: 26px; letter-spacing: -0.03em; }
     p { color: #4b5563; line-height: 1.6; margin: 8px 0 0; }
     label { display: block; margin-top: 18px; font-weight: 700; color: #1f2937; }
-    input { width: 100%; box-sizing: border-box; margin-top: 7px; padding: 11px 12px; border: 1px solid #d1d5db; border-radius: 10px; font-size: 15px; outline: none; }
+    input { width: 100%; min-width: 0; margin-top: 7px; padding: 11px 12px; border: 1px solid #d1d5db; border-radius: 10px; font-size: 16px; outline: none; }
     input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.14); }
     button { margin-top: 24px; width: 100%; padding: 12px 14px; border: 0; border-radius: 10px; background: #2563eb; color: white; font-size: 15px; font-weight: 800; cursor: pointer; }
     button.secondary { background: #f3f4f6; color: #111827; }
     a { color: #2563eb; font-weight: 700; text-decoration: none; }
-    .links { display: flex; gap: 14px; justify-content: center; margin-top: 18px; }
+    .links { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; margin-top: 18px; }
     .msg { margin-top: 16px; padding: 10px 12px; border-radius: 10px; display: none; font-size: 14px; }
     .ok { background: #ecfdf5; color: #065f46; display: block; }
     .err { background: #fef2f2; color: #991b1b; display: block; }
@@ -281,7 +282,7 @@ app.setNotFoundHandler((request, reply) => {
     ? candidate
     : path.join(distDir, "index.html");
   const extension = path.extname(filePath);
-  if (extension === ".html") {
+  if (extension === ".html" || path.basename(filePath) === "sw.js") {
     reply.header("Cache-Control", "no-store");
   } else {
     reply.header("Cache-Control", "public, max-age=31536000, immutable");

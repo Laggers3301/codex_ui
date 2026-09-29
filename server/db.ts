@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
 import type { CreateProjectInput, LocalSendSettings, Project, ReasoningEffort, UpdateLocalSendSettingsInput, UpdateProjectInput, UserProfile } from "./types.js";
 
@@ -52,6 +53,13 @@ type ThreadOwnerRow = {
   reasoning_effort_override: string | null;
   display_name: string | null;
   display_name_updated_at: string | null;
+  context_pin: string | null;
+  context_pin_updated_at: string | null;
+  context_profile: string | null;
+  context_window_override: number | null;
+  auto_compact_token_limit_override: number | null;
+  auto_compact_scope_override: string | null;
+  context_config_updated_at: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -75,6 +83,13 @@ export interface ThreadOwner {
   reasoningEffortOverride: ReasoningEffort | null;
   displayName: string | null;
   displayNameUpdatedAt: string | null;
+  contextPin: string | null;
+  contextPinUpdatedAt: string | null;
+  contextProfile: ThreadContextProfile;
+  contextWindowOverride: number | null;
+  autoCompactTokenLimitOverride: number | null;
+  autoCompactScopeOverride: ThreadContextScope;
+  contextConfigUpdatedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -88,6 +103,24 @@ export interface ThreadPresentation {
   model: string | null;
   reasoningEffort: ReasoningEffort | null;
   displayName: string | null;
+}
+
+export interface ThreadContextPin {
+  threadId: string;
+  text: string;
+  updatedAt: string | null;
+}
+
+export type ThreadContextProfile = "default" | "balanced" | "long" | "maximum" | "custom";
+export type ThreadContextScope = "total" | "body_after_prefix";
+
+export interface ThreadContextConfig {
+  threadId: string;
+  profile: ThreadContextProfile;
+  contextWindow: number | null;
+  compactTokenLimit: number | null;
+  scope: ThreadContextScope;
+  updatedAt: string | null;
 }
 
 export interface UnusedThread {
@@ -161,9 +194,28 @@ function toThreadOwner(row: ThreadOwnerRow): ThreadOwner {
     reasoningEffortOverride: toReasoningEffort(row.reasoning_effort_override),
     displayName: row.display_name?.trim() || null,
     displayNameUpdatedAt: row.display_name_updated_at || null,
+    contextPin: row.context_pin?.trim() || null,
+    contextPinUpdatedAt: row.context_pin_updated_at || null,
+    contextProfile: toThreadContextProfile(row.context_profile),
+    contextWindowOverride: finitePositiveInteger(row.context_window_override),
+    autoCompactTokenLimitOverride: finitePositiveInteger(row.auto_compact_token_limit_override),
+    autoCompactScopeOverride: toThreadContextScope(row.auto_compact_scope_override),
+    contextConfigUpdatedAt: row.context_config_updated_at || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+function finitePositiveInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
+}
+
+function toThreadContextProfile(value: unknown): ThreadContextProfile {
+  return value === "balanced" || value === "long" || value === "maximum" || value === "custom" ? value : "default";
+}
+
+function toThreadContextScope(value: unknown): ThreadContextScope {
+  return value === "body_after_prefix" ? value : "total";
 }
 
 function toReasoningEffort(value: unknown): ReasoningEffort | null {
@@ -188,7 +240,7 @@ export class ProjectStore {
   constructor(dbPath = path.join(serverConfig.dataDir, "codex-web.sqlite")) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
-    // The live 260803 mirror briefly writes this database from a second
+    // A live mirror may briefly write this database from a second
     // process. WAL keeps ordinary reads available during that write, while a
     // bounded busy timeout turns the remaining write/write race into a short
     // wait instead of an intermittent HTTP 500/502 "database is locked".
@@ -198,6 +250,56 @@ export class ProjectStore {
       PRAGMA synchronous = NORMAL;
     `);
     this.migrate();
+    this.db.exec(`CREATE TABLE IF NOT EXISTS conversation_timeline (
+      thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL,
+      item_json TEXT NOT NULL, PRIMARY KEY(thread_id, turn_id, item_id)
+    )`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS push_subscriptions (
+      endpoint TEXT PRIMARY KEY, user_id TEXT NOT NULL, subscription_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`);
+  }
+
+  savePushSubscription(userId: string, subscription: { endpoint: string; keys: { p256dh: string; auth: string } }): void {
+    this.db.prepare(`INSERT INTO push_subscriptions (endpoint, user_id, subscription_json, updated_at)
+      VALUES (?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET
+      user_id = excluded.user_id, subscription_json = excluded.subscription_json, updated_at = excluded.updated_at`)
+      .run(subscription.endpoint, userId, JSON.stringify(subscription), new Date().toISOString());
+  }
+
+  removePushSubscription(userId: string, endpoint: string): void {
+    this.db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?").run(endpoint, userId);
+  }
+
+  listPushSubscriptions(userId: string): Array<{ endpoint: string; keys: { p256dh: string; auth: string } }> {
+    return (this.db.prepare("SELECT subscription_json FROM push_subscriptions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 12")
+      .all(userId) as Array<{ subscription_json: string }>).map((row) => JSON.parse(row.subscription_json));
+  }
+
+  saveTimelineItem(threadId: string, turnId: string, item: Record<string, unknown>): void {
+    const previous = this.db.prepare("SELECT item_json FROM conversation_timeline WHERE thread_id = ? AND turn_id = ? AND item_id = ?")
+      .get(threadId, turnId, String(item.id)) as { item_json: string } | undefined;
+    if (previous) {
+      const saved = JSON.parse(previous.item_json) as Record<string, unknown>;
+      item = { ...saved, ...item, timelineAt: saved.timelineAt, timelineOrder: saved.timelineOrder };
+      for (const key of ["input", "aggregatedOutput"]) {
+        if (typeof item[key] === "string" && String(item[key]).includes("[实时预览已截断") && saved[key]) item[key] = saved[key];
+      }
+    }
+    this.db.prepare(`INSERT INTO conversation_timeline VALUES (?, ?, ?, ?)
+      ON CONFLICT(thread_id, turn_id, item_id) DO UPDATE SET item_json = excluded.item_json`)
+      .run(threadId, turnId, String(item.id), JSON.stringify(item));
+  }
+
+  readTimelineItems(threadId: string, turnId: string): Record<string, unknown>[] {
+    return (this.db.prepare("SELECT item_json FROM conversation_timeline WHERE thread_id = ? AND turn_id = ? ORDER BY rowid")
+      .all(threadId, turnId) as { item_json: string }[]).map((row) => JSON.parse(row.item_json));
+  }
+
+  readTimelineItem(threadId: string, itemId: string): Record<string, unknown> | null {
+    const row = this.db.prepare("SELECT item_json FROM conversation_timeline WHERE thread_id = ? AND item_id = ? LIMIT 1")
+      .get(threadId, itemId) as { item_json: string } | undefined;
+    return row ? JSON.parse(row.item_json) : null;
   }
 
   close(): void {
@@ -502,6 +604,13 @@ export class ProjectStore {
       reasoningEffortOverride,
       displayName: null,
       displayNameUpdatedAt: null,
+      contextPin: null,
+      contextPinUpdatedAt: null,
+      contextProfile: "default",
+      contextWindowOverride: null,
+      autoCompactTokenLimitOverride: null,
+      autoCompactScopeOverride: "total",
+      contextConfigUpdatedAt: null,
       createdAt: now,
       updatedAt: now
     };
@@ -566,6 +675,20 @@ export class ProjectStore {
     }]));
   }
 
+  locallyArchivedThreadIds(userId: string, projectId: string): Set<string> {
+    const rows = this.db.prepare(
+      "SELECT thread_id FROM thread_owners WHERE user_id = ? AND project_id = ? AND is_archived_local = 1"
+    ).all(userId, projectId) as Array<{ thread_id: string }>;
+    return new Set(rows.map(row => row.thread_id));
+  }
+
+  setThreadLocallyArchived(threadId: string, userId: string, projectId: string, archived: boolean): boolean {
+    const result = this.db.prepare(
+      "UPDATE thread_owners SET is_archived_local = ? WHERE thread_id = ? AND user_id = ? AND project_id = ?"
+    ).run(archived ? 1 : 0, threadId, userId, projectId);
+    return result.changes > 0;
+  }
+
   updateThreadDisplayName(threadId: string, userId: string, displayName: string): ThreadPresentation | null {
     const cleanThreadId = threadId.trim();
     const cleanUserId = userId.trim();
@@ -578,6 +701,96 @@ export class ProjectStore {
       .prepare("UPDATE thread_owners SET display_name = ?, display_name_updated_at = ?, updated_at = ? WHERE thread_id = ? AND user_id = ?")
       .run(cleanDisplayName, now, now, cleanThreadId, cleanUserId);
     return result.changes > 0 ? this.getThreadPresentation(cleanUserId, [cleanThreadId]).get(cleanThreadId) ?? null : null;
+  }
+
+  getThreadContextPin(threadId: string, userId: string): ThreadContextPin | null {
+    const cleanThreadId = threadId.trim();
+    const cleanUserId = userId.trim();
+    if (!cleanThreadId || !cleanUserId) return null;
+    const row = this.db
+      .prepare("SELECT context_pin, context_pin_updated_at FROM thread_owners WHERE thread_id = ? AND user_id = ?")
+      .get(cleanThreadId, cleanUserId) as { context_pin?: string | null; context_pin_updated_at?: string | null } | undefined;
+    if (!row) return null;
+    const storedText = row.context_pin?.trim() || "";
+    return {
+      threadId: cleanThreadId,
+      // Releases before the native-fork implementation stored generated
+      // branch summaries in context_pin. Keep those rows intact for audit, but
+      // never expose or re-inject them as if the user had pinned them.
+      text: isLegacyGeneratedBranchPin(storedText) ? "" : storedText,
+      updatedAt: row.context_pin_updated_at || null
+    };
+  }
+
+  setThreadContextPin(threadId: string, userId: string, text: string): ThreadContextPin | null {
+    const cleanThreadId = threadId.trim();
+    const cleanUserId = userId.trim();
+    const cleanText = text.trim().slice(0, 16_000);
+    if (!cleanThreadId || !cleanUserId) return null;
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE thread_owners
+         SET context_pin = ?, context_pin_updated_at = ?, updated_at = ?
+         WHERE thread_id = ? AND user_id = ?`
+      )
+      .run(cleanText || null, now, now, cleanThreadId, cleanUserId);
+    return result.changes > 0 ? this.getThreadContextPin(cleanThreadId, cleanUserId) : null;
+  }
+
+  getThreadContextConfig(threadId: string, userId: string): ThreadContextConfig | null {
+    const cleanThreadId = threadId.trim();
+    const cleanUserId = userId.trim();
+    if (!cleanThreadId || !cleanUserId) return null;
+    const row = this.db
+      .prepare(
+        `SELECT context_profile, context_window_override,
+                auto_compact_token_limit_override, auto_compact_scope_override,
+                context_config_updated_at
+         FROM thread_owners WHERE thread_id = ? AND user_id = ?`
+      )
+      .get(cleanThreadId, cleanUserId) as Pick<ThreadOwnerRow,
+        "context_profile" | "context_window_override" | "auto_compact_token_limit_override" |
+        "auto_compact_scope_override" | "context_config_updated_at"> | undefined;
+    if (!row) return null;
+    return {
+      threadId: cleanThreadId,
+      profile: toThreadContextProfile(row.context_profile),
+      contextWindow: finitePositiveInteger(row.context_window_override),
+      compactTokenLimit: finitePositiveInteger(row.auto_compact_token_limit_override),
+      scope: toThreadContextScope(row.auto_compact_scope_override),
+      updatedAt: row.context_config_updated_at || null
+    };
+  }
+
+  setThreadContextConfig(
+    threadId: string,
+    userId: string,
+    input: Omit<ThreadContextConfig, "threadId" | "updatedAt">
+  ): ThreadContextConfig | null {
+    const cleanThreadId = threadId.trim();
+    const cleanUserId = userId.trim();
+    if (!cleanThreadId || !cleanUserId) return null;
+    const now = new Date().toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE thread_owners
+         SET context_profile = ?, context_window_override = ?,
+             auto_compact_token_limit_override = ?, auto_compact_scope_override = ?,
+             context_config_updated_at = ?, updated_at = ?
+         WHERE thread_id = ? AND user_id = ?`
+      )
+      .run(
+        input.profile,
+        input.contextWindow,
+        input.compactTokenLimit,
+        input.scope,
+        now,
+        now,
+        cleanThreadId,
+        cleanUserId
+      );
+    return result.changes > 0 ? this.getThreadContextConfig(cleanThreadId, cleanUserId) : null;
   }
 
   setThreadPinned(threadId: string, userId: string, pinned: boolean): ThreadPresentation | null {
@@ -735,6 +948,25 @@ export class ProjectStore {
     return new Set(rows.map((row) => row.thread_id));
   }
 
+  getProjectHookTrust(userId: string, projectId: string): Map<string, string> {
+    const rows = this.db.prepare("SELECT hook_key, trusted_hash FROM project_hook_trust WHERE user_id = ? AND project_id = ?")
+      .all(userId, projectId) as Array<{ hook_key: string; trusted_hash: string }>;
+    return new Map(rows.map(row => [row.hook_key, row.trusted_hash]));
+  }
+
+  setProjectHookTrust(userId: string, projectId: string, key: string, hash: string | null): void {
+    if (!this.getProject(projectId, userId)) throw new Error("Project not found.");
+    if (hash) {
+      this.db.prepare(`INSERT INTO project_hook_trust (user_id, project_id, hook_key, trusted_hash, updated_at)
+        VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, project_id, hook_key)
+        DO UPDATE SET trusted_hash = excluded.trusted_hash, updated_at = excluded.updated_at`)
+        .run(userId, projectId, key, hash, new Date().toISOString());
+    } else {
+      this.db.prepare("DELETE FROM project_hook_trust WHERE user_id = ? AND project_id = ? AND hook_key = ?")
+        .run(userId, projectId, key);
+    }
+  }
+
   private migrate(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS users (
@@ -749,6 +981,18 @@ export class ProjectStore {
     this.migrateProjectsTable();
     this.createThreadOwnersTable();
     this.createUnuseTable();
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS project_hook_trust (
+        user_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        hook_key TEXT NOT NULL,
+        trusted_hash TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, project_id, hook_key),
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+      );
+    `);
   }
 
   private ensureAdminUser(): void {
@@ -878,11 +1122,19 @@ export class ProjectStore {
         project_id TEXT NOT NULL,
         root_path TEXT NOT NULL,
         is_pinned INTEGER NOT NULL DEFAULT 0,
+        is_archived_local INTEGER NOT NULL DEFAULT 0,
         manual_order INTEGER,
         model_override TEXT,
         reasoning_effort_override TEXT,
         display_name TEXT,
         display_name_updated_at TEXT,
+        context_pin TEXT,
+        context_pin_updated_at TEXT,
+        context_profile TEXT NOT NULL DEFAULT 'default',
+        context_window_override INTEGER,
+        auto_compact_token_limit_override INTEGER,
+        auto_compact_scope_override TEXT NOT NULL DEFAULT 'total',
+        context_config_updated_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -894,6 +1146,9 @@ export class ProjectStore {
     const hasColumn = (name: string) => columns.some((column) => column.name === name);
     if (!hasColumn("is_pinned")) {
       this.db.exec("ALTER TABLE thread_owners ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!hasColumn("is_archived_local")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN is_archived_local INTEGER NOT NULL DEFAULT 0");
     }
     if (!hasColumn("manual_order")) {
       this.db.exec("ALTER TABLE thread_owners ADD COLUMN manual_order INTEGER");
@@ -909,6 +1164,27 @@ export class ProjectStore {
     }
     if (!hasColumn("display_name_updated_at")) {
       this.db.exec("ALTER TABLE thread_owners ADD COLUMN display_name_updated_at TEXT");
+    }
+    if (!hasColumn("context_pin")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN context_pin TEXT");
+    }
+    if (!hasColumn("context_pin_updated_at")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN context_pin_updated_at TEXT");
+    }
+    if (!hasColumn("context_profile")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN context_profile TEXT NOT NULL DEFAULT 'default'");
+    }
+    if (!hasColumn("context_window_override")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN context_window_override INTEGER");
+    }
+    if (!hasColumn("auto_compact_token_limit_override")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN auto_compact_token_limit_override INTEGER");
+    }
+    if (!hasColumn("auto_compact_scope_override")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN auto_compact_scope_override TEXT NOT NULL DEFAULT 'total'");
+    }
+    if (!hasColumn("context_config_updated_at")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN context_config_updated_at TEXT");
     }
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_thread_owners_user_pinned_order ON thread_owners(user_id, is_pinned, manual_order)");
   }

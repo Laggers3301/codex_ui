@@ -106,6 +106,47 @@ export interface CodexLeaderboard {
   errors: string[];
 }
 
+export interface TrackedQuotaDayAccount {
+  accountId: string;
+  accountLabel: string;
+  userTokens: number;
+  quotaPercent: number;
+}
+
+export interface TrackedQuotaDay {
+  date: string;
+  userTokens: number;
+  quotaPercent: number;
+  accounts: TrackedQuotaDayAccount[];
+}
+
+export interface TrackedQuotaAccount {
+  accountId: string;
+  accountLabel: string;
+  cycleStartAt: number | null;
+  resetAt: number | null;
+  accountUsedPercent: number | null;
+  accountRemainingPercent: number | null;
+  userCycleTokens: number;
+  userCycleQuotaPercent: number;
+  todayTokens: number;
+  todayQuotaPercent: number;
+}
+
+export interface TrackedQuotaUsage {
+  userId: string;
+  timeZone: string;
+  today: string;
+  dailyLimitPercent: number;
+  unlimitedAccountId: string | null;
+  todayQuotaPercent: number;
+  blocked: boolean;
+  accounts: TrackedQuotaAccount[];
+  days: TrackedQuotaDay[];
+  updatedAt: string;
+  errors: string[];
+}
+
 export interface CodexSkill {
   name: string;
   displayName: string;
@@ -225,6 +266,9 @@ export interface ThreadSummary {
   status: unknown;
   turns: Turn[];
   searchMatch?: ThreadSearchMatch;
+  searchMatches?: ThreadSearchMatch[];
+  searchHitCount?: number;
+  projectId?: string;
 }
 
 export interface ThreadSearchMatch {
@@ -243,6 +287,38 @@ export interface ThreadPresentation {
   manualOrder: number | null;
   model: string | null;
   reasoningEffort: ReasoningEffort | null;
+}
+
+export interface ThreadContextPin {
+  threadId: string;
+  text: string;
+  updatedAt: string | null;
+}
+
+export type ThreadContextProfile = "default" | "balanced" | "long" | "maximum" | "custom";
+export type ThreadContextScope = "total" | "body_after_prefix";
+
+export interface ThreadContextConfig {
+  threadId: string;
+  profile: ThreadContextProfile;
+  contextWindow: number | null;
+  compactTokenLimit: number | null;
+  scope: ThreadContextScope;
+  updatedAt: string | null;
+}
+
+export interface ThreadContextStatus {
+  usedTokens: number | null;
+  contextWindow: number | null;
+  usedPercent: number | null;
+  compactTokenLimit: number | null;
+  effectiveCompactTokenLimit: number | null;
+  compactAtPercent: number | null;
+  warningPercent: number;
+  lastTokenCountAt: string | null;
+  compactedAt: string[];
+  config: ThreadContextConfig;
+  pin: ThreadContextPin;
 }
 
 export interface Turn {
@@ -339,6 +415,7 @@ export interface LiveTurnState {
 }
 
 export interface LiveToolItem {
+  sourceItemId?: string;
   itemId: string;
   threadId: string | null;
   turnId: string | null;
@@ -370,7 +447,7 @@ export interface ProjectFile {
 
 export interface ProjectFilePreview extends ProjectFile {
   line: number | null;
-  kind: "markdown" | "text" | "image" | "pdf" | "binary";
+  kind: "markdown" | "text" | "image" | "video" | "pdf" | "binary";
   truncated: boolean;
   content?: string;
 }

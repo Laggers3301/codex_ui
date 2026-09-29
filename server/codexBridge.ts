@@ -74,6 +74,28 @@ export class CodexBridge extends EventEmitter {
     this.proc = null;
   }
 
+  /** Stop the owned app-server and wait until it can no longer write rollouts. */
+  async stopAndWait(timeoutMs = 10_000): Promise<void> {
+    const proc = this.proc;
+    if (!proc) {
+      this.stop();
+      return;
+    }
+    const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
+    this.stop();
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        exited,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("Codex app-server did not stop before the rollback timeout.")), timeoutMs);
+        })
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
   async request(method: string, params?: unknown, timeoutMs = 120_000): Promise<unknown> {
     await this.start();
     return this.sendRequest(method, params, timeoutMs);

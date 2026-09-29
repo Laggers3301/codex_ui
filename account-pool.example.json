@@ -2,12 +2,12 @@
   "accounts": [
     {
       "id": "account-1",
-      "label": "260707",
+      "label": "Primary account",
       "codexHome": "/absolute/path/to/account-1/codex-home"
     },
     {
       "id": "account-2",
-      "label": "260803",
+      "label": "Secondary account",
       "codexHome": "/absolute/path/to/account-2/codex-home"
     }
   ],

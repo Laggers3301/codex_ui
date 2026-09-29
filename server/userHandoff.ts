@@ -5,10 +5,19 @@ import { DatabaseSync } from "node:sqlite";
 import os from "node:os";
 import path from "node:path";
 import type { ProjectStore, ThreadOwner } from "./db.js";
+import { serverConfig } from "./config.js";
 import { findThreadJsonlPathById } from "./threadFallback.js";
 
 export const userHandoffFormat = "codex-web-user-handoff";
 export const userHandoffVersion = 1;
+
+const handoffSourceAliases = new Map<string, string[]>([
+  ["wjm", ["jiaming"]],
+  ["jyh", ["jiangyuhua"]],
+  ["wxr", ["wangxuran"]],
+  ["wm", ["wuming", "吴明"]],
+  ["xjy", ["xujiayu", "x'j'y"]]
+]);
 
 export interface UserHandoffSession {
   threadId: string;
@@ -154,7 +163,14 @@ export async function stageUserHandoffExport(
   const sessionsRoot = codexSessionsRoot();
   const workDir = await makePrivateDirectory("codex-web-handoff-export-");
   const archiveSessionsRoot = path.join(workDir, "sessions");
-  const owners = store.listVisibleThreadOwnersForUser(cleanUser);
+  const sourceUserIds = [cleanUser, ...(handoffSourceAliases.get(cleanUser) ?? [])];
+  const ownersByThreadId = new Map<string, ThreadOwner>();
+  for (const sourceUserId of sourceUserIds) {
+    for (const owner of store.listVisibleThreadOwnersForUser(sourceUserId)) {
+      if (!ownersByThreadId.has(owner.threadId)) ownersByThreadId.set(owner.threadId, owner);
+    }
+  }
+  const owners = [...ownersByThreadId.values()];
   const threadNames = sourceThreadNames(owners.map((owner) => owner.threadId));
   const sessions: UserHandoffSession[] = [];
   const skippedThreadIds: string[] = [];
@@ -262,7 +278,10 @@ function parseManifest(value: unknown, expectedUserId: string): UserHandoffManif
 }
 
 async function importedProjectForUser(store: ProjectStore, userId: string, sourceLabel: string, projectRoot: string) {
-  const root = path.join(path.resolve(projectRoot), "codex_zerotier_remote", "users", safeUserDirectoryName(userId), "migrated-from-little-right");
+  const directoryName = sourceLabel.trim().toLowerCase() === "codex1"
+    ? "codex1-migrated"
+    : `migrated-from-${safeUserDirectoryName(sourceLabel)}`;
+  const root = path.join(path.resolve(projectRoot), "users", safeUserDirectoryName(userId), directoryName);
   await fs.mkdir(root, { recursive: true, mode: 0o700 });
   return store.getProjectByRootPath(root, userId) ?? store.createProject({
     userId,
@@ -277,13 +296,29 @@ export async function importStagedUserHandoff(
   userId: string,
   extractedDirectory: string,
   projectRoot: string,
-  options: { overwriteExisting?: boolean } = {}
+  options: { overwriteExisting?: boolean; targetCodexHome?: string } = {}
 ): Promise<ImportedUserHandoff> {
   const cleanUser = cleanUserId(userId);
   const manifestPath = path.join(extractedDirectory, "manifest.json");
   const manifest = parseManifest(JSON.parse(await fs.readFile(manifestPath, "utf8")), cleanUser);
+  // A refreshed source handoff must not resurrect a conversation that was
+  // deliberately replaced by a verified fork on the user's dedicated account.
+  const migratedSourceIds = new Set<string>();
+  if (cleanUser === serverConfig.trackedQuotaUser && serverConfig.trackedQuotaAllowedAccountId) {
+    const journalPath = path.join(serverConfig.dataDir, `${cleanUser}-${serverConfig.trackedQuotaAllowedAccountId}-migration.json`);
+    try {
+      const journal = JSON.parse(await fs.readFile(journalPath, "utf8")) as Record<string, { verified?: boolean; targetThreadId?: string }>;
+      for (const [threadId, entry] of Object.entries(journal)) {
+        if (entry.verified && entry.targetThreadId) migratedSourceIds.add(threadId);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
   const archiveSessionsRoot = path.join(extractedDirectory, "sessions");
-  const targetSessionsRoot = codexSessionsRoot();
+  const targetSessionsRoot = options.targetCodexHome
+    ? path.join(path.resolve(options.targetCodexHome), "sessions")
+    : codexSessionsRoot();
 
   type CopyPlan = { entry: UserHandoffSession; sourcePath: string; destinationPath: string; alreadyPresent: boolean };
   const plans: CopyPlan[] = [];
@@ -350,9 +385,12 @@ export async function importStagedUserHandoff(
       });
     } else if (existingOwner.userId === cleanUser) {
       // Re-running a handoff keeps the existing JSONL but converges every source
-      // session into the dedicated little-right workspace.
+      // session into the dedicated receiving workspace.
       store.moveThreadOwnerToProject(plan.entry.threadId, cleanUser, project.id, project.rootPath);
     }
+    // The source export contains visible sessions only. A stale local soft-delete
+    // must not keep a successfully refreshed source conversation hidden.
+    if (!migratedSourceIds.has(plan.entry.threadId)) store.restoreThreadFromUnused(plan.entry.threadId, cleanUser);
     if (plan.entry.sourceName) {
       const updateDisplayName = (store as ProjectStore & {
         updateThreadDisplayName?: (threadId: string, userId: string, displayName: string) => unknown;

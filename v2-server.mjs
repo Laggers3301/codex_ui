@@ -10,6 +10,8 @@ const upstreamHost = "127.0.0.1";
 const upstreamPort = Number(process.env.CODEX_V2_UPSTREAM_PORT ?? 4576);
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
 const sessionCookieName = process.env.CODEX_V2_SESSION_COOKIE_NAME?.trim() || "codex_remote_session_4575";
+const upstreamRetryDelaysMs = [100, 250, 500, 1_000, 2_000, 3_000];
+const upstreamAgent = new http.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 32 });
 
 const mime = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -53,21 +55,39 @@ function requireAuthorization(request, response) {
 }
 
 function proxyHttp(request, response) {
-  const upstream = http.request({
-    host: upstreamHost,
-    port: upstreamPort,
-    method: request.method,
-    path: request.url,
-    headers: { ...request.headers, host: `${upstreamHost}:${upstreamPort}` }
-  }, (upstreamResponse) => {
-    response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
-    upstreamResponse.pipe(response);
-  });
-  upstream.on("error", (error) => {
-    if (!response.headersSent) response.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
-    response.end(`Codex backend unavailable: ${error.message}`);
-  });
-  request.pipe(upstream);
+  const retryable = request.method === "GET" || request.method === "HEAD";
+
+  const attempt = (attemptIndex = 0) => {
+    if (request.destroyed || response.destroyed || response.writableEnded) return;
+    const upstream = http.request({
+      host: upstreamHost,
+      port: upstreamPort,
+      method: request.method,
+      path: request.url,
+      headers: { ...request.headers, host: `${upstreamHost}:${upstreamPort}` },
+      agent: upstreamAgent
+    }, (upstreamResponse) => {
+      response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+      upstreamResponse.pipe(response);
+    });
+    upstream.on("error", (error) => {
+      const retryDelay = upstreamRetryDelaysMs[attemptIndex];
+      if (retryable && retryDelay !== undefined && !response.headersSent && !response.writableEnded) {
+        setTimeout(() => attempt(attemptIndex + 1), retryDelay);
+        return;
+      }
+      if (!response.headersSent) {
+        response.writeHead(502, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+        response.end(`Codex backend unavailable: ${error.message}`);
+      } else {
+        response.destroy(error);
+      }
+    });
+    if (retryable) upstream.end();
+    else request.pipe(upstream);
+  };
+
+  attempt();
 }
 
 async function staticFileFor(url) {
@@ -96,7 +116,7 @@ const server = http.createServer(async (request, response) => {
     const extension = path.extname(filePath).toLowerCase();
     response.writeHead(200, {
       "Content-Type": mime.get(extension) ?? "application/octet-stream",
-      "Cache-Control": extension === ".html" ? "no-store" : "public, max-age=31536000, immutable"
+      "Cache-Control": extension === ".html" || path.basename(filePath) === "sw.js" ? "no-store" : "public, max-age=31536000, immutable"
     });
     response.end(body);
     return;

@@ -7,18 +7,46 @@ import type { Server as HttpServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
 import type { CodexBridge } from "./codexBridge.js";
+import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
+import { serverConfig } from "./config.js";
 import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
 import { LiveStateStore } from "./liveState.js";
+import { journalItem } from "./timelineJournal.js";
 import { RequestDeduper } from "./requestDeduper.js";
+import {
+  contextRecoveryPrompt,
+  isContextCompactionItem,
+  isGenericContextLossReply,
+  isPotentialGenericContextLossReply
+} from "./contextRecovery.js";
+import { allowedAccountForUser, assertTrackedUserQuotaAvailable, invalidateTrackedQuotaCacheForUser } from "./routes.js";
 import { findThreadJsonlPathById } from "./threadFallback.js";
+import { scopedHookTrustConfig } from "./hookTrust.js";
+import {
+  contextPinDeveloperInstructions,
+  contextWindowMeasuredForConfig,
+  defaultThreadContextConfig,
+  readThreadContextUsage,
+  resolveThreadContextConfig,
+  threadContextFeatureEnabled,
+  threadContextConfigOverrides,
+  threadTurnContextConfigOverrides
+} from "./threadContext.js";
 import type { Project, RpcEnvelope, SocketClientMessage, SocketServerMessage } from "./types.js";
+import { sendUserPush } from "./webPush.js";
 
 const commandSchema = z.array(z.string()).min(1);
+const threadStartContextConfigSchema = z.object({
+  profile: z.enum(["default", "balanced", "long", "maximum", "custom"]),
+  contextWindow: z.number().int().nullable().optional(),
+  compactTokenLimit: z.number().int().nullable().optional(),
+  scope: z.enum(["total", "body_after_prefix"]).nullable().optional()
+}).strict();
 const contextProbeBytes = 512 * 1024;
 const contextPrecompactThreshold = 0.85;
 const contextFullThreshold = 0.98;
-const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? "/home/ls/codex_zerotier_remote/users";
+const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 
 type UserWebSocket = WebSocket & {
   codexUserId?: string;
@@ -35,6 +63,8 @@ type SocketRequestGuards = {
   activeTurnsByThread: Map<string, string>;
   /** Covers the narrow gap before app-server returns a turn id. */
   startingThreads: Set<string>;
+  /** Turns created for a real user task, as opposed to maintenance compaction. */
+  recoverableTurnIds: Set<string>;
 };
 
 function send(ws: WebSocket, message: SocketServerMessage): void {
@@ -64,6 +94,29 @@ function broadcast(wss: WebSocketServer, message: SocketServerMessage): void {
 
 function textInput(prompt: string) {
   return [{ type: "text", text: prompt, text_elements: [] }];
+}
+
+function skillNamesFromPrompt(prompt: string): string[] {
+  const prefix = prompt.match(/^((?:\$[a-z][a-z0-9:_-]*(?:[ \t]+|\r?\n)?)+)/)?.[0] ?? "";
+  return [...prefix.matchAll(/\$([a-z][a-z0-9:_-]*)/g)].map((match) => match[1]);
+}
+
+async function promptInput(bridge: CodexBridge, threadId: string, cwd: string, prompt: string, selected: unknown) {
+  if (!Array.isArray(selected) || selected.length === 0) return textInput(prompt);
+  const names = [...new Set(selected)].filter((name): name is string => typeof name === "string" && /^[a-zA-Z0-9:_-]{1,120}$/.test(name)).slice(0, 8);
+  if (names.length !== selected.length) throw new Error("技能选择无效，请重新选择后发送。");
+  const targeted = bridge as CodexBridge & { requestOnThreadAccount?: (threadId: string, method: string, params: unknown) => Promise<unknown> };
+  const result = targeted.requestOnThreadAccount
+    ? await targeted.requestOnThreadAccount(threadId, "skills/list", { cwds: [cwd], forceReload: false })
+    : await bridge.request("skills/list", { cwds: [cwd], forceReload: false });
+  const groups = (result as { data?: Array<{ skills?: Array<{ name?: string; path?: string; enabled?: boolean }> }> }).data ?? [];
+  const available = new Map(groups.flatMap((group) => group.skills ?? []).filter((skill) => skill.enabled && skill.path).map((skill) => [skill.name, skill.path]));
+  const references = names.map((name) => {
+    const path = available.get(name);
+    if (!path) throw new Error(`技能 ${name} 在当前会话所属账号不可用，请刷新技能列表。`);
+    return { type: "skill", name, path };
+  });
+  return [...textInput(prompt), ...references];
 }
 
 /**
@@ -121,6 +174,12 @@ function pickReasoningEffort(value: unknown, fallback: Project["defaultReasoning
     return value;
   }
   return fallback;
+}
+
+function requestedCollaborationMode(value: unknown, model: string, reasoningEffort: string) {
+  if (value === undefined || value === "default") return undefined;
+  if (value !== "plan") throw new Error("Invalid collaboration mode.");
+  return { mode: "plan", settings: { model, reasoning_effort: reasoningEffort } };
 }
 
 function sessionUserIdFromHeaders(headers: Record<string, unknown> | IncomingHttpHeaders): string | null {
@@ -200,7 +259,7 @@ async function threadContextCapacity(threadId: string): Promise<ThreadContextCap
           continue;
         }
         const info = asRecord(record.payload.info);
-        const total = finiteNumber(asRecord(info.total_token_usage).total_tokens);
+        const total = finiteNumber(asRecord(info.last_token_usage).total_tokens);
         const window = finiteNumber(info.model_context_window);
         if (total === null || window === null || window <= 0) {
           return "healthy";
@@ -279,6 +338,16 @@ function notificationTurnId(envelope: RpcEnvelope): string | null {
   return stringOrNull(params.turnId) ?? stringOrNull(turn.id);
 }
 
+function changesFromTurnDiff(diff: string): Array<{ path: string; kind: string; diff: string }> {
+  return diff.split(/(?=^diff --git )/m).filter((block) => block.trim()).map((block) => ({
+    path: block.match(/^diff --git a\/.*? b\/(.+)$/m)?.[1]
+      ?? block.match(/^\+\+\+ b\/(.+)$/m)?.[1]
+      ?? "本轮变更",
+    kind: "",
+    diff: block
+  }));
+}
+
 function notificationProcessId(envelope: RpcEnvelope): string | null {
   const params = asRecord(envelope.params);
   return stringOrNull(params.processId);
@@ -321,7 +390,9 @@ function rememberAcceptedTurn(guards: SocketRequestGuards, threadId: string, req
   // `turn/started` will replace this placeholder with the canonical turn id.
   // Keeping a placeholder closes the race where a second prompt lands after
   // the RPC response but before the notification reaches this server.
-  guards.activeTurnsByThread.set(threadId, turnIdFromStartResult(result) ?? `pending:${requestId}`);
+  const turnId = turnIdFromStartResult(result);
+  guards.activeTurnsByThread.set(threadId, turnId ?? `pending:${requestId}`);
+  if (turnId) guards.recoverableTurnIds.add(turnId);
 }
 
 function runDedupedPrompt<T>(
@@ -346,12 +417,95 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
   const liveStates = new Map<string, LiveStateStore>();
   const processOwners = new Map<string, string>();
+  const processSockets = new Map<string, WebSocket>();
+  const pendingApprovalOwners = new Map<number | string, string>();
   const turnOwners = new Map<string, string>();
+  const contextRecoveryByTurn = new Map<string, { threadId: string; steerStatus: "pending" | "accepted" | "failed" }>();
+  const contextRecoveryRetries = new Map<string, number>();
   const guards: SocketRequestGuards = {
     requestDeduper: new RequestDeduper({ ttlMs: 30_000, maxEntries: 2_048 }),
     promptDeduper: new RequestDeduper({ ttlMs: 8_000, maxEntries: 2_048 }),
     activeTurnsByThread: new Map(),
-    startingThreads: new Set()
+    startingThreads: new Set(),
+    recoverableTurnIds: new Set()
+  };
+  const startingQueuedThreads = new Set<string>();
+  const startNextQueuedTurn = async (owner: string, threadId: string): Promise<void> => {
+    if (startingQueuedThreads.has(threadId) || guards.activeTurnsByThread.has(threadId) || guards.startingThreads.has(threadId)) return;
+    startingQueuedThreads.add(threadId);
+    try {
+      const queued = await bridge.request("thread/queue/list", { threadId, limit: 1 }) as {
+        data?: Array<{ id?: string }>;
+      };
+      const queuedSubmissionId = queued.data?.[0]?.id;
+      if (!queuedSubmissionId || guards.activeTurnsByThread.has(threadId)) return;
+      await assertTrackedUserQuotaAvailable(bridge, store, owner, threadId);
+      const result = await bridge.request("thread/queue/start", { threadId, queuedSubmissionId });
+      rememberAcceptedTurn(guards, threadId, `queued:${queuedSubmissionId}`, result);
+      store.touchThreadOwner(threadId);
+      sendToUser(wss, owner, { type: "turn.queue.started", data: { threadId, queuedSubmissionId } });
+    } catch (error) {
+      console.error("[thread.queue.start.error]", JSON.stringify({ threadId, error: error instanceof Error ? error.message : String(error) }));
+    } finally {
+      startingQueuedThreads.delete(threadId);
+    }
+  };
+  const steerQueuedSubmission = async (owner: string, threadId: string, expectedTurnId: string, queuedSubmissionId: string) => {
+    if (startingQueuedThreads.has(threadId)) throw new Error("排队消息正在启动，请稍后重试。");
+    startingQueuedThreads.add(threadId);
+    try {
+      const queued = await bridge.request("thread/queue/list", { threadId, limit: 100 }) as {
+        data?: Array<{ id?: string; input?: Array<{ type?: string; text?: string }> }>;
+      };
+      const entry = queued.data?.find((item) => item.id === queuedSubmissionId);
+      const prompt = entry?.input?.filter((part) => part.type === "text").map((part) => part.text ?? "").join(" ").trim();
+      if (!prompt) throw new Error("排队消息已不存在或没有文字内容。");
+      const result = await bridge.request("turn/steer", { threadId, expectedTurnId, input: entry?.input ?? textInput(prompt) });
+      await bridge.request("thread/queue/delete", { threadId, queuedSubmissionId });
+      store.touchThreadOwner(threadId);
+      return result;
+    } finally {
+      startingQueuedThreads.delete(threadId);
+      if (!guards.activeTurnsByThread.has(threadId)) setTimeout(() => void startNextQueuedTurn(owner, threadId), 0);
+    }
+  };
+
+  const startFallbackContextRecovery = async (owner: string, threadId: string, priorTurnId: string): Promise<void> => {
+    const retryCount = contextRecoveryRetries.get(threadId) ?? 0;
+    if (retryCount >= 2 || guards.activeTurnsByThread.has(threadId)) return;
+    const threadOwner = store.getThreadOwner(threadId);
+    const project = threadOwner ? store.getProject(threadOwner.projectId, owner) : null;
+    if (!threadOwner || !project) return;
+    contextRecoveryRetries.set(threadId, retryCount + 1);
+    try {
+      await assertTrackedUserQuotaAvailable(bridge, store, owner, threadId);
+      await bridge.request("thread/resume", {
+        threadId,
+        cwd: threadOwner.rootPath,
+        model: threadOwner.modelOverride ?? project.defaultModel,
+        approvalPolicy: project.defaultApprovalPolicy,
+        sandbox: project.defaultSandbox
+      }, 30_000);
+      const requestId = `context-recovery:${priorTurnId}:${retryCount + 1}`;
+      const turn = await bridge.request("turn/start", {
+        threadId,
+        input: textInput(contextRecoveryPrompt()),
+        cwd: threadOwner.rootPath,
+        approvalPolicy: project.defaultApprovalPolicy,
+        sandboxPolicy: sandboxPolicy(project, project.defaultSandbox),
+        model: threadOwner.modelOverride ?? project.defaultModel,
+        effort: threadOwner.reasoningEffortOverride ?? project.defaultReasoningEffort
+      }, 30_000);
+      rememberAcceptedTurn(guards, threadId, requestId, turn);
+      store.touchThreadOwner(threadId);
+    } catch (error) {
+      console.error("[context.recovery.fallback.error]", JSON.stringify({
+        owner,
+        threadId,
+        priorTurnId,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    }
   };
 
   // Wi-Fi/ZeroTier can leave a browser TCP socket half-open: the tab still says
@@ -402,6 +556,30 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
 
     const turnId = notificationTurnId(message);
+    if (message.method === "turn/diff/updated" && turnId) {
+      const threadId = notificationThreadId(message)
+        ?? [...guards.activeTurnsByThread].find(([, activeTurnId]) => activeTurnId === turnId)?.[0];
+      const diff = asRecord(message.params).diff;
+      if (threadId && typeof diff === "string") {
+        try {
+          store.saveTimelineItem(threadId, turnId, {
+            id: `turn-diff:${turnId}`,
+            type: "fileChange",
+            source: "turnDiff",
+            changes: changesFromTurnDiff(diff),
+            timelineAt: new Date().toISOString()
+          });
+        } catch (error) {
+          console.warn("Could not persist turn diff", { threadId, turnId, error });
+        }
+      }
+    }
+    const state = liveStateFor(owner);
+    const completingAgentMessages = turnId && message.method === "turn/completed"
+      ? state.snapshot().agentMessages
+        .filter((item) => item.turnId === turnId)
+        .sort((left, right) => left.sequence - right.sequence)
+      : [];
     if (turnId && message.method === "turn/started") {
       turnOwners.set(turnId, owner);
       const threadId = notificationThreadId(message);
@@ -410,12 +588,51 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       }
     }
 
-    const liveUpdate = liveStateFor(owner).recordNotification(message);
+    const liveUpdate = state.recordNotification(message);
+    const recovery = turnId ? contextRecoveryByTurn.get(turnId) : undefined;
+    const suppressGenericRecoveryMessage = Boolean(
+      recovery
+      && liveUpdate?.kind === "agent"
+      && isPotentialGenericContextLossReply(liveUpdate.item.text)
+    );
+    if (liveUpdate?.item.threadId && liveUpdate.item.turnId && !suppressGenericRecoveryMessage) {
+      store.saveTimelineItem(liveUpdate.item.threadId, liveUpdate.item.turnId, journalItem(liveUpdate));
+    }
     sendToUser(wss, owner, { type: "codex.notification", data: message });
     if (liveUpdate?.kind === "tool") {
       sendToUser(wss, owner, { type: "live.tool", data: liveUpdate.item });
-    } else if (liveUpdate?.kind === "agent") {
+    } else if (liveUpdate?.kind === "agent" && !suppressGenericRecoveryMessage) {
       sendToUser(wss, owner, { type: "live.agent", data: liveUpdate.item });
+    }
+
+    if (
+      liveUpdate?.kind === "tool"
+      && liveUpdate.item.threadId
+      && liveUpdate.item.turnId
+      && guards.recoverableTurnIds.has(liveUpdate.item.turnId)
+      && isContextCompactionItem(liveUpdate.item)
+      && !contextRecoveryByTurn.has(liveUpdate.item.turnId)
+    ) {
+      const attempt = { threadId: liveUpdate.item.threadId, steerStatus: "pending" as const };
+      contextRecoveryByTurn.set(liveUpdate.item.turnId, attempt);
+      void bridge.request("turn/steer", {
+        threadId: liveUpdate.item.threadId,
+        expectedTurnId: liveUpdate.item.turnId,
+        input: textInput(contextRecoveryPrompt())
+      }).then(() => {
+        if (contextRecoveryByTurn.get(liveUpdate.item.turnId!) === attempt) {
+          contextRecoveryByTurn.set(liveUpdate.item.turnId!, { ...attempt, steerStatus: "accepted" });
+        }
+      }).catch((error) => {
+        if (contextRecoveryByTurn.get(liveUpdate.item.turnId!) === attempt) {
+          contextRecoveryByTurn.set(liveUpdate.item.turnId!, { ...attempt, steerStatus: "failed" });
+        }
+        console.error("[context.recovery.steer.error]", JSON.stringify({
+          threadId: liveUpdate.item.threadId,
+          turnId: liveUpdate.item.turnId,
+          error: error instanceof Error ? error.message : String(error)
+        }));
+      });
     }
 
     const maybe = message as { method?: string; params?: { processId?: string; deltaBase64?: string; stream?: string } };
@@ -431,12 +648,42 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
 
     if (turnId && message.method === "turn/completed") {
+      const completedRecovery = contextRecoveryByTurn.get(turnId);
+      const latestAgentText = completingAgentMessages.at(-1)?.text ?? "";
+      const needsFallbackRecovery = Boolean(completedRecovery && isGenericContextLossReply(latestAgentText));
+      const completedThreadId = notificationThreadId(message);
+      if (completedThreadId) {
+        for (const item of store.readTimelineItems(completedThreadId, turnId)) {
+          if (item.completed === false) store.saveTimelineItem(completedThreadId, turnId, { ...item, completed: true });
+        }
+      }
+      invalidateTrackedQuotaCacheForUser(owner);
       turnOwners.delete(turnId);
+      guards.recoverableTurnIds.delete(turnId);
+      contextRecoveryByTurn.delete(turnId);
       const threadId = notificationThreadId(message);
       if (threadId) {
         const activeTurn = guards.activeTurnsByThread.get(threadId);
         if (activeTurn === turnId || activeTurn?.startsWith("pending:")) {
           guards.activeTurnsByThread.delete(threadId);
+        }
+        if (needsFallbackRecovery) {
+          setTimeout(() => void startFallbackContextRecovery(owner, threadId, turnId), 0);
+        } else if (completedRecovery) {
+          contextRecoveryRetries.delete(threadId);
+        } else {
+          setTimeout(() => void startNextQueuedTurn(owner, threadId), 0);
+        }
+        const turnStatus = pickString(asRecord(asRecord(message.params).turn).status);
+        if (turnStatus === "completed" && !needsFallbackRecovery) {
+          const threadOwner = store.getThreadOwner(threadId);
+          void sendUserPush(store, owner, {
+            type: "completed",
+            threadId,
+            projectId: threadOwner?.projectId,
+            title: "Codex 已完成回答",
+            body: "点开查看本轮结果"
+          }).catch((error) => console.warn("Completion push failed", error));
         }
       }
     }
@@ -445,6 +692,19 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   bridge.on("serverRequest", (request) => {
     const owner = ownerForEnvelope(request as RpcEnvelope);
     if (owner) {
+      if (request.id !== undefined && (request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")) {
+        pendingApprovalOwners.set(request.id, owner);
+        const threadId = notificationThreadId(request as RpcEnvelope);
+        if (threadId) {
+          void sendUserPush(store, owner, {
+            type: "approval",
+            threadId,
+            projectId: store.getThreadOwner(threadId)?.projectId,
+            title: "Codex 等待批准",
+            body: "点开查看待批准的操作"
+          }).catch((error) => console.warn("Approval push failed", error));
+        }
+      }
       sendToUser(wss, owner, { type: "codex.serverRequest", data: request });
     }
   });
@@ -471,13 +731,21 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       type: "hello",
       ok: true,
       data: {
-        pendingServerRequests: [],
+        pendingServerRequests: bridge.getPendingServerRequests().filter((pending) => pendingApprovalOwners.get(pending.id) === sessionUserId),
         liveState: liveStateFor(sessionUserId).snapshot()
       }
     });
 
     ws.on("message", (raw) => {
-      void handleClientMessage(ws, bridge, store, liveStateFor(sessionUserId), processOwners, guards, sessionUserId, raw.toString("utf8"));
+      void handleClientMessage(ws, bridge, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission);
+    });
+    ws.on("close", () => {
+      for (const [processId, socket] of processSockets) {
+        if (socket !== ws) continue;
+        processSockets.delete(processId);
+        processOwners.delete(processId);
+        void bridge.request("command/exec/terminate", { processId }, 10_000).catch(() => undefined);
+      }
     });
   });
 
@@ -490,9 +758,13 @@ async function handleClientMessage(
   store: ProjectStore,
   liveState: LiveStateStore,
   processOwners: Map<string, string>,
+  processSockets: Map<string, WebSocket>,
+  pendingApprovalOwners: Map<number | string, string>,
   guards: SocketRequestGuards,
   sessionUserId: string,
-  raw: string
+  raw: string,
+  startNextQueuedTurn: (owner: string, threadId: string) => Promise<void>,
+  steerQueuedSubmission: (owner: string, threadId: string, expectedTurnId: string, queuedSubmissionId: string) => Promise<unknown>
 ): Promise<void> {
   let message: SocketClientMessage;
   try {
@@ -511,6 +783,7 @@ async function handleClientMessage(
       }
 
       case "thread.start": {
+        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId);
         const project = getProjectOrThrow(store, message.projectId, sessionUserId);
         const prompt = pickString(message.prompt).trim();
         if (!prompt) {
@@ -518,6 +791,12 @@ async function handleClientMessage(
         }
         const model = pickString(message.model, project.defaultModel).trim() || project.defaultModel;
         const reasoningEffort = pickReasoningEffort(message.reasoningEffort, project.defaultReasoningEffort);
+        const requestedContextConfig = !threadContextFeatureEnabled || message.contextConfig === undefined
+          ? null
+          : resolveThreadContextConfig("", threadStartContextConfigSchema.parse(message.contextConfig));
+        const requestedContextPin = threadContextFeatureEnabled
+          ? pickString(message.contextPin).trim().slice(0, 16_000)
+          : "";
         const data = await runDedupedPrompt(
           guards,
           sessionUserId,
@@ -527,13 +806,22 @@ async function handleClientMessage(
           model,
           reasoningEffort,
           async () => {
-            const thread = await bridge.request("thread/start", {
+            const startParams = {
               cwd: project.rootPath,
               model,
               approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
               sandbox: pickString(message.sandbox, project.defaultSandbox),
-              threadSource: "user"
-            });
+              threadSource: "user",
+              config: {
+                ...threadContextConfigOverrides(requestedContextConfig),
+                ...await scopedHookTrustConfig(bridge, store, sessionUserId, project)
+              },
+              developerInstructions: contextPinDeveloperInstructions(requestedContextPin)
+            };
+            const allowedAccountId = allowedAccountForUser(sessionUserId);
+            const thread = allowedAccountId && isAccountPoolBridge(bridge)
+              ? await bridge.startThreadOnAccount(allowedAccountId, startParams)
+              : await bridge.request("thread/start", startParams);
             const threadId = (thread as { thread?: { id?: string } }).thread?.id;
             if (!threadId) {
               throw new Error("Codex did not return a thread id.");
@@ -546,6 +834,17 @@ async function handleClientMessage(
               model,
               reasoningEffort
             });
+            if (requestedContextConfig) {
+              store.setThreadContextConfig(threadId, sessionUserId, {
+                profile: requestedContextConfig.profile,
+                contextWindow: requestedContextConfig.contextWindow,
+                compactTokenLimit: requestedContextConfig.compactTokenLimit,
+                scope: requestedContextConfig.scope
+              });
+            }
+            if (requestedContextPin) {
+              store.setThreadContextPin(threadId, sessionUserId, requestedContextPin);
+            }
             const autoTitle = titleFromFirstPrompt(prompt);
             store.updateThreadDisplayName(threadId, sessionUserId, autoTitle);
             const createdThread = (thread as { thread?: { name?: string; title?: string } }).thread;
@@ -559,12 +858,17 @@ async function handleClientMessage(
             });
             const turn = await bridge.request("turn/start", {
               threadId,
-              input: textInput(prompt),
+              input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames),
+              collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
               cwd: project.rootPath,
               approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
               sandboxPolicy: sandboxPolicy(project, pickSandbox(message.sandbox, project.defaultSandbox)),
               model,
-              effort: reasoningEffort
+              effort: reasoningEffort,
+              config: {
+                ...threadTurnContextConfigOverrides(requestedContextConfig),
+                ...await scopedHookTrustConfig(bridge, store, sessionUserId, project, threadId)
+              }
             });
             rememberAcceptedTurn(guards, threadId, requestId, turn);
             store.touchThreadOwner(threadId);
@@ -576,6 +880,7 @@ async function handleClientMessage(
       }
 
       case "turn.start": {
+        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, pickString(message.threadId));
         const project = getProjectOrThrow(store, message.projectId, sessionUserId);
         const threadId = pickString(message.threadId);
         const prompt = pickString(message.prompt).trim();
@@ -600,21 +905,36 @@ async function handleClientMessage(
             assertNoActiveTurn(guards, threadId);
             guards.startingThreads.add(threadId);
             try {
+              const contextConfig = store.getThreadContextConfig(threadId, sessionUserId)
+                ?? defaultThreadContextConfig(threadId);
+              const contextUsage = await readThreadContextUsage(threadId, contextConfig);
               await bridge.request("thread/resume", {
                 threadId,
                 cwd: project.rootPath,
                 model,
                 approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
-                sandbox: pickString(message.sandbox, project.defaultSandbox)
+                sandbox: pickString(message.sandbox, project.defaultSandbox),
+                config: {
+                  ...threadContextConfigOverrides(contextConfig, contextWindowMeasuredForConfig(contextConfig, contextUsage)),
+                  ...await scopedHookTrustConfig(bridge, store, sessionUserId, project, threadId)
+                },
+                developerInstructions: threadContextFeatureEnabled
+                  ? contextPinDeveloperInstructions(store.getThreadContextPin(threadId, sessionUserId)?.text ?? "")
+                  : undefined
               }, 30_000);
               const turn = await bridge.request("turn/start", {
                 threadId,
-                input: textInput(prompt),
+                input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames),
+                collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
                 cwd: project.rootPath,
                 approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
                 sandboxPolicy: sandboxPolicy(project, pickSandbox(message.sandbox, project.defaultSandbox)),
                 model,
-                effort: reasoningEffort
+                effort: reasoningEffort,
+                config: {
+                  ...threadTurnContextConfigOverrides(contextConfig, contextWindowMeasuredForConfig(contextConfig, contextUsage)),
+                  ...await scopedHookTrustConfig(bridge, store, sessionUserId, project, threadId)
+                }
               }, 30_000);
               rememberAcceptedTurn(guards, threadId, requestId, turn);
               if (!owner?.modelOverride || !owner.reasoningEffortOverride) {
@@ -632,6 +952,7 @@ async function handleClientMessage(
       }
 
       case "turn.steer": {
+        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, pickString(message.threadId));
         const threadId = pickString(message.threadId);
         const expectedTurnId = pickString(message.expectedTurnId);
         const prompt = pickString(message.prompt).trim();
@@ -651,13 +972,80 @@ async function handleClientMessage(
             const value = await bridge.request("turn/steer", {
               threadId,
               expectedTurnId,
-              input: textInput(prompt)
+              input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", prompt, message.skillNames)
             });
             store.touchThreadOwner(threadId);
             return value;
           }
         );
         send(ws, { type: "ack", requestId, ok: true, data: result });
+        break;
+      }
+
+      case "turn.queue.add": {
+        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, pickString(message.threadId));
+        const threadId = pickString(message.threadId);
+        const prompt = pickString(message.prompt).trim();
+        if (!threadId || !prompt) throw new Error("threadId and prompt are required.");
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        const result = await guards.requestDeduper.run(
+          { userId: sessionUserId, requestId },
+          async () => bridge.request("thread/queue/add", { threadId, input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", prompt, message.skillNames), clientUserMessageId: requestId }),
+          { serializeKey: `queue:${threadId}` }
+        );
+        send(ws, { type: "ack", requestId, ok: true, data: result });
+        setTimeout(() => void startNextQueuedTurn(sessionUserId, threadId), 0);
+        break;
+      }
+
+      case "turn.queue.list": {
+        const threadId = pickString(message.threadId);
+        if (!threadId) throw new Error("threadId is required.");
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        const result = await bridge.request("thread/queue/list", { threadId, limit: 100 });
+        send(ws, { type: "ack", requestId, ok: true, data: { threadId, ...asRecord(result) } });
+        break;
+      }
+
+      case "turn.queue.delete": {
+        const threadId = pickString(message.threadId);
+        const queuedSubmissionId = pickString(message.queuedSubmissionId);
+        if (!threadId || !queuedSubmissionId) throw new Error("threadId and queuedSubmissionId are required.");
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        const result = await bridge.request("thread/queue/delete", { threadId, queuedSubmissionId });
+        send(ws, { type: "ack", requestId, ok: true, data: { threadId, ...asRecord(result) } });
+        break;
+      }
+
+      case "turn.queue.update": {
+        const threadId = pickString(message.threadId);
+        const queuedSubmissionId = pickString(message.queuedSubmissionId);
+        const prompt = pickString(message.prompt).trim();
+        if (!threadId || !queuedSubmissionId || !prompt) throw new Error("threadId, queuedSubmissionId and prompt are required.");
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        const skillNames = Array.isArray(message.skillNames) ? message.skillNames : skillNamesFromPrompt(prompt);
+        const skillPrefix = Array.isArray(message.skillNames) ? prompt.match(/^((?:\$[a-z][a-z0-9:_-]*(?:[ \t]+|\r?\n)?)+)/)?.[0] ?? "" : "";
+        const promptBody = skillPrefix && skillNamesFromPrompt(skillPrefix).every((name) => skillNames.includes(name))
+          ? prompt.slice(skillPrefix.length).trimStart()
+          : prompt;
+        const result = await bridge.request("thread/queue/update", { threadId, queuedSubmissionId, input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", promptBody, skillNames) });
+        send(ws, { type: "ack", requestId, ok: true, data: { threadId, ...asRecord(result) } });
+        break;
+      }
+
+      case "turn.queue.steer": {
+        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, pickString(message.threadId));
+        const threadId = pickString(message.threadId);
+        const expectedTurnId = pickString(message.expectedTurnId);
+        const queuedSubmissionId = pickString(message.queuedSubmissionId);
+        if (!threadId || !expectedTurnId || !queuedSubmissionId) throw new Error("threadId, expectedTurnId and queuedSubmissionId are required.");
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        const result = await guards.requestDeduper.run(
+          { userId: sessionUserId, requestId },
+          () => steerQueuedSubmission(sessionUserId, threadId, expectedTurnId, queuedSubmissionId),
+          { serializeKey: `queue:${threadId}` }
+        );
+        send(ws, { type: "ack", requestId, ok: true, data: { threadId, ...asRecord(result) } });
         break;
       }
 
@@ -719,7 +1107,72 @@ async function handleClientMessage(
         break;
       }
 
+      case "goal.set": {
+        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, pickString(message.threadId));
+        const threadId = pickString(message.threadId);
+        const objective = pickString(message.objective).trim();
+        if (!threadId || !objective) {
+          throw new Error("threadId and objective are required.");
+        }
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        const status = pickString(message.status, "active");
+        if (status !== "active" && status !== "paused" && status !== "blocked" && status !== "usageLimited" && status !== "budgetLimited" && status !== "complete") {
+          throw new Error("Invalid Goal status.");
+        }
+        const tokenBudget = typeof message.tokenBudget === "number" && Number.isInteger(message.tokenBudget)
+          ? message.tokenBudget
+          : null;
+        const data = await guards.requestDeduper.run(
+          { userId: sessionUserId, requestId },
+          async () => {
+            const goal = await bridge.request("thread/goal/set", { threadId, objective, status, tokenBudget });
+            if (status !== "active" || guards.activeTurnsByThread.has(threadId)) {
+              return goal;
+            }
+
+            // Setting a goal on an idle thread persists the native objective but
+            // does not always create the first turn. Kick off one explicitly;
+            // if the native goal manager won the race, its active-turn error is
+            // harmless and the goal remains active for subsequent continuation.
+            const owner = store.getThreadOwner(threadId);
+            const project = owner ? store.getProject(owner.projectId, sessionUserId) : null;
+            if (!owner || !project) {
+              return goal;
+            }
+            try {
+              await bridge.request("thread/resume", {
+                threadId,
+                cwd: owner.rootPath,
+                model: owner.modelOverride ?? project.defaultModel,
+                approvalPolicy: project.defaultApprovalPolicy,
+                sandbox: project.defaultSandbox
+              }, 30_000);
+              const turn = await bridge.request("turn/start", {
+                threadId,
+                input: textInput("请立即开始执行当前 Goal，并持续工作直到目标完成。"),
+                cwd: owner.rootPath,
+                approvalPolicy: project.defaultApprovalPolicy,
+                sandboxPolicy: sandboxPolicy(project, project.defaultSandbox),
+                model: owner.modelOverride ?? project.defaultModel,
+                effort: owner.reasoningEffortOverride ?? project.defaultReasoningEffort
+              }, 30_000);
+              rememberAcceptedTurn(guards, threadId, requestId, turn);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              if (!/active turn|turn.*already|goal continuation/i.test(message)) {
+                throw error;
+              }
+            }
+            return goal;
+          },
+          { serializeKey: `thread:${threadId}` }
+        );
+        send(ws, { type: "ack", requestId, ok: true, data });
+        break;
+      }
+
       case "thread.compact": {
+        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, pickString(message.threadId));
         const project = getProjectOrThrow(store, message.projectId, sessionUserId);
         const threadId = pickString(message.threadId);
         if (!threadId) {
@@ -782,7 +1235,9 @@ async function handleClientMessage(
         const tty = pickBoolean(message.tty, true);
         const disableTimeout = pickBoolean(message.disableTimeout, false);
         processOwners.set(processId, sessionUserId);
-        const result = await bridge.request(
+        processSockets.set(processId, ws);
+        let result: unknown;
+        try { result = await bridge.request(
           "command/exec",
           {
             command,
@@ -792,12 +1247,16 @@ async function handleClientMessage(
             streamStdoutStderr: true,
             disableTimeout,
             timeoutMs: disableTimeout ? undefined : 120_000,
-            cwd: pickString(message.cwd, project.rootPath),
+            // A browser must not override its owned project's filesystem boundary.
+            cwd: project.rootPath,
             ...(tty ? { size: message.size ?? { cols: 100, rows: 28 } } : {}),
             sandboxPolicy: sandboxPolicy(project, pickSandbox(message.sandbox, project.defaultSandbox))
           },
           disableTimeout ? 86_400_000 : 180_000
-        );
+        ); } finally {
+          processOwners.delete(processId);
+          processSockets.delete(processId);
+        }
         send(ws, { type: "ack", requestId, ok: true, data: { processId, result } });
         break;
       }
@@ -816,6 +1275,22 @@ async function handleClientMessage(
         break;
       }
 
+      case "command.resize": {
+        const processId = pickString(message.processId);
+        if (!processId || processOwners.get(processId) !== sessionUserId) {
+          throw new Error("Process is not visible for this logged-in user.");
+        }
+        const size = message.size as { cols?: unknown; rows?: unknown } | undefined;
+        const cols = Number(size?.cols);
+        const rows = Number(size?.rows);
+        if (!Number.isInteger(cols) || cols < 20 || cols > 400 || !Number.isInteger(rows) || rows < 5 || rows > 200) {
+          throw new Error("Invalid terminal size.");
+        }
+        const result = await bridge.request("command/exec/resize", { processId, size: { cols, rows } });
+        send(ws, { type: "ack", requestId, ok: true, data: result });
+        break;
+      }
+
       case "command.terminate": {
         const processId = pickString(message.processId);
         if (!processId) {
@@ -826,6 +1301,7 @@ async function handleClientMessage(
         }
         const result = await bridge.request("command/exec/terminate", { processId });
         processOwners.delete(processId);
+        processSockets.delete(processId);
         send(ws, { type: "ack", requestId, ok: true, data: result });
         break;
       }
@@ -835,7 +1311,11 @@ async function handleClientMessage(
         if (responseId === undefined) {
           throw new Error("codexRequestId is required.");
         }
+        if (pendingApprovalOwners.get(responseId) !== sessionUserId) {
+          throw new Error("This approval does not belong to the logged-in user.");
+        }
         bridge.respondToServerRequest(responseId, message.result);
+        pendingApprovalOwners.delete(responseId);
         send(ws, { type: "ack", requestId, ok: true });
         break;
       }

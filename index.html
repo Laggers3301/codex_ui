@@ -2,198 +2,98 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <link rel="icon" type="image/svg+xml" href="/chatgpt-favicon.svg?v=20260824" />
     <title>Codex Web Console</title>
+    <script>
+      (() => {
+        const theme = localStorage.getItem("codex-web-color-theme") === "light" ? "light" : "dark";
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        const platform = navigator.userAgentData?.platform || navigator.platform || navigator.userAgent;
+        if (/Win/i.test(platform)) document.documentElement.dataset.platform = "windows";
+        else if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)) document.documentElement.dataset.platform = "mobile";
+      })();
+    </script>
+    <script>
+      (() => {
+        const phoneQuery = window.matchMedia("(max-width: 900px)");
+        let frame = 0;
+
+        function syncPhoneViewport() {
+          frame = 0;
+          const root = document.documentElement;
+          if (!phoneQuery.matches) {
+            root.style.removeProperty("--phone-viewport-height");
+            return;
+          }
+          const viewportHeight = Math.round(window.visualViewport?.height || window.innerHeight);
+          root.style.setProperty("--phone-viewport-height", `${viewportHeight}px`);
+          if (window.scrollX !== 0 || window.scrollY !== 0) window.scrollTo(0, 0);
+        }
+
+        function schedulePhoneViewportSync() {
+          if (frame) cancelAnimationFrame(frame);
+          frame = requestAnimationFrame(syncPhoneViewport);
+        }
+
+        schedulePhoneViewportSync();
+        phoneQuery.addEventListener?.("change", schedulePhoneViewportSync);
+        window.addEventListener("resize", schedulePhoneViewportSync, { passive: true });
+        window.addEventListener("orientationchange", schedulePhoneViewportSync, { passive: true });
+        window.addEventListener("scroll", schedulePhoneViewportSync, { passive: true });
+        window.visualViewport?.addEventListener("resize", schedulePhoneViewportSync, { passive: true });
+        window.visualViewport?.addEventListener("scroll", schedulePhoneViewportSync, { passive: true });
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </head>
   <body>
     <div id="root"></div>
-    <div class="v2AccountDock" id="v2AccountDock">
-      <div class="v2AccountMenu" id="v2AccountMenu" hidden>
-        <div class="v2AccountIdentity">
-          <span class="v2Avatar">GY</span>
-          <strong>gyj</strong>
-        </div>
-        <button type="button" id="v2QuotaMenuButton">
-          <span class="v2MenuIcon">◔</span>
-          <span>剩余用量</span>
-          <small id="v2QuotaSummary">查看详情</small>
-          <span class="v2ChevronGlyph" aria-hidden="true"></span>
-        </button>
-        <div class="v2QuotaStrip"><span id="v2QuotaFill"></span></div>
-        <button type="button"><span class="v2MenuIcon">↗</span><span>了解更多</span></button>
-        <button type="button"><span class="v2MenuIcon">◉</span><span>显示宠物</span></button>
-        <button type="button"><span class="v2MenuIcon">⌁</span><span>邀请好友</span></button>
-        <button type="button"><span class="v2MenuIcon">⚙</span><span>设置</span><small>Ctrl+,</small></button>
-        <button type="button"><span class="v2MenuIcon">↪</span><span>退出登录</span></button>
-      </div>
-      <button class="v2AccountTrigger" id="v2AccountTrigger" type="button" aria-expanded="false">
-        <span class="v2Avatar">GY</span>
-        <strong>gyj</strong>
-      </button>
-    </div>
-    <script>
-      (() => {
-        const dock = document.getElementById("v2AccountDock");
-        const menu = document.getElementById("v2AccountMenu");
-        const trigger = document.getElementById("v2AccountTrigger");
-        const quotaMenuButton = document.getElementById("v2QuotaMenuButton");
-        const quotaSummary = document.getElementById("v2QuotaSummary");
-        const quotaFill = document.getElementById("v2QuotaFill");
-        const accountAvatars = [...document.querySelectorAll(".v2Avatar")];
-        const accountNames = [...document.querySelectorAll(".v2AccountIdentity strong, .v2AccountTrigger strong")];
-
-        function userInitials(username) {
-          const value = String(username || "").trim();
-          if (!value) return "?";
-          const parts = value.split(/[._\\-\\s]+/).filter(Boolean);
-          if (parts.length > 1) return parts.slice(0, 2).map((part) => part[0]).join("").toUpperCase();
-          return Array.from(value).slice(0, 2).join("").toUpperCase();
-        }
-
-        async function syncAccountIdentity() {
-          try {
-            const response = await fetch("/api/auth/me", { credentials: "same-origin", cache: "no-store" });
-            const body = await response.json().catch(() => ({}));
-            const username = body?.data?.username;
-            if (!username) return;
-            const initials = userInitials(username);
-            accountAvatars.forEach((element) => { element.textContent = initials; });
-            accountNames.forEach((element) => { element.textContent = username; });
-          } catch {
-            // The login page and static shell remain usable while auth is unavailable.
-          }
-        }
-
-        function syncQuota() {
-          const source = document.querySelector(".quotaButton");
-          const text = source?.textContent?.trim() || "查看详情";
-          quotaSummary.textContent = text.replace(/^额度\s*/, "剩余 ");
-          const match = text.match(/([0-9]+(?:\.[0-9]+)?)%/);
-          quotaFill.style.width = `${Math.max(4, Math.min(100, Number(match?.[1] || 0)))}%`;
-        }
-
-        trigger.addEventListener("click", () => {
-          const opening = menu.hidden;
-          menu.hidden = !opening;
-          trigger.setAttribute("aria-expanded", String(opening));
-          if (opening) syncQuota();
-        });
-        quotaMenuButton.addEventListener("click", () => {
-          document.querySelector(".quotaButton")?.click();
-          menu.hidden = true;
-          trigger.setAttribute("aria-expanded", "false");
-        });
-        document.addEventListener("click", (event) => {
-          if (!dock.contains(event.target)) {
-            menu.hidden = true;
-            trigger.setAttribute("aria-expanded", "false");
-          }
-        });
-        void syncAccountIdentity();
-      })();
-    </script>
-    <div class="v2ProjectDock" id="v2ProjectDock">
-      <div class="v2BrandRow"><strong>Codex</strong><button class="v2SidebarToggle" id="v2SidebarToggle" type="button" title="折叠侧边栏" aria-label="折叠侧边栏">‹</button></div>
-      <div class="v2PrimaryNav">
-        <button id="v2NewConversation" type="button"><svg class="v2NavGlyph v2NewThreadGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z"></path></svg><strong>新对话</strong></button>
-        <button id="v2OpenPlugins" type="button"><svg class="v2NavGlyph v2PluginGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 22v-5"></path><path d="M9 8V2"></path><path d="M15 8V2"></path><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"></path></svg><strong>插件</strong></button>
-        <button id="v2NewWorkspace" type="button"><svg class="v2NavGlyph v2NewWorkspaceGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 10v6"></path><path d="M9 13h6"></path><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"></path></svg><strong>新建工作区</strong></button>
-      </div>
-      <button class="v2ProjectTrigger" id="v2ProjectTrigger" type="button" aria-expanded="false">
-        <span class="v2FolderIcon"></span>
-        <span><small>选择文件</small><strong id="v2ProjectName">项目文件夹</strong></span>
-        <span class="v2ChevronGlyph" aria-hidden="true"></span>
-      </button>
-      <div class="v2ProjectMenu" id="v2ProjectMenu" hidden>
-        <div class="v2ProjectSearchRow"><span>⌕</span><input id="v2ProjectSearch" placeholder="检索项目文件夹" /></div>
-        <div class="v2ProjectOptions" id="v2ProjectOptions"></div>
-        <button class="v2OpenFolder" id="v2OpenFolder" type="button"><span>＋</span>连接新的本地文件夹</button>
-      </div>
-    </div>
-
     <div class="v2PlusMenu" id="v2PlusMenu" hidden>
       <span class="v2MenuSection">添加</span>
-      <button type="button" data-action="upload"><span>⌕</span><span><strong>文件和文件夹</strong><small>上传到当前工作区</small></span></button>
-      <button type="button" data-action="send-markdown"><span>⇲</span><span><strong>发送对话记录到本机</strong><small>发送当前会话记录</small></span></button>
-      <button type="button" data-action="settings"><span>⚙</span><span><strong>设备与导出设置</strong><small>配置文件发送和对话导出</small></span></button>
-      <button type="button" data-action="quota"><span>◔</span><span><strong>剩余用量</strong><small>查看额度与重置时间</small></span></button>
-      <button type="button" data-action="leaderboard"><span>♜</span><span><strong>排行榜</strong><small>查看 Token 使用排行</small></span></button>
-      <span class="v2MenuSection">能力</span>
-      <button type="button" data-action="skills"><span>◇</span><span><strong>技能与插件</strong><small>管理 Codex 扩展能力</small></span></button>
-      <button type="button" data-action="migration"><span>⇄</span><span><strong>迁移 4090-left 会话</strong><small>保留现有迁移功能</small></span></button>
+      <button type="button" data-action="upload"><span class="v2MenuIcon" data-icon="upload"></span><span><strong>文件和文件夹</strong><small>上传到当前工作区</small></span></button>
+      <button type="button" data-action="goal"><span class="v2MenuIcon" data-icon="goal"></span><span><strong>持续目标</strong><small>输入目标后发送</small></span></button>
+      <button type="button" data-action="plan" aria-pressed="false"><span class="v2MenuIcon" data-icon="plan"></span><span><strong>计划模式</strong><small>先审方案，再决定是否执行</small></span></button>
+      <button type="button" data-action="skills"><span class="v2MenuIcon" data-icon="skills"></span><span><strong>技能与插件</strong><small>选择当前可用的能力</small></span></button>
+      <span class="v2MenuSection">会话</span>
+      <button type="button" data-action="send-markdown"><span class="v2MenuIcon" data-icon="send"></span><span><strong>发送对话记录到本机</strong><small>发送当前会话记录</small></span></button>
+      <button type="button" data-action="context"><span class="v2MenuIcon" data-icon="context"></span><span><strong>上下文状态</strong><small>查看会话上下文与压缩设置</small></span></button>
+      <span class="v2MenuSection">工作区</span>
+      <button type="button" data-action="worktree"><span class="v2MenuIcon" data-icon="worktree"></span><span><strong>独立工作树</strong><small>隔离改动并接力当前会话</small></span></button>
+      <button type="button" data-action="archive-list"><span class="v2MenuIcon" data-icon="archive-list"></span><span><strong>归档会话</strong><small>查看并恢复已归档对话</small></span></button>
+      <button type="button" data-action="archive-current"><span class="v2MenuIcon" data-icon="archive-current"></span><span><strong>归档当前会话</strong><small>从列表收起，随时可恢复</small></span></button>
+      <button type="button" data-action="terminal"><span class="v2MenuIcon" data-icon="terminal"></span><span><strong>交互终端</strong><small>在当前工作区运行命令</small></span></button>
+      <button type="button" data-action="hooks"><span class="v2MenuIcon" data-icon="hooks"></span><span><strong>Hooks 状态</strong><small>检查与审核当前工作区</small></span></button>
+      <span class="v2MenuSection">设置与用量</span>
+      <button type="button" data-action="settings"><span class="v2MenuIcon" data-icon="settings"></span><span><strong>设备与导出设置</strong><small>配置文件发送和对话导出</small></span></button>
+      <button type="button" data-action="quota"><span class="v2MenuIcon" data-icon="quota"></span><span><strong>剩余用量</strong><small>查看额度与重置时间</small></span></button>
+      <button type="button" data-action="leaderboard"><span class="v2MenuIcon" data-icon="leaderboard"></span><span><strong>排行榜</strong><small>查看 Token 使用排行</small></span></button>
     </div>
 
-    <script>
+    <script type="module">
+      import { Plus, FolderUpload, Target, Application, Send, ChartPie, Setting, Time, Trophy, Plan, Branch, History, FileCollection, Terminal } from "@icon-park/svg";
       (() => {
-        const projectDock = document.getElementById("v2ProjectDock");
-        const projectTrigger = document.getElementById("v2ProjectTrigger");
-        const projectMenu = document.getElementById("v2ProjectMenu");
-        const projectName = document.getElementById("v2ProjectName");
-        const projectSearch = document.getElementById("v2ProjectSearch");
-        const projectOptions = document.getElementById("v2ProjectOptions");
         const plusMenu = document.getElementById("v2PlusMenu");
-
-        const sidebarToggle = document.getElementById("v2SidebarToggle");
-        sidebarToggle.addEventListener("click", () => {
-          const threadList = document.querySelector(".threadList");
-          const target = threadList?.classList.contains("collapsed")
-            ? document.querySelector(".threadListRestoreButton")
-            : document.querySelector(".threadList .panelCollapseButton");
-          target?.click();
-        });
-        document.getElementById("v2NewConversation").addEventListener("click", () => {
-          document.querySelector(".newThreadButton")?.click();
-        });
-        document.getElementById("v2OpenPlugins").addEventListener("click", () => {
-          clickExisting(".skillsButton", /Skills|技能|插件/);
-        });
-        document.getElementById("v2NewWorkspace").addEventListener("click", () => {
-          clickExisting(".projectCreator .iconTextButton", /选择目录/);
-        });
-
-        const projects = () => [...document.querySelectorAll(".projectRow")].map((row) => ({
-          row,
-          button: row.querySelector(".projectSelectButton"),
-          name: row.querySelector(".projectSelectButton strong")?.textContent?.trim() || "未命名项目",
-          path: row.querySelector(".projectSelectButton small")?.textContent?.trim() || ""
-        })).filter((project) => project.button);
-
-        function renderProjects() {
-          const all = projects();
-          const selected = all.find((project) => project.row.classList.contains("selected"));
-          if (selected) projectName.textContent = selected.name;
-          const query = projectSearch.value.trim().toLowerCase();
-          projectOptions.replaceChildren();
-          all.filter((project) => `${project.name} ${project.path}`.toLowerCase().includes(query)).forEach((project) => {
-            const option = document.createElement("button");
-            option.type = "button";
-            option.className = project.row.classList.contains("selected") ? "selected" : "";
-            option.innerHTML = '<span class="v2FolderIcon"></span><span><strong></strong><small></small></span><span class="v2ProjectCheck"></span>';
-            option.querySelector("strong").textContent = project.name;
-            option.querySelector("small").textContent = project.path;
-            option.querySelector(".v2ProjectCheck").textContent = option.className ? "✓" : "";
-            option.addEventListener("click", () => {
-              project.button.click();
-              projectMenu.hidden = true;
-              projectTrigger.setAttribute("aria-expanded", "false");
-              setTimeout(renderProjects, 0);
-            });
-            projectOptions.appendChild(option);
-          });
-        }
-
-        projectTrigger.addEventListener("click", () => {
-          const opening = projectMenu.hidden;
-          projectMenu.hidden = !opening;
-          projectTrigger.setAttribute("aria-expanded", String(opening));
-          if (opening) { renderProjects(); setTimeout(() => projectSearch.focus(), 0); }
-        });
-        projectSearch.addEventListener("input", renderProjects);
-        document.getElementById("v2OpenFolder").addEventListener("click", () => {
-          [...document.querySelectorAll("button")].find((button) => /选择目录|连接本地记录|添加.*项目/i.test(button.textContent || ""))?.click();
-          projectMenu.hidden = true;
+        let plusCloseTimer = 0;
+        const closePlusMenu = () => {
+          if (plusMenu.hidden || plusMenu.classList.contains("uiClosing")) return;
+          plusMenu.classList.add("uiClosing");
+          document.querySelector(".v2ComposerPlus")?.setAttribute("aria-expanded", "false");
+          clearTimeout(plusCloseTimer);
+          plusCloseTimer = window.setTimeout(() => {
+            plusMenu.hidden = true;
+            plusMenu.classList.remove("uiClosing");
+          }, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 200);
+        };
+        const iconOptions = { theme: "outline", size: 18, fill: "currentColor", strokeWidth: 4, strokeLinecap: "round", strokeLinejoin: "round" };
+        const iconMarkup = (icon, size = 18) => icon({ ...iconOptions, size })
+          .replace(/^<\?xml[^>]*>/, "")
+          .replace("<svg ", '<svg aria-hidden="true" focusable="false" ');
+        const menuIcons = { upload: FolderUpload, goal: Target, plan: Plan, skills: Application, send: Send, context: ChartPie, worktree: Branch, "archive-list": History, "archive-current": FileCollection, terminal: Terminal, hooks: Setting, settings: Setting, quota: Time, leaderboard: Trophy };
+        plusMenu.querySelectorAll("[data-icon]").forEach((slot) => {
+          const icon = menuIcons[slot.dataset.icon];
+          if (icon) slot.innerHTML = iconMarkup(icon);
         });
 
         function clickExisting(selector, pattern) {
@@ -205,10 +105,6 @@
         function installShellBridges() {
           const threadList = document.querySelector(".threadList");
           if (threadList) {
-            const collapsed = threadList.classList.contains("collapsed");
-            sidebarToggle.textContent = collapsed ? "›" : "‹";
-            sidebarToggle.title = collapsed ? "展开侧边栏" : "折叠侧边栏";
-            sidebarToggle.setAttribute("aria-label", sidebarToggle.title);
             const applySidebarWidth = (width) => {
               // During conversation switches the grid briefly reports 0px.
               // Do not persist that transient layout state into the fixed V2 dock.
@@ -247,17 +143,36 @@
           const plus = document.createElement("button");
           plus.type = "button";
           plus.className = "v2ComposerPlus";
-          plus.textContent = "+";
+          plus.setAttribute("aria-expanded", "false");
+          plus.innerHTML = iconMarkup(Plus, 20);
           plus.title = "添加文件、能力或查看用量";
           plus.addEventListener("click", (event) => {
             event.stopPropagation();
-            const opening = plusMenu.hidden;
-            plusMenu.hidden = !opening;
+            const opening = plusMenu.hidden || plusMenu.classList.contains("uiClosing");
             if (opening) {
+              clearTimeout(plusCloseTimer);
+              plusMenu.classList.remove("uiClosing");
+              plusMenu.hidden = false;
+              plus.setAttribute("aria-expanded", "true");
+              const goalButton = plusMenu.querySelector('[data-action="goal"]');
+              goalButton.disabled = document.querySelector('.composer[data-has-thread="true"]') === null;
+              goalButton.title = goalButton.disabled ? "请先开始一个会话，再设定持续目标" : "";
+              const planBridge = document.querySelector('.composer .v2PlanModeBridge');
+              const planButton = plusMenu.querySelector('[data-action="plan"]');
+              const planEnabled = planBridge?.getAttribute('aria-pressed') === 'true';
+              planButton.setAttribute('aria-pressed', String(planEnabled));
+              planButton.querySelector('small').textContent = planEnabled ? '已开启；点击关闭' : '先审方案，再决定是否执行';
+              const hasProject = Boolean(document.querySelector('.projectTitle .recordMapping'));
+              const hasThread = document.querySelector('.composer[data-has-thread="true"]') !== null;
+              for (const action of ['worktree', 'archive-list', 'archive-current', 'terminal', 'hooks']) {
+                plusMenu.querySelector(`[data-action="${action}"]`).disabled = !hasProject || (action === 'archive-current' && !hasThread);
+              }
+              plusMenu.querySelector('[data-action="worktree"] small').textContent = hasThread ? '隔离改动并接力当前会话' : '创建隔离的工作区会话';
               const rect = plus.getBoundingClientRect();
-              plusMenu.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - 422))}px`;
+              const menuWidth = Math.min(500, window.innerWidth - 24);
+              plusMenu.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - menuWidth - 12))}px`;
               plusMenu.style.bottom = `${window.innerHeight - rect.top + 8}px`;
-            }
+            } else closePlusMenu();
           });
           tools.prepend(plus);
 
@@ -274,25 +189,12 @@
           if (action === "quota") clickExisting(".quotaButton", /额度|剩余用量/);
           if (action === "leaderboard") clickExisting(".leaderboardButton", /排行榜/);
           if (action === "skills") clickExisting(".skillsButton", /Skills|技能|插件/);
-          if (action === "migration") window.dispatchEvent(new CustomEvent("codex:migrate-4090-left"));
-          plusMenu.hidden = true;
+          if (action === "plan") document.querySelector('.composer .v2PlanModeBridge')?.click();
+          if (action === "context") clickExisting(".v2ContextStatusButton", /上下文|会话状态/);
+          if (action === "goal") window.dispatchEvent(new CustomEvent("codex:compose-goal"));
+          if (["worktree", "archive-list", "archive-current", "terminal", "hooks"].includes(action)) window.dispatchEvent(new CustomEvent("codex:workspace-action", { detail: action }));
+          closePlusMenu();
         });
-
-        window.addEventListener("codex:migration-status", (event) => {
-          const button = plusMenu.querySelector('[data-action="migration"]');
-          if (!button) return;
-          const status = event.detail || {};
-          const running = status.kind === "running";
-          button.disabled = running;
-          const title = button.querySelector("strong");
-          const detail = button.querySelector("small");
-          if (title) title.textContent = running ? "正在迁移 4090-left 会话…" : "迁移 4090-left 会话";
-          if (detail) detail.textContent = status.message || "重新补充并覆盖已有会话";
-        });
-
-        const accountButtons = document.querySelectorAll(".v2AccountMenu button");
-        const logout = accountButtons[accountButtons.length - 1];
-        if (logout) logout.addEventListener("click", () => window.location.assign("/__v2_logout"));
 
         let scheduled = false;
         const observer = new MutationObserver(() => {
@@ -301,18 +203,13 @@
           requestAnimationFrame(() => {
             scheduled = false;
             installShellBridges();
-            renderProjects();
           });
         });
         observer.observe(document.getElementById("root"), { childList: true, subtree: true });
         installShellBridges();
 
         document.addEventListener("click", (event) => {
-          if (!projectDock.contains(event.target)) {
-            projectMenu.hidden = true;
-            projectTrigger.setAttribute("aria-expanded", "false");
-          }
-          if (!plusMenu.contains(event.target) && !event.target.closest(".v2ComposerPlus")) plusMenu.hidden = true;
+          if (!plusMenu.contains(event.target) && !event.target.closest(".v2ComposerPlus")) closePlusMenu();
         });
       })();
     </script>
