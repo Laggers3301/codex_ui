@@ -7086,9 +7086,9 @@ body:has(.globalSearchScrim) .v2AccountDock {
 /* Tool summaries use dedicated columns; no content can clip the terminal glyph. */
 .messageItem.kind-tool,
 .messageItem.kind-tool:not(.toolExpanded) {
-  grid-template-columns: 17px max-content minmax(0, 1fr) !important;
+  grid-template-columns: 18px max-content minmax(0, 1fr) !important;
   grid-auto-rows: minmax(18px, auto);
-  column-gap: 7px !important;
+  column-gap: 6px !important;
   max-height: none !important;
   min-height: 26px !important;
   overflow: visible !important;
@@ -7097,22 +7097,23 @@ body:has(.globalSearchScrim) .v2AccountDock {
 
 .messageItem.kind-tool::before,
 .messageItem.kind-tool:not(.toolExpanded)::before {
-  content: ">_" !important;
+  content: "" !important;
   position: static !important;
   z-index: auto !important;
   display: grid !important;
   grid-column: 1 !important;
   grid-row: 1 !important;
-  width: 17px !important;
-  min-width: 17px !important;
-  height: 15px !important;
+  width: 18px !important;
+  min-width: 18px !important;
+  height: 18px !important;
   align-self: center !important;
   place-items: center !important;
-  border: 1px solid #777a75 !important;
-  border-radius: 3px !important;
-  background: transparent !important;
-  color: #aeb1ab !important;
-  font: 7px/13px "Cascadia Code", monospace !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: var(--ui-content-muted) !important;
+  color: var(--ui-content-muted) !important;
+  -webkit-mask: url("/icons/iconpark-terminal.svg") center / contain no-repeat;
+  mask: url("/icons/iconpark-terminal.svg") center / contain no-repeat;
   transform: none !important;
 }
 
@@ -7204,7 +7205,7 @@ body:has(.globalSearchScrim) .v2AccountDock {
 
 .toolBundle.toolExpanded {
   display: grid !important;
-  grid-template-columns: 17px minmax(0, 1fr) !important;
+  grid-template-columns: 18px minmax(0, 1fr) !important;
   grid-template-rows: 28px auto !important;
   width: min(860px, 100%) !important;
   max-width: min(860px, 100%) !important;
@@ -7244,7 +7245,7 @@ body:has(.globalSearchScrim) .v2AccountDock {
 }
 
 .toolBundle:not(.toolExpanded)::before {
-  height: 26px !important;
+  height: 18px !important;
   transition: opacity 180ms ease !important;
 }
 
@@ -7367,7 +7368,7 @@ body:has(.globalSearchScrim) .v2AccountDock {
 
 .toolBundleEntry {
   display: grid !important;
-  grid-template-columns: 17px minmax(0, 1fr) !important;
+  grid-template-columns: 18px minmax(0, 1fr) !important;
   margin: 0 !important;
   width: 100% !important;
   max-width: 100% !important;
@@ -11291,7 +11292,7 @@ body:has(.threadList.collapsed) .v2BrandRow > .v2ThemeToggle { display: none; }
 :root[data-theme="light"] .messageItem.kind-user .persistedUserAttachment.image { background: var(--ui-code-bg) !important; border-color: transparent !important; color: var(--ui-code-content) !important; }
 :root[data-theme="light"] .toolImagePreviewGrid .inlineMessageImage { background: var(--ui-surface) !important; }
 :root[data-theme="light"] .toolImagePreviewGrid .inlineImageButton > span { color: #5f6a60 !important; }
-:root[data-theme="light"] .messageItem.kind-tool:not(.toolExpanded)::before { background: linear-gradient(to bottom,transparent,var(--ui-surface) 80%) !important; }
+:root[data-theme="light"] .messageItem.kind-tool:not(.toolExpanded)::before { background: var(--ui-content-muted) !important; }
 :root[data-theme="light"] .messageItem.kind-tool::after { background: linear-gradient(90deg,transparent,var(--ui-surface) 16px) !important; color: var(--ui-content-muted) !important; }
 
 .codexApprovalCard {
@@ -12381,4 +12382,25 @@ body:has(.directoryPickerScrim) :is(.threadList, .v2ProjectDock, .v2AccountDock)
   .groupedModelPicker .groupedModelMenu, .groupedModelCascade { animation: none !important; transition: none !important; }
   .groupedModelRow, .groupedModelRow svg { transition: none !important; }
   .providerFailureNotice { animation: none !important; }
+}
+
+/* Keep the three conversation controls on one line on narrow phones. The
+   desktop auto margin on Context was consuming the model's remaining space. */
+@media (max-width: 720px) {
+  .composerTools:not(:has(.selectedSkillChip)) { flex-wrap: nowrap !important; }
+  .composerTools .iconTextButton.v2ContextStatusButton,
+  .composerTools .iconTextButton.v2FastModeButton:not(.v2ContextStatusButton) {
+    margin-left: 0 !important;
+    flex: 0 0 auto;
+  }
+  .composerTools .groupedModelPicker {
+    min-width: 0;
+    flex: 0 1 auto;
+  }
+  .composerTools .groupedModelPicker .polishedSelectTrigger > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }
