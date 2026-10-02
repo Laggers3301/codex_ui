@@ -1,5 +1,12 @@
 import { Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { lazy, Suspense } from "react";
+import { PreviewZoom } from "./PreviewZoom";
+const DocumentPreview = lazy(() => import("./DocumentPreview"));
+const DocumentWorkbench = lazy(() => import("./writing/DocumentWorkbench"));
+import type { WritingProject, WritingSelection } from "./writing/types";
+import { withoutDocumentContext, type ComposerDocumentReference } from "./documentReference";
+import "./writingCanvas.css";
 import { Application as IconParkApplication, Command as IconParkCommand } from "@icon-park/svg";
 import { nodeInputRule } from "@tiptap/core";
 import { InlineMath, BlockMath } from "@tiptap/extension-mathematics";
@@ -10,6 +17,7 @@ import { BubbleMenu } from "@tiptap/react/menus";
 import StarterKit from "@tiptap/starter-kit";
 import { toggleComposerList } from "./composerList";
 import { classifyProviderFailure, type ProviderFailureNotice } from "./providerFailure";
+import { readTurnProgress, turnProgressText, updateTurnProgress, type TurnProgress } from "./turnProgress";
 import { exhaustedAccountSuggestion, type ExhaustedAccountSuggestion } from "./accountExhaustion";
 import "katex/dist/katex.min.css";
 import {
@@ -48,6 +56,14 @@ import {
 import ReactMarkdown, { type Components } from "react-markdown";
 import { coalesceToolOutputs, collapseCodeModeWrappers, latestUserTimelineIndex, liveTimelineItems, mergeTimelineItems } from "./conversationTimeline";
 import { ToolReveal } from "./ToolReveal";
+import { skillReadSummary } from "./skillReadSummary";
+import { GoalProgress } from "./GoalProgress";
+import { useThreadGoal } from "./threadGoal";
+import { SubagentActivity, SubagentToolCard } from "./SubagentActivity";
+import { SubagentPanel } from "./SubagentPanel";
+import { SelectionAskAction, type SelectionAskActionHandle } from "./SelectionAskAction";
+import { collectAgents, parseAgentOperation, reconcileSubagents } from "./subagentPresentation";
+import { useSubagentDirectory } from "./subagentDirectory";
 import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, type ToolQuestion } from "./questionTool";
 import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
@@ -91,6 +107,7 @@ import {
   readThreadContext,
   readThread,
   readThreadItemOutput,
+  readSubagentItemOutput,
   removePushSubscription,
   savePushSubscription,
   selectDirectory,
@@ -398,7 +415,8 @@ const domesticModelGroups: Array<{ key: ModelPickerSection; label: string }> = [
   { key: "kimi", label: "Kimi" },
   { key: "mimo", label: "MiMo" },
   { key: "glm", label: "GLM" },
-  { key: "minimax", label: "MiniMax" }
+  { key: "minimax", label: "MiniMax" },
+  { key: "domestic", label: "Other" }
 ];
 
 function modelPickerGroup(model: string): ModelPickerSection {
@@ -412,6 +430,13 @@ function modelPickerGroup(model: string): ModelPickerSection {
   return "domestic";
 }
 
+function MobileModelPage({ active, children }: { active: boolean; children: ReactNode }) {
+  const presence = useExitPresence(active);
+  if (!presence.present) return null;
+  return <div className={`groupedModelMobilePage${active ? " active" : " uiClosing"}`}
+    aria-hidden={!active} inert={!active}>{children}</div>;
+}
+
 function ModelGroupedSelect({
   value, profiles, onChange, disabled = false, title
 }: {
@@ -422,11 +447,33 @@ function ModelGroupedSelect({
   title?: string;
 }) {
   const [open, setOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const [mobileMenuLeft, setMobileMenuLeft] = useState(0);
+  const [mobile, setMobile] = useState(() => window.matchMedia("(max-width: 720px)").matches);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 720px)");
+    const update = () => setMobile(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
   const [branch, setBranch] = useState<"gpt" | "domestic" | null>(null);
   const [lastBranch, setLastBranch] = useState<"gpt" | "domestic">("domestic");
   const [provider, setProvider] = useState<ModelPickerSection | null>(null);
   const [lastProvider, setLastProvider] = useState<ModelPickerSection>("doubao");
   const menuPresence = useExitPresence(open);
+  useLayoutEffect(() => {
+    if (!mobile || !menuPresence.present) return;
+    const update = () => {
+      const rect = pickerRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const width = Math.min(300, window.innerWidth - 20);
+      const left = Math.max(10, Math.min(rect.right - width, window.innerWidth - width - 10));
+      setMobileMenuLeft(left - rect.left);
+    };
+    update();
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, [mobile, menuPresence.present]);
   const visibleProfiles = profiles.filter((profile) => !isUltraModelProfile(profile));
   const selected = visibleProfiles.find((profile) => profile.id === value) ?? visibleProfiles[0];
   const modelNames = [...new Set(visibleProfiles.map((profile) => profile.model))];
@@ -449,7 +496,8 @@ function ModelGroupedSelect({
     </button>
   ));
   return (
-    <div className={`polishedSelect v2ModelPicker groupedModelPicker ${open ? "open" : ""}`}
+    <div ref={pickerRef} className={`polishedSelect v2ModelPicker groupedModelPicker ${open ? "open" : ""}`}
+      style={mobile ? { "--mobile-model-menu-left": `${mobileMenuLeft}px` } as CSSProperties : undefined}
       onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false); }}>
       <button className="polishedSelectTrigger" type="button" disabled={disabled} title={title}
         aria-haspopup="dialog" aria-expanded={open}
@@ -461,6 +509,33 @@ function ModelGroupedSelect({
         <div className={`polishedSelectMenu groupedModelMenu${menuPresence.closing ? " uiClosing" : ""}`}
           role="dialog" aria-label="选择模型和推理档位" aria-hidden={menuPresence.closing} inert={menuPresence.closing}
           onMouseDown={(event) => event.preventDefault()}>
+          {mobile ? <div className="groupedModelMobilePages">
+            <MobileModelPage active={!branch}>
+              <div className="groupedModelHeading">选择模型</div>
+              <div className="groupedModelRows">
+                <button className="groupedModelRow" type="button" onClick={() => selectBranch("gpt")}><span>GPT</span><ChevronRight size={15} /></button>
+                <button className="groupedModelRow" type="button" onClick={() => selectBranch("domestic")}><span>国产模型</span><ChevronRight size={15} /></button>
+              </div>
+            </MobileModelPage>
+            <MobileModelPage active={Boolean(branch) && !provider}>
+              <button className="groupedModelBack" type="button" onClick={() => { setProvider(null); setBranch(null); }} aria-label="返回模型分类">
+                <ChevronLeft size={16} /><span>{lastBranch === "gpt" ? "GPT" : "国产模型"}</span>
+              </button>
+              <div className="groupedModelRows" role={lastBranch === "gpt" ? "listbox" : undefined}>
+                {lastBranch === "gpt" ? profileOptions("gpt") : domesticModelGroups.filter(group => groupCount(group.key) > 0).map(group => (
+                  <button className="groupedModelRow" type="button" key={group.key} onClick={() => selectProvider(group.key)}>
+                    <span>{group.label}</span><ChevronRight size={15} />
+                  </button>
+                ))}
+              </div>
+            </MobileModelPage>
+            <MobileModelPage active={Boolean(provider) && branch === "domestic"}>
+              <button className="groupedModelBack" type="button" onClick={() => setProvider(null)} aria-label="返回国产模型分类">
+                <ChevronLeft size={16} /><span>{domesticModelGroups.find(group => group.key === lastProvider)?.label ?? "模型"}</span>
+              </button>
+              <div className="groupedModelRows" role="listbox">{profileOptions(lastProvider)}</div>
+            </MobileModelPage>
+          </div> : <>
           <div className="groupedModelHeading">选择模型</div>
           <div className="groupedModelRows">
             <button className={`groupedModelRow${branch === "gpt" ? " active" : ""}`} type="button" aria-expanded={branch === "gpt"} onClick={() => selectBranch("gpt")}><span>GPT</span><ChevronRight size={15} /></button>
@@ -485,6 +560,7 @@ function ModelGroupedSelect({
               <div className="groupedModelRows" role="listbox">{profileOptions(lastProvider)}</div>
             </div>
           </div>
+          </>}
         </div>
       ) : null}
     </div>
@@ -506,7 +582,7 @@ interface LiveToolEntry extends LiveToolItem {}
 
 type LiveTimelineEntry =
   | { id: string; kind: "agent"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; text: string; sourceItemId?: string }
-  | { id: string; kind: "tool"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; tool: string; input: string; output: string; completed: boolean; sourceItemId?: string };
+  | { id: string; kind: "tool"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; tool: string; input: string; output: string; completed: boolean; sourceItemId?: string; collaboration?: Record<string, unknown> };
 
 interface PendingUserMessage {
   id: string;
@@ -911,22 +987,25 @@ type DeferredToolOutputElement = HTMLPreElement & {
   previewToolOutput?: string;
 };
 
-const DeferredToolOutput = memo(function DeferredToolOutput({
+export const DeferredToolOutput = memo(function DeferredToolOutput({
   text,
   deferred = false,
   threadId,
   itemId,
-  projectId
+  projectId,
+  loadOutput
 }: {
   text: string;
   deferred?: boolean;
   threadId?: string;
   itemId?: string;
   projectId?: string;
+  loadOutput?: () => Promise<string>;
 }) {
   const [loadedOutput, setLoadedOutput] = useState<string | null>(null);
   const [loadError, setLoadError] = useState("");
   const loadingRef = useRef(false);
+  const outputScopeRef = useRef({ deferred, itemId, projectId, text, threadId });
   const output = useMemo(() => displayOutputText(loadedOutput ?? text), [loadedOutput, text]);
   const preview = useMemo(() => {
     const lines = output.split(/\r?\n/).filter((line) => line.trim()).slice(0, 2).join("\n");
@@ -935,6 +1014,9 @@ const DeferredToolOutput = memo(function DeferredToolOutput({
   const outputRef = useRef<DeferredToolOutputElement>(null);
 
   useEffect(() => {
+    const scope = outputScopeRef.current;
+    if (scope.deferred === deferred && scope.itemId === itemId && scope.projectId === projectId && scope.text === text && scope.threadId === threadId) return;
+    outputScopeRef.current = { deferred, itemId, projectId, text, threadId };
     setLoadedOutput(null);
     setLoadError("");
     loadingRef.current = false;
@@ -942,17 +1024,18 @@ const DeferredToolOutput = memo(function DeferredToolOutput({
 
   const loadFullOutput = useCallback(async () => {
     if (!deferred || !threadId || !itemId || loadingRef.current || loadedOutput !== null) return;
+    const scope = outputScopeRef.current;
     loadingRef.current = true;
     setLoadError("");
     try {
-      const response = await readThreadItemOutput(threadId, itemId, projectId);
-      setLoadedOutput(response.data.output);
+      const output = loadOutput ? await loadOutput() : (await readThreadItemOutput(threadId, itemId, projectId)).data.output;
+      if (outputScopeRef.current === scope) setLoadedOutput(output);
     } catch (error) {
-      setLoadError(error instanceof Error ? error.message : String(error));
+      if (outputScopeRef.current === scope) setLoadError(error instanceof Error ? error.message : String(error));
     } finally {
-      loadingRef.current = false;
+      if (outputScopeRef.current === scope) loadingRef.current = false;
     }
-  }, [deferred, itemId, loadedOutput, projectId, threadId]);
+  }, [deferred, itemId, loadedOutput, projectId, threadId, loadOutput]);
 
   useEffect(() => {
     const element = outputRef.current;
@@ -991,10 +1074,11 @@ function itemKind(item: ThreadItem): MessageKind {
   if (role === "user" || type === "user" || type === "usermessage") {
     return "user";
   }
+  if (parseAgentOperation(item)) return "tool";
   if (token.includes("reasoning") || token.includes("thinking")) {
     return "reasoning";
   }
-  if (token.includes("assistant") || token.includes("agent")) {
+  if (role === "assistant" || role === "agent" || type === "agentmessage" || type === "assistantmessage") {
     return "agent";
   }
   if (token.includes("tool") || token.includes("command") || token.includes("functioncall") || token.includes("filechange") || token.includes("mcp") || token.includes("websearch") || item.command || item.aggregatedOutput || Array.isArray(item.changes)) {
@@ -1018,6 +1102,7 @@ function isInternalRuntimeUserText(value: string): boolean {
     || text.startsWith("<recommended_plugins>")
     || text.startsWith("<permissions instructions>")
     || text.startsWith("<app-context>")
+    || text.startsWith("<codex_document_context>")
     || /^# AGENTS\.md instructions(?:\r?\n|$)/.test(text)
     || /^<skill>\s*<name>[^<]+<\/name>\s*<path>[^<]+SKILL\.md<\/path>/.test(text);
 }
@@ -1581,6 +1666,11 @@ const fallbackModelProfiles: ModelProfile[] = [
   { id: "gpt-6-astra:high", label: "GPT-6-Astra high", model: "gpt-6-astra", effort: "high" },
   { id: "gpt-6-astra:medium", label: "GPT-6-Astra medium", model: "gpt-6-astra", effort: "medium" },
   { id: "gpt-6-astra:low", label: "GPT-6-Astra low", model: "gpt-6-astra", effort: "low" },
+  { id: "gpt-6.1-sol:max", label: "GPT-6.1-Sol max", model: "gpt-6.1-sol", effort: "max" },
+  { id: "gpt-6.1-sol:xhigh", label: "GPT-6.1-Sol xhigh", model: "gpt-6.1-sol", effort: "xhigh" },
+  { id: "gpt-6.1-sol:high", label: "GPT-6.1-Sol high", model: "gpt-6.1-sol", effort: "high" },
+  { id: "gpt-6.1-sol:medium", label: "GPT-6.1-Sol medium", model: "gpt-6.1-sol", effort: "medium" },
+  { id: "gpt-6.1-sol:low", label: "GPT-6.1-Sol low", model: "gpt-6.1-sol", effort: "low" },
   { id: "gpt-6-sol:max", label: "GPT-6-Sol max", model: "gpt-6-sol", effort: "max" },
   { id: "gpt-6-sol:xhigh", label: "GPT-6-Sol xhigh", model: "gpt-6-sol", effort: "xhigh" },
   { id: "gpt-6-sol:high", label: "GPT-6-Sol high", model: "gpt-6-sol", effort: "high" },
@@ -2112,7 +2202,7 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
     const copy = localizedSkill(skill);
     return { kind: "skill" as const, command: `$${skill.name}`, label: copy.name, detail: copy.description, insert: "", skillName: skill.name };
   }).filter((item) => slashQuery !== null && `${item.command} ${item.label} ${item.detail} ${item.skillName === "build-web-data-visualization:data-visualization" ? "visualize" : ""}`.toLocaleLowerCase().includes(slashQuery));
-  const featuredSkillNames = new Set(["pdf", "build-web-data-visualization:data-visualization", "product-design:design-qa", "imagegen"]);
+  const featuredSkillNames = new Set(["latex-word-authoring", "pdf", "build-web-data-visualization:data-visualization", "product-design:design-qa", "imagegen"]);
   const slashMatches = slashQuery === ""
     ? [...skillSuggestions.filter((item) => featuredSkillNames.has(item.skillName)), ...commandSuggestions, ...skillSuggestions.filter((item) => !featuredSkillNames.has(item.skillName))]
     : [...commandSuggestions, ...skillSuggestions];
@@ -2244,7 +2334,9 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
     const input = editor.view.dom;
     const updateHeight = () => {
       const maxHeight = Number.parseFloat(window.getComputedStyle(shell).maxHeight) || 300;
-      const nextHeight = Math.min(maxHeight, Math.max(height, input.scrollHeight));
+      const minimumHeight = window.matchMedia("(max-width: 720px)").matches
+        ? Math.max(30, Math.min(38, height * .65)) : height;
+      const nextHeight = Math.min(maxHeight, Math.max(minimumHeight, input.scrollHeight));
       setAnimatedHeight((current) => current === nextHeight ? current : nextHeight);
     };
     const observer = new ResizeObserver(updateHeight);
@@ -2401,7 +2493,7 @@ const ReasoningGlyph = memo(function ReasoningGlyph() {
   );
 });
 
-const ReasoningMessage = memo(function ReasoningMessage({
+export const ReasoningMessage = memo(function ReasoningMessage({
   text,
   projectId,
   onOpenFileLink
@@ -2413,6 +2505,12 @@ const ReasoningMessage = memo(function ReasoningMessage({
   const displayText = useMemo(() => reasoningDisplayText(text), [text]);
   const preview = useMemo(() => reasoningPreviewText(displayText), [displayText]);
   const [expanded, setExpanded] = useState(false);
+  const [bodyMounted, setBodyMounted] = useState(false);
+  useEffect(() => {
+    if (expanded) { setBodyMounted(true); return; }
+    const timer = window.setTimeout(() => setBodyMounted(false), window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 330);
+    return () => window.clearTimeout(timer);
+  }, [expanded]);
   const expandable = Boolean(displayText);
   const summary = (
     <>
@@ -2431,9 +2529,9 @@ const ReasoningMessage = memo(function ReasoningMessage({
         onClick={() => setExpanded((current) => !current)}>{summary}</button>
       <div className="reasoningExpandedShell" aria-hidden={!expanded} inert={!expanded}>
         <div className="reasoningExpandedClip">
-          <div className="reasoningExpandedBody">
+          {expanded || bodyMounted ? <div className="reasoningExpandedBody">
             <MarkdownMessage text={displayText} projectId={projectId} onOpenFileLink={onOpenFileLink} />
-          </div>
+          </div> : null}
         </div>
       </div>
     </div>
@@ -2512,7 +2610,7 @@ function collapsedUserMessagePreview(text: string): string {
 }
 
 function visibleUserHistoryText(text: string): string {
-  const withoutUploads = skillReferencesInPrompt(text).body.replace(/(?:\r?\n){0,2}上传文件：\s*(?:\r?\n-\s+[^\r\n]+)+\s*$/, "").trim();
+  const withoutUploads = skillReferencesInPrompt(withoutDocumentContext(text)).body.replace(/(?:\r?\n){0,2}上传文件：\s*(?:\r?\n-\s+[^\r\n]+)+\s*$/, "").trim();
   // App-server review actions include machine-readable context and action tags.
   // The transcript should show the actual findings, not that transport wrapper.
   const reviewAction = withoutUploads.match(/^<user_action>\s*[\s\S]*?<action>review<\/action>\s*<results>([\s\S]*?)<\/results>\s*<\/user_action>$/);
@@ -2943,28 +3041,41 @@ const ComposerImageThumbnail = memo(function ComposerImageThumbnail({ upload }: 
   return <img className="uploadedImageThumbnail" src={source} alt={`${upload.name} 预览`} />;
 });
 
-const PendingUserImagePreviews = memo(function PendingUserImagePreviews({
+const PendingUserAttachmentPreviews = memo(function PendingUserAttachmentPreviews({
   uploads,
-  onOpenFileLink
+  onOpenFileLink,
+  excludeTargets
 }: {
   uploads?: ComposerUpload[];
   onOpenFileLink: (target: string, gallery?: string[]) => void;
+  excludeTargets?: ReadonlySet<string>;
 }) {
-  const images = uploads?.filter((upload) => upload.isImage) ?? [];
-  if (!images.length) {
+  const visibleUploads = uploads?.filter((upload) => !excludeTargets?.has(upload.relativePath)) ?? [];
+  if (!visibleUploads.length) {
     return null;
   }
   return (
-    <div className="inlineImagePreviewGrid pendingUserImagePreviews" aria-label="本条消息附带的图片">
-      {images.map((upload) => (
+    <div className="pendingUserAttachmentPreviews" aria-label="本条消息的附件">
+      {visibleUploads.map((upload) => upload.isImage ? (
         <button
           className="inlineImageButton pendingUserImagePreview"
           type="button"
           key={upload.relativePath}
-          onClick={() => onOpenFileLink(upload.relativePath, images.map((image) => image.relativePath))}
+          onClick={() => onOpenFileLink(upload.relativePath, visibleUploads.filter((image) => image.isImage).map((image) => image.relativePath))}
           title="打开图片预览"
         >
           <ComposerImageThumbnail upload={upload} />
+        </button>
+      ) : (
+        <button
+          className="persistedUserAttachment pendingUserFilePreview"
+          type="button"
+          key={upload.relativePath}
+          onClick={() => onOpenFileLink(upload.relativePath)}
+          title={`打开 ${upload.name}`}
+        >
+          <span className={`persistedUserAttachmentIcon${/\.pdf$/i.test(upload.name) ? " pdf" : ""}`}><FileText size={16} /></span>
+          <span>{upload.name}</span>
         </button>
       ))}
     </div>
@@ -2999,6 +3110,23 @@ function persistedUserAttachmentsFromText(text: string): PersistedUserAttachment
     attachments.push({ name, target, isImage: isInlineImageTarget(target) });
   }
   return attachments;
+}
+
+function threadHasPendingAttachments(thread: ThreadSummary, entry: PendingUserMessage): boolean {
+  if (!entry.attachments?.length) return true;
+  const turn = entry.turnId
+    ? thread.turns?.find((candidate) => candidate.id === entry.turnId)
+    : thread.turns?.find((candidate) => (
+      (candidate.items ?? []).some((item) => itemKind(item) === "user" && userTextsMatch(itemText(item), entry.text))
+      || (!turnHasUserItem(candidate) && userTextsMatch(turnUserText(candidate), entry.text))
+    ));
+  if (!turn) return false;
+  const userText = [
+    turnUserText(turn),
+    ...(turn.items ?? []).filter((item) => itemKind(item) === "user").map(itemText)
+  ].join("\n");
+  const persistedTargets = new Set(persistedUserAttachmentsFromText(userText).map((attachment) => attachment.target));
+  return entry.attachments.every((upload) => persistedTargets.has(upload.relativePath));
 }
 
 const PersistedUserAttachmentPreviews = memo(function PersistedUserAttachmentPreviews({
@@ -3041,6 +3169,32 @@ const PersistedUserAttachmentPreviews = memo(function PersistedUserAttachmentPre
 
 function modelProfileById(id: string, profiles: ModelProfile[]): ModelProfile {
   return profiles.find((profile) => profile.id === id) ?? profiles[0] ?? fallbackModelProfiles[0];
+}
+
+const reasoningEfforts: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
+
+function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return typeof value === "string" && reasoningEfforts.some((effort) => effort === value);
+}
+
+function exactModelProfile(model: string, effort: ReasoningEffort, profiles: ModelProfile[]): ModelProfile | null {
+  return profiles.find((profile) => profile.model === model && profile.effort === effort) ?? null;
+}
+
+function syntheticModelProfile(model: string, effort: ReasoningEffort): ModelProfile {
+  return {
+    id: `synthetic:${model}:${effort}`,
+    label: `${model} ${effort}`,
+    model,
+    effort
+  };
+}
+
+function modelProfileForExistingThread(thread: ThreadSummary, project: Project | null, profiles: ModelProfile[]): ModelProfile {
+  const model = thread.configuredModel ?? project?.defaultModel ?? "gpt-5.5";
+  const rawEffort = thread.configuredReasoningEffort ?? project?.defaultReasoningEffort ?? "xhigh";
+  const effort = isReasoningEffort(rawEffort) ? rawEffort : "xhigh";
+  return exactModelProfile(model, effort, profiles) ?? syntheticModelProfile(model, effort);
 }
 
 function isUltraModelProfile(profile: ModelProfile): boolean {
@@ -3221,6 +3375,7 @@ function quotaMarkdown(quota: CodexQuota): string {
     `- 主额度：${rateWindowText(quota.rateLimits?.primary ?? null)}`,
     `- 次额度：${rateWindowText(quota.rateLimits?.secondary ?? null)}`,
     `- reset credits：${quota.resetCredits?.availableCount ?? "-"}`,
+    `- Credits 余额：${creditBalanceText(quota)}${quota.rateLimits?.credits && quota.errors.some(error => error.startsWith("rateLimits:")) ? "（缓存值，刷新失败）" : ""}`,
     `- lifetime tokens：${formatNumber(quota.usage?.summary?.lifetimeTokens)}`,
     `- peak daily tokens：${formatNumber(quota.usage?.summary?.peakDailyTokens)}`
   ];
@@ -3243,6 +3398,18 @@ function quotaMarkdown(quota: CodexQuota): string {
     lines.push("", `读取警告：${quota.errors.join("；")}`);
   }
   return lines.join("\n");
+}
+
+function creditBalanceText(quota: CodexQuota): string {
+  const credits = quota.rateLimits?.credits;
+  if (!credits) return "未读取到";
+  if (credits.unlimited === true) return "不限额";
+  if (credits.balance !== null && credits.balance.trim() !== "") {
+    const balance = Number(credits.balance);
+    if (Number.isFinite(balance)) return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 4 }).format(balance);
+    return credits.balance;
+  }
+  return credits.hasCredits === false ? "0" : "未读取到余额";
 }
 
 function AccountQuotaDetails({ quota }: { quota: CodexQuota }) {
@@ -3272,6 +3439,7 @@ function AccountQuotaDetails({ quota }: { quota: CodexQuota }) {
           ))}
           <div><span>总token</span><strong>{formatNumber(quota.usage?.summary?.lifetimeTokens)}</strong></div>
           <div><span>重置额度</span><strong>{formatNumber(quota.resetCredits?.availableCount)}</strong></div>
+          <div title="订阅额度用尽后使用的 Credits 余额"><span>Credits</span><strong title={quota.rateLimits?.credits?.balance ?? undefined}>{creditBalanceText(quota)}{quota.rateLimits?.credits && quota.errors.some(error => error.startsWith("rateLimits:")) ? "（缓存）" : ""}</strong></div>
     </div>
   );
 }
@@ -3487,6 +3655,7 @@ function skillsMarkdown(skills: CodexSkill[]): string {
 }
 
 const localizedSkillCopy: Record<string, { name: string; description: string }> = {
+  "latex-word-authoring": { name: "LaTeX / Word 写作", description: "编写、局部修改、编译及转换 LaTeX / Word 文档" },
   pdf: { name: "PDF 文档", description: "读取、制作与检查 PDF 的排版" },
   "build-web-data-visualization:data-visualization": { name: "数据可视化", description: "把数据制作成清晰的交互图表" },
   "build-web-data-visualization:dashboards-and-real-time-visualization": { name: "实时仪表盘", description: "设计实时更新的指标看板" },
@@ -3552,6 +3721,7 @@ function localizedSkill(skill: CodexSkill) {
 }
 
 function skillSection(name: string): string {
+  if (name === "latex-word-authoring") return "文档写作";
   if (name.startsWith("build-web-data-visualization:")) return "数据可视化";
   if (name.startsWith("product-design:")) return "产品设计";
   return "基础技能";
@@ -3737,15 +3907,17 @@ function applyStoredThreadModelProfile(
   thread: ThreadSummary,
   profiles: ModelProfile[]
 ): ThreadSummary {
+  // Existing backend configuration is authoritative. A stale browser default
+  // must never relabel a non-GPT thread or change the next outgoing request.
+  if (thread.configuredModel || thread.configuredReasoningEffort) {
+    return thread;
+  }
   const profileId = lookupThreadModelProfileId(userId, thread.id, profiles);
   if (!profileId) {
     return thread;
   }
   const profile = profiles.find((item) => item.id === profileId);
   if (!profile) {
-    return thread;
-  }
-  if (thread.configuredModel === profile.model && thread.configuredReasoningEffort === profile.effort) {
     return thread;
   }
   return {
@@ -3942,12 +4114,13 @@ export function App() {
   const queuedInterruptPromptRequestIdsRef = useRef(new Set<string>());
   const turnThreadIdsRef = useRef(new Map<string, string>());
   const threadProjectIdsRef = useRef(new Map<string, string>());
-  const autoSendEnabledRef = useRef(true);
+  const autoSendEnabledRef = useRef(false);
   const autoSentGeneratedFileKeysRef = useRef(new Set<string>());
   const autoSendInFlightFileKeysRef = useRef(new Set<string>());
   const interruptTimeoutsRef = useRef(new Map<string, number>());
   const newThreadDraftModeRef = useRef(true);
   const quotaRefreshInFlightRef = useRef<Promise<QuotaRefreshResult> | null>(null);
+  const quotaRefreshThreadIdRef = useRef<string | undefined>(undefined);
   const leaderboardRefreshInFlightRef = useRef<Promise<LeaderboardRefreshResult> | null>(null);
   const trackedQuotaRefreshInFlightRef = useRef<Promise<TrackedQuotaRefreshResult> | null>(null);
   const threadSearchRequestRef = useRef(0);
@@ -3994,7 +4167,7 @@ export function App() {
     }
     projectGroupRectsRef.current = next;
   }, [orderedProjects]);
-  const userEffectInitializedRef = useRef(false);
+  const initializedUserIdRef = useRef<string | null>(null);
   const [projectRoot, setProjectRoot] = useState("/Volumes/DevDrive/program");
   const [threadContextFeatureEnabled, setThreadContextFeatureEnabled] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(() => storedNumber(sidebarWidthStorageKey, 280, 220, 640));
@@ -4003,7 +4176,13 @@ export function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => storedBoolean(sidebarCollapsedStorageKey));
   const [threadListCollapsed, setThreadListCollapsed] = useState(() => storedBoolean(threadListCollapsedStorageKey));
   const [systemDirectoryPickerAvailable, setSystemDirectoryPickerAvailable] = useState(false);
-  const [selectedProjectId, setSelectedProjectId] = useState<string>(() => window.localStorage.getItem(sidebarProjectSelectionKey(getApiUserId())) ?? "");
+  const [selectedProjectId, setSelectedProjectId] = useState<string>(() => {
+    const link = new URLSearchParams(window.location.search);
+    // Start notification/deep-link hydration in its target workspace. Otherwise
+    // the default workspace's later initialization can erase selectThread().
+    if (link.get("thread") && link.get("project")) return link.get("project")!;
+    return window.localStorage.getItem(sidebarProjectSelectionKey(getApiUserId())) ?? "";
+  });
   const [expandedProjectIds, setExpandedProjectIds] = useState<string[]>(() => {
     const userId = getApiUserId();
     const stored = window.localStorage.getItem(sidebarExpandedProjectsKey(userId));
@@ -4061,6 +4240,15 @@ export function App() {
   }, [threads, selectedProjectId]);
   const [savingThreadOrder, setSavingThreadOrder] = useState(false);
   const [selectedThread, setSelectedThread] = useState<ThreadSummary | null>(null);
+  const threadGoal = useThreadGoal(selectedThread?.id ?? null, selectedUserId);
+  const [writingSession, setWritingSession] = useState<{ project: WritingProject; userId: string; initialPath?: string } | null>(null);
+  const [writingClosing, setWritingClosing] = useState(false);
+  const [writingChatVisible, setWritingChatVisible] = useState(false);
+  const [writingChatWidth, setWritingChatWidth] = useState(380);
+  const [writingRevisions, setWritingRevisions] = useState<Record<string, number>>({});
+  const [documentReference, setDocumentReference] = useState<ComposerDocumentReference | null>(null);
+  const writingCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeWritingSession = writingSession?.userId === selectedUserId ? writingSession : null;
   const [openingThreadId, setOpeningThreadId] = useState<string | null>(null);
   const [threadHistory, setThreadHistory] = useState<ThreadHistoryPage | null>(null);
   const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
@@ -4139,6 +4327,7 @@ export function App() {
   const [socketStatus, setSocketStatus] = useState<"connecting" | "open" | "closed">("closed");
   const [liveDeltas, setLiveDeltas] = useState<Record<string, LiveDeltaEntry>>({});
   const [liveTools, setLiveTools] = useState<Record<string, LiveToolEntry>>({});
+  const [turnProgress, setTurnProgress] = useState<Record<string, TurnProgress>>({});
   const [answeredQuestionItems, setAnsweredQuestionItems] = useState<Record<string, true>>({});
   const submittingQuestionItemsRef = useRef(new Set<string>());
   const [expandedToolBundles, setExpandedToolBundles] = useState<Record<string, true>>({});
@@ -4153,6 +4342,7 @@ export function App() {
   const [filePreview, setFilePreview] = useState<ProjectFilePreview | null>(null);
   const [runnablePreview, setRunnablePreview] = useState<RunnablePreview | null>(null);
   const [filePreviewObjectUrl, setFilePreviewObjectUrl] = useState<string>("");
+  const [filePreviewClosing, setFilePreviewClosing] = useState(false);
   const [imagePreviewMode, setImagePreviewMode] = useState<"fit" | "width" | "actual">("fit");
   const [imageGallery, setImageGallery] = useState<{ projectId: string; targets: string[]; index: number } | null>(null);
   const [imageViewerClosing, setImageViewerClosing] = useState(false);
@@ -4169,6 +4359,7 @@ export function App() {
   const imageViewerPreviousTimerRef = useRef<number | null>(null);
   const imageViewerPreloadsRef = useRef(new Map<string, HTMLImageElement>());
   const filePreviewRequestIdRef = useRef(0);
+  const filePreviewCloseTimerRef = useRef<number | null>(null);
   const [filePreviewLoading, setFilePreviewLoading] = useState(false);
   const [filePreviewError, setFilePreviewError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -4243,6 +4434,22 @@ export function App() {
   const [diffPanelResizing, setDiffPanelResizing] = useState(false);
   const [diffPanelWidth, setDiffPanelWidth] = useState(() => storedNumber("codex-web-diff-panel-width", 560, 350, 900));
   const diffPanelCloseTimerRef = useRef<number | null>(null);
+  const [subagentReview, setSubagentReview] = useState<{ projectId: string; threadId: string; initialAgent?: string; initialView?: "active" | "history"; requestId: string } | null>(null);
+  const [subagentPanelVisible, setSubagentPanelVisible] = useState(false);
+  const subagentPanelCloseTimerRef = useRef<number | null>(null);
+  const subagentPanelFramesRef = useRef<number[]>([]);
+  const subagentPanelReturnFocusRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    for (const frame of subagentPanelFramesRef.current) window.cancelAnimationFrame(frame);
+    if (subagentPanelCloseTimerRef.current !== null) window.clearTimeout(subagentPanelCloseTimerRef.current);
+    subagentPanelCloseTimerRef.current = null;
+    setSubagentReview(null);
+    setSubagentPanelVisible(false);
+    return () => {
+      for (const frame of subagentPanelFramesRef.current) window.cancelAnimationFrame(frame);
+      if (subagentPanelCloseTimerRef.current !== null) window.clearTimeout(subagentPanelCloseTimerRef.current);
+    };
+  }, [selectedUserId, selectedThread?.id]);
   const diffInitialRestoreRef = useRef(new Set<string>());
   const [unreadResultThreads, setUnreadResultThreads] = useState<Record<string, true>>({});
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
@@ -4259,7 +4466,7 @@ export function App() {
   const [temporaryPrompt, setTemporaryPrompt] = useState("");
   const [temporaryModelProfileId, setTemporaryModelProfileId] = useState(defaultModelProfileId);
   const [temporaryAskWidth, setTemporaryAskWidth] = useState(() => storedNumber("codex-web-temporary-ask-width", 390, 300, 760));
-  const [selectionAction, setSelectionAction] = useState<{ text: string; left: number; top: number } | null>(null);
+  const selectionAskActionRef = useRef<SelectionAskActionHandle>(null);
   const [temporaryCloseConfirm, setTemporaryCloseConfirm] = useState(false);
   const [temporaryCloseDontAsk, setTemporaryCloseDontAsk] = useState(() => storedBoolean("codex-web-temporary-close-dont-ask"));
   const accountMenuPresence = useExitPresence(accountMenuOpen);
@@ -4289,23 +4496,54 @@ export function App() {
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
     [projects, selectedProjectId]
   );
+  useEffect(() => {
+    setDocumentReference(null);
+  }, [selectedUserId, selectedProjectId, selectedThread?.id]);
+  useEffect(() => () => { if (writingCloseTimerRef.current) clearTimeout(writingCloseTimerRef.current); }, []);
+  function openWriting(path?: string) {
+    if (!selectedProject) return;
+    if (writingCloseTimerRef.current) clearTimeout(writingCloseTimerRef.current);
+    setWritingClosing(false);
+    setWritingChatVisible(false);
+    setWritingSession({ project: { id: selectedProject.id, name: selectedProject.name, rootPath: selectedProject.rootPath }, userId: selectedUserId, initialPath: path });
+  }
+  function closeWriting() {
+    setWritingClosing(true);
+    if (writingCloseTimerRef.current) clearTimeout(writingCloseTimerRef.current);
+    writingCloseTimerRef.current = setTimeout(() => { setWritingSession(null); setWritingClosing(false); writingCloseTimerRef.current = null; }, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 300);
+  }
+  function referenceWritingSelection(selection: WritingSelection) {
+    if (!activeWritingSession || activeWritingSession.project.id !== selectedProjectId) {
+      setError("请先切回文档所属工作区，再引用选区。");
+      return;
+    }
+    setDocumentReference({ ...selection, projectId: activeWritingSession.project.id });
+    if (skills.some(skill => skill.name === "latex-word-authoring")) setSelectedSkillNames(current => current.includes("latex-word-authoring") ? current : [...current, "latex-word-authoring"]);
+    setWritingChatVisible(true);
+    window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".composerRichInput")?.focus());
+  }
   const draftModelProfile = useMemo(
     () => modelProfileById(newThreadModelProfileId, modelProfiles),
     [newThreadModelProfileId, modelProfiles]
   );
+  const selectableModelProfiles = useMemo(() => {
+    if (!selectedThread) {
+      return modelProfiles;
+    }
+    const profile = modelProfileForExistingThread(selectedThread, selectedProject, modelProfiles);
+    return modelProfiles.some((item) => item.id === profile.id)
+      ? modelProfiles
+      : [profile, ...modelProfiles];
+  }, [modelProfiles, selectedProject, selectedThread]);
   const activeModelProfileId = useMemo(() => {
     if (!selectedThread) {
       return draftModelProfile.id;
     }
-    return modelProfileIdFor(
-      selectedThread.configuredModel ?? selectedProject?.defaultModel ?? "gpt-5.5",
-      selectedThread.configuredReasoningEffort ?? selectedProject?.defaultReasoningEffort ?? "xhigh",
-      modelProfiles
-    );
+    return modelProfileForExistingThread(selectedThread, selectedProject, modelProfiles).id;
   }, [draftModelProfile.id, modelProfiles, selectedProject, selectedThread]);
   const selectedModelProfile = useMemo(
-    () => modelProfileById(activeModelProfileId, modelProfiles),
-    [activeModelProfileId, modelProfiles]
+    () => modelProfileById(activeModelProfileId, selectableModelProfiles),
+    [activeModelProfileId, selectableModelProfiles]
   );
   const temporaryModelProfile = useMemo(
     () => modelProfileById(temporaryModelProfileId, modelProfiles),
@@ -4408,7 +4646,7 @@ export function App() {
     setTemporaryAsk(null);
     setTemporaryThread(null);
     setTemporaryPrompt("");
-    setSelectionAction(null);
+    selectionAskActionRef.current?.dismiss();
     if (!current?.threadId) return;
     setLiveDeltas((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== current.threadId)));
     setLiveTools((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== current.threadId)));
@@ -4444,7 +4682,7 @@ export function App() {
   function openTemporaryAsk(text: string, left: number, top: number) {
     if (!selectedProject || !text.trim()) return;
     if (temporaryAskRef.current) {
-      setSelectionAction(null);
+      selectionAskActionRef.current?.dismiss();
       return;
     }
     const requestId = `temp-${requestToken()}`;
@@ -4463,7 +4701,7 @@ export function App() {
     setTemporaryThread(null);
     setTemporaryPrompt("");
     setTemporaryModelProfileId(activeModelProfileId);
-    setSelectionAction(null);
+    selectionAskActionRef.current?.dismiss();
   }
 
   function sendTemporaryPrompt() {
@@ -4546,40 +4784,6 @@ export function App() {
       }
     }
   }
-
-  useEffect(() => {
-    const updateSelectionAction = () => {
-      const selection = window.getSelection();
-      const text = selection?.toString().trim() ?? "";
-      const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
-      const commonAncestor = range?.commonAncestorContainer;
-      const ancestorElement = commonAncestor instanceof Element ? commonAncestor : commonAncestor?.parentElement;
-      if (ancestorElement?.closest(".composer, .temporaryAskPanel, .globalSearchDialog") || !text || text.length > 6000 || selection?.isCollapsed) {
-        setSelectionAction(null);
-        return;
-      }
-      const rect = range?.getBoundingClientRect();
-      if (!rect || rect.width === 0 || rect.height === 0) return;
-      setSelectionAction({
-        text,
-        left: Math.min(Math.max(rect.left + rect.width / 2 - 78, 12), window.innerWidth - 190),
-        top: Math.min(rect.bottom + 8, window.innerHeight - 54),
-      });
-    };
-    const handleSelectionChange = () => window.requestAnimationFrame(updateSelectionAction);
-    const handleMouseUp = (event: MouseEvent) => {
-      if ((event.target as HTMLElement | null)?.closest(".selectionAskButton")) return;
-      window.setTimeout(updateSelectionAction, 0);
-    };
-    document.addEventListener("selectionchange", handleSelectionChange, true);
-    document.addEventListener("mouseup", handleMouseUp, true);
-    document.addEventListener("pointerup", handleMouseUp, true);
-    return () => {
-      document.removeEventListener("selectionchange", handleSelectionChange, true);
-      document.removeEventListener("mouseup", handleMouseUp, true);
-      document.removeEventListener("pointerup", handleMouseUp, true);
-    };
-  }, []);
 
   function updateMessageScrollState() {
     const element = messagesRef.current;
@@ -5193,11 +5397,14 @@ export function App() {
     const threadId = params.get("thread");
     const projectId = params.get("project");
     if (!threadId || !projectId) return;
+    // A cached project list may precede the authoritative list. Keep the link
+    // pending until its owned workspace arrives instead of silently losing it.
+    if (!projects.some((project) => project.id === projectId)) return;
     notificationLinkHandledRef.current = true;
     params.delete("thread");
     params.delete("project");
     window.history.replaceState(null, "", `${window.location.pathname}${params.size ? `?${params}` : ""}${window.location.hash}`);
-    if (projects.some((project) => project.id === projectId)) selectThread(threadId, projectId);
+    selectThread(threadId, projectId);
   }, [projects]);
 
   useEffect(() => {
@@ -5976,6 +6183,12 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    // Restoring a conversation after page reload happens after the initial
+    // quota request. Resolve its sticky account once restoration completes.
+    void refreshQuota(false, { background: true });
+  }, [selectedThread?.id]);
+
+  useEffect(() => {
     const threadId = selectedThread?.id;
     setExhaustedAccountNotice(null);
     setDismissedExhaustedThreadId(null);
@@ -6133,12 +6346,16 @@ export function App() {
   }, [trackedQuotaOpen]);
 
   useEffect(() => {
-    if (!userEffectInitializedRef.current) {
-      userEffectInitializedRef.current = true;
+    // Strict Mode replays mount effects. Only a real identity change may clear
+    // the workspace/thread; a replay must not erase a pending deep link.
+    if (initializedUserIdRef.current === selectedUserId) return;
+    const firstUserInitialization = initializedUserIdRef.current === null;
+    initializedUserIdRef.current = selectedUserId;
+    if (firstUserInitialization) {
       setApiUserId(selectedUserId);
       setPushEnabled(storedBooleanWithDefault(`codex-web-push:${selectedUserId}`, false));
       setCodexFastModeEnabled(storedBoolean(codexFastModeStorageKey(selectedUserId)));
-      const savedAutoSendPreference = storedBooleanWithDefault(autoSendPreferenceStorageKey(selectedUserId), true);
+      const savedAutoSendPreference = storedBooleanWithDefault(autoSendPreferenceStorageKey(selectedUserId), false);
       autoSendEnabledRef.current = savedAutoSendPreference;
       setAutoSendGeneratedFiles(savedAutoSendPreference);
       void refreshProjects();
@@ -6151,7 +6368,7 @@ export function App() {
     setPushEnabled(storedBooleanWithDefault(`codex-web-push:${selectedUserId}`, false));
     setProjectOrder(storedJson<string[]>(sidebarProjectOrderKey(selectedUserId), []));
     setExpandedProjectIds(storedJson<string[]>(sidebarExpandedProjectsKey(selectedUserId), []));
-    const savedAutoSendPreference = storedBooleanWithDefault(autoSendPreferenceStorageKey(selectedUserId), true);
+    const savedAutoSendPreference = storedBooleanWithDefault(autoSendPreferenceStorageKey(selectedUserId), false);
     autoSendEnabledRef.current = savedAutoSendPreference;
     setAutoSendGeneratedFiles(savedAutoSendPreference);
     setCodexFastModeEnabled(storedBoolean(codexFastModeStorageKey(selectedUserId)));
@@ -6239,7 +6456,7 @@ export function App() {
     window.localStorage.setItem(sidebarProjectSelectionKey(selectedUserId), selectedProject.id);
     void refreshSkills(selectedProject.id);
     void refreshThreads(selectedProject.id);
-  }, [selectedProjectId]);
+  }, [selectedProject?.id]);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -6387,7 +6604,7 @@ export function App() {
   }
 
   function renderLocalMessage(entry: LocalMessage) {
-    if (entry.meta === "Codex Web · 分支续接" || entry.meta === "Codex Web · status") return null;
+    if (entry.meta === "Codex Web · 分支续接" || entry.meta === "Codex Web · status" || entry.meta === "Codex Web · Goal") return null;
     return (
       <article className={`messageItem kind-${entry.kind ?? "system"}`} key={entry.id}>
         <div className="messageMeta">{entry.meta}</div>
@@ -6407,6 +6624,15 @@ export function App() {
   }
 
   async function refreshQuota(showMessage = false, options: QuotaRefreshOptions = {}): Promise<CodexQuota | null> {
+    const threadId = selectedThreadRef.current?.id;
+    const pending = quotaRefreshInFlightRef.current;
+    if (pending && quotaRefreshThreadIdRef.current !== threadId) {
+      // Share quota work only within the same conversation. An initial request
+      // without a thread, or a previous conversation's late response, cannot
+      // supply the current-account indicator for the newly selected thread.
+      await pending;
+      return refreshQuota(showMessage, options);
+    }
     const background = options.background === true;
     if (!background) {
       setQuotaLoading(true);
@@ -6414,14 +6640,17 @@ export function App() {
 
     let refresh = quotaRefreshInFlightRef.current;
     if (!refresh) {
-      refresh = readCodexAccountPool(options.force === true, selectedThread?.id)
+      quotaRefreshThreadIdRef.current = threadId;
+      refresh = readCodexAccountPool(options.force === true, threadId)
         .then((response): QuotaRefreshResult => {
           const previous = storedJson<CodexAccountPool | null>(accountPoolSnapshotStorageKey, null);
           const nextPool = mergeAccountPoolWithLastKnownGood(previous, response.data);
           const nextQuota = selectedQuotaFromPool(nextPool);
-          window.localStorage.setItem(accountPoolSnapshotStorageKey, JSON.stringify(nextPool));
-          setAccountPool(nextPool);
-          setQuota(nextQuota);
+          if (selectedThreadRef.current?.id === threadId) {
+            window.localStorage.setItem(accountPoolSnapshotStorageKey, JSON.stringify(nextPool));
+            setAccountPool(nextPool);
+            setQuota(nextQuota);
+          }
           return { quota: nextQuota, pool: nextPool, error: null };
         })
         .catch((caught): QuotaRefreshResult => ({
@@ -6557,12 +6786,13 @@ export function App() {
       setProjectRoot(response.projectRoot);
       setSystemDirectoryPickerAvailable(Boolean(response.systemDirectoryPickerAvailable));
       setThreadContextFeatureEnabled(Boolean(response.threadContextFeatureEnabled));
-      if (!response.data.some((project) => project.id === selectedProjectId)) {
+      const currentProjectId = selectedProjectIdRef.current;
+      if (!response.data.some((project) => project.id === currentProjectId)) {
         setSelectedThread(null);
         setThreads([]);
         setSelectedProjectId("");
       }
-      if ((!selectedProjectId || !response.data.some((project) => project.id === selectedProjectId)) && response.data[0]) {
+      if ((!currentProjectId || !response.data.some((project) => project.id === currentProjectId)) && response.data[0]) {
         setSelectedProjectId(response.data[0].id);
       }
     } catch (caught) {
@@ -6720,6 +6950,7 @@ export function App() {
         window.requestAnimationFrame(() => setTerminalVisible(true));
       }
       if (action === "hooks") void showProjectHooks();
+      if (action === "writing") openWriting();
     };
     window.addEventListener("codex:workspace-action", handleWorkspaceAction);
     return () => window.removeEventListener("codex:workspace-action", handleWorkspaceAction);
@@ -6911,7 +7142,9 @@ export function App() {
           return true;
         }
         const attachedToLoadedTurn = Boolean(entry.turnId && nextThreadWithStoredModel.turns.some((turn) => turn.id === entry.turnId));
-        return (!attachedToLoadedTurn && entry.keepAtBottomUntil > now) || !threadHasUserText(nextThreadWithStoredModel, entry.text);
+        return (!attachedToLoadedTurn && entry.keepAtBottomUntil > now)
+          || !threadHasUserText(nextThreadWithStoredModel, entry.text)
+          || !threadHasPendingAttachments(nextThreadWithStoredModel, entry);
       }));
       return nextThreadWithStoredModel;
     } catch (caught) {
@@ -7054,8 +7287,11 @@ export function App() {
   }
 
   async function changeConversationModelProfile(nextProfileId: string) {
-    const profile = modelProfileById(nextProfileId, modelProfiles);
     const thread = selectedThreadRef.current;
+    const profile = thread
+      ? modelProfileById(nextProfileId, selectableModelProfiles)
+      : modelProfileById(nextProfileId, modelProfiles);
+    const isCatalogProfile = modelProfiles.some((item) => item.id === profile.id);
     if (!thread?.id) {
       setNewThreadModelProfileId(profile.id);
       if (selectedProjectIdRef.current) {
@@ -7071,9 +7307,13 @@ export function App() {
     const previousEffort = thread.configuredReasoningEffort ?? selectedProject?.defaultReasoningEffort ?? profile.effort;
     setError("");
     setSavingThreadModel(true);
-    setNewThreadModelProfileId(profile.id);
-    window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, projectId), profile.id);
-    window.localStorage.setItem(threadModelPreferenceStorageKey(selectedUserId, thread.id), profile.id);
+    if (isCatalogProfile) {
+      setNewThreadModelProfileId(profile.id);
+      window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, projectId), profile.id);
+      window.localStorage.setItem(threadModelPreferenceStorageKey(selectedUserId, thread.id), profile.id);
+    } else {
+      window.localStorage.removeItem(threadModelPreferenceStorageKey(selectedUserId, thread.id));
+    }
     applyThreadModelProfile(thread.id, profile.model, profile.effort);
     try {
       const response = await updateThreadModelProfile(projectId, thread.id, {
@@ -7343,24 +7583,27 @@ export function App() {
   }
 
   function closeFilePreview() {
-    if (runnablePreview) {
-      setRunnablePreview(null);
-      return;
-    }
+    if (filePreviewClosing) return;
     filePreviewRequestIdRef.current += 1;
-    setFilePreview(null);
-    setFilePreviewError("");
-    setFilePreviewLoading(false);
-    setFilePreviewObjectUrl((current) => {
-      if (current) {
-        URL.revokeObjectURL(current);
-      }
-      return "";
-    });
+    setFilePreviewClosing(true);
+    if (filePreviewCloseTimerRef.current !== null) window.clearTimeout(filePreviewCloseTimerRef.current);
+    filePreviewCloseTimerRef.current = window.setTimeout(() => {
+      setFilePreview(null);
+      setRunnablePreview(null);
+      setFilePreviewError("");
+      setFilePreviewLoading(false);
+      setFilePreviewObjectUrl("");
+      setFilePreviewClosing(false);
+      filePreviewCloseTimerRef.current = null;
+    }, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 260);
   }
 
   const openFilePreview = useCallback(async (filePath: string, galleryTargets?: string[]) => {
+    if (filePreviewCloseTimerRef.current !== null) window.clearTimeout(filePreviewCloseTimerRef.current);
+    filePreviewCloseTimerRef.current = null;
+    setFilePreviewClosing(false);
     setRunnablePreview(null);
+    setImageViewerActionsOpen(false);
     const projectId = selectedProject?.id;
     if (!projectId) {
       return;
@@ -7399,7 +7642,7 @@ export function App() {
       const response = await previewProjectFile(projectId, filePath);
       if (requestId !== filePreviewRequestIdRef.current) return;
       setFilePreview(response.data);
-      if (response.data.kind === "image" || response.data.kind === "video" || response.data.kind === "pdf") {
+      if (response.data.kind === "image" || response.data.kind === "video") {
         const blob = await fetchProjectFileBlob(projectId, response.data.relativePath);
         if (requestId !== filePreviewRequestIdRef.current) return;
         setFilePreviewObjectUrl(URL.createObjectURL(blob));
@@ -7410,6 +7653,19 @@ export function App() {
       if (requestId === filePreviewRequestIdRef.current) setFilePreviewLoading(false);
     }
   }, [selectedProject?.id]);
+
+  useEffect(() => () => {
+    if (filePreviewCloseTimerRef.current !== null) window.clearTimeout(filePreviewCloseTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!(filePreview || filePreviewLoading || filePreviewError || runnablePreview)) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); closeFilePreview(); }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [Boolean(filePreview || filePreviewLoading || filePreviewError || runnablePreview), filePreviewClosing]);
 
   const activeImageTarget = imageGallery?.targets[imageGallery.index] ?? "";
   const activeImageUrl = imageGallery && activeImageTarget ? rawFileUrlForProject(imageGallery.projectId, activeImageTarget) : "";
@@ -8025,37 +8281,25 @@ export function App() {
     }
     if (command === "goal-stop" || command === "goalstop") {
       if (!selectedThread?.id) {
-        addLocalMessage("/goal-stop 需要先打开一个已有会话。");
+        setError("请先打开一个会话，再结束其持续目标。");
         setPrompt("");
         return true;
       }
-      const requestId = `goal-clear-${requestToken()}`;
-      codexSocket.send({
-        type: "goal.clear",
-        requestId,
-        userId: selectedUserId,
-        threadId: selectedThread.id
-      });
-      addLocalMessage("已请求彻底结束当前 Goal；现有轮次会停止，之后不会再自动续跑。", "Codex Web · Goal");
+      threadGoal.clear();
       setPrompt("");
       return true;
     }
     if (command === "goal") {
-      if (!selectedThread?.id || !argument) {
-        addLocalMessage("用法：`/goal 目标`，需要先打开一个会话并提供持续目标。");
+      if (!selectedThread?.id) {
+        setError("请先打开一个会话，再设置其持续目标。");
         setPrompt("");
         return true;
       }
-      const requestId = `goal-set-${requestToken()}`;
-      codexSocket.send({
-        type: "goal.set",
-        requestId,
-        userId: selectedUserId,
-        threadId: selectedThread.id,
-        objective: argument,
-        status: "active"
-      });
-      addLocalMessage(`已设置并启动原生 Goal：${argument}`, "Codex Web · Goal");
+      if (argument === "pause") threadGoal.pause();
+      else if (argument === "resume") threadGoal.resume();
+      else if (argument === "clear") threadGoal.clear();
+      else if (argument) threadGoal.set(argument);
+      else threadGoal.refresh();
       setPrompt("");
       return true;
     }
@@ -8149,7 +8393,7 @@ export function App() {
   }
 
   function queuedSubmissionText(entry: QueuedSubmission) {
-    return skillReferencesInPrompt(entry.input.filter((part) => part.type === "text").map((part) => part.text ?? "").join(" ").trim()).body;
+    return skillReferencesInPrompt(withoutDocumentContext(entry.input.filter((part) => part.type === "text").map((part) => part.text ?? "").join(" ").trim())).body;
   }
 
   function steerQueuedSubmission(entry: QueuedSubmission) {
@@ -8254,6 +8498,7 @@ export function App() {
     }
     const promptUploads = isQuestionAnswer ? [] : [...uploadedFiles];
     const skillNames = isQuestionAnswer ? [] : selectedSkills.map((skill) => skill.name);
+    const reference = !isQuestionAnswer && documentReference?.projectId === selectedProject.id ? (() => { const { projectId: _projectId, ...selection } = documentReference; return selection; })() : undefined;
     const sentPromptText = promptWithUploadedFiles(promptText, promptUploads);
     const visibleText = visiblePromptText(promptText, promptUploads);
     if (selectedThread && selectedActiveTurnId && mode === "queue") {
@@ -8265,6 +8510,7 @@ export function App() {
           projectId: selectedProject.id,
           threadId: selectedThread.id,
           prompt: sentPromptText,
+          documentReference: reference,
           skillNames
         });
         pendingQueuedPromptsRef.current.set(requestId, { threadId: selectedThread.id, text: promptText, uploads: promptUploads });
@@ -8273,6 +8519,7 @@ export function App() {
           setPrompt("");
           setUploadedFiles([]);
           setSelectedSkillNames([]);
+          setDocumentReference(null);
         }
         return true;
       } catch (caught) {
@@ -8302,6 +8549,7 @@ export function App() {
           threadId: selectedThread.id,
           expectedTurnId: selectedActiveTurnId,
           prompt: sentPromptText,
+          documentReference: reference,
           skillNames
         }
       : selectedThread
@@ -8312,6 +8560,7 @@ export function App() {
           projectId: selectedProject.id,
           threadId: selectedThread.id,
           prompt: sentPromptText,
+          documentReference: reference,
           skillNames,
           model: selectedModelProfile.model,
           reasoningEffort: selectedModelProfile.effort,
@@ -8326,6 +8575,7 @@ export function App() {
           userId: selectedUserId,
           projectId: selectedProject.id,
           prompt: sentPromptText,
+          documentReference: reference,
           skillNames,
           model: selectedModelProfile.model,
           reasoningEffort: selectedModelProfile.effort,
@@ -8363,6 +8613,7 @@ export function App() {
         setPrompt("");
         setUploadedFiles([]);
         setSelectedSkillNames([]);
+        setDocumentReference(null);
       }
       return true;
     } catch (caught) {
@@ -8598,7 +8849,7 @@ export function App() {
         if (entry.requestId !== requestId) {
           return [entry];
         }
-        if (entry.threadId && currentThread?.id === entry.threadId && threadHasUserText(currentThread, entry.text)) {
+        if (entry.threadId && currentThread?.id === entry.threadId && threadHasUserText(currentThread, entry.text) && threadHasPendingAttachments(currentThread, entry)) {
           return [];
         }
         return [{ ...entry, keepAtBottomUntil: 0 }];
@@ -8713,6 +8964,11 @@ export function App() {
   }
 
   function handleSocketMessage(message: SocketMessage) {
+    if (message.type === "turn.progress") {
+      const progress = readTurnProgress(message.data);
+      if (progress) setTurnProgress(current => updateTurnProgress(current, selectedUserId, progress, activeTurnsByThreadRef.current[progress.threadId]));
+      return;
+    }
     if (message.type === "turn.queue.started") {
       const data = message.data as { threadId?: string } | undefined;
       if (data?.threadId && data.threadId === selectedThreadRef.current?.id) {
@@ -8721,9 +8977,17 @@ export function App() {
       return;
     }
     if (message.type === "hello") {
-      const data = message.data as { liveState?: LiveStateSnapshot; pendingServerRequests?: Array<{ id: string | number; method: string; params: Record<string, unknown> }> } | undefined;
+      const data = message.data as { liveState?: LiveStateSnapshot; turnProgress?: unknown[]; pendingServerRequests?: Array<{ id: string | number; method: string; params: Record<string, unknown> }> } | undefined;
       hydrateLiveState(data?.liveState);
       refreshSelectedThreadFromLiveState(data?.liveState);
+      setTurnProgress(current => {
+        let next = Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${selectedUserId}:`)));
+        for (const raw of data?.turnProgress ?? []) {
+          const progress = readTurnProgress(raw);
+          if (progress) next = updateTurnProgress(next, selectedUserId, progress, activeTurnsByThreadRef.current[progress.threadId]);
+        }
+        return next;
+      });
       setPendingApprovals(Object.fromEntries((data?.pendingServerRequests ?? [])
         .filter((request) => request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")
         .map((request) => [String(request.id), request])));
@@ -8797,6 +9061,8 @@ export function App() {
     if (message.type === "ack") {
       // The embedded terminal owns its errors; they must not become a chat banner.
       if (message.requestId?.startsWith("term-")) return;
+      // The thread-scoped Goal controller owns its confirmation and errors.
+      if (message.requestId?.startsWith("goal-")) return;
       if (message.requestId?.startsWith("approval-")) {
         const pending = approvalResponseRequestsRef.current.get(message.requestId);
         approvalResponseRequestsRef.current.delete(message.requestId);
@@ -9036,10 +9302,14 @@ export function App() {
           setNewThreadContextConfig(emptyThreadContextConfig());
         }
         if (requestContext) {
-          const createdThreadProfileId = modelProfileIdFor(requestContext.model, requestContext.reasoningEffort, modelProfiles);
-          window.localStorage.setItem(threadModelPreferenceStorageKey(selectedUserId, newThread.id), createdThreadProfileId);
+          const createdProfile = exactModelProfile(requestContext.model, requestContext.reasoningEffort, modelProfiles);
           if (requestContext.projectId) {
-            window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, requestContext.projectId), createdThreadProfileId);
+            if (createdProfile) {
+              window.localStorage.setItem(threadModelPreferenceStorageKey(selectedUserId, newThread.id), createdProfile.id);
+              window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, requestContext.projectId), createdProfile.id);
+            } else {
+              window.localStorage.removeItem(threadModelPreferenceStorageKey(selectedUserId, newThread.id));
+            }
           }
         }
         const normalizedThread = {
@@ -9180,6 +9450,13 @@ export function App() {
         const turnId = notificationTurnId(params);
         const threadId = notificationThreadId(params);
         if (threadId && turnId) {
+          setTurnProgress(current => {
+            const key = `${selectedUserId}:${threadId}`;
+            if (!current[key]) return current;
+            const next = { ...current };
+            delete next[key];
+            return next;
+          });
           markLiveEvent(threadId);
           turnThreadIdsRef.current.set(turnId, threadId);
           activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [threadId]: turnId };
@@ -9189,8 +9466,13 @@ export function App() {
       if (notification.method === "turn/completed") {
         const turnId = notificationTurnId(params);
         const threadId = notificationThreadId(params) ?? (turnId ? turnThreadIdsRef.current.get(turnId) ?? null : null);
+        if (threadId && turnId) setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "completed", silentForMs: 0 }));
         const completedTurn = params.turn && typeof params.turn === "object" ? params.turn as Record<string, unknown> : {};
         const completedStatus = typeof completedTurn.status === "string" ? completedTurn.status : "completed";
+        if (threadId && selectedThreadRef.current?.id === threadId && selectedProjectIdRef.current) {
+          const projectId = selectedProjectIdRef.current;
+          setWritingRevisions(current => ({ ...current, [projectId]: (current[projectId] ?? 0) + 1 }));
+        }
         if (completedStatus === "failed" && threadId && selectedThreadRef.current?.id === threadId) {
           const model = selectedThreadRef.current.configuredModel ?? selectedModelProfile.model;
           const providerNotice = classifyProviderFailure(model, completedTurn.error);
@@ -9357,7 +9639,9 @@ export function App() {
         </article>
       ) : null;
     }
-    const liveToolItem: ThreadItem = { id: entry.id, type: "toolCall", tool: entry.tool, input: entry.input };
+    const liveToolItem: ThreadItem = { id: entry.id, type: "toolCall", tool: entry.tool, input: entry.input, collaboration: entry.collaboration };
+    const collaborationItem = { ...liveToolItem, aggregatedOutput: entry.output, completed: entry.completed };
+    if (parseAgentOperation(collaborationItem)) return <article className="messageItem kind-tool subagentMessage" key={entry.id}><SubagentToolCard item={collaborationItem} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} /></article>;
     const liveQuestions = parseQuestionTool(safeText(entry.tool), entry.input);
     if (liveQuestions && questionIsAnswered(entry.id, entry.turnId ?? undefined)) return null;
     return (
@@ -9376,6 +9660,59 @@ export function App() {
     setPrompt((current) => [current.trim(), `审查意见 ${citation}${quotedSource}\n${commentText}`].filter(Boolean).join("\n\n"));
     window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".composerRichInput")?.focus());
   };
+  function openSubagentReview(initialAgent?: string, initialView?: "active" | "history") {
+    if (!selectedProject?.id || !selectedThread?.id) return;
+    if (subagentPanelCloseTimerRef.current !== null) window.clearTimeout(subagentPanelCloseTimerRef.current);
+    for (const frame of subagentPanelFramesRef.current) window.cancelAnimationFrame(frame);
+    subagentPanelReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setSubagentReview({ projectId: selectedProject.id, threadId: selectedThread.id, initialAgent, initialView, requestId: crypto.randomUUID() });
+    setSubagentPanelVisible(false);
+    subagentPanelFramesRef.current = [window.requestAnimationFrame(() => {
+      subagentPanelFramesRef.current.push(window.requestAnimationFrame(() => setSubagentPanelVisible(true)));
+    })];
+  }
+  function closeSubagentReview() {
+    for (const frame of subagentPanelFramesRef.current) window.cancelAnimationFrame(frame);
+    setSubagentPanelVisible(false);
+    if (subagentPanelCloseTimerRef.current !== null) window.clearTimeout(subagentPanelCloseTimerRef.current);
+    subagentPanelCloseTimerRef.current = window.setTimeout(() => {
+      setSubagentReview(null);
+      subagentPanelCloseTimerRef.current = null;
+      if (subagentPanelReturnFocusRef.current?.isConnected) subagentPanelReturnFocusRef.current.focus({ preventScroll: true });
+    }, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 420);
+  }
+  function renderSubagentThreadItem(item: ThreadItem, turn: Turn, agentId: string, bundleId = `subagent:${agentId}:${turn.id}`) {
+    const projectId = subagentReview?.projectId;
+    const parentThreadId = subagentReview?.threadId;
+    const kind = itemKind(item);
+    if (parseAgentOperation(item)) return <SubagentToolCard item={item} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} />;
+    if (kind === "reasoning") {
+      return reasoningItemDisplayText(item) ? renderToolBundleGroup(bundleId, [item], 0, agentId, projectId, turn.id, { readOnly: true }) : null;
+    }
+    if (kind === "tool") {
+      const output = displayOutputText(safeText(item.aggregatedOutput) || safeText(item.output));
+      return renderToolBundleGroup(bundleId, [item], 0, agentId, projectId, turn.id, { readOnly: true, loadOutput: async () => {
+        if (!projectId || !parentThreadId) return output;
+        return (await readSubagentItemOutput(projectId, parentThreadId, agentId, String(item.outputItemId ?? item.id))).data.output;
+      } });
+    }
+    const raw = itemText(item);
+    const text = kind === "user" ? visibleUserHistoryText(raw) : stripInterruptArtifacts(raw);
+    if (!text.trim() && !imagePreviewsFromItem(item, projectId).length) return null;
+    return <div className={kind === "user" ? "subagentRecordUser" : "subagentRecordAnswer"}>
+      {text.trim() ? <MarkdownMessage text={text} projectId={projectId} onOpenFileLink={openFilePreview} renderMath={kind === "agent" || kind === "user"} /> : null}
+      <MessageImagePreviews item={item} projectId={projectId} onOpenFileLink={openFilePreview} />
+    </div>;
+  }
+  function renderSubagentToolBundle(items: ThreadItem[], turn: Turn, agentId: string, bundleId: string, lastActivity: boolean) {
+    return renderPersistedToolBundle(bundleId, items, true, agentId, subagentReview?.projectId, turn.id,
+      lastActivity && isRunningStatus(turn.status), {
+        readOnly: true,
+        renderEntry: (entries) => <div className="subagentBundleItem" key={entries[0].id} data-message-key={`${turn.id}:${entries[0].id}`}>
+          {renderSubagentThreadItem(entries[0], turn, agentId, bundleId)}
+        </div>
+      });
+  }
   const openDiffReview = (changes: unknown[], title = "文件变更", turnId?: string, itemId?: string, threadId = selectedThread?.id, focusPath?: string) => {
     if (diffPanelCloseTimerRef.current !== null) window.clearTimeout(diffPanelCloseTimerRef.current);
     if (threadId && turnId && itemId) {
@@ -9425,7 +9762,8 @@ export function App() {
     groupIndex: number,
     contextThreadId = selectedThread?.id,
     contextProjectId = selectedProject?.id,
-    contextTurnId?: string
+    contextTurnId?: string,
+    historyContext?: { readOnly: boolean; loadOutput?: () => Promise<string> }
   ) => {
     const entryKey = `${bundleId}:item:${entries[0].id}`;
     if (entries.length === 1 && itemKind(entries[0]) === "reasoning") {
@@ -9440,9 +9778,10 @@ export function App() {
     const call = entries.find((entry) => safeText(entry.type).toLowerCase() === "toolcall") ?? entries[0];
     const toolName = safeText(call.tool).trim() || (safeText(call.type).toLowerCase() === "filechange" ? "文件变更" : "tool");
     const inputText = safeText(call.input) || safeText(call.command);
+    const agentOperation = parseAgentOperation(call);
     const questions = parseQuestionToolItem(call);
-    if (questions && questionIsAnswered(call.id, contextTurnId)) return null;
-    const toolSummary = questions?.map((question) => question.title).join(" · ") || ([
+    if (questions && !historyContext?.readOnly && questionIsAnswered(call.id, contextTurnId)) return null;
+    const toolSummary = agentOperation?.agents.map(agent => agent.name.replace(/^\/root\//, "")).join(" · ") || questions?.map((question) => question.title).join(" · ") || skillReadSummary(call) || (agentOperation ? "" : [
       ...(Array.isArray(call.summary) ? call.summary.map(safeText) : []),
       safeText(call.command),
       inputText
@@ -9468,7 +9807,7 @@ export function App() {
         aria-expanded={expanded}
         onClick={(event) => {
           event.stopPropagation();
-          if (!expanded) revealExpandedTool(event.currentTarget);
+          if (!expanded && !historyContext?.readOnly) revealExpandedTool(event.currentTarget);
           setExpandedToolEntries((current) => {
             if (current[entryKey]) {
               const next = { ...current };
@@ -9481,11 +9820,11 @@ export function App() {
       >
         <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
         <ToolReveal open={expanded}>
-        {questions ? <ToolQuestionCard questions={questions} onChoose={(answer) => chooseToolQuestion(call.id, answer)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
+        {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer) => chooseToolQuestion(call.id, answer)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
         <MessageImagePreviews item={call} projectId={contextProjectId} onOpenFileLink={openFilePreview} />
         {hasChanges ? <button className="openDiffReviewButton" type="button" onClick={(event) => { event.stopPropagation(); openDiffReview(call.changes ?? [], "本轮文件变更", contextTurnId, call.id, contextThreadId); }}><FileText size={14} /> 查看变更 · {call.changes?.length ?? 0} 个文件</button> : null}
-        {!questions && outputText ? <DeferredToolOutput text={displayOutputText(outputText)} deferred={Boolean(deferredOutputItem)} threadId={contextThreadId} itemId={String(deferredOutputItem?.outputItemId ?? deferredOutputItem?.id ?? call.id)} projectId={contextProjectId} /> : null}
-        {!outputText && running ? <div className="messageBody">正在执行...</div> : null}
+        {!agentOperation && (!questions || historyContext?.readOnly) && (outputText || deferredOutputItem) ? <DeferredToolOutput text={displayOutputText(outputText)} deferred={Boolean(deferredOutputItem)} threadId={contextThreadId} itemId={String(deferredOutputItem?.outputItemId ?? deferredOutputItem?.id ?? call.id)} projectId={contextProjectId} loadOutput={historyContext?.loadOutput} /> : null}
+        {!agentOperation && !outputText && running ? <div className="messageBody">正在执行...</div> : null}
         </ToolReveal>
       </article>
     );
@@ -9518,23 +9857,26 @@ export function App() {
     complete = true,
     contextThreadId = selectedThread?.id,
     contextProjectId = selectedProject?.id,
-    contextTurnId?: string
+    contextTurnId?: string,
+    keepShimmering?: boolean,
+    historyContext?: { readOnly: boolean; renderEntry: (entries: ThreadItem[], groupIndex: number) => ReactNode }
   ) => {
     const hasRunningTool = bundleItems.some((item) => safeText(item.type).toLowerCase() === "toolcall" && item.completed === false);
-    // A turn can still be generating text after its tools have completed.
-    // The bundle shimmer must follow tool completion only, not turn completion.
+    // Keep the entire activity bundle alive through tool-to-answer gaps. The
+    // caller clears this only when the next assistant body actually appears.
+    const shimmering = keepShimmering ?? hasRunningTool;
     const running = hasRunningTool;
     const expanded = Boolean(expandedToolBundles[bundleId]);
     const bundleGroups = getToolBundleGroups(bundleItems);
     return (
       <article
-        className={`messageItem kind-tool type-toolCall toolBundle${expanded ? " toolExpanded" : ""}${running ? " live" : ""}${running ? " toolBundleRunning" : ""}`}
+        className={`messageItem kind-tool type-toolCall toolBundle${expanded ? " toolExpanded" : ""}${shimmering ? " live toolBundleShimmering" : ""}${running ? " toolBundleRunning" : ""}`}
         key={bundleId}
         data-message-key={bundleId}
         aria-expanded={expanded}
         onClick={(event) => {
           event.preventDefault();
-          if (!expanded) revealExpandedTool(event.currentTarget);
+          if (!expanded && !historyContext?.readOnly) revealExpandedTool(event.currentTarget);
           setExpandedToolBundles((current) => {
             if (current[bundleId]) {
               const next = { ...current };
@@ -9548,13 +9890,13 @@ export function App() {
           });
         }}
       >
-        <div className={`messageMeta toolBundleTitle${running ? " live" : ""}`}>
+        <div className={`messageMeta toolBundleTitle${shimmering ? " live" : ""}`}>
           <span className="toolBundleTitleLabel">{summarizeToolBundleTitle(bundleItems, !running)}</span>
         </div>
         <ToolReveal open={expanded}>
-          <div className="toolBundleEntries">
+          <div className="toolBundleEntries" onClick={historyContext?.readOnly ? (event) => event.stopPropagation() : undefined}>
             {bundleGroups.map((bundleGroup, groupIndex) => (
-              renderToolBundleGroup(bundleId, bundleGroup, groupIndex, contextThreadId, contextProjectId, contextTurnId)
+              historyContext ? historyContext.renderEntry(bundleGroup, groupIndex) : renderToolBundleGroup(bundleId, bundleGroup, groupIndex, contextThreadId, contextProjectId, contextTurnId)
             ))}
           </div>
         </ToolReveal>
@@ -9562,7 +9904,8 @@ export function App() {
     );
   };
 
-  const renderPersistedThreadItem = (item: ThreadItem, turn: Turn, navigationKey: string | null, messageRefKey: string) => {
+  const renderPersistedThreadItem = (item: ThreadItem, turn: Turn, navigationKey: string | null, messageRefKey: string, shimmerReasoning = false) => {
+    if (parseAgentOperation(item)) return <article className="messageItem kind-tool subagentMessage" key={item.id}><SubagentToolCard item={item} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} /></article>;
     const itemKindValue = itemKind(item);
     const isUserMessage = itemKindValue === "user";
     const rawItemText = itemText(item);
@@ -9570,6 +9913,11 @@ export function App() {
     const reasoningText = itemKindValue === "reasoning" ? reasoningItemDisplayText(item) : "";
     const userVisibleText = isUserMessage ? cleanedItemText : "";
     const isLiveAgent = itemKindValue === "agent" && item.timelineLive === true;
+    const isFirstUserItemInTurn = !isUserMessage || (turn.items ?? []).find((candidate) => itemKind(candidate) === "user")?.id === item.id;
+    const pendingUploads = isUserMessage && isFirstUserItemInTurn
+      ? (pendingUserAttachmentsByTurn.get(turn.id) ?? []).flatMap((entry) => entry.attachments ?? [])
+      : [];
+    const persistedAttachmentTargets = new Set(persistedUserAttachmentsFromText(rawItemText).map((attachment) => attachment.target));
     const hasRenderableItemContent =
       Boolean(item.command) ||
       Boolean(safeText(item.output).trim()) ||
@@ -9589,7 +9937,7 @@ export function App() {
     }
     return (
       <article
-        className={`${messageClassName(item)}${isLiveAgent ? " live" : ""}`}
+        className={`${messageClassName(item)}${isLiveAgent || (itemKindValue === "reasoning" && shimmerReasoning) ? " live" : ""}`}
         key={`${turn.id}-${item.id}`}
         data-message-key={messageRefKey}
         ref={(element) => {
@@ -9610,6 +9958,7 @@ export function App() {
           <>
             <CollapsibleUserMessage text={userVisibleText} skillNames={skillReferencesInPrompt(rawItemText).names} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
             <PersistedUserAttachmentPreviews text={rawItemText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+            <PendingUserAttachmentPreviews uploads={pendingUploads} excludeTargets={persistedAttachmentTargets} onOpenFileLink={openFilePreview} />
           </>
         ) : isLiveAgent ? (
           <LiveAgentStreamMessage text={cleanedItemText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
@@ -9758,7 +10107,7 @@ export function App() {
         <div className="messageMeta">用户 · sending</div>
         <CollapsibleUserMessage text={visibleUserHistoryText(entry.text)} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
         {entry.attachments?.length
-          ? <PendingUserImagePreviews uploads={entry.attachments} onOpenFileLink={openFilePreview} />
+          ? <PendingUserAttachmentPreviews uploads={entry.attachments} onOpenFileLink={openFilePreview} />
           : <PersistedUserAttachmentPreviews text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />}
         {entry.turnId && selectedThread?.id === entry.threadId && (!selectedActiveTurnId || lastStoppedTurnForEdit?.turnId === entry.turnId) && (interruptRequestedTurnIdsRef.current.has(entry.turnId) || interruptingTurns[entry.turnId] || lastStoppedTurnForEdit?.turnId === entry.turnId || selectedThread.turns.some((turn) => turn.id === entry.turnId && ["interrupted", "failed"].some((status) => normalizedToken(turn.status).includes(status)))) ? <div className="v2UserMessageActions" aria-label="用户消息操作">
           <button type="button" title="编辑最后一条提问" aria-label="编辑最后一条提问" disabled={editingLastPrompt || Boolean(editingPromptDraft)} onClick={() => void editLatestPrompt(entry.turnId!, entry.attachments?.length && /^上传了 \d+ 个文件：/.test(entry.text) ? "" : entry.text, entry.text, entry.attachments ?? [])}><PencilLine size={15} /></button>
@@ -9795,6 +10144,16 @@ export function App() {
       if (!entry.turnId || !displayedTurnIds.has(entry.turnId) || persistedUserTurnIds.has(entry.turnId)) {
         continue;
       }
+      const entries = byTurn.get(entry.turnId) ?? [];
+      entries.push(entry);
+      byTurn.set(entry.turnId, entries);
+    }
+    return byTurn;
+  }, [displayedTurnIds, persistedUserTurnIds, visiblePendingUserMessages]);
+  const pendingUserAttachmentsByTurn = useMemo(() => {
+    const byTurn = new Map<string, PendingUserMessage[]>();
+    for (const entry of visiblePendingUserMessages) {
+      if (!entry.turnId || !displayedTurnIds.has(entry.turnId) || !persistedUserTurnIds.has(entry.turnId) || !entry.attachments?.length) continue;
       const entries = byTurn.get(entry.turnId) ?? [];
       entries.push(entry);
       byTurn.set(entry.turnId, entries);
@@ -9919,6 +10278,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     ? Boolean(interruptingTurns[selectedActiveTurnId])
     : Boolean(currentPendingTurnStart && queuedInterruptPrompts[currentPendingTurnStart.requestId]);
   const conversationRunState = selectedActiveTurnId || currentPendingTurnStart ? "running" : "idle";
+  const loadedConversationAgents = useMemo(() => selectedThread ? collectAgents(mergeTimelineItems(
+    displayedConversationTurns.flatMap(turn => turn.items), liveTimelineItems(liveTimelineEntries)
+  )) : [], [selectedThread?.id, displayedConversationTurns, liveTimelineEntries]);
+  const subagentDirectory = useSubagentDirectory(selectedUserId, selectedProject?.id, selectedThread?.id, Boolean(selectedThread?.id), Boolean(selectedActiveTurnId));
+  const conversationAgents = useMemo(() => reconcileSubagents(loadedConversationAgents, subagentDirectory.rows), [loadedConversationAgents, subagentDirectory.rows]);
+  const composerAgents = useMemo(() => reconcileSubagents([], subagentDirectory.rows), [subagentDirectory.rows]);
+  const knownSubagentStates = subagentReview?.threadId === selectedThread?.id ? conversationAgents : [];
   const olderHistoryItemCount = threadHistory?.hasOlder ? Math.max(0, threadHistory.totalItems - threadHistory.nextBefore) : 0;
   const loadedHistoryItemCount = threadHistory ? Math.min(threadHistory.nextBefore, threadHistory.totalItems) : 0;
   const conversationLocalMessageLayout = useMemo(() => {
@@ -10864,7 +11230,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 </label>
               </div>
               <p className="settingsHint">
-                ZeroTier IP、当前登录名和下载目录会自动填入；下载目录默认是远端 SSH 用户的 Downloads。SSH 用户名可修改，需与设备上的系统用户名一致。保存并测试 SSH 成功后，生成文件即可自动发送。设备需开启 SSH/远程登录并允许 4090-left 免密登录；4090-left 目录只作临时中转，不是最终保存位置。
+                ZeroTier IP、当前登录名和下载目录会自动填入；下载目录默认是远端 SSH 用户的 Downloads。SSH 用户名可修改，需与设备上的系统用户名一致。保存并测试 SSH 成功后，可手动发送文件；仅勾选下方自动发送选项才会在任务完成后自动发送。设备需开启 SSH/远程登录并允许 4090-left 免密登录；4090-left 目录只作临时中转，不是最终保存位置。
                 {detectedClientHost ? ` 当前浏览器来源 ZeroTier IP：${detectedClientHost}` : ""}
               </p>
               {settingsTestStatus ? <p className={`settingsTestStatus ${settingsTestStatus.kind}`}>{settingsTestStatus.message}</p> : null}
@@ -11035,7 +11401,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         ) : null}
 
 
-        <div className={`workspace${diffPanelVisible || terminalVisible ? " diffPanelOpen" : ""}${diffPanelResizing ? " diffPanelResizing" : ""}`} style={{ gridTemplateColumns: `${threadListCollapsed ? 56 : threadListWidth}px 0px minmax(0, 1fr) auto` }}>
+        <div className={`workspace${diffPanelVisible || terminalVisible || subagentPanelVisible ? " diffPanelOpen" : ""}${diffPanelResizing ? " diffPanelResizing" : ""}`} style={{ gridTemplateColumns: `${threadListCollapsed ? 56 : threadListWidth}px 0px minmax(0, 1fr) auto` }}>
           <nav className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
             <div className="v2ProjectDock">
               <div className="v2BrandRow">
@@ -11066,7 +11432,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <svg className="v2NavGlyph v2NewThreadGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7" /><path d="M16 3h5v5" /><path d="m21 3-9 9" /></svg>
                   <strong>新建对话</strong>
                 </button>
-                <button type="button" onClick={() => void openSkillsPicker(false)}>
+                <button type="button" onClick={() => void openSkillsPicker(true)}>
                   <svg className="v2NavGlyph v2PluginGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 22v-5" /><path d="M9 8V2" /><path d="M15 8V2" /><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" /></svg>
                   <strong>插件</strong>
                 </button>
@@ -11360,20 +11726,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <span className="v2Avatar">{userInitials(selectedUser?.name ?? selectedUserId)}</span>
                   <strong>{selectedUser?.name ?? selectedUserId}</strong>
                 </div>
-                <button
-                  type="button"
-                  id="v2QuotaMenuButton"
-                  onClick={() => {
-                    document.querySelector<HTMLButtonElement>(".quotaButton.v2QuotaTopButton")?.click();
-                    setAccountMenuOpen(false);
-                  }}
-                >
-                  <span className="v2MenuIcon">◔</span>
-                  <span>剩余用量</span>
-                  <small>查看详情</small>
-                  <span className="v2ChevronGlyph" aria-hidden="true" />
-                </button>
-                <div className="v2QuotaStrip"><span /></div>
                 <button type="button" onClick={() => window.location.assign("/__v2_logout")}>
                   <span className="v2MenuIcon">↪</span><span>退出登录</span>
                 </button>
@@ -11421,6 +11773,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             </button>
           ) : null}
 
+          <div className={`writingCanvas${activeWritingSession ? " writingActive" : ""}${writingChatVisible ? " writingChatVisible" : ""}`} style={{ "--writing-chat-width": `${writingChatWidth}px` } as CSSProperties}>
+          {activeWritingSession ? <>
+            <nav className="writingCanvasTabs" aria-label="写作与聊天"><button type="button" role="tab" aria-selected={!writingChatVisible} onClick={() => setWritingChatVisible(false)}>文档</button><button type="button" role="tab" aria-selected={writingChatVisible} onClick={() => setWritingChatVisible(true)}>Codex</button></nav>
+            <Suspense fallback={<div className="writingCanvasLoading" role="status">正在加载写作工作台…</div>}>
+              <DocumentWorkbench key={`${activeWritingSession.userId}:${activeWritingSession.project.id}:${activeWritingSession.initialPath ?? ""}`} project={activeWritingSession.project} initialPath={activeWritingSession.initialPath} revision={writingRevisions[activeWritingSession.project.id] ?? 0} onReference={referenceWritingSelection} onClose={closeWriting} onToggleChat={() => setWritingChatVisible(value => !value)} chatVisible={writingChatVisible} closing={writingClosing} />
+            </Suspense>
+            {writingChatVisible ? <div className="writingCanvasChatResize" role="separator" aria-label="调整写作与聊天宽度" aria-orientation="vertical" onMouseDown={event => beginRightPanelResize(event, writingChatWidth, setWritingChatWidth, "codex-writing-chat-width", 310, Math.min(650, window.innerWidth * .5))} /> : null}
+          </> : null}
           <section className="conversation">
             <div className="conversationHeader">
               <div className="conversationTitle">
@@ -11440,7 +11800,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     ? "当前会话运行中；完成后可切换下一轮模型"
                     : `仅影响${selectedThread ? "当前会话后续轮次" : "这次新会话"}：${selectedModelProfile.model} / ${selectedModelProfile.effort}`}
                 >
-                  {modelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => (
+                  {selectableModelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => (
                     <option key={profile.id} value={profile.id}>
                       {profile.label}
                     </option>
@@ -11505,6 +11865,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 <nav
                   className="promptNavigator"
                   aria-label="本会话提示词导航"
+                  aria-hidden={diffPanelVisible || terminalVisible || subagentPanelVisible}
+                  inert={diffPanelVisible || terminalVisible || subagentPanelVisible}
                   onMouseLeave={() => hoverPromptNavigation(null)}
                 >
                   <span className="promptNavigatorLabel" aria-hidden="true">提示</span>
@@ -11619,23 +11981,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 onScroll={() => {
                   updateMessageScrollState();
                 }}
-                onMouseUp={(event) => {
-                  const selection = window.getSelection();
-                  const text = selection?.toString().trim() ?? "";
-                  if (!text || text.length > 6000) {
-                    return;
-                  }
-                  const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
-                  const rect = range?.getBoundingClientRect();
-                  if (!rect || rect.width === 0 || rect.height === 0) {
-                    return;
-                  }
-                  setSelectionAction({
-                    text,
-                    left: Math.min(Math.max(rect.left + rect.width / 2 - 78, 12), window.innerWidth - 190),
-                    top: Math.min(rect.bottom + 8, window.innerHeight - 54),
-                  });
-                }}
                 onClick={(event) => {
                   const target = event.target as HTMLElement;
                   if (target.closest("a, button, input, textarea, select")) {
@@ -11709,7 +12054,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                             <LiveAgentStreamMessage text={stripInterruptArtifacts(entry.text)} projectId={temporaryAsk.projectId} onOpenFileLink={openFilePreview} />
                           </article>
                         ) : null)
-                        : (
+                        : parseAgentOperation({ id: entry.id, type: "toolCall", tool: entry.tool, input: entry.input, aggregatedOutput: entry.output, collaboration: entry.collaboration, completed: entry.completed }) ? <SubagentToolCard key={`temporary-live:${entry.id}`} item={{ id: entry.id, type: "toolCall", tool: entry.tool, input: entry.input, aggregatedOutput: entry.output, collaboration: entry.collaboration, completed: entry.completed }} /> : (
                           <article className="messageItem kind-tool type-toolCall live temporaryAskTool" key={`temporary-live:${entry.id}`}>
                             <div className="messageMeta">{entry.completed ? "工具输出" : "调用工具"} · {entry.tool}</div>
                             {entry.input ? <pre>{safeText(entry.input)}</pre> : null}
@@ -11781,6 +12126,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   const liveItems = sanitizeTurnItems(liveTimelineItems(liveTimelineByTurn.get(turn.id) ?? []));
                   // Merge identities and chronology before introducing message boundaries.
                   const items = collapseCodeModeWrappers(coalesceToolOutputs(mergeTimelineItems(coalesceToolOutputs(historyItems), liveItems)));
+                  const hasAgentAnswerFromIndex = new Array<boolean>(items.length + 1).fill(false);
+                  for (let index = items.length - 1; index >= 0; index -= 1) {
+                    const item = items[index];
+                    hasAgentAnswerFromIndex[index] = hasAgentAnswerFromIndex[index + 1]
+                      || (itemKind(item) === "agent" && Boolean(stripInterruptArtifacts(itemText(item)).trim()));
+                  }
                   const renderedHistoryItems: React.ReactNode[] = [];
                   const pendingTurnUserMessages = pendingUserMessagesByTurn.get(turn.id) ?? [];
                   const isRunningTurn = Boolean(selectedActiveTurnId && selectedActiveTurnId === turn.id);
@@ -11797,12 +12148,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     }
                   }
                   const pendingToolGroup: ThreadItem[] = [];
-                  const flushToolGroup = (indexBase: number) => {
+                  const flushToolGroup = (indexBase: number, answerAlreadyStarting = false) => {
                     if (pendingToolGroup.length === 0) {
                       return indexBase;
                     }
                     const bundleId = `${turn.id}-toolbundle-${pendingToolGroup[0].id}`;
                     const isLiveRunningTurn = Boolean(selectedActiveTurnId && turn.id === selectedActiveTurnId);
+                    const keepShimmering = isLiveRunningTurn && !answerAlreadyStarting;
                     const isBundleComplete = !isLiveRunningTurn || pendingToolGroup.every((toolItem) => safeText(toolItem.type).toLowerCase() !== "toolcall" || toolItem.completed !== false);
                     if (pendingToolGroup.some((item) => itemKind(item) === "tool")) {
                       renderedHistoryItems.push(
@@ -11812,7 +12164,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           isBundleComplete,
                           selectedThread?.id,
                           selectedProject?.id,
-                          turn.id
+                          turn.id,
+                          keepShimmering
                         )
                       );
                     } else {
@@ -11821,7 +12174,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           reasoningItem,
                           turn,
                           null,
-                          messageElementKey(selectedThread?.id ?? "", turn.id, reasoningItem.id)
+                          messageElementKey(selectedThread?.id ?? "", turn.id, reasoningItem.id),
+                          keepShimmering
                         ));
                       }
                     }
@@ -11833,7 +12187,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     const kind = itemKind(item);
                     const inlineQuestions = kind === "tool" ? parseQuestionToolItem(item) : null;
                     if (inlineQuestions) {
-                      toolGroupIndex = flushToolGroup(toolGroupIndex);
+                      toolGroupIndex = flushToolGroup(toolGroupIndex, true);
                       if (!questionIsAnswered(item.id, turn.id, items)) renderedHistoryItems.push(
                         <article className="messageItem kind-question" key={`${turn.id}-${item.id}-question`}>
                           <ToolQuestionCard questions={inlineQuestions} onChoose={(answer) => chooseToolQuestion(item.id, answer)} />
@@ -11856,7 +12210,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         continue;
                       }
                     }
-                    toolGroupIndex = flushToolGroup(toolGroupIndex);
+                    toolGroupIndex = flushToolGroup(toolGroupIndex, hasAgentAnswerFromIndex[itemIndex]);
                     const itemKindValue = kind;
                     const isUserMessage = itemKindValue === "user";
                     const rawItemText = itemText(item);
@@ -12120,6 +12474,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 <button type="button" onClick={cancelEditingPrompt} disabled={editingLastPrompt}>取消</button>
               </div> : null}
               <div className="composerBody">
+                <div className="composerThreadActivity">
+                  <ToolReveal key={`progress:${selectedUserId}:${selectedThread?.id ?? "new"}`} open={Boolean(selectedThread?.id && turnProgress[`${selectedUserId}:${selectedThread.id}`]?.turnId === selectedActiveTurnId)}><div className="composerRunNotice" role="status">{turnProgressText(selectedThread?.id ? turnProgress[`${selectedUserId}:${selectedThread.id}`] : undefined)}</div></ToolReveal>
+                  <GoalProgress key={`goal:${selectedUserId}:${selectedThread?.id ?? "new"}`} controller={threadGoal} running={conversationRunState === "running"} />
+                  <SubagentActivity key={`agents:${selectedUserId}:${selectedThread?.id ?? "new"}`} agents={composerAgents} directoryPage={subagentDirectory.page} parentRunning={Boolean(selectedActiveTurnId)} taskKey={selectedActiveTurnId ?? "idle"} onOpen={openSubagentReview} onOpenHistory={() => openSubagentReview(undefined, "history")} />
+                  <ToolReveal open={Boolean(documentReference && documentReference.projectId === selectedProject?.id)}><div className="composerDocumentReference"><FileText size={14} /><span title={documentReference?.text}><strong>{documentReference?.path}</strong> · {documentReference?.text.slice(0, 120)}</span><button type="button" aria-label="移除文档引用" onClick={() => setDocumentReference(null)}><X size={14} /></button></div></ToolReveal>
+                </div>
                 <div className="composerTools">
                   {planMode ? <button className="v2PlanActiveChip" type="button" onClick={() => setPlanMode(false)} title="关闭计划模式，恢复可执行改动"><Lightbulb size={14} />计划</button> : null}
                   {selectedSkills.map((skill) => (
@@ -12161,7 +12521,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     onChange={(profileId) => void changeConversationModelProfile(profileId)}
                     disabled={savingThreadModel || conversationRunState === "running"}
                     title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
-                    profiles={modelProfiles}
+                    profiles={selectableModelProfiles}
                   />
                   <button
                     className="v2SendMarkdownLocalAction"
@@ -12313,7 +12673,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               </button>
             </div>
           </section>
-          {diffReview || terminalProjectId ? <aside className={`diffReviewPanel${diffReview && terminalProjectId ? " rightPanelSplit" : ""}`} style={{ width: diffPanelVisible || terminalVisible ? diffPanelWidth : 0 }} aria-label="工作区右侧面板">
+          </div>
+          {diffReview || terminalProjectId || subagentReview ? <aside className={`diffReviewPanel${terminalProjectId && (diffReview || subagentReview) ? " rightPanelSplit" : ""}${subagentReview && diffReview ? " rightPanelWithAgents" : ""}`} style={{ width: diffPanelVisible || terminalVisible || subagentPanelVisible ? diffPanelWidth : 0 }} aria-label="工作区右侧面板">
             <div className="diffReviewResizeHandle" role="separator" aria-orientation="vertical" aria-label="拖动调整变更面板宽度" onMouseDown={(event) => {
               setDiffPanelResizing(true);
               beginRightPanelResize(event, diffPanelWidth, setDiffPanelWidth, "codex-web-diff-panel-width", 350, Math.min(900, window.innerWidth - (threadListCollapsed ? 56 : threadListWidth) - 320));
@@ -12340,7 +12701,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 ? <div className="nativeReviewResult"><div className="nativeReviewResultLabel">审查结果 · 原始意见</div><MarkdownMessage text={reviewText.replace(/^Full review comments:/m, "审查意见：")} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /></div>
                 : <div className="nativeReviewPending" role="status"><span className="nativeReviewActivity" aria-hidden="true" />{reviewTurn?.completedAt ? "本次审查没有文字结果，请查看会话记录。" : reviewProgress ? `正在审查 · ${reviewProgress}` : "正在审查；原生审查通常在完成后一次性返回意见。"}</div>;
             })() : <FileChangeReview changes={diffReview.focusPath ? diffReview.changes.filter((change) => fileChangePath(change) === diffReview.focusPath) : diffReview.changes} onComment={addInlineReviewComment} />}</div></section> : null}
-            {terminalProjectId ? <TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={Boolean(diffReview)} onClose={() => {
+            {subagentReview ? <SubagentPanel key={`${selectedUserId}:${subagentReview.requestId}`} projectId={subagentReview.projectId} parentThreadId={subagentReview.threadId} initialAgent={subagentReview.initialAgent} initialView={subagentReview.initialView} visible={subagentPanelVisible} parentRunning={subagentReview.threadId === selectedThread?.id && Boolean(selectedActiveTurnId)} knownAgents={knownSubagentStates} onClose={closeSubagentReview} renderItem={renderSubagentThreadItem} renderBundle={renderSubagentToolBundle} /> : null}
+            {terminalProjectId ? <TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={Boolean(diffReview || subagentReview)} onClose={() => {
               setTerminalVisible(false);
               if (terminalCloseTimerRef.current !== null) window.clearTimeout(terminalCloseTimerRef.current);
               terminalCloseTimerRef.current = window.setTimeout(() => {
@@ -12371,6 +12733,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 <div className={`imageViewerActionMenu${imageViewerActionsOpen ? " open" : ""}`} aria-hidden={!imageViewerActionsOpen}>
                   <button type="button" disabled={!imageViewerActionsOpen || sharingBrowserFile} onClick={() => { setImageViewerActionsOpen(false); void shareOrDownloadPreviewFile(); }}>{sharingBrowserFile ? "准备中…" : "下载 / 分享"}</button>
                   <button type="button" disabled={!imageViewerActionsOpen || sendingLocalFile} onClick={() => { setImageViewerActionsOpen(false); void sendPreviewFileToLocal(); }}>{sendingLocalFile ? "发送中…" : "SSH 发送"}</button>
+                  <label className="documentAutoSendToggle"><input type="checkbox" checked={autoSendGeneratedFiles} onChange={event => updateAutoSendGeneratedFiles(event.target.checked)} />自动发送生成文件</label>
                 </div>
               </div>
               <button className="imageViewerRoundButton" type="button" aria-label="关闭图片预览" title="关闭（Esc）" onClick={closeImageViewer}><X size={20} /></button>
@@ -12414,17 +12777,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         </div>
       ) : null}
       {filePreview || filePreviewLoading || filePreviewError || runnablePreview ? (
-        <div className="modalScrim filePreviewScrim" role="dialog" aria-modal="true" aria-labelledby="file-preview-title">
-          <section className="filePreviewDialog">
-            <header className="filePreviewHeader">
-              <div>
-                <h2 id="file-preview-title">{runnablePreview?.title ?? filePreview?.name ?? "文件预览"}</h2>
-                <p>
-                  {runnablePreview ? "隔离预览 · 无法访问号池页面或本地文件" : filePreview?.relativePath ?? filePreviewError}
-                  {filePreview?.line ? <span>:{filePreview.line}</span> : null}
-                </p>
+        <div className={`imageViewer documentViewer${filePreviewClosing ? " closing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="file-preview-title" onMouseDown={event => { if (event.target === event.currentTarget) closeFilePreview(); }}>
+          <section className="documentViewerPanel">
+            <header className="imageViewerHeader">
+              <div className="imageViewerTitle" title={filePreview?.relativePath}>
+                <strong id="file-preview-title">{runnablePreview?.title ?? filePreview?.name ?? "文件预览"}</strong>
               </div>
-              <div className="filePreviewActions">
+              <div className="imageViewerHeaderActions">
                 {!runnablePreview && filePreview?.kind === "text" && !filePreview.truncated && /\.(?:html?|mmd|mermaid)$/i.test(filePreview.name) ? (
                   <button className="iconTextButton" type="button" onClick={() => setRunnablePreview({ kind: /\.(?:mmd|mermaid)$/i.test(filePreview.name) ? "mermaid" : "html", title: filePreview.name, source: filePreview.content ?? "" })}>运行</button>
                 ) : null}
@@ -12436,27 +12795,27 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     ))}
                   </div>
                 ) : null}
-                {filePreview && !runnablePreview ? (
-                  <>
-                    <button className="iconTextButton" type="button" onClick={() => void shareOrDownloadPreviewFile()} disabled={sharingBrowserFile}>
-                      {sharingBrowserFile ? "准备中" : "下载/分享"}
-                    </button>
-                    <button className="iconTextButton" type="button" onClick={() => void sendPreviewFileToLocal()} disabled={sendingLocalFile}>
-                      {sendingLocalFile ? "发送中" : "SSH 发送"}
-                    </button>
-                  </>
-                ) : null}
-                <button className="iconButton" type="button" onClick={closeFilePreview} title="Close preview">
-                  <X size={17} />
+                {filePreview && !runnablePreview ? <div className="imageViewerActionWrap">
+                  <button className="imageViewerRoundButton" type="button" aria-label="文件操作" title="下载、分享或 SSH 发送" aria-expanded={imageViewerActionsOpen} onClick={() => setImageViewerActionsOpen(current => !current)}><MoreHorizontal size={20} /></button>
+                  <div className={`imageViewerActionMenu${imageViewerActionsOpen ? " open" : ""}`} aria-hidden={!imageViewerActionsOpen}>
+                    {/\.(tex|docx)$/i.test(filePreview.name) ? <button type="button" disabled={!imageViewerActionsOpen} onClick={() => { const path = filePreview.relativePath; closeFilePreview(); openWriting(path); }}>在写作工作台中打开</button> : null}
+                    <button type="button" disabled={!imageViewerActionsOpen || sharingBrowserFile} onClick={() => { setImageViewerActionsOpen(false); void shareOrDownloadPreviewFile(); }}>{sharingBrowserFile ? "准备中…" : "下载 / 分享"}</button>
+                    <button type="button" disabled={!imageViewerActionsOpen || sendingLocalFile} onClick={() => { setImageViewerActionsOpen(false); void sendPreviewFileToLocal(); }}>{sendingLocalFile ? "发送中…" : "SSH 发送"}</button>
+                    <label className="documentAutoSendToggle"><input type="checkbox" checked={autoSendGeneratedFiles} onChange={event => updateAutoSendGeneratedFiles(event.target.checked)} />自动发送生成文件</label>
+                  </div>
+                </div> : null}
+                <button className="imageViewerRoundButton" type="button" onClick={closeFilePreview} aria-label="关闭文件预览" title="关闭（Esc）">
+                  <X size={20} />
                 </button>
               </div>
             </header>
             <div className={`filePreviewBody${filePreview?.kind === "image" && filePreviewObjectUrl ? ` imagePreviewBody imagePreviewBody-${imagePreviewMode}` : ""}`}>
               {runnablePreview ? <RunnablePreviewFrame preview={runnablePreview} /> : null}
-              {!runnablePreview && filePreviewLoading ? <div className="emptyState">Loading file preview.</div> : null}
+              {!runnablePreview && filePreviewLoading ? <div className="documentPreviewStatus" role="status">正在打开文件…</div> : null}
               {!runnablePreview && !filePreviewLoading && filePreviewError ? <div className="filePreviewError">{filePreviewError}</div> : null}
               {!runnablePreview && !filePreviewLoading && filePreview ? (
                 <>
+                  {["markdown","text","image","video"].includes(filePreview.kind) ? <PreviewZoom>
                   {filePreview.kind === "markdown" ? (
                     <div className="fileMarkdownPreview">
                       <MarkdownMessage text={filePreview.content ?? ""} projectId={selectedProject?.id} onOpenFileLink={(target) => void openFilePreview(target)} />
@@ -12476,35 +12835,24 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       当前浏览器无法播放此视频。
                     </video>
                   ) : null}
-                  {filePreview.kind === "pdf" && filePreviewObjectUrl ? (
-                    <iframe className="filePdfPreview" src={filePreviewObjectUrl} title={filePreview.name} />
-                  ) : null}
-                  {filePreview.kind === "binary" ? (
+                  </PreviewZoom> : null}
+                  {/\.(pdf|docx|xlsx|pptx|zip)$/i.test(filePreview.name) ? <Suspense fallback={<div className="documentPreviewStatus" role="status">正在加载预览器…</div>}><DocumentPreview name={filePreview.name} url={filePreviewObjectUrl || rawFileUrlForProject(selectedProject!.id, filePreview.relativePath)} /></Suspense> : null}
+                  {filePreview.kind === "binary" && !/\.(pdf|docx|xlsx|pptx|zip)$/i.test(filePreview.name) ? (
                     <div className="fileBinaryPreview">
                       <FileText size={28} />
-                      <strong>{filePreview.mime}</strong>
+                      <strong>暂不支持此格式的在线预览</strong>
                       <span>{formatBytes(filePreview.size)}</span>
+                      <span>可从右上角下载；旧版 Office 文件请另存为 DOCX、XLSX 或 PPTX 后查看。</span>
                     </div>
                   ) : null}
-                  {filePreview.truncated ? <p className="previewHint">Preview truncated at 2 MB.</p> : null}
+                  {filePreview.truncated && (filePreview.kind === "text" || filePreview.kind === "markdown") ? <p className="previewHint">文本预览截取前 2 MB；完整内容请下载查看。</p> : null}
                 </>
               ) : null}
             </div>
           </section>
         </div>
       ) : null}
-      {selectionAction ? (
-        <button
-          className="selectionAskButton"
-          type="button"
-          style={{ left: selectionAction.left, top: selectionAction.top }}
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() => openTemporaryAsk(selectionAction.text, selectionAction.left, selectionAction.top)}
-        >
-          <MessageSquare size={14} />
-          在侧边提问
-        </button>
-      ) : null}
+      <SelectionAskAction ref={selectionAskActionRef} scope={`${selectedUserId}:${selectedThread?.id ?? ""}`} onAsk={openTemporaryAsk} />
     </main>
     </RunnablePreviewContext.Provider>
   );

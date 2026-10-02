@@ -25,6 +25,7 @@ interface VirtualConversationProps extends HTMLAttributes<HTMLDivElement> {
   containerRef?: Ref<HTMLDivElement>;
   threadKey: string;
   virtualize?: boolean;
+  estimateRowSize?: (index: number) => number;
   historyRevision?: number;
   shouldFollowEnd?: () => boolean;
 }
@@ -46,7 +47,7 @@ function stableRowKey(node: ReactNode, index: number): string {
 }
 
 function VirtualConversationInner(
-  { children, containerRef, threadKey, virtualize = false, historyRevision = 0, shouldFollowEnd, className, onScroll, onWheel, onTouchStart, onTouchMove, onPointerDown, onPointerUp, onTouchEnd, onKeyDown, ...containerProps }: VirtualConversationProps,
+  { children, containerRef, threadKey, virtualize = false, estimateRowSize, historyRevision = 0, shouldFollowEnd, className, onScroll, onWheel, onTouchStart, onTouchMove, onPointerDown, onPointerUp, onTouchEnd, onKeyDown, ...containerProps }: VirtualConversationProps,
   forwardedRef: Ref<VirtualConversationHandle>
 ) {
   const rows = Children.toArray(children).map((node, index) => ({
@@ -166,7 +167,7 @@ function VirtualConversationInner(
     getScrollElement: () => useFlowLayout ? null : scrollElementRef.current,
     // The history control is only one line tall. A 260px estimate here leaves
     // a visible empty band above the oldest message until it is measured.
-    estimateSize: (index) => index === 0 ? 44 : 260,
+    estimateSize: estimateRowSize ?? ((index) => index === 0 ? 44 : 260),
     getItemKey: (index) => rowsRef.current[index]?.key ?? index,
     // Keep a small runway around the viewport; rendering every loaded turn
     // defeats pagination once a reader has scrolled through many pages.

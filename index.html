@@ -60,6 +60,7 @@
       <button type="button" data-action="send-markdown"><span class="v2MenuIcon" data-icon="send"></span><span><strong>发送对话记录到本机</strong><small>发送当前会话记录</small></span></button>
       <button type="button" data-action="context"><span class="v2MenuIcon" data-icon="context"></span><span><strong>上下文状态</strong><small>查看会话上下文与压缩设置</small></span></button>
       <span class="v2MenuSection">工作区</span>
+      <button type="button" data-action="writing"><span class="v2MenuIcon" data-icon="writing"></span><span><strong>LaTeX / Word 写作</strong><small>编辑、编译与引用文档选区</small></span></button>
       <button type="button" data-action="worktree"><span class="v2MenuIcon" data-icon="worktree"></span><span><strong>独立工作树</strong><small>隔离改动并接力当前会话</small></span></button>
       <button type="button" data-action="archive-list"><span class="v2MenuIcon" data-icon="archive-list"></span><span><strong>归档会话</strong><small>查看并恢复已归档对话</small></span></button>
       <button type="button" data-action="archive-current"><span class="v2MenuIcon" data-icon="archive-current"></span><span><strong>归档当前会话</strong><small>从列表收起，随时可恢复</small></span></button>
@@ -72,10 +73,40 @@
     </div>
 
     <script type="module">
-      import { Plus, FolderUpload, Target, Application, Send, ChartPie, Setting, Time, Trophy, Plan, Branch, History, FileCollection, Terminal } from "@icon-park/svg";
+      import { Plus, FolderUpload, Target, Application, Send, ChartPie, Setting, Time, Trophy, Plan, Branch, History, FileCollection, Terminal, FileEditing } from "@icon-park/svg";
       (() => {
         const plusMenu = document.getElementById("v2PlusMenu");
         let plusCloseTimer = 0;
+        let plusPositionFrame = 0;
+        const positionPlusMenu = () => {
+          plusPositionFrame = 0;
+          if (plusMenu.hidden || plusMenu.classList.contains("uiClosing")) return;
+          const anchor = document.querySelector(".v2ComposerPlus");
+          if (!anchor) return;
+          const viewport = window.visualViewport;
+          const viewportTop = viewport?.offsetTop || 0;
+          const viewportLeft = viewport?.offsetLeft || 0;
+          const viewportWidth = viewport?.width || window.innerWidth;
+          const viewportHeight = viewport?.height || window.innerHeight;
+          const rect = anchor.getBoundingClientRect();
+          const width = Math.min(440, viewportWidth - 24);
+          const bottom = Math.min(rect.top - 8, viewportTop + viewportHeight - 12);
+          const availableHeight = Math.max(40, bottom - viewportTop - 12);
+          plusMenu.style.boxSizing = "border-box";
+          plusMenu.style.width = `${width}px`;
+          plusMenu.style.maxHeight = `${Math.min(600, availableHeight)}px`;
+          plusMenu.style.left = `${Math.max(viewportLeft + 12, Math.min(rect.left, viewportLeft + viewportWidth - width - 12))}px`;
+          plusMenu.style.bottom = "auto";
+          plusMenu.style.top = `${Math.max(viewportTop + 12, bottom - plusMenu.offsetHeight)}px`;
+        };
+        const schedulePlusPosition = () => {
+          if (plusPositionFrame) cancelAnimationFrame(plusPositionFrame);
+          plusPositionFrame = requestAnimationFrame(positionPlusMenu);
+        };
+        window.addEventListener("resize", schedulePlusPosition, { passive: true });
+        window.visualViewport?.addEventListener("resize", schedulePlusPosition, { passive: true });
+        window.visualViewport?.addEventListener("scroll", schedulePlusPosition, { passive: true });
+        const plusAnchorObserver = new ResizeObserver(schedulePlusPosition);
         const closePlusMenu = () => {
           if (plusMenu.hidden || plusMenu.classList.contains("uiClosing")) return;
           plusMenu.classList.add("uiClosing");
@@ -90,7 +121,7 @@
         const iconMarkup = (icon, size = 18) => icon({ ...iconOptions, size })
           .replace(/^<\?xml[^>]*>/, "")
           .replace("<svg ", '<svg aria-hidden="true" focusable="false" ');
-        const menuIcons = { upload: FolderUpload, goal: Target, plan: Plan, skills: Application, send: Send, context: ChartPie, worktree: Branch, "archive-list": History, "archive-current": FileCollection, terminal: Terminal, hooks: Setting, settings: Setting, quota: Time, leaderboard: Trophy };
+        const menuIcons = { upload: FolderUpload, goal: Target, plan: Plan, skills: Application, send: Send, context: ChartPie, writing: FileEditing, worktree: Branch, "archive-list": History, "archive-current": FileCollection, terminal: Terminal, hooks: Setting, settings: Setting, quota: Time, leaderboard: Trophy };
         plusMenu.querySelectorAll("[data-icon]").forEach((slot) => {
           const icon = menuIcons[slot.dataset.icon];
           if (icon) slot.innerHTML = iconMarkup(icon);
@@ -164,17 +195,17 @@
               planButton.querySelector('small').textContent = planEnabled ? '已开启；点击关闭' : '先审方案，再决定是否执行';
               const hasProject = Boolean(document.querySelector('.projectTitle .recordMapping'));
               const hasThread = document.querySelector('.composer[data-has-thread="true"]') !== null;
-              for (const action of ['worktree', 'archive-list', 'archive-current', 'terminal', 'hooks']) {
+              for (const action of ['writing', 'worktree', 'archive-list', 'archive-current', 'terminal', 'hooks']) {
                 plusMenu.querySelector(`[data-action="${action}"]`).disabled = !hasProject || (action === 'archive-current' && !hasThread);
               }
               plusMenu.querySelector('[data-action="worktree"] small').textContent = hasThread ? '隔离改动并接力当前会话' : '创建隔离的工作区会话';
-              const rect = plus.getBoundingClientRect();
-              const menuWidth = Math.min(500, window.innerWidth - 24);
-              plusMenu.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - menuWidth - 12))}px`;
-              plusMenu.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+              positionPlusMenu();
+              schedulePlusPosition();
             } else closePlusMenu();
           });
           tools.prepend(plus);
+          plusAnchorObserver.disconnect();
+          plusAnchorObserver.observe(tools.closest(".composer"));
 
           const textarea = document.querySelector(".composer textarea");
           if (textarea) textarea.placeholder = "随心输入";
@@ -192,7 +223,7 @@
           if (action === "plan") document.querySelector('.composer .v2PlanModeBridge')?.click();
           if (action === "context") clickExisting(".v2ContextStatusButton", /上下文|会话状态/);
           if (action === "goal") window.dispatchEvent(new CustomEvent("codex:compose-goal"));
-          if (["worktree", "archive-list", "archive-current", "terminal", "hooks"].includes(action)) window.dispatchEvent(new CustomEvent("codex:workspace-action", { detail: action }));
+          if (["writing", "worktree", "archive-list", "archive-current", "terminal", "hooks"].includes(action)) window.dispatchEvent(new CustomEvent("codex:workspace-action", { detail: action }));
           closePlusMenu();
         });
 

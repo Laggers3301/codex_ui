@@ -81,7 +81,7 @@ describe("sanitizeThreadPayloadForClient", () => {
 
     sanitizeThreadPayloadForClient(payload);
 
-    expect(payload.thread.turns[0].items.map((item) => item.id)).toEqual(["prompt", "compact", "continued"]);
+    expect(payload.thread.turns[0].items.map((item) => item.id)).toEqual(["prompt", "continued"]);
   });
 
   it("does not hide a similar assistant answer when no compaction occurred", () => {
@@ -106,11 +106,19 @@ describe("modelProfilesFromCatalog", () => {
           supported_reasoning_levels: [{ effort: "low" }, { effort: "ultra" }]
         },
         {
+          slug: "gpt-6.1-sol",
+          display_name: "GPT-6.1-Sol",
+          visibility: "list",
+          shell_type: "unified_exec",
+          priority: 1,
+          supported_reasoning_levels: [{ effort: "low" }, { effort: "max" }, { effort: "ultra" }]
+        },
+        {
           slug: "gpt-5.6-sol",
           display_name: "GPT-5.6 Sol",
           visibility: "list",
           shell_type: "shell_command",
-          priority: 1,
+          priority: 4,
           supported_reasoning_levels: [{ effort: "high" }]
         },
         {
@@ -118,7 +126,7 @@ describe("modelProfilesFromCatalog", () => {
           display_name: "GPT-6 Sol",
           visibility: "list",
           shell_type: "unified_exec",
-          priority: 1,
+          priority: 2,
           supported_reasoning_levels: [{ effort: "max" }]
         },
         {
@@ -126,7 +134,7 @@ describe("modelProfilesFromCatalog", () => {
           display_name: "GPT-6 Luna",
           visibility: "list",
           shell_type: "unified_exec",
-          priority: 2,
+          priority: 3,
           supported_reasoning_levels: [{ effort: "medium" }]
         },
         {
@@ -158,9 +166,11 @@ describe("modelProfilesFromCatalog", () => {
 
     expect(profiles.map((profile) => profile.id)).toEqual([
       "gpt-6-astra:low",
+      "gpt-6.1-sol:max",
+      "gpt-6.1-sol:low",
       "gpt-6-sol:max",
-      "gpt-5.6-sol:high",
-      "gpt-6-luna:medium"
+      "gpt-6-luna:medium",
+      "gpt-5.6-sol:high"
     ]);
     expect(profiles.some((profile) => profile.effort === "ultra")).toBe(false);
   });

@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+export class LegacyRollbackConflictError extends Error {}
+
 export interface AppendedRollbackMarker {
   filePath: string;
   originalSize: number;

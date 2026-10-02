@@ -23,6 +23,8 @@ export interface LiveAgentMessage {
 }
 
 export interface LiveToolItem {
+  collaboration?: Record<string, unknown>;
+  internal?: boolean;
   itemId: string;
   sourceItemId?: string;
   threadId: string | null;
@@ -83,6 +85,11 @@ function livePreview(text: string, maxChars = MAX_LIVE_TOOL_TEXT_CHARS): string 
 
 function normalizedToken(value: unknown): string {
   return textFromValue(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function isContextCompactionItem(item: Record<string, unknown>): boolean {
+  const token = normalizedToken(item.type ?? item.kind ?? item.tool ?? item.name);
+  return token.includes("contextcompaction");
 }
 
 function isToolItem(item: Record<string, unknown>): boolean {
@@ -322,6 +329,11 @@ export class LiveStateStore {
       threadId: existing?.threadId ?? threadId,
       turnId: existing?.turnId ?? turnId ?? activeTurn?.turnId ?? null,
       tool: toolLabel(item) || existing?.tool || "tool",
+      internal: isContextCompactionItem(item) || existing?.internal,
+      ...(normalizedToken(item.type) === "collabagenttoolcall" ? { collaboration: {
+        type: "collabAgentToolCall", tool: item.tool, status: item.status, senderThreadId: item.senderThreadId,
+        receiverThreadIds: item.receiverThreadIds, agentsStates: item.agentsStates, model: item.model
+      } } : existing?.collaboration ? { collaboration: existing.collaboration } : {}),
       input: toolInput(item) || existing?.input || "",
       output: toolOutput(item) || existing?.output || "",
       completed: completed || existing?.completed || false,

@@ -4119,6 +4119,9 @@ pre,
   .temporaryAskComposer .composerRichInput {
     font-size: 16px;
   }
+  .composerRichInput .is-empty:first-child::before {
+    font-size: 14px;
+  }
 }
 
 .composerBody > .composerTools {
@@ -4721,22 +4724,6 @@ pre,
   text-align: center;
 }
 
-.v2QuotaStrip {
-  height: 3px;
-  margin: -2px 10px 6px 35px;
-  overflow: hidden;
-  border-radius: 99px;
-  background: #424440;
-}
-
-.v2QuotaStrip span {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: #d5d7d2;
-  transition: width 300ms ease;
-}
-
 .messageItem.live {
   animation: v2-event-enter 180ms cubic-bezier(0.2, 0, 0, 1) both;
 }
@@ -4818,8 +4805,7 @@ pre,
   .composer,
   .threadRow,
   .projectRow,
-  .newThreadButton,
-  .v2QuotaStrip span {
+  .newThreadButton {
     transition: none;
   }
 }
@@ -5324,10 +5310,6 @@ pre,
   width: 310px;
 }
 
-.v2AccountMenu button:not(#v2QuotaMenuButton):not(:last-child) {
-  display: none;
-}
-
 .conversation:has(.threadRunState.running) .messages::after {
   content: none;
   display: none;
@@ -5666,7 +5648,7 @@ pre,
 .messageItem.live.kind-reasoning .messageMarkdown {
   opacity: 1 !important;
   color: transparent !important;
-  background-image: linear-gradient(90deg, #777a75 0%, #777a75 30%, #f0f1ed 50%, #aeb1ab 62%, #777a75 82%, #777a75 100%) !important;
+  background-image: var(--ui-work-shimmer-gradient) !important;
   background-size: 200% 100% !important;
   background-repeat: repeat-x !important;
   background-clip: text !important;
@@ -5815,6 +5797,58 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
 
   .filePreviewDialog .imagePreviewBody {
     padding: 10px;
+  }
+}
+
+/* File preview: keep the scrim mounted for an actual eased exit, and give
+   each newly resolved preview (text/image/PDF/HTML) a gentle content handoff. */
+@keyframes filePreviewBackdropIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes filePreviewBackdropOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes filePreviewPanelIn {
+  from { opacity: 0; transform: translateY(14px) scale(.975); filter: blur(4px); }
+  to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+}
+@keyframes filePreviewPanelOut {
+  from { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+  to { opacity: 0; transform: translateY(8px) scale(.985); filter: blur(2px); }
+}
+@keyframes filePreviewContentIn {
+  from { opacity: 0; transform: translateY(7px) scale(.992); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.filePreviewScrim {
+  animation: filePreviewBackdropIn .28s ease-out both;
+}
+.filePreviewScrim.closing {
+  pointer-events: none;
+  animation: filePreviewBackdropOut .24s ease-in both !important;
+}
+.filePreviewDialog {
+  transform-origin: 50% 54%;
+  animation: filePreviewPanelIn .38s cubic-bezier(.16, 1, .3, 1) both;
+  will-change: transform, opacity;
+}
+.filePreviewDialog.closing {
+  pointer-events: none;
+  animation: filePreviewPanelOut .24s cubic-bezier(.4, 0, .7, 1) both !important;
+}
+.filePreviewBody > * {
+  animation: filePreviewContentIn .3s cubic-bezier(.16, 1, .3, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .filePreviewScrim,
+  .filePreviewScrim.closing,
+  .filePreviewDialog,
+  .filePreviewDialog.closing,
+  .filePreviewBody > * {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }
 
@@ -6030,15 +6064,14 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
 }
 
 /* Pending attachments render exactly like their persisted message counterparts. */
-.messageItem.kind-user .pendingUserImagePreviews {
+.messageItem.kind-user .pendingUserAttachmentPreviews {
   display: flex;
   width: 100%;
   max-width: 560px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   gap: 8px;
   margin: 8px 0 0;
   padding: 0 0 3px;
-  overflow-x: auto;
 }
 
 .messageItem.kind-user .pendingUserImagePreview {
@@ -6067,6 +6100,10 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
 
 .messageItem.kind-user .pendingUserImagePreview > span:last-child {
   display: none;
+}
+
+.messageItem.kind-user .pendingUserFilePreview {
+  width: fit-content;
 }
 
 /* Keep every user attachment visually flush with the borderless message bubble. */
@@ -6720,22 +6757,30 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .polishedSelect.open .polishedSelectChevron::before { transform: rotate(225deg) translate(-1px, -1px); }
 
 .messageItem.kind-tool::after,
-.messageItem.kind-tool:not(.toolExpanded)::after {
+.messageItem.kind-tool:not(.toolExpanded)::after,
+.reasoningDisclosureTrigger::after {
   content: "" !important;
+  position: absolute;
+  box-sizing: border-box;
   top: 10px !important;
   right: 7px !important;
+  bottom: auto !important;
   width: 6px !important;
   height: 6px !important;
   padding: 0 !important;
-  border-right: 1.3px solid #8f928d;
-  border-bottom: 1.3px solid #8f928d;
+  border-right: 1.3px solid var(--ui-content-muted, #8f928d);
+  border-bottom: 1.3px solid var(--ui-content-muted, #8f928d);
   background: transparent !important;
   font-size: 0 !important;
   line-height: 0 !important;
   transform: rotate(45deg) !important;
+  transform-origin: center;
+  pointer-events: none;
+  transition: transform 160ms ease;
 }
 
-.messageItem.kind-tool.toolExpanded::after {
+.messageItem.kind-tool.toolExpanded::after,
+.reasoningDisclosure.expanded .reasoningDisclosureTrigger::after {
   content: "" !important;
   transform: rotate(225deg) !important;
 }
@@ -6767,8 +6812,9 @@ body:has(.globalSearchScrim) .v2AccountDock {
   background: transparent;
   box-shadow: none;
   opacity: 0.62;
-  transform: translateY(-50%);
-  transition: width 180ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 160ms ease, background-color 160ms ease, box-shadow 180ms ease;
+  visibility: visible;
+  transform: translate(0, -50%);
+  transition: width 180ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity var(--ui-popover-fade-duration, .28s) ease, transform var(--ui-popover-motion-duration, .42s) var(--ui-popover-motion-ease, cubic-bezier(.16, 1, .3, 1)), visibility 0s, background-color 160ms ease, box-shadow 180ms ease;
 }
 
 .promptNavigator:hover,
@@ -6777,6 +6823,18 @@ body:has(.globalSearchScrim) .v2AccountDock {
   background: transparent;
   box-shadow: none;
   opacity: 1;
+}
+
+.workspace.diffPanelOpen .promptNavigator {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate(-18px, -50%);
+  transition: opacity var(--ui-popover-fade-duration, .28s) ease, transform var(--ui-popover-motion-duration, .42s) var(--ui-popover-motion-ease, cubic-bezier(.16, 1, .3, 1)), visibility 0s var(--ui-popover-fade-duration, .28s);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .promptNavigator, .workspace.diffPanelOpen .promptNavigator { transition: none; }
 }
 
 .promptNavigatorLabel {
@@ -7261,12 +7319,6 @@ body:has(.globalSearchScrim) .v2AccountDock {
   text-overflow: ellipsis;
 }
 
-.toolBundle:not(.toolExpanded)::after {
-  right: 12px !important;
-  bottom: 4px !important;
-  font-size: 11px !important;
-}
-
 .toolBundle > .toolReveal,
 .toolBundleEntry > .toolReveal {
   grid-column: 1 / -1;
@@ -7366,7 +7418,8 @@ body:has(.globalSearchScrim) .v2AccountDock {
   margin: -2px 0 10px !important;
 }
 
-.toolBundleEntry {
+.messageItem.kind-tool.toolBundleEntry,
+.messageItem.kind-tool.toolBundleEntry:not(.toolExpanded) {
   display: grid !important;
   grid-template-columns: 18px minmax(0, 1fr) !important;
   margin: 0 !important;
@@ -7461,12 +7514,67 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .toolBundleTitle.live,
 .toolBundle.live > .messageMeta {
   color: transparent !important;
-  background-image: linear-gradient(90deg, #8f938c 0%, #f0f1ed 42%, #8f938c 84%) !important;
+  background-image: var(--ui-work-shimmer-gradient) !important;
   background-size: 200% 100% !important;
   background-repeat: repeat-x !important;
   background-clip: text !important;
   -webkit-background-clip: text !important;
   animation: v2-seamless-shimmer 2.35s linear infinite !important;
+}
+
+/* Keep shimmer on the complete active work cluster, including rows whose
+   individual tool calls already finished. React clears this state only when
+   answer text starts appearing in the next assistant message. */
+.toolBundleShimmering > .messageMeta,
+.toolBundleShimmering .toolBundleTitleLabel,
+.toolBundleShimmering .toolBundleEntry > .messageMeta,
+.toolBundleShimmering .toolBundleEntryLabel,
+.toolBundleShimmering .toolBundleEntrySummary,
+.toolBundleShimmering .toolBundleReasoningEntry .reasoningLabel,
+.toolBundleShimmering .toolBundleReasoningEntry .reasoningSummaryPreview,
+.toolBundleShimmering .toolBundleReasoningEntry .reasoningExpandedBody .messageMarkdown > * {
+  color: transparent !important;
+  background-image: var(--ui-work-shimmer-gradient) !important;
+  background-size: 200% 100% !important;
+  background-repeat: repeat-x !important;
+  background-clip: text !important;
+  -webkit-background-clip: text !important;
+  animation: v2-seamless-shimmer 2.35s linear infinite !important;
+}
+:root[data-theme="light"] .toolBundleShimmering .toolBundleEntry > .messageMeta,
+:root[data-theme="light"] .toolBundleShimmering .toolBundleEntryLabel,
+:root[data-theme="light"] .toolBundleShimmering .toolBundleEntrySummary,
+:root[data-theme="light"] .toolBundleShimmering .toolBundleReasoningEntry .reasoningLabel,
+:root[data-theme="light"] .toolBundleShimmering .toolBundleReasoningEntry .reasoningSummaryPreview,
+:root[data-theme="light"] .toolBundleShimmering .toolBundleReasoningEntry .reasoningExpandedBody .messageMarkdown > * {
+  background-image: var(--ui-work-shimmer-gradient) !important;
+}
+.toolBundle:not(.toolBundleShimmering) .toolBundleEntry.live > .messageMeta {
+  color: var(--ui-content-muted) !important;
+  -webkit-text-fill-color: currentColor !important;
+  background: none !important;
+  animation: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .v2ThinkingLine,
+  .toolBundleShimmering > .messageMeta,
+  .toolBundleShimmering .toolBundleTitleLabel {
+    color: var(--ui-content-muted) !important;
+    -webkit-text-fill-color: currentColor !important;
+    background: none !important;
+    animation: none !important;
+  }
+  .toolBundleShimmering .toolBundleEntry > .messageMeta,
+  .toolBundleShimmering .toolBundleEntryLabel,
+  .toolBundleShimmering .toolBundleEntrySummary,
+  .toolBundleShimmering .toolBundleReasoningEntry .reasoningLabel,
+  .toolBundleShimmering .toolBundleReasoningEntry .reasoningSummaryPreview,
+  .toolBundleShimmering .toolBundleReasoningEntry .reasoningExpandedBody .messageMarkdown > * {
+    color: var(--ui-content-muted) !important;
+    -webkit-text-fill-color: currentColor !important;
+    background: none !important;
+    animation: none !important;
+  }
 }
 
 /* Unified Codex-style model and policy selectors. */
@@ -8823,7 +8931,6 @@ textarea:focus {
     max-width: calc(100dvw - 20px);
   }
 
-  .v2PlusMenu,
   .skillPickerPopover,
   .globalSearchDialog,
   .leaderboardDialog,
@@ -10217,8 +10324,9 @@ textarea:focus {
 
 /* GPT-6 reasoning summaries: one quiet timeline row, with details on demand. */
 .messageItem.kind-reasoning {
-  width: min(760px, 100%) !important;
-  max-width: min(760px, 100%) !important;
+  /* Match the tool bundle rail so both disclosure chevrons share a right edge. */
+  width: min(860px, 100%) !important;
+  max-width: min(860px, 100%) !important;
   margin: 1px 0 7px !important;
   padding: 0 !important;
   border: 0 !important;
@@ -10247,27 +10355,12 @@ textarea:focus {
 }
 
 .reasoningDisclosureTrigger {
-  grid-template-columns: 17px auto minmax(0, 1fr) 14px;
+  position: relative;
   width: 100%;
   border: 0;
   background: transparent;
   text-align: left;
   cursor: pointer;
-}
-
-.reasoningDisclosureTrigger::after {
-  content: "";
-  width: 5px;
-  height: 5px;
-  justify-self: center;
-  border-right: 1px solid #737770;
-  border-bottom: 1px solid #737770;
-  transform: translateY(-1px) rotate(45deg);
-  transition: transform 160ms ease;
-}
-
-.reasoningDisclosure.expanded .reasoningDisclosureTrigger::after {
-  transform: translateY(1px) rotate(225deg);
 }
 
 .reasoningSummaryRow:hover,
@@ -10769,11 +10862,26 @@ body:has(.threadList.collapsed) .v2BrandRow > .v2ThemeToggle { display: none; }
     bottom: max(10px, env(safe-area-inset-bottom)) !important;
     left: max(10px, env(safe-area-inset-left)) !important;
     width: auto !important;
-    max-height: min(360px, 42dvh) !important;
+    min-height: 76px !important;
+    max-height: min(240px, 30dvh) !important;
+    padding-block: 7px;
   }
 
+  .conversation > .composer .composerBody {
+    min-height: 56px;
+    max-height: min(226px, calc(30dvh - 14px));
+    gap: 4px;
+  }
   .conversation > .composer .composerRichEditor {
-    max-height: min(300px, max(90px, calc(42dvh - 58px)));
+    min-height: 30px !important;
+    max-height: min(180px, max(48px, calc(30dvh - 58px)));
+  }
+  .conversation > .composer .composerRichInput {
+    min-height: 28px;
+    padding-block: 3px;
+  }
+  .conversation > .composer .uploadedFileList {
+    max-height: min(80px, 12dvh);
   }
 
   .conversation > .scrollToBottomButton {
@@ -11012,7 +11120,7 @@ body:has(.threadList.collapsed) .v2BrandRow > .v2ThemeToggle { display: none; }
 :root[data-theme="light"] .messageMarkdown :not(pre) > code { background: #eceeea; color: #67522e; }
 :root[data-theme="light"] .reasoningExpandedBody { color: #747a72; border-left-color: #cbd1c9; }
 :root[data-theme="light"] .messageItem.live.kind-reasoning .reasoningLabel,
-:root[data-theme="light"] .messageItem.live.kind-reasoning .reasoningSummaryPreview { background-image: linear-gradient(90deg, #828982 0%, #828982 30%, var(--ui-contrast) 50%, #737b73 62%, #828982 82%, #828982 100%) !important; }
+:root[data-theme="light"] .messageItem.live.kind-reasoning .reasoningSummaryPreview { background-image: var(--ui-work-shimmer-gradient) !important; }
 :root[data-theme="light"] .conversation > .composer {
   background: transparent !important;
   box-shadow: 0 12px 36px rgba(39, 46, 38, .11) !important;
@@ -11283,6 +11391,41 @@ body:has(.threadList.collapsed) .v2BrandRow > .v2ThemeToggle { display: none; }
 :root[data-theme="light"] .toolBundle > .messageMeta,
 :root[data-theme="light"] .toolBundleEntrySummary,
 :root[data-theme="light"] .toolImagePreviewLabel { color: var(--ui-content-muted) !important; }
+/* The theme's static tool colors must not paint over active gradient text.
+   Include the bundle header as well as its rows, but never restart shimmer on
+   a completed child after the bundle's next assistant answer has appeared. */
+:root[data-theme="light"] :is(
+  .toolBundleShimmering > .messageMeta,
+  .toolBundleShimmering .toolBundleTitleLabel,
+  .toolBundleShimmering .toolBundleEntry > .messageMeta,
+  .toolBundleShimmering .toolBundleEntryLabel,
+  .toolBundleShimmering .toolBundleEntrySummary,
+  .messageItem.live.kind-tool:not(.toolBundle):not(.toolBundleEntry) > .messageMeta
+) {
+  color: transparent !important;
+  -webkit-text-fill-color: transparent !important;
+  background-image: var(--ui-work-shimmer-gradient) !important;
+  background-size: 200% 100% !important;
+  background-repeat: repeat-x !important;
+  background-clip: text !important;
+  -webkit-background-clip: text !important;
+  animation: v2-seamless-shimmer 2.35s linear infinite !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  :root[data-theme="light"] :is(
+    .toolBundleShimmering > .messageMeta,
+    .toolBundleShimmering .toolBundleTitleLabel,
+    .toolBundleShimmering .toolBundleEntry > .messageMeta,
+    .toolBundleShimmering .toolBundleEntryLabel,
+    .toolBundleShimmering .toolBundleEntrySummary,
+    .messageItem.live.kind-tool:not(.toolBundle):not(.toolBundleEntry) > .messageMeta
+  ) {
+    color: var(--ui-content-muted) !important;
+    -webkit-text-fill-color: currentColor !important;
+    background: none !important;
+    animation: none !important;
+  }
+}
 :root[data-theme="light"] .messageItem.kind-tool .toolReveal pre,
 :root[data-theme="light"] .messageItem.kind-tool .toolReveal .outputBlock,
 :root[data-theme="light"] .messageItem.kind-tool > pre,
@@ -11293,7 +11436,7 @@ body:has(.threadList.collapsed) .v2BrandRow > .v2ThemeToggle { display: none; }
 :root[data-theme="light"] .toolImagePreviewGrid .inlineMessageImage { background: var(--ui-surface) !important; }
 :root[data-theme="light"] .toolImagePreviewGrid .inlineImageButton > span { color: #5f6a60 !important; }
 :root[data-theme="light"] .messageItem.kind-tool:not(.toolExpanded)::before { background: var(--ui-content-muted) !important; }
-:root[data-theme="light"] .messageItem.kind-tool::after { background: linear-gradient(90deg,transparent,var(--ui-surface) 16px) !important; color: var(--ui-content-muted) !important; }
+:root[data-theme="light"] .messageItem.kind-tool::after { background: transparent !important; color: var(--ui-content-muted) !important; }
 
 .codexApprovalCard {
   display: grid;
@@ -11634,6 +11777,9 @@ body:has(.threadList.collapsed) .v2BrandRow > .v2ThemeToggle { display: none; }
   from { opacity: 0; transform: translateY(calc(-50% + 8px)) scale(.96); }
   to { opacity: 1; transform: translateY(-50%) scale(1); }
 }
+:root { --ui-work-shimmer-gradient: linear-gradient(90deg, #777a75 0%, #777a75 30%, #f0f1ed 50%, #aeb1ab 62%, #777a75 82%, #777a75 100%); }
+:root[data-theme="light"] { --ui-work-shimmer-gradient: linear-gradient(90deg, #737b73 0%, #737b73 30%, rgba(115,123,115,.14) 50%, rgba(115,123,115,.58) 62%, #737b73 82%, #737b73 100%); }
+
 .imageViewer {
   position: fixed;
   inset: 0;
@@ -11740,6 +11886,45 @@ body:has(.threadList.collapsed) .v2BrandRow > .v2ThemeToggle { display: none; }
 }
 
 /* A queued note lifts clear of the composer, then recedes once it is sent. */
+.documentViewer { display: block; }
+.documentViewerPanel { height: 100%; display: grid; grid-template-rows: 64px minmax(0,1fr); min-width: 0; }
+.documentViewer .filePreviewBody { min-width: 0; min-height: 0; height: auto; padding: 0 20px 20px; overflow: auto; color: #e7e9e5; animation: imageViewerContentEnter .38s cubic-bezier(.16,1,.3,1) both; }
+:root[data-theme] .documentViewer .filePreviewBody { background: transparent !important; color: #e7e9e5 !important; }
+.documentViewer.closing .filePreviewBody { animation: imageViewerContentExit .2s cubic-bezier(.4,0,.7,1) both; }
+.documentViewer .fileTextPreview { margin: 0 auto; max-width: 1200px; padding: 24px; background: #242624 !important; color: #e7e9e5 !important; white-space: pre-wrap; overflow-wrap: anywhere; }
+.documentViewer .fileMarkdownPreview { margin: 0 auto; max-width: 1100px; padding: 24px; background: var(--ui-glass-background); color: var(--ui-content); border-radius: 12px; }
+.documentViewer .fileBinaryPreview { min-height: 200px; color: #c6cbc3; }
+.documentViewer .filePreviewError { color: #ffc0b8; }
+.documentOfficeFrame { width: 100%; height: 100%; min-height: 300px; display: block; border: 0; border-radius: 8px; background: white; }
+.documentPreviewStatus { display: grid; min-height: 200px; height: 100%; place-items: center; padding: 24px; text-align: center; color: #d8dcd5; }
+.documentPdfViewer { display: grid; grid-template-rows: minmax(0,1fr) 64px; height: 100%; min-height: 0; }
+.documentZoomViewer { display: grid; grid-template-rows: minmax(0,1fr) 64px; height: 100%; min-height: 0; }
+.documentZoomStage { overflow: auto; min-width: 0; min-height: 0; overscroll-behavior: contain; }
+.documentZoomContent { transform-origin: top left; transition: transform .3s cubic-bezier(.16,1,.3,1); }
+.documentZoomExtent { transition: width .3s cubic-bezier(.16,1,.3,1),height .3s cubic-bezier(.16,1,.3,1); }
+.documentArchiveSelected { height: 100%; display: grid; grid-template-rows: 36px minmax(0,1fr); min-height: 0; }
+.documentArchiveNavigation { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.documentArchiveNavigation span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; }
+.documentArchive button,.documentArchiveNavigation button { border: 0; background: transparent; color: #d8dcd5; font: inherit; cursor: pointer; text-align: left; overflow-wrap: anywhere; }
+.documentArchive button:hover,.documentArchiveNavigation button:hover { color: white; text-decoration: underline; }
+.documentPdfStage { min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.documentPdfPages { width: max-content; min-width: 100%; display: flex; flex-direction: column; align-items: center; }
+.documentPdfPage { width: max-content; min-width: 100%; padding: 10px 0; text-align: center; }
+.documentPdfPage > span { display: block; margin-bottom: 8px; color: #aeb3ae; font-size: 12px; }
+.documentPdfPage canvas { max-width: none; background: white; display: block; margin: auto; box-shadow: 0 4px 20px #0004; transition: width .3s cubic-bezier(.16,1,.3,1),height .3s cubic-bezier(.16,1,.3,1); }
+.documentArchive { max-width: 1100px; margin: auto; padding: 16px; background: #242624; border-radius: 12px; }
+.documentArchive table { width: 100%; border-collapse: collapse; }
+.documentArchive th, .documentArchive td { border-bottom: 1px solid #ffffff16; padding: 8px 12px; text-align: left; overflow-wrap: anywhere; }
+.documentArchive td:last-child { width: 100px; white-space: nowrap; }
+.documentAutoSendToggle { display: flex; align-items: center; gap: 8px; padding: 9px 10px; color: #d8dcd5; font-size: 12px; cursor: pointer; }
+.documentViewer .imageViewerActionMenu { min-width: 185px; }
+@media(max-width:720px) {
+  .documentViewerPanel { grid-template-rows: calc(56px + env(safe-area-inset-top)) minmax(0,1fr); }
+  .documentViewer .filePreviewBody { padding: 0 8px max(8px,env(safe-area-inset-bottom)); }
+  .documentArchive { padding: 8px; }
+}
+@media(prefers-reduced-motion:reduce) { .documentViewer .filePreviewBody { animation: none !important; } .documentPdfPage canvas,.documentZoomContent,.documentZoomExtent { transition: none; } }
+
 @keyframes queuedDropletEnter {
   from { opacity: 0; transform: translateY(17px) scale(.94, .78); filter: blur(3px); border-radius: 22px; }
   64% { opacity: 1; transform: translateY(-3px) scale(1.01, 1.015); filter: blur(0); }
@@ -11750,9 +11935,10 @@ body:has(.threadList.collapsed) .v2BrandRow > .v2ThemeToggle { display: none; }
   to { opacity: 0; transform: translateY(-11px) scale(.97, .87); filter: blur(3px); }
 }
 @keyframes pendingMessageLift {
-  from { opacity: 0; transform: translateY(28px) scale(.91, .84); filter: blur(3px); }
-  68% { opacity: 1; transform: translateY(-3px) scale(1.008, 1.01); filter: blur(0); }
-  to { opacity: 1; transform: translateY(0) scale(1); filter: blur(0); }
+  0% { opacity: 0; transform: translate3d(18px, 30px, 0) scale(.72, .64); filter: blur(2.5px); }
+  58% { opacity: 1; transform: translate3d(-2px, -3px, 0) scale(1.035, 1.045); filter: blur(0); }
+  76% { opacity: 1; transform: translate3d(1px, 1px, 0) scale(.985, .99); }
+  100% { opacity: 1; transform: translate3d(0, 0, 0) scale(1); filter: blur(0); }
 }
 .queuedSubmissionStrip {
   transform-origin: center bottom;
@@ -11764,7 +11950,7 @@ body:has(.threadList.collapsed) .v2BrandRow > .v2ThemeToggle { display: none; }
 }
 .messageItem.kind-user.pending {
   transform-origin: right bottom;
-  animation: pendingMessageLift .48s cubic-bezier(.16,1,.3,1) both;
+  animation: pendingMessageLift .52s cubic-bezier(.2,.9,.25,1) both;
 }
 @media (prefers-reduced-motion: reduce) {
   .queuedSubmissionStrip, .queuedSubmissionStrip.closing, .messageItem.kind-user.pending { animation: none !important; }
@@ -12360,9 +12546,25 @@ body:has(.directoryPickerScrim) :is(.threadList, .v2ProjectDock, .v2AccountDock)
   .composerTools .groupedModelPicker { max-width: min(260px, 52vw); }
   .groupedModelPicker .groupedModelMenu {
     width: min(300px, calc(100dvw - 20px)) !important;
+    left: var(--mobile-model-menu-left, 0px) !important;
+    right: auto !important;
     max-height: calc(100dvh - 245px);
     overflow-x: hidden;
     overflow-y: auto;
+  }
+  .groupedModelMobilePages { position: relative; }
+  .groupedModelMobilePage { min-width: 0; }
+  .groupedModelMobilePage.active {
+    animation: groupedModelCascadeRise .3s cubic-bezier(.16,1,.3,1) both;
+  }
+  .groupedModelMobilePage.uiClosing {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    animation: uiGlassSurfaceExit .2s cubic-bezier(.4,0,.7,1) both;
+  }
+  .groupedModelMobilePage .groupedModelRows {
+    max-height: max(100px, calc(100dvh - 300px));
   }
   .groupedModelCascade[data-visible="true"] {
     position: relative;
@@ -12379,7 +12581,7 @@ body:has(.directoryPickerScrim) :is(.threadList, .v2ProjectDock, .v2AccountDock)
   .groupedModelProfile strong { white-space: normal; overflow-wrap: anywhere; text-overflow: clip; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .groupedModelPicker .groupedModelMenu, .groupedModelCascade { animation: none !important; transition: none !important; }
+  .groupedModelPicker .groupedModelMenu, .groupedModelCascade, .groupedModelMobilePage { animation: none !important; transition: none !important; }
   .groupedModelRow, .groupedModelRow svg { transition: none !important; }
   .providerFailureNotice { animation: none !important; }
 }

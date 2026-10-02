@@ -4,7 +4,7 @@ import { removeStagedUserHandoff, stageUserHandoffExport } from "../server/userH
 
 async function main(): Promise<void> {
   const userId = process.argv[2] ?? "";
-  const sourceLabel = process.env.CODEX_WEB_INSTANCE_LABEL ?? "source-host";
+  const sourceLabel = process.env.CODEX_WEB_INSTANCE_LABEL ?? "little-right";
   const store = new ProjectStore();
   let staged: Awaited<ReturnType<typeof stageUserHandoffExport>> | null = null;
   try {

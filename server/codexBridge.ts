@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import readline from "node:readline";
 import { serverConfig } from "./config.js";
@@ -15,6 +16,34 @@ export interface CodexBridgeLaunchOptions {
   command: string;
   args: readonly string[];
   env?: NodeJS.ProcessEnv;
+  scope?: {
+    unitPrefix: string;
+    slice: string;
+    memoryHigh: string;
+    memoryMax: string;
+    memorySwapMax: string;
+  };
+}
+
+/** Keep agent tools outside the web backend's cgroup, with a per-account cap. */
+export function codexProcessCommand(launch: CodexBridgeLaunchOptions, nonce = randomUUID().slice(0, 8)):
+  { command: string; args: string[] } {
+  if (!launch.scope) return { command: launch.command, args: [...launch.args] };
+  const { unitPrefix, slice, memoryHigh, memoryMax, memorySwapMax } = launch.scope;
+  if (!/^[A-Za-z0-9-]+$/.test(unitPrefix) || !/^[A-Za-z0-9-]+\.slice$/.test(slice)) {
+    throw new Error("Invalid Codex resource scope name.");
+  }
+  return {
+    command: "/usr/bin/systemd-run",
+    args: [
+      "--user", "--scope", "--collect", "--quiet",
+      `--slice=${slice}`, `--unit=${unitPrefix}-${nonce}`,
+      "-p", `MemoryHigh=${memoryHigh}`,
+      "-p", `MemoryMax=${memoryMax}`,
+      "-p", `MemorySwapMax=${memorySwapMax}`,
+      "--", launch.command, ...launch.args
+    ]
+  };
 }
 
 interface PendingRequest {
@@ -126,7 +155,8 @@ export class CodexBridge extends EventEmitter {
   }
 
   private async spawnServer(): Promise<void> {
-    this.proc = spawn(this.launch.command, [...this.launch.args], {
+    const command = codexProcessCommand(this.launch);
+    this.proc = spawn(command.command, command.args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: this.launch.env ?? process.env,
       shell: false

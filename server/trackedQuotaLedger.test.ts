@@ -11,6 +11,14 @@ const initial: TrackedQuotaLedgerSnapshot = {
 };
 
 describe("tracked quota incremental attribution", () => {
+  it("preserves accrued quota through reset drift and a deduplicated token baseline", () => {
+    const seeded = advanceTrackedQuotaLedger(null, initial, { cyclePercent: 78, dailyPercent: { "2026-09-28": 78 } });
+    const corrected = advanceTrackedQuotaLedger(seeded, { ...initial, resetAt: initial.resetAt + 2, totalTokens: 800, observedAt: 2000 }, { cyclePercent: 29, dailyPercent: {} });
+    expect(corrected.userCycleQuotaPercent).toBe(78);
+    expect(corrected.observedTotalTokens).toBe(800);
+    const next = advanceTrackedQuotaLedger(corrected, { ...initial, resetAt: initial.resetAt + 2, quotaPercent: 65, totalTokens: 900, userTokens: 600, observedAt: 3000 }, { cyclePercent: 0, dailyPercent: {} });
+    expect(next.userCycleQuotaPercent).toBe(83);
+  });
   it("does not reduce a user's accrued percentage when others continue using the account", () => {
     const seeded = advanceTrackedQuotaLedger(null, initial, {
       cyclePercent: 50,

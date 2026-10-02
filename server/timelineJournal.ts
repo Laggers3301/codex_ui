@@ -1,11 +1,12 @@
 import type { LiveStateUpdate } from "./liveState.js";
+import { isContextCompactionItem } from "./contextRecovery.js";
 
 type Item = Record<string, unknown>;
 
 export function journalItem(update: LiveStateUpdate): Item {
   const item = update.item;
   return update.kind === "tool"
-    ? { id: item.itemId, callId: item.itemId, sourceItemId: update.item.sourceItemId, type: "toolCall", tool: update.item.tool, input: (update.historyItem ?? update.item).input, aggregatedOutput: (update.historyItem ?? update.item).output, completed: item.completed, timelineAt: item.startedAt, timelineOrder: item.sequence }
+    ? { id: item.itemId, callId: item.itemId, sourceItemId: update.item.sourceItemId, type: "toolCall", tool: update.item.tool, collaboration: update.item.collaboration, input: (update.historyItem ?? update.item).input, aggregatedOutput: (update.historyItem ?? update.item).output, completed: item.completed, timelineAt: item.startedAt, timelineOrder: item.sequence }
     : { id: update.item.sourceItemId, type: "agentMessage", text: update.item.text, timelineAt: item.startedAt, timelineOrder: item.sequence };
 }
 
@@ -26,6 +27,9 @@ export function overlayJournal(thread: Item, read: (turnId: string) => Item[], i
     }
     const merged = items.map((item) => ({ ...item }));
     for (const entry of read(String(turn.id))) {
+      if (isContextCompactionItem(entry)) {
+        continue;
+      }
       if (entry.source === "turnDiff" && items.some((item) => item.type === "fileChange"
         && Array.isArray(item.changes) && item.changes.some((change) => typeof (change as Item)?.diff === "string"))) {
         continue;

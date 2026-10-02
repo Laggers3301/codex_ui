@@ -3,12 +3,12 @@ import { branchTitle } from "./routes.js";
 
 describe("branch title", () => {
   it("uses the target account's short name", () => {
-    expect(branchTitle("name", "260803", "260901")).toBe("name - 0803");
+    expect(branchTitle("name", "261201", "261202")).toBe("name - 1201");
   });
 
   it("replaces a previous account suffix instead of stacking them", () => {
-    expect(branchTitle("name - 0901", "260803", "260901")).toBe("name - 0803");
-    expect(branchTitle("name · 分支", "260803", "260901")).toBe("name - 0803");
+    expect(branchTitle("name - 1202", "261201", "261202")).toBe("name - 1201");
+    expect(branchTitle("name · 分支", "261201", "261202")).toBe("name - 1201");
   });
 
   it("preserves descriptive labels and leaves unpooled branches unnamed by account", () => {

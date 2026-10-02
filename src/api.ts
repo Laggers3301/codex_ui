@@ -25,6 +25,7 @@ import type {
   ThreadPresentation,
   ThreadListResponse,
   ThreadReadResponse,
+  SubagentThreadSummary,
   ThreadSummary,
   ThreadSearchMatch,
   TrackedQuotaUsage,
@@ -274,6 +275,30 @@ export function listThreads(projectId: string, search?: string): Promise<ThreadL
 
 export function listArchivedThreads(projectId: string): Promise<ThreadListResponse> {
   return request(`/api/projects/${projectId}/threads?archived=true&fast=false`, { cache: "no-store" });
+}
+
+function subagentUrl(projectId: string, parentThreadId: string): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(parentThreadId)}/subagents`;
+}
+
+export function listSubagentThreads(projectId: string, parentThreadId: string, signal?: AbortSignal, options: { view?: "all" | "active" | "history"; q?: string; cursor?: string; limit?: number } = {}): Promise<import("./types").SubagentDirectoryResponse> {
+  const params = new URLSearchParams();
+  if (options.view) params.set("view", options.view);
+  if (options.q?.trim()) params.set("q", options.q.trim());
+  if (options.cursor) params.set("cursor", options.cursor);
+  if (options.limit) params.set("limit", String(options.limit));
+  return request(subagentUrl(projectId, parentThreadId) + (params.size ? `?${params}` : ""), { cache: "no-store", signal });
+}
+
+export function readSubagentThread(projectId: string, parentThreadId: string, agentId: string, options: { before?: number; beforeCursor?: string; limit?: number; signal?: AbortSignal } = {}): Promise<ThreadReadResponse> {
+  const params = new URLSearchParams({ limit: String(options.limit ?? 128) });
+  if (options.beforeCursor) params.set("cursor", options.beforeCursor);
+  else if (options.before) params.set("before", String(options.before));
+  return request(`${subagentUrl(projectId, parentThreadId)}/${encodeURIComponent(agentId)}?${params}`, { cache: "no-store", signal: options.signal });
+}
+
+export function readSubagentItemOutput(projectId: string, parentThreadId: string, agentId: string, itemId: string): Promise<{ data: { output: string } }> {
+  return request(`${subagentUrl(projectId, parentThreadId)}/${encodeURIComponent(agentId)}/items/${encodeURIComponent(itemId)}/output`, { cache: "no-store" });
 }
 
 export function setThreadArchived(projectId: string, threadId: string, archived: boolean): Promise<{ ok: boolean }> {

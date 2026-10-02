@@ -11,6 +11,8 @@ import { authenticatedUserFromHeaders, changeUserPassword, clearSessionCookie, c
 import { serverConfig } from "./config.js";
 import { ProjectStore } from "./db.js";
 import { registerRoutes } from "./routes.js";
+import { DocumentCompiler } from "./documentCompiler.js";
+import { registerDocumentWorkbenchRoutes } from "./documentWorkbench.js";
 import { attachSocketServer } from "./socket.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -104,6 +106,13 @@ const store = new ProjectStore();
 const bridge = serverConfig.accountPoolFile
   ? AccountPoolBridge.fromFile(serverConfig.accountPoolFile)
   : new CodexBridge();
+bridge.on("accountAuth", (diagnostic: { accountId: string; code: string; requiresLogin: boolean }) => {
+  if (diagnostic.requiresLogin) app.log.warn(diagnostic, "Account authentication requires device login");
+  else app.log.info(diagnostic, "Account authentication lifecycle");
+});
+bridge.on("accountRuntime", (diagnostic: Record<string, unknown>) => {
+  app.log.info(diagnostic, "Account runtime lifecycle");
+});
 
 await app.register(multipart, {
   limits: {
@@ -113,6 +122,8 @@ await app.register(multipart, {
 });
 
 registerRoutes(app, bridge as CodexBridge, store);
+const documentCompiler = new DocumentCompiler();
+registerDocumentWorkbenchRoutes(app, store, { compiler: documentCompiler });
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char] ?? char));

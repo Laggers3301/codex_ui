@@ -6,18 +6,23 @@ import type { IncomingHttpHeaders } from "node:http";
 import type { Server as HttpServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
+import { serverConfig } from "./config.js";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
-import { serverConfig } from "./config.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
 import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
 import { LiveStateStore } from "./liveState.js";
+import { notificationIsContextCompaction, RawCompactFilter } from "./rawNotificationFilter.js";
 import { journalItem } from "./timelineJournal.js";
 import { RequestDeduper } from "./requestDeduper.js";
+import { getOwnedThreadGoal, setGoalAndStartIfIdle } from "./goalExecution.js";
+import { documentContextInput, documentReferenceFromInput } from "./documentContext.js";
 import {
+  continuationRecoveryPrompt,
   contextRecoveryPrompt,
   isContextCompactionItem,
   isGenericContextLossReply,
+  isPlanOnlyContinuationReply,
   isPotentialGenericContextLossReply
 } from "./contextRecovery.js";
 import { allowedAccountForUser, assertTrackedUserQuotaAvailable, invalidateTrackedQuotaCacheForUser } from "./routes.js";
@@ -35,6 +40,7 @@ import {
 } from "./threadContext.js";
 import type { Project, RpcEnvelope, SocketClientMessage, SocketServerMessage } from "./types.js";
 import { sendUserPush } from "./webPush.js";
+import { meaningfulTurnProgressMethod, TurnWatchdog, type WatchdogProbeClaim, type WatchdogTurn } from "./turnWatchdog.js";
 
 const commandSchema = z.array(z.string()).min(1);
 const threadStartContextConfigSchema = z.object({
@@ -47,6 +53,15 @@ const contextProbeBytes = 512 * 1024;
 const contextPrecompactThreshold = 0.85;
 const contextFullThreshold = 0.98;
 const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
+const DEFAULT_COMPACT_TIMEOUT_MS = 600_000;
+
+function compactTimeoutMs(): number {
+  const raw = Number(process.env.CODEX_WEB_COMPACT_TIMEOUT_MS ?? DEFAULT_COMPACT_TIMEOUT_MS);
+  if (!Number.isFinite(raw)) {
+    return DEFAULT_COMPACT_TIMEOUT_MS;
+  }
+  return Math.min(Math.max(Math.trunc(raw), 30_000), 1_800_000);
+}
 
 type UserWebSocket = WebSocket & {
   codexUserId?: string;
@@ -101,8 +116,9 @@ function skillNamesFromPrompt(prompt: string): string[] {
   return [...prefix.matchAll(/\$([a-z][a-z0-9:_-]*)/g)].map((match) => match[1]);
 }
 
-async function promptInput(bridge: CodexBridge, threadId: string, cwd: string, prompt: string, selected: unknown) {
-  if (!Array.isArray(selected) || selected.length === 0) return textInput(prompt);
+async function promptInput(bridge: CodexBridge, threadId: string, cwd: string, prompt: string, selected: unknown, documentReference?: unknown) {
+  const context = documentContextInput(cwd, documentReference);
+  if (!Array.isArray(selected) || selected.length === 0) return [...textInput(prompt), ...context];
   const names = [...new Set(selected)].filter((name): name is string => typeof name === "string" && /^[a-zA-Z0-9:_-]{1,120}$/.test(name)).slice(0, 8);
   if (names.length !== selected.length) throw new Error("技能选择无效，请重新选择后发送。");
   const targeted = bridge as CodexBridge & { requestOnThreadAccount?: (threadId: string, method: string, params: unknown) => Promise<unknown> };
@@ -116,7 +132,7 @@ async function promptInput(bridge: CodexBridge, threadId: string, cwd: string, p
     if (!path) throw new Error(`技能 ${name} 在当前会话所属账号不可用，请刷新技能列表。`);
     return { type: "skill", name, path };
   });
-  return [...textInput(prompt), ...references];
+  return [...textInput(prompt), ...references, ...context];
 }
 
 /**
@@ -318,8 +334,9 @@ async function compactThreadAndWait(bridge: CodexBridge, threadId: string): Prom
     };
 
     bridge.on("notification", onNotification);
-    timeout = setTimeout(() => finish(new Error("Timed out while compacting the Codex conversation.")), 180_000);
-    void bridge.request("thread/compact/start", { threadId }, 180_000).catch((error) => {
+    const timeoutMs = compactTimeoutMs();
+    timeout = setTimeout(() => finish(new Error("Timed out while compacting the Codex conversation.")), timeoutMs);
+    void bridge.request("thread/compact/start", { threadId }, timeoutMs).catch((error) => {
       finish(error instanceof Error ? error : new Error(String(error)));
     });
   });
@@ -336,6 +353,28 @@ function notificationTurnId(envelope: RpcEnvelope): string | null {
   const params = asRecord(envelope.params);
   const turn = asRecord(params.turn);
   return stringOrNull(params.turnId) ?? stringOrNull(turn.id);
+}
+
+function notificationAccountId(envelope: RpcEnvelope): string | null {
+  return stringOrNull(asRecord(envelope).accountId) ?? stringOrNull(asRecord(envelope.params).accountId);
+}
+
+function watchdogProgressData(turn: WatchdogTurn, state: string, probeStatus?: string) {
+  return {
+    threadId: turn.threadId,
+    turnId: turn.turnId,
+    state,
+    phase: turn.phase,
+    lastProgressAt: new Date(turn.lastProgressAt).toISOString(),
+    lastProgressMethod: turn.lastProgressMethod,
+    silentForMs: Math.max(0, Date.now() - turn.lastProgressAt),
+    ...(probeStatus ? { probeStatus } : {}),
+    ...(turn.activeFlags.length ? { activeFlags: turn.activeFlags } : {})
+  };
+}
+
+function watchdogState(turn: WatchdogTurn): string {
+  return turn.phase === "waiting_approval" || turn.phase === "waiting_subagents" ? turn.phase : "no_progress";
 }
 
 function changesFromTurnDiff(diff: string): Array<{ path: string; kind: string; diff: string }> {
@@ -419,9 +458,12 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   const processOwners = new Map<string, string>();
   const processSockets = new Map<string, WebSocket>();
   const pendingApprovalOwners = new Map<number | string, string>();
+  const pendingApprovalTurns = new Map<number | string, { userId: string; accountId: string | null; threadId: string; turnId: string | null }>();
   const turnOwners = new Map<string, string>();
+  const rawCompactFilter = new RawCompactFilter();
   const contextRecoveryByTurn = new Map<string, { threadId: string; steerStatus: "pending" | "accepted" | "failed" }>();
   const contextRecoveryRetries = new Map<string, number>();
+  const planContinuationByTurn = new Map<string, { rootTurnId: string; count: number }>();
   const guards: SocketRequestGuards = {
     requestDeduper: new RequestDeduper({ ttlMs: 30_000, maxEntries: 2_048 }),
     promptDeduper: new RequestDeduper({ ttlMs: 8_000, maxEntries: 2_048 }),
@@ -429,6 +471,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     startingThreads: new Set(),
     recoverableTurnIds: new Set()
   };
+  const turnWatchdog = new TurnWatchdog();
   const startingQueuedThreads = new Set<string>();
   const startNextQueuedTurn = async (owner: string, threadId: string): Promise<void> => {
     if (startingQueuedThreads.has(threadId) || guards.activeTurnsByThread.has(threadId) || guards.startingThreads.has(threadId)) return;
@@ -470,7 +513,12 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
   };
 
-  const startFallbackContextRecovery = async (owner: string, threadId: string, priorTurnId: string): Promise<void> => {
+  const startFallbackContextRecovery = async (
+    owner: string,
+    threadId: string,
+    priorTurnId: string,
+    options?: { prompt?: string; plan?: { rootTurnId: string; count: number } }
+  ): Promise<void> => {
     const retryCount = contextRecoveryRetries.get(threadId) ?? 0;
     if (retryCount >= 2 || guards.activeTurnsByThread.has(threadId)) return;
     const threadOwner = store.getThreadOwner(threadId);
@@ -489,7 +537,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const requestId = `context-recovery:${priorTurnId}:${retryCount + 1}`;
       const turn = await bridge.request("turn/start", {
         threadId,
-        input: textInput(contextRecoveryPrompt()),
+        input: textInput(options?.prompt ?? contextRecoveryPrompt()),
         cwd: threadOwner.rootPath,
         approvalPolicy: project.defaultApprovalPolicy,
         sandboxPolicy: sandboxPolicy(project, project.defaultSandbox),
@@ -497,6 +545,12 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         effort: threadOwner.reasoningEffortOverride ?? project.defaultReasoningEffort
       }, 30_000);
       rememberAcceptedTurn(guards, threadId, requestId, turn);
+      if (options?.plan) {
+        const newTurnId = turnIdFromStartResult(turn);
+        if (newTurnId) {
+          planContinuationByTurn.set(newTurnId, { rootTurnId: options.plan.rootTurnId, count: options.plan.count });
+        }
+      }
       store.touchThreadOwner(threadId);
     } catch (error) {
       console.error("[context.recovery.fallback.error]", JSON.stringify({
@@ -533,6 +587,13 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     return state;
   };
 
+  const sendTurnProgress = (turn: ReturnType<TurnWatchdog["start"]>, state: string, probeStatus?: string) => {
+    sendToUser(wss, turn.userId, {
+      type: "turn.progress",
+      data: watchdogProgressData(turn, state, probeStatus)
+    });
+  };
+
   const ownerForEnvelope = (envelope: RpcEnvelope): string | null => {
     const threadId = notificationThreadId(envelope);
     if (threadId) {
@@ -549,13 +610,23 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     return processId ? processOwners.get(processId) ?? null : null;
   };
 
-  bridge.on("notification", (message) => {
+  const processBridgeNotification = (message: RpcEnvelope) => {
     const owner = ownerForEnvelope(message);
     if (!owner) {
       return;
     }
 
     const turnId = notificationTurnId(message);
+    const threadIdForWatchdog = notificationThreadId(message);
+    const accountId = notificationAccountId(message);
+    if (turnId && threadIdForWatchdog && message.method === "turn/started") {
+      turnWatchdog.start(owner, accountId, threadIdForWatchdog, turnId);
+    }
+    const progressMethod = meaningfulTurnProgressMethod(message);
+    if (turnId && threadIdForWatchdog && progressMethod) {
+      const progress = turnWatchdog.progress(owner, accountId, threadIdForWatchdog, turnId, progressMethod);
+      if (progress?.resumed) sendTurnProgress(progress.turn, "active");
+    }
     if (message.method === "turn/diff/updated" && turnId) {
       const threadId = notificationThreadId(message)
         ?? [...guards.activeTurnsByThread].find(([, activeTurnId]) => activeTurnId === turnId)?.[0];
@@ -575,6 +646,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       }
     }
     const state = liveStateFor(owner);
+    const suppressRawCompact = rawCompactFilter.observe(message);
+    const recordLiveState = !suppressRawCompact || notificationIsContextCompaction(message);
     const completingAgentMessages = turnId && message.method === "turn/completed"
       ? state.snapshot().agentMessages
         .filter((item) => item.turnId === turnId)
@@ -588,18 +661,33 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       }
     }
 
-    const liveUpdate = state.recordNotification(message);
+    const liveUpdate = recordLiveState ? state.recordNotification(message) : null;
+    if (liveUpdate?.kind === "tool" && liveUpdate.item.threadId && liveUpdate.item.turnId) {
+      const label = liveUpdate.item.tool.toLowerCase();
+      const phase = liveUpdate.item.completed
+        ? "running"
+        : label.includes("collab") || label.includes("agent") ? "waiting_subagents" : "tool_running";
+      turnWatchdog.setPhase(owner, accountId, liveUpdate.item.threadId, liveUpdate.item.turnId, phase);
+    }
     const recovery = turnId ? contextRecoveryByTurn.get(turnId) : undefined;
     const suppressGenericRecoveryMessage = Boolean(
       recovery
       && liveUpdate?.kind === "agent"
       && isPotentialGenericContextLossReply(liveUpdate.item.text)
     );
-    if (liveUpdate?.item.threadId && liveUpdate.item.turnId && !suppressGenericRecoveryMessage) {
+    const suppressInternalToolMessage = liveUpdate?.kind === "tool" && liveUpdate.item.internal;
+    if (
+      liveUpdate?.item.threadId
+      && liveUpdate.item.turnId
+      && !suppressGenericRecoveryMessage
+      && !suppressInternalToolMessage
+    ) {
       store.saveTimelineItem(liveUpdate.item.threadId, liveUpdate.item.turnId, journalItem(liveUpdate));
     }
-    sendToUser(wss, owner, { type: "codex.notification", data: message });
-    if (liveUpdate?.kind === "tool") {
+    if (!suppressRawCompact) {
+      sendToUser(wss, owner, { type: "codex.notification", data: message });
+    }
+    if (liveUpdate?.kind === "tool" && !suppressInternalToolMessage) {
       sendToUser(wss, owner, { type: "live.tool", data: liveUpdate.item });
     } else if (liveUpdate?.kind === "agent" && !suppressGenericRecoveryMessage) {
       sendToUser(wss, owner, { type: "live.agent", data: liveUpdate.item });
@@ -649,11 +737,25 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
 
     if (turnId && message.method === "turn/completed") {
       const completedRecovery = contextRecoveryByTurn.get(turnId);
-      const latestAgentText = completingAgentMessages.at(-1)?.text ?? "";
+      const completedPlan = turnId ? planContinuationByTurn.get(turnId) : undefined;
+      const latestAgent = completingAgentMessages.at(-1);
+      const latestAgentText = latestAgent?.text ?? "";
       const needsFallbackRecovery = Boolean(completedRecovery && isGenericContextLossReply(latestAgentText));
       const completedThreadId = notificationThreadId(message);
+      const completedItems = completedThreadId ? store.readTimelineItems(completedThreadId, turnId) : [];
+      const latestAgentItem = [...completedItems].reverse().find((item) => item.type === "agentMessage");
+      const latestAgentOrder = Number(latestAgentItem?.timelineOrder ?? latestAgent?.sequence);
+      const hasToolAfterLatestAgent = Number.isFinite(latestAgentOrder)
+        ? completedItems.some((item) => item.type === "toolCall" && Number(item.timelineOrder) > latestAgentOrder)
+        : false;
+      const nextPlanCount = (completedPlan?.count ?? 0) + 1;
+      const needsPlanContinuation = nextPlanCount <= 2
+        && isPlanOnlyContinuationReply(latestAgentText)
+        && !hasToolAfterLatestAgent;
+      const runtimeExited = asRecord(message.params).runtimeExited === true;
+      const needsRecovery = !runtimeExited && (needsFallbackRecovery || needsPlanContinuation);
       if (completedThreadId) {
-        for (const item of store.readTimelineItems(completedThreadId, turnId)) {
+        for (const item of completedItems) {
           if (item.completed === false) store.saveTimelineItem(completedThreadId, turnId, { ...item, completed: true });
         }
       }
@@ -661,21 +763,40 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       turnOwners.delete(turnId);
       guards.recoverableTurnIds.delete(turnId);
       contextRecoveryByTurn.delete(turnId);
+      planContinuationByTurn.delete(turnId);
       const threadId = notificationThreadId(message);
       if (threadId) {
         const activeTurn = guards.activeTurnsByThread.get(threadId);
         if (activeTurn === turnId || activeTurn?.startsWith("pending:")) {
           guards.activeTurnsByThread.delete(threadId);
         }
-        if (needsFallbackRecovery) {
-          setTimeout(() => void startFallbackContextRecovery(owner, threadId, turnId), 0);
-        } else if (completedRecovery) {
+        if (runtimeExited) {
+          contextRecoveryRetries.delete(threadId);
+          setTimeout(() => void startNextQueuedTurn(owner, threadId), 0);
+        } else if (needsRecovery) {
+          setTimeout(() => void startFallbackContextRecovery(
+            owner,
+            threadId,
+            turnId,
+            needsFallbackRecovery
+              ? undefined
+              : {
+                prompt: continuationRecoveryPrompt(),
+                plan: { rootTurnId: completedPlan?.rootTurnId ?? turnId, count: nextPlanCount }
+              }
+          ), 0);
+        } else if (completedRecovery || completedPlan) {
           contextRecoveryRetries.delete(threadId);
         } else {
           setTimeout(() => void startNextQueuedTurn(owner, threadId), 0);
         }
         const turnStatus = pickString(asRecord(asRecord(message.params).turn).status);
-        if (turnStatus === "completed" && !needsFallbackRecovery) {
+        const finishedWatchdogTurn = turnWatchdog.finish(owner, accountId, threadId, turnId);
+        if (finishedWatchdogTurn) {
+          const progressState = turnStatus === "failed" ? "failed" : turnStatus === "interrupted" ? "interrupted" : "completed";
+          sendTurnProgress(finishedWatchdogTurn, progressState);
+        }
+        if (turnStatus === "completed" && !needsRecovery) {
           const threadOwner = store.getThreadOwner(threadId);
           void sendUserPush(store, owner, {
             type: "completed",
@@ -687,7 +808,65 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         }
       }
     }
-  });
+  };
+  bridge.on("notification", processBridgeNotification);
+
+  const runWatchdogProbe = async (claim: WatchdogProbeClaim): Promise<void> => {
+    const turn = claim.turn;
+    if (claim.shouldDiagnose) {
+      const phase = turn.phase === "waiting_approval" || turn.phase === "waiting_subagents" ? turn.phase : "no_progress";
+      console.warn("[turn.watchdog.no_progress]", JSON.stringify({
+        userId: turn.userId,
+        accountId: turn.accountId,
+        threadId: turn.threadId,
+        turnId: turn.turnId,
+        silentForMs: Math.max(0, Date.now() - turn.lastProgressAt),
+        lastProgressMethod: turn.lastProgressMethod,
+        phase
+      }));
+      sendTurnProgress(turn, phase);
+    }
+    try {
+      if (!store.userCanAccessThread(turn.threadId, turn.userId)) {
+        turnWatchdog.failProbe(turn.userId, turn.accountId, turn.threadId, turn.turnId, claim.token);
+        return;
+      }
+      // AccountPoolBridge routes thread/read to the pinned account. This is a
+      // bounded read-only observation and must never count as turn progress.
+      const response = await bridge.request("thread/read", { threadId: turn.threadId, includeTurns: false }, 10_000);
+      const thread = asRecord(asRecord(response).thread);
+      const status = asRecord(thread.status);
+      const statusName = pickString(status.type, "unknown");
+      const flagsRaw = Array.isArray(status.activeFlags) ? status.activeFlags : [];
+      const flags = flagsRaw.map((flag) => typeof flag === "string" ? flag : pickString(asRecord(flag).type ?? asRecord(flag).name ?? asRecord(flag).flag)).filter(Boolean);
+      const resolved = turnWatchdog.resolveProbe(turn.userId, turn.accountId, turn.threadId, turn.turnId, claim.token, statusName, flags);
+      if (!resolved) return; // A newer turn replaced this probe while it was in flight.
+      const liveTurn = liveStateFor(turn.userId).snapshot().toolItems
+        .find((item) => item.threadId === turn.threadId && item.turnId === turn.turnId && !item.completed);
+      if (liveTurn && resolved.turn.phase === "running") {
+        const label = liveTurn.tool.toLowerCase();
+        turnWatchdog.setPhase(turn.userId, turn.accountId, turn.threadId, turn.turnId,
+          label.includes("collab") || label.includes("agent") ? "waiting_subagents" : "tool_running");
+      }
+      if (resolved.changed) sendTurnProgress(turn, resolved.turn.phase, statusName);
+    } catch (error) {
+      const probeStillCurrent = turnWatchdog.failProbe(turn.userId, turn.accountId, turn.threadId, turn.turnId, claim.token);
+      if (!probeStillCurrent) return;
+      console.warn("[turn.watchdog.probe.error]", JSON.stringify({
+        userId: turn.userId,
+        accountId: turn.accountId,
+        threadId: turn.threadId,
+        turnId: turn.turnId,
+        error: error instanceof Error ? error.message : String(error)
+      }));
+    }
+  };
+
+  const watchdogInterval = setInterval(() => {
+    for (const claim of turnWatchdog.claimDueProbes()) void runWatchdogProbe(claim);
+  }, 15_000);
+  watchdogInterval.unref?.();
+  wss.on("close", () => clearInterval(watchdogInterval));
 
   bridge.on("serverRequest", (request) => {
     const owner = ownerForEnvelope(request as RpcEnvelope);
@@ -696,6 +875,10 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         pendingApprovalOwners.set(request.id, owner);
         const threadId = notificationThreadId(request as RpcEnvelope);
         if (threadId) {
+          const turnId = notificationTurnId(request as RpcEnvelope);
+          const accountId = notificationAccountId(request as RpcEnvelope);
+          pendingApprovalTurns.set(request.id, { userId: owner, accountId, threadId, turnId });
+          turnWatchdog.setPhase(owner, accountId, threadId, turnId, "waiting_approval");
           void sendUserPush(store, owner, {
             type: "approval",
             threadId,
@@ -710,6 +893,38 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   });
 
   bridge.on("status", (status) => {
+    const statusRecord = asRecord(status);
+    if (statusRecord.state === "exited") {
+      const accountId = stringOrNull(statusRecord.accountId);
+      for (const turn of turnWatchdog.activeForAccount(accountId)) {
+        for (const [requestId, approval] of pendingApprovalTurns) {
+          if (approval.accountId === turn.accountId && approval.threadId === turn.threadId && approval.turnId === turn.turnId) {
+            pendingApprovalTurns.delete(requestId);
+            pendingApprovalOwners.delete(requestId);
+          }
+        }
+        console.error("[turn.watchdog.runtime_exited]", JSON.stringify({
+          userId: turn.userId,
+          accountId: turn.accountId,
+          threadId: turn.threadId,
+          turnId: turn.turnId,
+          code: typeof statusRecord.code === "number" ? statusRecord.code : undefined,
+          signal: typeof statusRecord.signal === "string" ? statusRecord.signal : undefined
+        }));
+        // Reuse the regular completion path: it marks unfinished live tool
+        // items complete, clears the active guard and advances queued work.
+        processBridgeNotification({
+          method: "turn/completed",
+          accountId: turn.accountId,
+          params: {
+            threadId: turn.threadId,
+            turnId: turn.turnId,
+            turn: { id: turn.turnId, status: "interrupted" },
+            runtimeExited: true
+          }
+        } as RpcEnvelope);
+      }
+    }
     broadcast(wss, { type: "codex.status", data: status });
   });
 
@@ -732,12 +947,14 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       ok: true,
       data: {
         pendingServerRequests: bridge.getPendingServerRequests().filter((pending) => pendingApprovalOwners.get(pending.id) === sessionUserId),
-        liveState: liveStateFor(sessionUserId).snapshot()
+        liveState: liveStateFor(sessionUserId).snapshot(),
+        turnProgress: turnWatchdog.diagnosedForUser(sessionUserId)
+          .map((turn) => watchdogProgressData(turn, watchdogState(turn)))
       }
     });
 
     ws.on("message", (raw) => {
-      void handleClientMessage(ws, bridge, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission);
+      void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission);
     });
     ws.on("close", () => {
       for (const [processId, socket] of processSockets) {
@@ -755,11 +972,14 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
 async function handleClientMessage(
   ws: WebSocket,
   bridge: CodexBridge,
+  rawCompactFilter: RawCompactFilter,
   store: ProjectStore,
   liveState: LiveStateStore,
   processOwners: Map<string, string>,
   processSockets: Map<string, WebSocket>,
   pendingApprovalOwners: Map<number | string, string>,
+  pendingApprovalTurns: Map<number | string, { userId: string; accountId: string | null; threadId: string; turnId: string | null }>,
+  turnWatchdog: TurnWatchdog,
   guards: SocketRequestGuards,
   sessionUserId: string,
   raw: string,
@@ -858,7 +1078,7 @@ async function handleClientMessage(
             });
             const turn = await bridge.request("turn/start", {
               threadId,
-              input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames),
+              input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames, message.documentReference),
               collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
               cwd: project.rootPath,
               approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
@@ -924,7 +1144,7 @@ async function handleClientMessage(
               }, 30_000);
               const turn = await bridge.request("turn/start", {
                 threadId,
-                input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames),
+                input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames, message.documentReference),
                 collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
                 cwd: project.rootPath,
                 approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
@@ -972,7 +1192,7 @@ async function handleClientMessage(
             const value = await bridge.request("turn/steer", {
               threadId,
               expectedTurnId,
-              input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", prompt, message.skillNames)
+              input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", prompt, message.skillNames, message.documentReference)
             });
             store.touchThreadOwner(threadId);
             return value;
@@ -990,7 +1210,7 @@ async function handleClientMessage(
         assertThreadOwnedBy(store, threadId, sessionUserId);
         const result = await guards.requestDeduper.run(
           { userId: sessionUserId, requestId },
-          async () => bridge.request("thread/queue/add", { threadId, input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", prompt, message.skillNames), clientUserMessageId: requestId }),
+          async () => bridge.request("thread/queue/add", { threadId, input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", prompt, message.skillNames, message.documentReference), clientUserMessageId: requestId }),
           { serializeKey: `queue:${threadId}` }
         );
         send(ws, { type: "ack", requestId, ok: true, data: result });
@@ -1028,7 +1248,12 @@ async function handleClientMessage(
         const promptBody = skillPrefix && skillNamesFromPrompt(skillPrefix).every((name) => skillNames.includes(name))
           ? prompt.slice(skillPrefix.length).trimStart()
           : prompt;
-        const result = await bridge.request("thread/queue/update", { threadId, queuedSubmissionId, input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", promptBody, skillNames) });
+        const queuedState = asRecord(await bridge.request("thread/queue/list", { threadId, limit: 100 }));
+        const queuedItems = Array.isArray(queuedState.data) ? queuedState.data.map(asRecord) : [];
+        const queuedItem = queuedItems.find((item) => item.id === queuedSubmissionId);
+        if (!queuedItem) throw new Error("排队中的消息暂时无法读取，请刷新队列后重试编辑。");
+        const documentReference = documentReferenceFromInput(queuedItem?.input);
+        const result = await bridge.request("thread/queue/update", { threadId, queuedSubmissionId, input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", promptBody, skillNames, documentReference) });
         send(ws, { type: "ack", requestId, ok: true, data: { threadId, ...asRecord(result) } });
         break;
       }
@@ -1107,15 +1332,23 @@ async function handleClientMessage(
         break;
       }
 
-      case "goal.set": {
-        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, pickString(message.threadId));
+      case "goal.get": {
         const threadId = pickString(message.threadId);
-        const objective = pickString(message.objective).trim();
-        if (!threadId || !objective) {
-          throw new Error("threadId and objective are required.");
+        if (!threadId) throw new Error("threadId is required.");
+        const data = await getOwnedThreadGoal({ bridge, store, userId: sessionUserId, threadId });
+        send(ws, { type: "ack", requestId, ok: true, data });
+        break;
+      }
+
+      case "goal.set": {
+        const threadId = pickString(message.threadId);
+        const objective = typeof message.objective === "string" ? message.objective.trim() : undefined;
+        if (!threadId || (objective !== undefined && !objective)) {
+          throw new Error("threadId is required, and objective must not be empty when provided.");
         }
         assertThreadOwnedBy(store, threadId, sessionUserId);
         const status = pickString(message.status, "active");
+        if (status === "active") await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, threadId);
         if (status !== "active" && status !== "paused" && status !== "blocked" && status !== "usageLimited" && status !== "budgetLimited" && status !== "complete") {
           throw new Error("Invalid Goal status.");
         }
@@ -1124,50 +1357,21 @@ async function handleClientMessage(
           : null;
         const data = await guards.requestDeduper.run(
           { userId: sessionUserId, requestId },
-          async () => {
-            const goal = await bridge.request("thread/goal/set", { threadId, objective, status, tokenBudget });
-            if (status !== "active" || guards.activeTurnsByThread.has(threadId)) {
-              return goal;
-            }
-
-            // Setting a goal on an idle thread persists the native objective but
-            // does not always create the first turn. Kick off one explicitly;
-            // if the native goal manager won the race, its active-turn error is
-            // harmless and the goal remains active for subsequent continuation.
-            const owner = store.getThreadOwner(threadId);
-            const project = owner ? store.getProject(owner.projectId, sessionUserId) : null;
-            if (!owner || !project) {
-              return goal;
-            }
-            try {
-              await bridge.request("thread/resume", {
-                threadId,
-                cwd: owner.rootPath,
-                model: owner.modelOverride ?? project.defaultModel,
-                approvalPolicy: project.defaultApprovalPolicy,
-                sandbox: project.defaultSandbox
-              }, 30_000);
-              const turn = await bridge.request("turn/start", {
-                threadId,
-                input: textInput("请立即开始执行当前 Goal，并持续工作直到目标完成。"),
-                cwd: owner.rootPath,
-                approvalPolicy: project.defaultApprovalPolicy,
-                sandboxPolicy: sandboxPolicy(project, project.defaultSandbox),
-                model: owner.modelOverride ?? project.defaultModel,
-                effort: owner.reasoningEffortOverride ?? project.defaultReasoningEffort
-              }, 30_000);
-              rememberAcceptedTurn(guards, threadId, requestId, turn);
-            } catch (error) {
-              const message = error instanceof Error ? error.message : String(error);
-              if (!/active turn|turn.*already|goal continuation/i.test(message)) {
-                throw error;
-              }
-            }
-            return goal;
-          },
+          () => setGoalAndStartIfIdle({
+            bridge,
+            store,
+            registry: guards,
+            userId: sessionUserId,
+            threadId,
+            objective,
+            status,
+            tokenBudget,
+            requestId,
+            rememberAcceptedTurn: (acceptedThreadId, acceptedRequestId, result) => rememberAcceptedTurn(guards, acceptedThreadId, acceptedRequestId, result)
+          }),
           { serializeKey: `thread:${threadId}` }
         );
-        send(ws, { type: "ack", requestId, ok: true, data });
+        send(ws, { type: "ack", requestId, ok: true, data: { threadId, ...asRecord(data) } });
         break;
       }
 
@@ -1182,9 +1386,15 @@ async function handleClientMessage(
         const result = await guards.requestDeduper.run(
           { userId: sessionUserId, requestId },
           async () => {
-            const value = await bridge.request("thread/compact/start", { threadId }, 180_000);
-            store.touchThreadOwner(threadId);
-            return value;
+            rawCompactFilter.markRequested(threadId);
+            try {
+              const value = await bridge.request("thread/compact/start", { threadId }, compactTimeoutMs());
+              store.touchThreadOwner(threadId);
+              return value;
+            } catch (error) {
+              rawCompactFilter.clear(threadId);
+              throw error;
+            }
           },
           { serializeKey: `thread:${threadId}` }
         );
@@ -1316,6 +1526,11 @@ async function handleClientMessage(
         }
         bridge.respondToServerRequest(responseId, message.result);
         pendingApprovalOwners.delete(responseId);
+        const approvalTurn = pendingApprovalTurns.get(responseId);
+        pendingApprovalTurns.delete(responseId);
+        if (approvalTurn) {
+          turnWatchdog.setPhase(approvalTurn.userId, approvalTurn.accountId, approvalTurn.threadId, approvalTurn.turnId, "running");
+        }
         send(ws, { type: "ack", requestId, ok: true });
         break;
       }

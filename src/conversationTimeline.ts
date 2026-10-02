@@ -91,13 +91,13 @@ export function collapseCodeModeWrappers(items: ThreadItem[]): ThreadItem[] {
 
 export function liveTimelineItems(entries: Array<{
   id: string; kind: "agent" | "tool"; sourceItemId?: string; startedAt: string; sequence: number;
-  text?: string; tool?: string; input?: string; output?: string; completed?: boolean;
+  text?: string; tool?: string; input?: string; output?: string; completed?: boolean; collaboration?: Record<string, unknown>;
 }>): ThreadItem[] {
   const items: ThreadItem[] = [];
   const agents = new Map<string, ThreadItem>();
   for (const entry of entries) {
     if (entry.kind === "tool") {
-      items.push({ id: entry.id, callId: entry.id, sourceItemId: entry.sourceItemId, type: "toolCall", tool: entry.tool, input: entry.input, aggregatedOutput: entry.output, completed: entry.completed, timelineAt: entry.startedAt, timelineOrder: entry.sequence });
+      items.push({ id: entry.id, callId: entry.id, sourceItemId: entry.sourceItemId, type: "toolCall", tool: entry.tool, input: entry.input, aggregatedOutput: entry.output, completed: entry.completed, collaboration: entry.collaboration, timelineAt: entry.startedAt, timelineOrder: entry.sequence });
     } else {
       const id = entry.sourceItemId ?? entry.id;
       const existing = agents.get(id);

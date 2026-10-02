@@ -16,6 +16,7 @@ const upstreamAgent = new http.Agent({ keepAlive: true, maxSockets: 256, maxFree
 const mime = new Map([
   [".html", "text/html; charset=utf-8"],
   [".js", "text/javascript; charset=utf-8"],
+  [".mjs", "text/javascript; charset=utf-8"],
   [".css", "text/css; charset=utf-8"],
   [".json", "application/json; charset=utf-8"],
   [".svg", "image/svg+xml"],
@@ -116,7 +117,7 @@ const server = http.createServer(async (request, response) => {
     const extension = path.extname(filePath).toLowerCase();
     response.writeHead(200, {
       "Content-Type": mime.get(extension) ?? "application/octet-stream",
-      "Cache-Control": extension === ".html" || path.basename(filePath) === "sw.js" ? "no-store" : "public, max-age=31536000, immutable"
+      "Cache-Control": extension === ".html" || ["sw.js", "loader.mjs"].includes(path.basename(filePath)) ? "no-store" : "public, max-age=31536000, immutable"
     });
     response.end(body);
     return;

@@ -264,7 +264,7 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
     || (stat.size === state.size && stat.mtimeMs !== state.mtimeMs)
     || !boundaryMatches
   ));
-  const generation = (state?.generation ?? 0) + (mustReset ? 1 : 0);
+  let generation = (state?.generation ?? 0) + (mustReset ? 1 : 0);
   if (mustReset) state = null;
   if (state && state.size === stat.size && state.mtimeMs === stat.mtimeMs) return;
 
@@ -344,7 +344,22 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
             });
           }
           if (record.type === "event_msg") {
-            if (payload.type === "task_started" && typeof payload.turn_id === "string") {
+            if (payload.type === "thread_rolled_back" && Number.isSafeInteger(payload.num_turns) && Number(payload.num_turns) > 0) {
+              // Search projections must rebuild even when the replacement
+              // happens to reuse the deleted turn's ordinal range.
+              generation += 1;
+              currentTurnId = null;
+              const count = Number(payload.num_turns);
+              operations.push(() => {
+                const removed = db.prepare("SELECT turn_id FROM thread_turns WHERE thread_id = ? ORDER BY start_offset DESC LIMIT ?").all(threadId, count) as { turn_id: string }[];
+                for (const { turn_id: turnId } of removed) {
+                  db.prepare("DELETE FROM thread_records_fts WHERE rowid IN (SELECT rowid FROM thread_records WHERE thread_id = ? AND turn_id = ?)").run(threadId, turnId);
+                  db.prepare("DELETE FROM thread_records WHERE thread_id = ? AND turn_id = ?").run(threadId, turnId);
+                  db.prepare("DELETE FROM thread_turns WHERE thread_id = ? AND turn_id = ?").run(threadId, turnId);
+                }
+                ordinal = nextOrdinal(threadId);
+              });
+            } else if (payload.type === "task_started" && typeof payload.turn_id === "string") {
               currentTurnId = payload.turn_id;
               const turnId = currentTurnId;
               const startOffset = lineStart;

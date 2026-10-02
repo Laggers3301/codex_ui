@@ -240,7 +240,7 @@ export class ProjectStore {
   constructor(dbPath = path.join(serverConfig.dataDir, "codex-web.sqlite")) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
-    // The live 260803 mirror briefly writes this database from a second
+    // The live account-a mirror briefly writes this database from a second
     // process. WAL keeps ordinary reads available during that write, while a
     // bounded busy timeout turns the remaining write/write race into a short
     // wait instead of an intermittent HTTP 500/502 "database is locked".

@@ -1,0 +1,9 @@
+SuperDoc runtime vendor bundle
+
+This directory contains the browser ESM bundle built from the official npm packages:
+- superdoc 1.30.0 (AGPL-3.0), LICENSE-superdoc.txt
+- @superdoc-dev/react 1.15.2 (AGPL-3.0), LICENSE-react-wrapper.txt; the wrapper stays in the normal app chunk
+- esbuild legal comments and bundled dependency attribution: superdoc.mjs.LEGAL.txt
+
+The generated SuperDoc bundle is self-contained and has no external imports. The proprietary @superdoc/docx-engine package is not present in the dependency graph or bundle.
+loader.mjs is a same-origin native module bridge that imports the adjacent bundle; it does not use eval, a Blob URL, or a remote host.

@@ -1,0 +1,179 @@
+.writingWorkbench {
+  --writing-ui-font-size: 13px;
+  --writing-meta-font-size: 12px;
+  --bg: var(--ui-surface, #151615);
+  --panel: var(--ui-surface-raised, #1c1d1c);
+  --panel-strong: var(--ui-surface, #151615);
+  --line: var(--ui-divider, rgba(255,255,255,.09));
+  --line-strong: var(--ui-control-hover, #303230);
+  --text: var(--ui-content, #f0f1ed);
+  --muted: var(--ui-content-muted, #969994);
+  --ink: var(--ui-content, #101214);
+  --writing-glass: var(--ui-control-glass-background, var(--ui-glass-background, rgba(255,255,255,.08)));
+  --writing-glass-hover: var(--ui-control-glass-hover, var(--ui-hover, rgba(255,255,255,.12)));
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  container-type: inline-size;
+  overflow: hidden;
+  color: var(--text, #232625);
+  background: var(--bg, #f4f2ed);
+  font-family: inherit;
+  font-size: var(--writing-ui-font-size);
+  line-height: 1.5;
+  font-weight: 420;
+  animation: writing-enter 260ms cubic-bezier(.2,.75,.25,1) backwards;
+}
+.writingWorkbench.writingClosing { pointer-events:none; animation:writing-exit 280ms cubic-bezier(.32,0,.67,0) both; }
+.writingWorkbench * { box-sizing: border-box; }
+.writingWorkbench :where(button, select) { color: inherit; font: inherit; }
+.writingWorkbench button { cursor: pointer; }
+.writingHeader { display:flex; align-items:center; gap:10px; min-height:58px; padding:8px 14px; border-bottom:1px solid var(--line, #d8d5cc); background:var(--panel, #fbfaf6); }
+.writingHeading { min-width:0; display:flex; align-items:baseline; gap:9px; flex:1; }
+.writingHeading strong { flex:none; font-size:var(--writing-ui-font-size); font-weight:550; letter-spacing:normal; }
+.writingHeading > span { overflow:hidden; color:var(--muted, #6e716d); font-size:var(--writing-ui-font-size); text-overflow:ellipsis; white-space:nowrap; }
+.writingHeading .writingDirtyDot { flex:none; padding:3px 7px; border-radius:20px; color:var(--amber, #b56b16); background:color-mix(in srgb, var(--amber, #b56b16) 12%, transparent); font-size:var(--writing-meta-font-size); }
+.writingActions { display:flex; flex:none; align-items:center; gap:6px; }
+.writingExport { position:relative; }
+.writingExportReveal { position:absolute; top:calc(100% + 6px); right:0; z-index:30; width:190px; }
+.writingExportMenu { display:flex; flex-direction:column; padding:5px; border-radius:10px; color:var(--text); background:var(--ui-glass-background); -webkit-backdrop-filter:blur(22px); backdrop-filter:blur(22px); box-shadow:var(--ui-glass-shadow); }
+.writingExportMenu button { min-height:34px; padding:6px 9px; border:0; border-radius:7px; background:transparent; text-align:left; font-size:var(--writing-ui-font-size); white-space:nowrap; }
+.writingExportMenu button:hover { background:var(--writing-glass-hover); }
+.writingActions select { min-height:34px; padding:0 27px 0 10px; border:1px solid var(--line, #d8d5cc); border-radius:9px; color:var(--text, #232625); background:var(--writing-glass); font-size:var(--writing-ui-font-size); }
+.writingButton, .writingIconButton { display:inline-flex; align-items:center; justify-content:center; gap:7px; min-height:34px; padding:0 10px; border:1px solid var(--line, #d8d5cc); border-radius:9px; background:var(--writing-glass); transition:background 170ms cubic-bezier(.2,.75,.25,1), transform 170ms cubic-bezier(.2,.75,.25,1), border-color 170ms ease; }
+.writingButton { font-size:var(--writing-ui-font-size); white-space:nowrap; }
+.writingIconButton { flex:0 0 34px; width:34px; padding:0; }
+.writingButton:hover:not(:disabled), .writingIconButton:hover:not(:disabled) { background:var(--writing-glass-hover); border-color:var(--line-strong, #bbb6aa); }
+.writingButton:active:not(:disabled), .writingIconButton:active:not(:disabled) { transform:scale(.96); }
+.writingPrimary { border-color:var(--teal, #207f78); color:#fff !important; background:var(--teal, #207f78); }
+.writingPrimary:hover:not(:disabled) { background:var(--teal-dark, #16645f); }
+.writingButton:disabled, .writingIconButton:disabled { cursor:not-allowed; opacity:.48; }
+.writingSubtle { border-color:transparent; background:transparent; color:var(--muted, #6e716d) !important; }
+.writingLayout { position:relative; display:flex; flex:1; min-height:0; min-width:0; overflow:hidden; }
+.writingExpandFiles { position:absolute; z-index:8; top:68px; left:8px; display:grid; place-items:center; width:31px; height:31px; border:1px solid var(--line, #d8d5cc); border-radius:9px; color:var(--muted, #6e716d); background:var(--writing-glass); box-shadow:0 3px 10px color-mix(in srgb, var(--ink, #101214) 10%, transparent); }
+.writingExpandFiles:hover { color:var(--text, #232625); background:var(--writing-glass-hover); }
+.writingFiles { display:flex; flex:none; flex-direction:column; min-width:0; max-width:38vw; border-right:1px solid var(--line, #d8d5cc); background:var(--panel, #fbfaf6); overflow:hidden; transition:width 220ms cubic-bezier(.2,.75,.25,1); }
+.writingFilesHeader { display:flex; align-items:center; justify-content:space-between; padding:13px 12px 8px 15px; color:var(--muted, #6e716d); font-size:var(--writing-ui-font-size); font-weight:550; letter-spacing:normal; text-transform:uppercase; }
+.writingFilesHeader button, .writingPaneTitle > button:not(.writingReferenceButton) { display:inline-grid; place-items:center; width:29px; height:29px; border:0; border-radius:8px; color:var(--muted, #6e716d); background:transparent; }
+.writingFilesHeader button:hover, .writingPaneTitle > button:not(.writingReferenceButton):hover { color:var(--text, #232625); background:var(--writing-glass); }
+.writingPath { overflow:hidden; margin:0 12px 9px; padding:5px 7px; border-radius:6px; color:var(--muted, #6e716d); background:color-mix(in srgb, var(--panel-strong, #fff) 58%, transparent); font-size:var(--writing-meta-font-size); text-overflow:ellipsis; white-space:nowrap; }
+.writingTree { flex:1; min-height:0; overflow:auto; padding:2px 7px; overscroll-behavior:contain; }
+.writingTreeEntry { display:flex; align-items:center; gap:5px; width:100%; min-height:33px; padding:0 8px; overflow:hidden; border:0; border-radius:7px; color:var(--text, #232625); background:transparent; text-align:left; }
+.writingTreeEntry:hover { background:var(--writing-glass); }
+.writingTreeEntry.selected { color:var(--teal-dark, #16645f); background:color-mix(in srgb, var(--teal, #207f78) 12%, transparent); }
+.writingTreeEntry > .writingTreeName { min-width:0; flex:1 1 0; overflow:hidden; font-size:var(--writing-ui-font-size); text-overflow:ellipsis; white-space:nowrap; }
+.writingTreeEntry > .writingIcon { flex:0 0 1.1em; }
+.writingTreeEntry > small { flex:none; color:var(--muted, #6e716d); font-size:var(--writing-meta-font-size); }
+.writingLoadMore { display:block; width:100%; min-height:34px; margin:5px 0 8px; border:1px solid var(--ui-divider, var(--line, #d8d5cc)); border-radius:8px; color:var(--ui-content-muted, var(--muted)); background:var(--ui-glass-background, transparent); font-size:var(--writing-ui-font-size); }
+.writingLoadMore:hover:not(:disabled) { color:var(--ui-content, var(--text)); background:var(--ui-control-glass-hover, var(--writing-glass-hover)); }
+.writingLoadMore:disabled { opacity:.55; cursor:progress; }
+.writingUp { color:var(--muted, #6e716d); font-size:var(--writing-ui-font-size); }
+.writingFileActions { display:grid; grid-template-columns:1fr 1fr; gap:5px; padding:9px; border-top:1px solid var(--line, #d8d5cc); }
+.writingFileActions button, .writingFileActions label { display:flex; align-items:center; justify-content:center; gap:5px; min-height:33px; padding:0 5px; border:1px solid var(--line, #d8d5cc); border-radius:8px; color:var(--muted, #6e716d); background:var(--writing-glass); font-size:var(--writing-ui-font-size); white-space:nowrap; cursor:pointer; }
+.writingFileActions button:hover, .writingFileActions label:hover { color:var(--text, #232625); background:var(--writing-glass-hover); }
+.writingFileActions label { grid-column:1 / -1; }
+.writingFileActions label { position:relative; }
+.writingFileActions input { position:absolute; inset:0; width:100%; height:100%; overflow:hidden; opacity:0; cursor:pointer; }
+.writingResizeHandle { position:relative; z-index:2; flex:none; width:7px; cursor:col-resize; touch-action:none; }
+.writingResizeHandle::after { position:absolute; top:0; bottom:0; left:3px; width:1px; background:var(--line, #d8d5cc); content:""; transition:background .15s; }
+.writingResizeHandle:hover::after, .writingResizeHandle:active::after { background:var(--teal, #207f78); }
+.writingEditorPane { display:flex; flex:none; flex-direction:column; min-width:180px; min-height:0; overflow:hidden; background:var(--bg, #f4f2ed); }
+.writingPreviewPane { display:flex; flex:1; flex-direction:column; min-width:180px; min-height:0; overflow:hidden; background:color-mix(in srgb, var(--panel, #fbfaf6) 65%, var(--bg, #f4f2ed)); }
+.writingModeDocx .writingEditorPane { flex:1 1 auto; width:auto !important; min-width:0; }
+.writingModeDocx .splitHandle, .writingModeDocx .writingPreviewPane,
+.writingModePdf .writingEditorPane, .writingModePdf .splitHandle,
+.writingModeAsset .writingEditorPane, .writingModeAsset .splitHandle { display:none; }
+.writingModePdf .writingPreviewPane, .writingModeAsset .writingPreviewPane { flex:1 1 auto; min-width:0; }
+.writingPaneTitle { display:flex; align-items:center; gap:9px; min-height:43px; padding:0 12px; border-bottom:1px solid var(--line, #d8d5cc); }
+.writingPaneTitle > span { min-width:0; flex:1; overflow:hidden; font-size:var(--writing-ui-font-size); font-weight:550; text-overflow:ellipsis; white-space:nowrap; }
+.writingPaneTitle > small { color:var(--muted, #6e716d); font-size:var(--writing-meta-font-size); white-space:nowrap; }
+.writingReferenceButton { padding:5px 8px; border:1px solid color-mix(in srgb, var(--teal, #207f78) 30%, var(--line, #d8d5cc)); border-radius:7px; color:var(--teal-dark, #16645f); background:var(--writing-glass); font-size:var(--writing-ui-font-size); }
+.writingReferenceButton:disabled { opacity:.45; cursor:not-allowed; }
+.writingEditorSurface, .writingPreviewSurface { position:relative; flex:1; min-height:0; overflow:auto; }
+.writingCodeEditor { height:100%; min-height:0; overflow:hidden; }
+.writingIcon { display:inline-flex; flex:none; width:1.1em; height:1.1em; align-items:center; justify-content:center; line-height:1; }
+.writingIcon svg { display:block; width:100%; height:100%; }
+.writingDocxEditor { position:relative; height:100%; min-height:0; overflow:auto; background:var(--panel-strong, #fff); }
+.writingDocxEditor > .superdoc-wrapper { width:100%; min-width:0; }
+.writingDocxEditor .superdoc-toolbar-container { min-width:0; max-width:100%; overflow-x:auto; overflow-y:hidden; overscroll-behavior:contain; }
+.writingDocxEditor .superdoc-editor-container { min-width:0; }
+.writingDocxEditor > div:first-child:not(:has(.superdoc)) { min-height:100%; }
+.writingDocxEditor .superdoc { min-height:100%; }
+/* Native Word pages remain white in both UI themes. Only establish the default
+   paper ink; explicit OOXML run colors must remain untouched. */
+.writingDocxEditor .superdoc-page { color:#202020; color-scheme:light; }
+.writingAssetPreview { width:100%; height:100%; min-height:0; color:var(--ui-content, var(--text)); }
+.writingAssetPreview .documentPdfViewer, .writingAssetPreview .documentZoomViewer, .writingAssetPreview .documentArchiveSelected { height:100%; min-height:0; }
+.writingAssetPreview .documentPdfStage, .writingAssetPreview .documentZoomStage { min-height:0; }
+.writingAssetPreview .fileTextPreview { margin:0 auto; max-width:900px; padding:20px; border-radius:9px; color:var(--ui-code-content, var(--text)); background:var(--ui-code-bg, var(--panel)); font:13px/1.65 Consolas, "Cascadia Code", monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+.writingAssetPreview .fileImagePreview, .writingAssetPreview .fileVideoPreview { width:auto; max-width:100%; max-height:100%; }
+.writingReferenceFloat { position:sticky; z-index:4; bottom:10px; float:right; margin:0 12px 10px 0; padding:7px 10px; border:1px solid var(--line, #d8d5cc); border-radius:20px; color:var(--text, #232625); background:var(--writing-glass); box-shadow:0 3px 14px color-mix(in srgb, var(--ink, #101214) 12%, transparent); -webkit-backdrop-filter:blur(12px) saturate(1.05); backdrop-filter:blur(12px) saturate(1.05); font-size:var(--writing-ui-font-size); }
+.writingReferenceFloat:hover { background:var(--writing-glass-hover); }
+.writingPdfViewer { position:relative; height:100%; min-height:0; overflow:auto; background:color-mix(in srgb, var(--bg, #f4f2ed) 88%, var(--ink, #101214)); }
+.writingPdfPages { display:flex; align-items:center; flex-direction:column; gap:18px; width:max-content; min-width:100%; min-height:100%; padding:20px 12px 70px; }
+.writingPdfPage { position:relative; flex:none; padding:8px; border:1px solid var(--line, #d8d5cc); border-radius:4px; background:white; box-shadow:0 4px 16px color-mix(in srgb, var(--ink, #101214) 15%, transparent); }
+.writingPdfPageNumber { position:absolute; top:7px; right:8px; z-index:2; padding:2px 5px; border-radius:5px; color:#575b55; background:rgba(255,255,255,.84); font-size:var(--writing-meta-font-size); }
+.writingPdfCanvasWrap { position:relative; }
+.writingPdfCanvasWrap canvas { display:block; }
+.writingPdfTextLayer { z-index:2; line-height:1; user-select:text; }
+.writingPdfZoom { position:sticky; z-index:3; bottom:10px; display:flex; align-items:center; justify-content:center; gap:4px; width:max-content; margin:-54px auto 12px; padding:4px; border:1px solid var(--line, #d8d5cc); border-radius:12px; background:var(--writing-glass); box-shadow:0 4px 16px color-mix(in srgb, var(--ink, #101214) 13%, transparent); -webkit-backdrop-filter:blur(12px) saturate(1.05); backdrop-filter:blur(12px) saturate(1.05); }
+.writingPdfZoom button { min-width:33px; height:30px; border:0; border-radius:8px; background:transparent; font-size:var(--writing-ui-font-size); }
+.writingPdfZoom button:hover { background:var(--writing-glass-hover); }
+.writingPdfZoom button:nth-child(2) { min-width:48px; color:var(--muted, #6e716d); font-size:var(--writing-ui-font-size); }
+.writingEmpty { display:flex; align-items:center; justify-content:center; flex-direction:column; gap:10px; min-height:100%; padding:26px; color:var(--muted, #6e716d); text-align:center; font-size:var(--writing-ui-font-size); }
+.writingWelcome strong { color:var(--text, #232625); font-size:var(--writing-ui-font-size); font-weight:550; }
+.writingEmpty svg { opacity:.56; }
+.writingErrorToast { position:absolute; z-index:20; right:18px; bottom:18px; display:flex; align-items:flex-start; gap:12px; max-width:min(540px,calc(100% - 36px)); padding:12px 14px; border:1px solid color-mix(in srgb, var(--red, #b54444) 40%, var(--line, #d8d5cc)); border-radius:12px; color:var(--text, #232625); background:var(--panel-strong, #fff); box-shadow:0 8px 32px color-mix(in srgb, var(--ink, #101214) 18%, transparent); font-size:var(--writing-ui-font-size); line-height:1.5; animation:writing-enter 220ms cubic-bezier(.2,.75,.25,1) both; }
+.writingNoticeToast { position:absolute; z-index:20; right:18px; bottom:18px; display:flex; align-items:flex-start; gap:12px; max-width:min(540px,calc(100% - 36px)); padding:12px 14px; border:1px solid color-mix(in srgb, var(--teal, #207f78) 40%, var(--line, #d8d5cc)); border-radius:12px; color:var(--text, #232625); background:var(--panel-strong, #fff); box-shadow:0 8px 32px color-mix(in srgb, var(--ink, #101214) 18%, transparent); font-size:var(--writing-ui-font-size); line-height:1.5; animation:writing-enter 220ms cubic-bezier(.2,.75,.25,1) both; }
+.writingErrorToast button, .writingNoticeToast button { flex:none; display:grid; place-items:center; width:25px; height:25px; margin:-4px -5px 0 0; border:0; border-radius:7px; background:transparent; }
+.writingErrorToast button:hover, .writingNoticeToast button:hover { background:var(--writing-glass); }
+.writingBusyStatus { position:absolute; z-index:18; left:50%; bottom:18px; display:flex; align-items:center; gap:7px; padding:7px 11px; border:1px solid var(--line, #d8d5cc); border-radius:20px; color:var(--muted, #6e716d); background:var(--writing-glass); box-shadow:0 3px 14px color-mix(in srgb, var(--ink, #101214) 12%, transparent); font-size:var(--writing-ui-font-size); transform:translateX(-50%); }
+.writingInlineError { position:sticky; z-index:5; top:0; padding:8px 12px; color:var(--red, #b54444); background:var(--panel-strong, #fff); font-size:var(--writing-ui-font-size); }
+.writingJobState { flex:none; padding:3px 7px; border-radius:20px; background:color-mix(in srgb, var(--teal, #207f78) 10%, transparent); }
+.writingJobState.failed { color:var(--red, #b54444); background:color-mix(in srgb, var(--red, #b54444) 10%, transparent); }
+.writingSpin { animation:writing-spin 1s linear infinite; }
+.writingMobileTabs { display:none; }
+@container (max-width: 800px) {
+  .writingFiles { width:170px !important; max-width:180px; }
+}
+@keyframes writing-enter { from { opacity:0; transform:translateY(7px) scale(.995); } to { opacity:1; transform:translateY(0) scale(1); } }
+@keyframes writing-exit { from { opacity:1; transform:translateY(0) scale(1); } to { opacity:0; transform:translateY(7px) scale(.995); } }
+@keyframes writing-spin { to { transform:rotate(360deg); } }
+@media (max-width: 720px) {
+  .writingHeader { min-height:55px; padding:7px 9px; gap:6px; flex-wrap:wrap; }
+  .writingBack { display:none; }
+  .writingHeading { flex:1 0 100%; flex-direction:row; align-items:baseline; gap:8px; }
+  .writingHeading > strong { flex:none; white-space:nowrap; }
+  .writingHeading > span { max-width:calc(100vw - 100px); font-size:var(--writing-ui-font-size); }
+  .writingHeading .writingDirtyDot { padding:1px 5px; font-size:var(--writing-meta-font-size); }
+  .writingActions { width:100%; flex-wrap:wrap; justify-content:flex-end; gap:3px; }
+  .writingActions .writingSubtle { display:none; }
+  .writingActions .writingButton { min-height:34px; padding:0 4px; gap:5px; font-size:var(--writing-ui-font-size); }
+  .writingActions select { min-height:34px; width:96px; max-width:96px; padding:0 3px 0 7px; font-size:var(--writing-ui-font-size); }
+  .writingMobileTabs { display:flex; flex:none; gap:4px; padding:6px 8px; border-bottom:1px solid var(--line, #d8d5cc); background:var(--panel, #fbfaf6); }
+  .writingMobileTabs button { flex:1; min-height:34px; border:0; border-radius:8px; color:var(--muted, #6e716d); background:transparent; font-size:var(--writing-ui-font-size); }
+  .writingMobileTabs button.active { color:var(--teal-dark, #16645f); background:color-mix(in srgb, var(--teal, #207f78) 11%, transparent); }
+  .writingFiles, .writingEditorPane, .writingPreviewPane { position:absolute; inset:0; display:flex; width:100% !important; max-width:none; min-width:0; border:0; visibility:hidden; opacity:0; pointer-events:none; transform:translateX(9px); transition:opacity 220ms cubic-bezier(.22,1,.36,1),transform 280ms cubic-bezier(.22,1,.36,1),visibility 0s linear 280ms; }
+  .writingModeDocx .writingEditorPane { display:flex; }
+  .writingModePdf .writingPreviewPane, .writingModeAsset .writingPreviewPane { display:flex; }
+  .writingExpandFiles { display:none; }
+  .writingFiles.mobileActive, .writingEditorPane.mobileActive, .writingPreviewPane.mobileActive { flex:1; visibility:visible; opacity:1; pointer-events:auto; transform:translateX(0); transition:opacity 220ms cubic-bezier(.22,1,.36,1),transform 280ms cubic-bezier(.22,1,.36,1),visibility 0s; }
+  .writingResizeHandle { display:none; }
+  .writingEditorPane, .writingPreviewPane { min-width:0; }
+  .writingEditorSurface, .writingPreviewSurface { min-height:0; }
+  .writingWorkbench input, .writingWorkbench textarea, .writingWorkbench select { font-size:16px; }
+  .writingWorkbench .cm-content, .writingWorkbench .cm-gutterElement { font-size:16px; }
+  .writingTreeEntry { min-height:42px; }
+  .writingFileActions { padding-bottom:max(9px, env(safe-area-inset-bottom)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .writingWorkbench, .writingErrorToast { animation:none; }
+  .writingWorkbench.writingClosing { animation:none; }
+  .writingSpin { animation-duration:2s; }
+  .writingButton, .writingIconButton, .writingFiles, .writingResizeHandle::after { transition:none; }
+}

@@ -1,0 +1,35 @@
+.workspace > .writingCanvas {
+  grid-column: 3;
+  grid-row: 1;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+.writingCanvas > .conversation { flex: 1; width: 100%; min-width: 0; min-height: 0; }
+.writingCanvas.writingActive > .conversation { flex: 0 0 var(--writing-chat-width, 380px); width: var(--writing-chat-width, 380px); }
+.writingCanvas.writingActive:not(.writingChatVisible) > .conversation { display: none; }
+.writingCanvas .writingWorkbench { min-width: 0; }
+.writingCanvasChatResize { flex: 0 0 7px; cursor: col-resize; touch-action: none; background: transparent; transition: background .2s; }
+.writingCanvasChatResize:hover { background: var(--ui-control-glass-hover); }
+.writingCanvasTabs { display: none; }
+.writingCanvasLoading { flex: 1; display: grid; place-content: center; min-width: 0; background: var(--ui-surface); color: var(--ui-content-muted); font-size: 13px; }
+.composerDocumentReference { display: flex; align-items: center; gap: 7px; width: 100%; min-width: 0; color: var(--ui-content-muted); font-size: 12px; padding: 7px 2px 5px; }
+.composerDocumentReference > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composerDocumentReference button { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; color: inherit; background: transparent; border: 0; border-radius: 6px; padding: 4px; cursor: pointer; font: inherit; }
+.composerDocumentReference button:hover { color: var(--ui-content); background: var(--ui-control-glass-hover); }
+.composerDocumentReference strong { font-weight: 500; color: var(--ui-content); }
+@media (max-width: 1100px) {
+  .writingCanvas.writingActive { flex-direction: column; }
+  .writingCanvasTabs { display: flex; flex: 0 0 34px; align-items: center; gap: 4px; padding: 0 10px; background: var(--ui-surface); }
+  .writingCanvasTabs button { border: 0; background: transparent; padding: 5px 10px; color: var(--ui-content-muted); font: inherit; font-size: 12px; border-radius: 6px; cursor: pointer; }
+  .writingCanvasTabs button[aria-selected=true] { background: var(--ui-control-glass-hover); color: var(--ui-content); }
+  .writingCanvasChatResize { display: none; }
+  .writingCanvas.writingActive.writingChatVisible > .writingWorkbench { display: none; }
+  .writingCanvas.writingActive > .conversation { flex: 1 1 0; width: 100%; }
+}
+@media (max-width: 720px) {
+  .workspace > .writingCanvas { grid-column: 1 / -1 !important; grid-row: 1; width: 100%; height: 100%; }
+  .writingCanvas > .conversation { width: 100%; height: 100%; }
+}

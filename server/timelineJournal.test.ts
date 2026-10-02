@@ -54,4 +54,25 @@ describe("durable tool timeline", () => {
     const deduplicated = overlayJournal({ turns: [{ id: "turn", items: [native] }] }, () => [diff], false);
     expect((deduplicated.turns as { items: { id: string }[] }[])[0].items).toHaveLength(1);
   });
+
+  it("keeps context compaction out of the client timeline overlay", () => {
+    const live = new LiveStateStore();
+    live.recordNotification({ method: "turn/started", params: { threadId: "thread", turnId: "turn" } });
+    const compact = live.recordNotification({ method: "item/completed", params: {
+      threadId: "thread",
+      turnId: "turn",
+      item: { id: "compact", type: "contextCompaction" }
+    } });
+
+    expect(compact).toMatchObject({ kind: "tool", item: { internal: true, tool: "contextCompaction" } });
+
+    const at = new Date(1700000000000).toISOString();
+    const entries = [
+      { id: "compact", type: "toolCall", tool: "contextCompaction", timelineAt: at },
+      { id: "command", type: "toolCall", tool: "exec", timelineAt: at }
+    ];
+    const result = overlayJournal({ turns: [{ id: "turn", items: [] }] }, () => entries, true);
+
+    expect((result.turns as { items: { id: string }[] }[])[0].items.map((item) => item.id)).toEqual(["command"]);
+  });
 });

@@ -1,0 +1,84 @@
+.subagentAvatar { display: inline-flex; align-items: center; justify-content: center; width: 17px; height: 17px; flex: 0 0 17px; }
+.subagentAvatar svg { display: block; width: 17px; height: 17px; }
+.agentColor0 { --agent-ink: #b98318; --agent-fill: #f5cf61; }
+.agentColor1 { --agent-ink: #aa4875; --agent-fill: #ec98bf; }
+.agentColor2 { --agent-ink: #278b6a; --agent-fill: #8edbc0; }
+.agentColor3 { --agent-ink: #287e99; --agent-fill: #9cdeec; }
+.agentColor4 { --agent-ink: #7760bb; --agent-fill: #c7b6f4; }
+.agentColor5 { --agent-ink: #b56046; --agent-fill: #f3b69c; }
+:root:not([data-theme="light"]) .subagentAvatar { filter: brightness(1.06); }
+.rightPaneSubagents { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: var(--ui-glass-background); color: var(--ui-content); -webkit-backdrop-filter: blur(22px) saturate(1.08); backdrop-filter: blur(22px) saturate(1.08); opacity: 0; transform: translateY(12px); filter: blur(2px); transition: opacity var(--ui-popover-fade-duration) var(--ui-popover-motion-ease), transform var(--ui-popover-motion-duration) var(--ui-popover-motion-ease), filter var(--ui-popover-fade-duration) var(--ui-popover-motion-ease); }
+.rightPaneSubagents.open { opacity: 1; transform: none; filter: none; }
+:root:not([data-theme="light"]) .rightPaneSubagents { background: var(--bg); -webkit-backdrop-filter: none; backdrop-filter: none; }
+.rightPanelWithAgents .rightPaneDiff, .rightPanelWithAgents .rightPaneSubagents { flex: 1 1 50%; min-height: 120px; }
+.subagentPanelHeader { min-height: 49px; gap: 7px; border-bottom: 0; font-size: 13px; }
+.subagentPanelHeader > div { flex: 1; align-items: center; gap: 7px; }
+.subagentPanelHeader h2 { font-size: 13px; font-weight: 550; }
+.subagentPanelHeader button { cursor: pointer; transition: background-color var(--ui-popover-fade-duration) var(--ui-popover-motion-ease), color var(--ui-popover-fade-duration) ease; }
+.subagentPanelHeader button:disabled { cursor: progress; opacity: .55; }
+.subagentDirectory { position: relative; flex: 1; min-height: 0; overflow: auto; padding: 3px 14px 18px; }
+.subagentDirectoryBrowser { display: flex; flex-direction: column; flex: 1; min-height: 0; min-width: 0; }
+.subagentDirectoryControls { display: grid; gap: 9px; padding: 3px 14px 11px; }
+.subagentDirectoryFilters { display: flex; gap: 5px; }
+.subagentDirectoryFilters button { padding: 6px 9px; border: 0; border-radius: 8px; background: transparent; color: var(--ui-content-muted); font: inherit; font-size: 12px; cursor: pointer; transition: background-color var(--ui-popover-fade-duration) var(--ui-popover-motion-ease), color var(--ui-popover-fade-duration) var(--ui-popover-motion-ease); }
+.subagentDirectoryFilters button[aria-selected="true"] { background: var(--ui-hover); color: var(--ui-content); }
+.subagentDirectorySearch { display: flex; min-width: 0; border-radius: 8px; background: var(--ui-hover); }
+.subagentDirectorySearch input { box-sizing: border-box; width: 100%; min-width: 0; height: 34px; padding: 7px 9px; border: 0; outline-offset: 2px; border-radius: inherit; background: transparent; color: var(--ui-content); font: inherit; font-size: 13px; line-height: 1.4; }
+.subagentDirectorySearch input::placeholder { color: var(--ui-content-muted); }
+.subagentDirectoryStage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+.subagentDirectoryResults { height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; overflow-anchor: none; padding: 0 14px 18px; opacity: 1; transform: none; transition: opacity var(--ui-popover-fade-duration) var(--ui-popover-motion-ease), transform var(--ui-popover-motion-duration) var(--ui-popover-motion-ease); }
+.subagentDirectoryResults.isFiltering { opacity: .35; transform: translateY(4px); }
+.subagentDirectoryResults .subagentDirectoryDate { margin: 0; padding: 12px 7px 5px; color: var(--ui-content-muted); font-size: 12px; font-weight: 450; }
+.subagentDirectoryIdentity { display: grid; gap: 2px; flex: 1; min-width: 0; }
+.subagentDirectoryIdentity .subagentDirectoryName { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagentDirectoryDetails { display: flex; gap: 8px; min-width: 0; color: var(--ui-content-muted); font-size: 11px; }
+.subagentDirectoryDetails > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagentDirectoryDetails time { flex: none; }
+.subagentDirectoryRow .subagentState.state-failed { color: var(--red); }
+.subagentDirectoryPagingReveal { position: absolute; inset: auto 0 5px; pointer-events: none; }
+.subagentDirectoryPaging { text-align: center; color: var(--ui-content-muted); font-size: 11px; }
+@media (hover: hover) { .subagentDirectoryFilters button:hover { background: var(--ui-hover); color: var(--ui-content); } }
+.subagentDirectoryFilters button:focus-visible { outline: 2px solid var(--ui-content-muted); outline-offset: 2px; }
+@media (max-width: 720px) { .subagentDirectorySearch input { height: 38px; font-size: 16px; } }
+@media (prefers-reduced-motion: reduce) { .subagentDirectoryFilters button, .subagentDirectoryResults { transition: none; } }
+.subagentDirectory h3 { margin: 13px 0 6px; color: var(--ui-content-muted); font-size: 12px; font-weight: 450; }
+.subagentDirectoryRow { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding: 10px 7px; border: 0; border-radius: 9px; background: transparent; color: var(--ui-content); font: inherit; font-size: 13px; text-align: left; cursor: pointer; transition: background-color var(--ui-popover-fade-duration) var(--ui-popover-motion-ease); }
+.subagentDirectoryRow:hover { background: var(--ui-hover); }
+.subagentDirectoryName { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.subagentDirectoryModel { max-width: 115px; overflow: hidden; color: var(--ui-content-muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.subagentDirectoryRow .subagentState { color: var(--ui-content-muted); }
+.subagentSiblingTabs { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; padding: 0 14px 6px; overflow-x: auto; scrollbar-width: thin; }
+.subagentSiblingTabs button { display: inline-flex; align-items: center; gap: 6px; max-width: 180px; flex: 0 0 auto; padding: 6px 8px; border: 0; border-radius: 8px; background: transparent; color: var(--ui-content-muted); font: inherit; font-size: 12px; cursor: pointer; transition: background-color var(--ui-popover-fade-duration) var(--ui-popover-motion-ease), color var(--ui-popover-fade-duration) ease; }
+.subagentSiblingTabs button[aria-pressed="true"], .subagentSiblingTabs button:hover { background: var(--ui-hover); color: var(--ui-content); }
+.subagentSiblingTabs button > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagentRecordModel { display: inline-flex; align-items: center; gap: 7px; flex: 0 1 auto; min-width: 0; max-width: 178px; margin: 0; padding: 5px 7px; border-radius: 8px; background: var(--ui-hover); color: var(--ui-content); font-size: 12px; line-height: 1.5; white-space: nowrap; transition: background-color var(--ui-popover-fade-duration) ease, color var(--ui-popover-fade-duration) ease; }
+.subagentRecordModelName { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.subagentRecordModel .subagentState { flex: none; color: var(--ui-content-muted); }
+.subagentActivityRunning .reasoningSummaryPreview { color: transparent !important; -webkit-text-fill-color: transparent !important; background-image: var(--ui-work-shimmer-gradient) !important; background-size: 200% 100% !important; background-clip: text !important; -webkit-background-clip: text !important; animation: v2-seamless-shimmer 2.35s linear infinite !important; }
+.subagentRecordStage { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+.subagentRecord { height: 100%; min-height: 0; padding: 4px 17px max(18px, env(safe-area-inset-bottom)); overflow-y: auto; overflow-x: hidden; overflow-anchor: none; opacity: 1; transition: opacity var(--ui-popover-fade-duration) var(--ui-popover-motion-ease), transform var(--ui-popover-motion-duration) var(--ui-popover-motion-ease); }
+.subagentRecord.switching { opacity: 0; transform: translateY(7px); pointer-events: none; }
+.subagentRecordRow { min-width: 0; }
+.subagentRecord .messageMarkdown { font-size: 14px; }
+.subagentRecord .subagentRecordUser { padding: 10px 12px; border-radius: 12px; background: var(--ui-hover); }
+.subagentRecord .reasoningDisclosure { min-width: 0; }
+.subagentRecord .messageItem { margin: 0; min-width: 0; max-width: 100%; }
+.subagentRecord .outputBlock { white-space: pre-wrap; overflow-wrap: anywhere; }
+.subagentPanelError button { padding: 6px 8px; border: 0; border-radius: 7px; background: transparent; color: var(--ui-content-muted); font: inherit; font-size: 12px; cursor: pointer; }
+.subagentPanelError button:hover { background: var(--ui-hover); }
+.subagentHistoryLoading { position: absolute; inset: 5px 0 auto; z-index: 1; display: flex; justify-content: center; pointer-events: none; }
+.subagentHistoryLoading > span { width: 13px; height: 13px; border: 2px solid var(--ui-hover); border-top-color: var(--ui-content-muted); border-radius: 50%; animation: subagentSpinner .9s linear infinite; }
+.subagentPanelEmpty { margin: 18px 0; color: var(--ui-content-muted); font-size: 13px; }
+.subagentPanelError { flex: 0 0 auto; padding: 10px 16px; color: var(--red); font-size: 12px; overflow-wrap: anywhere; }
+.subagentPanelError button { margin-left: 7px; color: inherit; }
+.subagentPanelLoading { display: grid; min-height: 100px; place-items: center; }
+.subagentRecordStage > .subagentPanelLoading { position: absolute; inset: 0; pointer-events: none; }
+.subagentPanelLoading > span { display: block; width: 17px; height: 17px; border: 2px solid var(--ui-hover); border-top-color: var(--ui-content-muted); border-radius: 50%; animation: subagentSpinner .9s linear infinite; }
+.subagentLoadingLayer { position: absolute; inset: 0; z-index: 2; display: grid; place-items: center; pointer-events: none; }
+.subagentLoadingLayer .threadOpeningIndicator { color: var(--ui-content-muted); }
+.subagentLoadingLayer.closing .threadOpeningIndicator { animation: threadOpeningHide .24s cubic-bezier(.4, 0, .7, 1) both; }
+.subagentDirectoryRow:focus-visible, .subagentPanelHeader button:focus-visible, .subagentSiblingTabs button:focus-visible { outline: 2px solid var(--ui-content-muted); outline-offset: 2px; }
+@keyframes subagentSpinner { to { transform: rotate(360deg); } }
+@media (max-width: 720px) { .subagentDirectoryModel { max-width: 95px; } .subagentDirectoryRow { padding: 12px 4px; } .subagentPanelHeader { padding-top: max(10px, env(safe-area-inset-top)); } .subagentRecordModel { max-width: 46%; } }
+@media (prefers-reduced-motion: reduce) { .rightPaneSubagents, .subagentRecord, .subagentPanelHeader button, .subagentSiblingTabs button, .subagentDirectoryRow { transition: none; } .subagentPanelLoading > span, .subagentHistoryLoading > span { animation: none; } .subagentActivityRunning .reasoningSummaryPreview { animation: none !important; background: none !important; color: var(--ui-content-muted) !important; -webkit-text-fill-color: currentColor !important; } }
+@media (prefers-reduced-motion: reduce) { .subagentLoadingLayer .threadOpeningIndicator, .subagentLoadingLayer .threadOpeningPulse i { animation: none; } }

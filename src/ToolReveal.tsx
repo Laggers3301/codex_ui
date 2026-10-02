@@ -36,6 +36,9 @@ export function ToolReveal({
     }
     return () => { cancelAnimationFrame(frame); cancelAnimationFrame(secondFrame); clearTimeout(timer); };
   }, [open, settleMs]);
+  // A settled, empty disclosure must not consume a flex/grid slot (and its
+  // associated gap). Keep it present only while opening or animating closed.
+  if (!mounted && !open) return null;
   return <div className={`toolReveal${className ? ` ${className}` : ""}${visible && open ? " isOpen" : ""}`} aria-hidden={!open} inert={!open}>
     <div className="toolRevealClip">{mounted ? (typeof children === "function" ? children() : children) : null}</div>
   </div>;

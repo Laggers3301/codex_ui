@@ -1,10 +1,13 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import Fastify from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
 import { AccountPoolBridge } from "./accountPoolBridge.js";
 import { CodexBridge } from "./codexBridge.js";
 import { appendLegacyRollbackMarker, removeAppendedRollbackMarker } from "./legacyRollback.js";
+import { ProjectStore } from "./db.js";
+import { registerRoutes } from "./routes.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -48,7 +51,7 @@ describe("legacy rollback marker", () => {
   });
 });
 
-const localCodex = path.resolve(process.cwd(), "../bin/codex-0.156.0/codex");
+const localCodex = process.env.CODEX_ROLLBACK_TEST_BIN ?? path.resolve(process.cwd(), "../bin/codex-0.159.2/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex");
 describe.skipIf(!((await fs.stat(localCodex).catch(() => null))?.isFile()))("isolated legacy rollback replay", () => {
   it("keeps the original thread id and first turn after a guarded account restart", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "legacy-rollback-appserver-"));
@@ -67,17 +70,42 @@ describe.skipIf(!((await fs.stat(localCodex).catch(() => null))?.isFile()))("iso
       records.push({ timestamp, type: "event_msg", payload: { type: "task_complete", turn_id: turnId, last_agent_message: `synthetic answer ${n}` } });
     }
     await fs.writeFile(file, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    const runtimes: CodexBridge[] = [];
     const pool = new AccountPoolBridge({ accounts: [{ id: "isolated", label: "isolated", codexHome: root }], stateFile: path.join(root, "pool-state.json") }, root,
-      (codexHome) => new CodexBridge({ command: localCodex, args: ["app-server", "--listen", "stdio://"], env: { ...process.env, CODEX_HOME: codexHome } }));
+      (codexHome) => {
+        const runtime = new CodexBridge({ command: localCodex, args: ["app-server", "--listen", "stdio://"], env: { ...process.env, CODEX_HOME: codexHome } });
+        runtimes.push(runtime);
+        return runtime;
+      });
+    const store = new ProjectStore(path.join(root, "test.sqlite"));
+    const project = store.createProject({ name: "rollback test", rootPath: root });
+    store.registerThreadOwner({ threadId: id, userId: "admin", projectId: project.id, rootPath: root });
+    const app = Fastify();
+    registerRoutes(app, pool as unknown as CodexBridge, store, { backgroundIndexing: false });
     try {
       const before = await pool.request("thread/read", { threadId: id, includeTurns: true }) as { thread: { turns: { id: string }[] } };
       expect(before.thread.turns).toHaveLength(2);
       const lastTurnId = before.thread.turns[1].id;
-      const result = await pool.rollbackLegacyLatest(id, lastTurnId) as { thread: { id: string; turns: { items: { content?: { text?: string }[] }[] }[] } };
+      const stale = await app.inject({ method: "POST", url: `/api/projects/${project.id}/threads/${id}/edit-latest`, payload: { turnId: before.thread.turns[0].id } });
+      expect(stale.statusCode).toBe(409);
+      expect((await pool.request("thread/read", { threadId: id, includeTurns: true }) as typeof before).thread.turns).toHaveLength(2);
+      const response = await app.inject({ method: "POST", url: `/api/projects/${project.id}/threads/${id}/edit-latest`, payload: { turnId: lastTurnId } });
+      expect(response.statusCode, response.body).toBe(200);
+      const result = response.json().data as { thread: { id: string; turns: { items: { content?: { text?: string }[] }[] }[] } };
       expect(result.thread.id).toBe(id);
       expect(result.thread.turns).toHaveLength(1);
       expect(result.thread.turns[0].items[0].content?.[0]?.text).toBe("synthetic question 1");
+      // A fresh resume must reconstruct the same history, not just hide it
+      // in the first read response.
+      const resumed = await pool.request("thread/resume", { threadId: id, cwd: process.cwd() }) as typeof result;
+      expect(resumed.thread.turns).toHaveLength(1);
+      const reread = await pool.request("thread/read", { threadId: id, includeTurns: true }) as typeof result;
+      expect(reread.thread.turns).toHaveLength(1);
+      expect(JSON.stringify(reread)).not.toContain("synthetic question 2");
     } finally {
+      await app.close();
+      store.close();
+      await Promise.all(runtimes.map((runtime) => runtime.stopAndWait()));
       pool.stop();
     }
   });

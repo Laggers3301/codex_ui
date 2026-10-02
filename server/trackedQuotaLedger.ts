@@ -30,7 +30,7 @@ export function advanceTrackedQuotaLedger(
   snapshot: TrackedQuotaLedgerSnapshot,
   initial: { cyclePercent: number; dailyPercent: Record<string, number> }
 ): TrackedQuotaLedgerAccount {
-  if (!previous || previous.resetAt !== snapshot.resetAt) {
+  if (!previous || Math.abs(previous.resetAt - snapshot.resetAt) > 5 * 60) {
     return {
       resetAt: snapshot.resetAt,
       observedQuotaPercent: boundedPercent(snapshot.quotaPercent),
@@ -42,6 +42,14 @@ export function advanceTrackedQuotaLedger(
       pendingQuotaPercent: 0,
       pendingSince: null
     };
+  }
+
+  // Corrected history (e.g. removed inherited fork usage) changes the token
+  // baseline, never already-accrued quota. Otherwise future genuine use would
+  // be ignored until it caught up with the old inflated denominator.
+  if (snapshot.totalTokens < previous.observedTotalTokens || snapshot.userTokens < previous.observedUserTokens) {
+    previous = { ...previous, observedTotalTokens: snapshot.totalTokens,
+      observedUserTokens: snapshot.userTokens, observedDailyTokens: { ...snapshot.dailyUserTokens } };
   }
 
   const quotaIncrease = Math.max(0, snapshot.quotaPercent - previous.observedQuotaPercent);
@@ -71,6 +79,7 @@ export function advanceTrackedQuotaLedger(
     }
     return {
       ...previous,
+      resetAt: snapshot.resetAt,
       observedQuotaPercent: Math.max(previous.observedQuotaPercent, snapshot.quotaPercent),
       observedTotalTokens: Math.max(previous.observedTotalTokens, snapshot.totalTokens),
       observedUserTokens: Math.max(previous.observedUserTokens, snapshot.userTokens),
@@ -84,6 +93,7 @@ export function advanceTrackedQuotaLedger(
 
   return {
     ...previous,
+    resetAt: snapshot.resetAt,
     observedQuotaPercent: Math.max(previous.observedQuotaPercent, snapshot.quotaPercent),
     // Hold token deltas until the corresponding official quota reading arrives.
     // A quota change without local usage is left pending briefly for JSONL lag.

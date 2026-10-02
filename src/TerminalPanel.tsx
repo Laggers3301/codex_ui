@@ -18,9 +18,10 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
     return Number.isFinite(stored) && stored >= 20 && stored <= 75 ? stored : 42;
   });
   const commandInput = useRef<HTMLInputElement>(null);
-  const submitLine = useRef<(line: string) => boolean>(() => false);
+  const submitLine = useRef<(line: string) => Promise<boolean>>(async () => false);
   const history = useRef<string[]>([]);
   const historyIndex = useRef(-1);
+  const submitting = useRef(false);
   const [line, setLine] = useState("");
   const [visible, setVisible] = useState(false);
   useEffect(() => {
@@ -65,11 +66,17 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
     let pendingInput = "";
     let inputTimer: number | null = null;
     let resizeTimer: number | null = null;
+    let appliedSize = "";
+    let pendingResize: { key: string; promise: Promise<boolean> } | null = null;
+    const resizeRequests = new Map<string, (ok: boolean) => void>();
     const send = (type: string, payload: Record<string, unknown> = {}): boolean => {
       try { codexSocket.send({ type, requestId: `${processId}-${crypto.randomUUID()}`, processId, ...payload }); return true; }
       catch { if (!disconnectedNoticeShown) { term.write("\r\n[连接断开，请关闭并重新打开终端]\r\n"); disconnectedNoticeShown = true; } return false; }
     };
     const unsubscribe = codexSocket.subscribe(message => {
+      if (message.type === "ack" && message.requestId) {
+        resizeRequests.get(message.requestId)?.(Boolean(message.ok));
+      }
       if (message.type === "terminal.output") {
         const data = message.data as { processId?: string; text?: string } | undefined;
         if (data?.processId === processId && data.text) term.write(data.text);
@@ -79,12 +86,46 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
       }
     });
     const flushInput = () => {
+      if (inputTimer !== null) window.clearTimeout(inputTimer);
       inputTimer = null;
       if (started && pendingInput) send("command.write", { data: pendingInput });
       pendingInput = "";
     };
-    submitLine.current = (value: string) => {
+    const syncSize = async (): Promise<boolean> => {
+      fit.fit();
+      if (!started || term.cols < 20 || term.rows < 5) return false;
+      const key = `${term.cols}:${term.rows}`;
+      if (pendingResize) {
+        const pending = pendingResize;
+        const ok = await pending.promise;
+        if (!ok) return false;
+        if (pending.key === key) return true;
+        return syncSize();
+      }
+      if (appliedSize === key) return true;
+      const requestId = `${processId}-resize-${crypto.randomUUID()}`;
+      const promise = new Promise<boolean>(resolve => {
+        const timer = window.setTimeout(() => finish(false), 3000);
+        const finish = (ok: boolean) => {
+          window.clearTimeout(timer);
+          resizeRequests.delete(requestId);
+          if (ok) appliedSize = key;
+          resolve(ok);
+        };
+        resizeRequests.set(requestId, finish);
+        try { codexSocket.send({ type: "command.resize", requestId, processId, size: { cols: term.cols, rows: term.rows } }); }
+        catch { finish(false); }
+      });
+      pendingResize = { key, promise };
+      const ok = await promise;
+      pendingResize = null;
+      return ok;
+    };
+    submitLine.current = async (value: string) => {
       if (!started) return false;
+      if (resizeTimer !== null) { window.clearTimeout(resizeTimer); resizeTimer = null; }
+      // Resize must be acknowledged by the PTY before Readline receives the line.
+      if (!await syncSize()) return false;
       if (pendingInput) flushInput();
       return send("command.write", { data: `${value}\r` });
     };
@@ -100,9 +141,9 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
       resizeTimer = window.setTimeout(() => {
         resizeTimer = null;
         if (started && term.cols >= 20 && term.rows >= 5) {
-          send("command.resize", { size: { cols: term.cols, rows: term.rows } });
+          void syncSize();
         }
-      }, 90);
+      }, 16);
     });
     resize.observe(host.current);
     const themeObserver = new MutationObserver(() => { term.options.theme = terminalTheme(); });
@@ -110,8 +151,9 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
     const start = () => {
       if (started) return;
       try {
+        fit.fit();
         codexSocket.send({ type: "command.exec", requestId: `${processId}-start`, processId,
-          projectId, command: ["/bin/bash", "-i"], tty: true, disableTimeout: true,
+          projectId, command: ["/usr/bin/env", "TERM=xterm-256color", "/bin/bash", "-i"], tty: true, disableTimeout: true,
           size: { cols: term.cols, rows: term.rows } });
         started = true;
       } catch { /* Wait for the socket's open event. */ }
@@ -124,7 +166,7 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
       }
     });
     start();
-    return () => { submitLine.current = () => false; themeObserver.disconnect(); resize.disconnect(); if (inputTimer !== null) window.clearTimeout(inputTimer); if (resizeTimer !== null) window.clearTimeout(resizeTimer); input.dispose(); unsubscribe(); unsubscribeStatus(); if (started) send("command.terminate"); term.dispose(); };
+    return () => { submitLine.current = async () => false; themeObserver.disconnect(); resize.disconnect(); if (inputTimer !== null) window.clearTimeout(inputTimer); if (resizeTimer !== null) window.clearTimeout(resizeTimer); for (const finish of resizeRequests.values()) finish(false); input.dispose(); unsubscribe(); unsubscribeStatus(); if (started) send("command.terminate"); term.dispose(); };
   }, [projectId]);
   return <aside ref={panel} className={`webTerminalPanel uiGlassSurface${visible ? " open" : ""}${resizing.current ? " resizing" : ""}`} style={split ? { flexBasis: `${splitPercent}%` } : undefined} role="dialog" aria-label={`${projectName} 交互终端`}>
     {split ? <div className="webTerminalSplitHandle" role="separator" aria-orientation="horizontal" aria-label="拖动调整终端与文件变更区域高度" aria-valuemin={20} aria-valuemax={75} aria-valuenow={Math.round(splitPercent)} tabIndex={0} onPointerDown={event => {
@@ -146,12 +188,17 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
     }} /> : null}
     <header><strong>终端 · {projectName}</strong><button type="button" onClick={() => { setVisible(false); onClose(); }} aria-label="关闭终端"><X size={17} /></button></header>
     <div ref={host} className="webTerminalCanvas" />
-    <form className="webTerminalCommandLine" onSubmit={event => {
+    <form className="webTerminalCommandLine" onSubmit={async event => {
       event.preventDefault();
-      if (!submitLine.current(line)) return;
-      if (line.trim()) history.current.push(line);
-      historyIndex.current = -1;
-      setLine("");
+      if (submitting.current) return;
+      submitting.current = true;
+      const submitted = line;
+      try {
+        if (!await submitLine.current(submitted)) return;
+        if (submitted.trim()) history.current.push(submitted);
+        historyIndex.current = -1;
+        setLine(current => current === submitted ? "" : current);
+      } finally { submitting.current = false; }
     }}>
       <span aria-hidden="true">›</span>
       <input ref={commandInput} aria-label="即时输入终端命令" title="本地即时输入，Enter 发送；交互程序可直接点击上方终端" autoComplete="off" autoCapitalize="off" spellCheck={false} value={line} onChange={event => { setLine(event.target.value); historyIndex.current = -1; }} onKeyDown={event => {

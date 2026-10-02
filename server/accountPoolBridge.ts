@@ -1,9 +1,11 @@
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { CodexBridge } from "./codexBridge.js";
 import { serverConfig } from "./config.js";
-import { appendLegacyRollbackMarker, removeAppendedRollbackMarker, type AppendedRollbackMarker } from "./legacyRollback.js";
+import { appendLegacyRollbackMarker, removeAppendedRollbackMarker, LegacyRollbackConflictError, type AppendedRollbackMarker } from "./legacyRollback.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -19,12 +21,20 @@ interface AccountPoolFile {
   accounts: AccountPoolEntryConfig[];
   stateFile?: string;
   quotaCacheMs?: number;
+  /** Deprecated compatibility field; pool quota reads never rotate OAuth tokens. */
   authRefreshIntervalMs?: number;
 }
 
 interface PersistedPoolState {
   threadAccounts?: Record<string, string>;
+  quotaSnapshots?: Record<string, { limits: unknown; usage: unknown }>;
+  authFailures?: Record<string, { code: AuthFailureCode; credentialVersion?: number; credentialFingerprint?: string | null }>;
 }
+
+type AuthFailureCode = "refresh_token_reused" | "refresh_token_invalidated" | "refresh_token_expired";
+const AUTH_FAILURE_CODES = new Set<AuthFailureCode>([
+  "refresh_token_reused", "refresh_token_invalidated", "refresh_token_expired"
+]);
 
 export interface AccountPoolRawSnapshot {
   id: string;
@@ -63,6 +73,57 @@ interface AccountRuntime {
   lastCheckedAt: string | null;
   cache: CachedAccountData | null;
   supportedModels: Set<string> | null;
+  authFileStamp: number;
+  credentialFingerprint: string | null;
+  authFailureCode: AuthFailureCode | null;
+  authFailureFingerprint: string | null;
+}
+
+function authCredentialIdentity(auth: JsonRecord): string | null {
+  const tokens = asRecord(auth.tokens);
+  const mode = String(auth.auth_mode ?? auth.authMode ?? "").toLowerCase();
+  const apiKey = [auth.OPENAI_API_KEY, auth.openai_api_key, auth.api_key, auth.apiKey, tokens.OPENAI_API_KEY, tokens.api_key, tokens.apiKey]
+    .find((value): value is string => typeof value === "string" && value.length > 0);
+  if ((mode.includes("api") || mode.includes("key")) && apiKey) {
+    return createHash("sha256").update("api-key\0").update(apiKey).digest("hex");
+  }
+  const refreshToken = tokens.refresh_token;
+  if (typeof refreshToken === "string" && refreshToken.length > 0) {
+    return createHash("sha256").update("refresh-token\0").update(refreshToken).digest("hex");
+  }
+  if (apiKey) return createHash("sha256").update("api-key\0").update(apiKey).digest("hex");
+  return null;
+}
+
+function authCredentialSnapshot(codexHome: string): { stamp: number; fingerprint: string | null } {
+  const file = path.join(codexHome, "auth.json");
+  let descriptor: number | null = null;
+  try {
+    descriptor = fs.openSync(file, "r");
+    const before = fs.fstatSync(descriptor);
+    if (!before.isFile() || before.size > 1024 * 1024) return { stamp: before.mtimeMs, fingerprint: null };
+    const contents = fs.readFileSync(descriptor, "utf8");
+    const after = fs.fstatSync(descriptor);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.mtimeMs !== after.mtimeMs) {
+      return { stamp: after.mtimeMs, fingerprint: null };
+    }
+    const auth = JSON.parse(contents) as JsonRecord;
+    return { stamp: after.mtimeMs, fingerprint: authCredentialIdentity(auth) };
+  } catch {
+    try { return { stamp: fs.statSync(file).mtimeMs, fingerprint: null }; }
+    catch { return { stamp: 0, fingerprint: null }; }
+  } finally {
+    if (descriptor !== null) fs.closeSync(descriptor);
+  }
+}
+
+function permanentAuthCode(message: string): AuthFailureCode | null {
+  const code = message.match(/\b(refresh_token_reused|refresh_token_invalidated|refresh_token_expired)\b/)?.[1];
+  return code && AUTH_FAILURE_CODES.has(code as AuthFailureCode) ? code as AuthFailureCode : null;
+}
+
+function authFailureWarning(code: AuthFailureCode): string {
+  return `account: OAuth refresh unavailable (${code}); credentials need replacement.`;
 }
 
 function asRecord(value: unknown): JsonRecord {
@@ -178,11 +239,24 @@ function accountSupportedModels(codexHome: string): Set<string> | null {
   }
 }
 
-function createAccountBridge(codexHome: string): CodexBridge {
+function createAccountBridge(codexHome: string, accountId: string): CodexBridge {
+  const scope = process.env.CODEX_WEB_ISOLATE_AGENT_SCOPES === "1" ? {
+    unitPrefix: `codex-agent-${accountId.replace(/[^A-Za-z0-9-]/g, "-")}`,
+    slice: "codex-workers.slice",
+    memoryHigh: "3G",
+    memoryMax: "4G",
+    memorySwapMax: "256M"
+  } : undefined;
   return new CodexBridge({
-    command: serverConfig.codexBin,
-    args: accountAppServerArgs(codexHome),
-    env: { ...process.env, CODEX_HOME: codexHome }
+    // The kernel lease spans every app-server refresh, including automatic
+    // native recovery during a turn. It is not just a browser-request mutex.
+    command: "/usr/bin/flock",
+    args: ["--exclusive", "--nonblock", "--no-fork", "--conflict-exit-code", "75",
+      path.join(codexHome, ".web-runtime.lock"), process.execPath,
+      fileURLToPath(new URL("../scripts/run-account-runtime.mjs", import.meta.url)),
+      serverConfig.codexBin, ...accountAppServerArgs(codexHome)],
+    env: { ...process.env, CODEX_HOME: codexHome },
+    scope
   });
 }
 
@@ -200,13 +274,34 @@ export class AccountPoolBridge extends EventEmitter {
   private readonly serverRequestAccounts = new Map<number | string, { bridge: CodexBridge; originalId: number | string }>();
   private readonly stateFile: string;
   private readonly quotaCacheMs: number;
-  private readonly authRefreshIntervalMs: number;
   private accountRefreshInFlight: Promise<void> | null = null;
   private accountRefreshCompletedAt = 0;
-  private authRefreshTimer: NodeJS.Timeout | null = null;
   private nextServerRequestId = 1;
-  private readonly bridgeFactory: (codexHome: string) => CodexBridge;
+  private readonly bridgeFactory: (codexHome: string, accountId: string) => CodexBridge;
   private readonly accountMaintenance = new Map<string, Promise<void>>();
+
+  private markReadyUnlessAuthFailure(account: AccountRuntime): void {
+    if (account.authFailureCode) {
+      account.health = "degraded";
+      account.lastError = authFailureWarning(account.authFailureCode);
+      return;
+    }
+    account.health = "ready";
+    account.lastError = null;
+  }
+
+  private updateCredentialVersion(account: AccountRuntime, next: { stamp: number; fingerprint: string | null }): void {
+    account.authFileStamp = next.stamp;
+    account.credentialFingerprint = next.fingerprint;
+    if (!account.authFailureCode || !account.authFailureFingerprint || !next.fingerprint) return;
+    if (account.authFailureFingerprint === next.fingerprint) return;
+    account.authFailureCode = null;
+    account.authFailureFingerprint = null;
+  }
+
+  private currentCredentialVersion(account: AccountRuntime): { stamp: number; fingerprint: string | null } {
+    return authCredentialSnapshot(account.codexHome);
+  }
 
   static fromFile(filePath: string): AccountPoolBridge {
     const absolute = path.resolve(filePath);
@@ -220,7 +315,7 @@ export class AccountPoolBridge extends EventEmitter {
   constructor(
     config: AccountPoolFile,
     configDirectory = process.cwd(),
-    bridgeFactory: (codexHome: string) => CodexBridge = createAccountBridge
+    bridgeFactory: (codexHome: string, accountId: string) => CodexBridge = createAccountBridge
   ) {
     super();
     this.bridgeFactory = bridgeFactory;
@@ -232,18 +327,31 @@ export class AccountPoolBridge extends EventEmitter {
     this.quotaCacheMs = Number.isInteger(config.quotaCacheMs) && Number(config.quotaCacheMs) >= 5_000
       ? Number(config.quotaCacheMs)
       : 30_000;
-    this.authRefreshIntervalMs = Number.isInteger(config.authRefreshIntervalMs)
-      && Number(config.authRefreshIntervalMs) >= 60_000
-      ? Number(config.authRefreshIntervalMs)
-      : 15 * 60_000;
 
+    const credentialHomes = new Set<string>();
+    const credentialSessions = new Set<string>();
     this.accounts = enabled.map((entry) => {
       const id = safeIdentifier(entry.id, "account id");
       if (this.accountsById.has(id)) {
         throw new Error("Duplicate account pool account id.");
       }
       const codexHome = safeAbsoluteDirectory(entry.codexHome, "CODEX_HOME");
-      const bridge = this.bridgeFactory(codexHome);
+      const canonicalHome = fs.realpathSync(codexHome);
+      if (credentialHomes.has(canonicalHome)) throw new Error("Multiple pool accounts cannot share one credential directory.");
+      credentialHomes.add(canonicalHome);
+      try {
+        const auth = JSON.parse(fs.readFileSync(path.join(codexHome, "auth.json"), "utf8"));
+        const refresh = auth.tokens?.refresh_token;
+        if (typeof refresh === "string" && refresh) {
+          if (credentialSessions.has(refresh)) throw new Error("Multiple pool accounts cannot share one OAuth refresh session.");
+          credentialSessions.add(refresh);
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message === "Multiple pool accounts cannot share one OAuth refresh session.") throw error;
+        // Native auth handling reports a missing/malformed credential file.
+      }
+      const bridge = this.bridgeFactory(codexHome, id);
+      const credential = authCredentialSnapshot(codexHome);
       const runtime: AccountRuntime = {
         id,
         label: safeLabel(entry.label),
@@ -255,7 +363,11 @@ export class AccountPoolBridge extends EventEmitter {
         lastError: null,
         lastCheckedAt: null,
         cache: null,
-        supportedModels: accountSupportedModels(codexHome)
+        supportedModels: accountSupportedModels(codexHome),
+        authFileStamp: credential.stamp,
+        credentialFingerprint: credential.fingerprint,
+        authFailureCode: null,
+        authFailureFingerprint: null
       };
       this.accountsById.set(id, runtime);
       this.forwardEvents(runtime, bridge);
@@ -277,10 +389,49 @@ export class AccountPoolBridge extends EventEmitter {
     });
     bridge.on("status", (status) => {
       const state = asRecord(status).state;
-      account.health = state === "ready" ? "ready" : state === "exited" ? "degraded" : account.health;
+      if (state === "ready") this.markReadyUnlessAuthFailure(account);
+      else if (state === "exited") account.health = "degraded";
       this.emit("status", { ...asRecord(status), accountId: account.id, accountLabel: account.label });
+      if (state === "exited" && asRecord(status).code === 75) {
+        account.lastError = "该账号已有运行时持有凭据锁，已阻止重复启动及并发刷新。";
+        this.emit("accountRuntime", { accountId: account.id, event: "lease_conflict" });
+      }
     });
-    bridge.on("stderr", (message) => this.emit("stderr", `[${account.id}] ${String(message)}`));
+    bridge.on("stderr", (message) => {
+      for (const line of String(message).split("\n")) {
+        if (!line.startsWith("[account-runtime] ")) continue;
+        try {
+          const runtime = asRecord(JSON.parse(line.slice("[account-runtime] ".length)));
+          if (!["started", "exited", "credentials_changed", "watch_failed", "spawn_failed"].includes(String(runtime.event))) continue;
+          this.emit("accountRuntime", {
+            accountId: account.id, event: runtime.event,
+            runtimePid: Number.isInteger(runtime.runtimePid) ? runtime.runtimePid : undefined,
+            nativePid: Number.isInteger(runtime.nativePid) ? runtime.nativePid : undefined,
+            authState: ["present", "missing", "invalid"].includes(String(runtime.authState)) ? runtime.authState : undefined,
+            lastRefresh: typeof runtime.lastRefresh === "string" && /^\d{4}-\d{2}-\d{2}T[0-9:.]+Z$/.test(runtime.lastRefresh) ? runtime.lastRefresh : undefined,
+            previousRefresh: typeof runtime.previousRefresh === "string" && /^\d{4}-\d{2}-\d{2}T[0-9:.]+Z$/.test(runtime.previousRefresh) ? runtime.previousRefresh : undefined,
+            refreshTokenChanged: typeof runtime.refreshTokenChanged === "boolean" ? runtime.refreshTokenChanged : undefined,
+            exitCode: Number.isInteger(runtime.code) ? runtime.code : undefined
+          });
+        } catch { /* An incomplete stderr chunk is not an auth failure. */ }
+      }
+      const code = permanentAuthCode(String(message));
+      if (code && account.authFailureCode !== code) {
+        account.authFailureCode = code;
+        account.authFailureFingerprint = account.credentialFingerprint;
+        account.health = "degraded";
+        account.lastError = authFailureWarning(code);
+        try {
+          this.persistState();
+        } catch {
+          this.emit("errorEvent", "Unable to persist account-pool authentication state.");
+        }
+        // Log only the classification, never native stderr (which may contain
+        // credentials, device codes or user content).
+        this.emit("accountAuth", { accountId: account.id, code, requiresLogin: true });
+      }
+      this.emit("stderr", `[${account.id}] ${String(message)}`);
+    });
     bridge.on("errorEvent", (message) => {
       account.health = "degraded";
       account.lastError = String(message);
@@ -296,6 +447,38 @@ export class AccountPoolBridge extends EventEmitter {
           this.threadAccounts.set(threadId, accountId);
         }
       }
+      for (const [id, failure] of Object.entries(parsed.authFailures ?? {})) {
+        const account = this.accountsById.get(id);
+        if (!account || account.kind !== "codex-account" || !failure || typeof failure !== "object") continue;
+        const code = (failure as { code?: unknown }).code;
+        const credentialVersion = (failure as { credentialVersion?: unknown }).credentialVersion;
+        const persistedFingerprint = (failure as { credentialFingerprint?: unknown }).credentialFingerprint;
+        if (typeof code !== "string" || !AUTH_FAILURE_CODES.has(code as AuthFailureCode)) continue;
+        if (typeof persistedFingerprint === "string" && /^[a-f\d]{64}$/i.test(persistedFingerprint)) {
+          if (account.credentialFingerprint && persistedFingerprint !== account.credentialFingerprint) continue;
+          account.authFailureFingerprint = persistedFingerprint.toLowerCase();
+        } else if (persistedFingerprint !== undefined) {
+          // Malformed identity cannot prove that credentials changed.
+          account.authFailureFingerprint = null;
+        } else if (typeof credentialVersion === "number" && Number.isFinite(credentialVersion) && credentialVersion > 0) {
+          // Legacy state stored only mtime: migrate only on an exact match,
+          // then bind the current private identity in memory.
+          if (account.authFileStamp !== credentialVersion) continue;
+          account.authFailureFingerprint = account.credentialFingerprint;
+        } else {
+          // Missing/unknown version metadata fails closed.
+          account.authFailureFingerprint = null;
+        }
+        account.authFailureCode = code as AuthFailureCode;
+        account.health = "degraded";
+        account.lastError = authFailureWarning(code as AuthFailureCode);
+      }
+      for (const [id, snapshot] of Object.entries(parsed.quotaSnapshots ?? {})) {
+        const account = this.accountsById.get(id);
+        if (!account || account.kind === "api-provider") continue;
+        account.cache = { account: {}, limits: snapshot.limits ?? {}, usage: snapshot.usage ?? {}, expiresAt: 0,
+          errors: ["rateLimits: 上次读取的缓存值，正在重新验证", "usage: 上次读取的缓存值，正在重新验证"] };
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         throw new Error("Unable to read the Codex account-pool state.");
@@ -306,43 +489,36 @@ export class AccountPoolBridge extends EventEmitter {
   private persistState(): void {
     fs.mkdirSync(path.dirname(this.stateFile), { recursive: true, mode: 0o700 });
     const temporary = `${this.stateFile}.${process.pid}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify({ threadAccounts: Object.fromEntries(this.threadAccounts) }, null, 2), { mode: 0o600 });
+    const quotaSnapshots = Object.fromEntries(this.accounts.filter(account => account.kind !== "api-provider" && account.cache)
+      .map(account => [account.id, { limits: account.cache!.limits, usage: account.cache!.usage }]));
+    const authFailures = Object.fromEntries(this.accounts.flatMap(account =>
+      account.kind === "codex-account" && account.authFailureCode && Number.isFinite(account.authFileStamp) && account.authFileStamp > 0
+        ? [[account.id, {
+          code: account.authFailureCode,
+          credentialVersion: account.authFileStamp,
+          credentialFingerprint: account.authFailureFingerprint
+        }]]
+        : []
+    ));
+    fs.writeFileSync(temporary, JSON.stringify({ threadAccounts: Object.fromEntries(this.threadAccounts), quotaSnapshots, authFailures }, null, 2), { mode: 0o600 });
     fs.renameSync(temporary, this.stateFile);
   }
 
   async start(): Promise<void> {
     const results = await Promise.allSettled(this.accounts.map(async (account) => {
       await account.bridge.start();
-      account.health = "ready";
+      this.markReadyUnlessAuthFailure(account);
     }));
     if (results.every((result) => result.status === "rejected")) {
       throw new Error("No Codex account in the pool could start.");
     }
     await this.refreshAccountData(false);
-    this.startAuthRefreshTimer();
   }
 
   stop(): void {
-    if (this.authRefreshTimer) {
-      clearInterval(this.authRefreshTimer);
-      this.authRefreshTimer = null;
-    }
     for (const account of this.accounts) {
       account.bridge.stop();
     }
-  }
-
-  private startAuthRefreshTimer(): void {
-    if (this.authRefreshTimer) return;
-    // Credential upkeep must not depend on a browser tab being open. Since the
-    // account list is built from account-pool.json, every enabled account added
-    // through the pool installer is covered automatically after its restart.
-    this.authRefreshTimer = setInterval(() => {
-      void this.refreshAccountData(true).catch((error) => {
-        this.emit("errorEvent", `Account credential refresh failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
-    }, this.authRefreshIntervalMs);
-    this.authRefreshTimer.unref();
   }
 
   getPendingServerRequests(): Array<{ id: number | string; method: string; params: unknown; receivedAt: string }> {
@@ -369,7 +545,10 @@ export class AccountPoolBridge extends EventEmitter {
     await this.waitForMaintenance(account);
     account.activeRequests += 1;
     try {
-      return await account.bridge.request(method, params, timeoutMs);
+      // Enforce native-owned renewal at the shared transport boundary, also
+      // covering explicit thread-account readers and future host call sites.
+      const requestParams = method === "account/read" ? { ...asRecord(params), refreshToken: false } : params;
+      return await account.bridge.request(method, requestParams, timeoutMs);
     } finally {
       account.activeRequests -= 1;
     }
@@ -394,15 +573,18 @@ export class AccountPoolBridge extends EventEmitter {
       return this.listThreads(params, timeoutMs);
     }
 
-    const account = await this.accountForRequest(method, params);
-    const startingProcessId = method === "command/exec" ? processIdFromParams(params) : null;
+    // Pool callers may read account state, but only Codex itself owns OAuth
+    // refresh. Clamp legacy/direct host account/read requests as well as quota
+    // polling so a caller cannot bypass the native refresh lifecycle.
+    const requestParams = method === "account/read" ? { ...asRecord(params), refreshToken: false } : params;
+    const account = await this.accountForRequest(method, requestParams);
+    const startingProcessId = method === "command/exec" ? processIdFromParams(requestParams) : null;
     // PTY requests stay pending until the shell exits. Follow-up write/resize
     // must resolve to this same account while the original request is running.
     if (startingProcessId) this.processAccounts.set(startingProcessId, account.id);
     try {
-      const result = await this.invokeAccount(account, method, params, timeoutMs);
-      account.health = "ready";
-      account.lastError = null;
+      const result = await this.invokeAccount(account, method, requestParams, timeoutMs);
+      this.markReadyUnlessAuthFailure(account);
       if (method === "thread/start" || method === "thread/fork") {
         const threadId = threadIdFromStartResult(result);
         if (threadId) {
@@ -411,7 +593,7 @@ export class AccountPoolBridge extends EventEmitter {
         }
       }
       if (method === "command/exec/terminate") {
-        const processId = processIdFromParams(params);
+        const processId = processIdFromParams(requestParams);
         if (processId) this.processAccounts.delete(processId);
       }
       if (startingProcessId) this.processAccounts.delete(startingProcessId);
@@ -462,8 +644,7 @@ export class AccountPoolBridge extends EventEmitter {
     if (!account) throw new Error(`Unknown account-pool account: ${accountId}`);
     try {
       const result = await this.invokeAccount(account, "thread/fork", params, timeoutMs);
-      account.health = "ready";
-      account.lastError = null;
+      this.markReadyUnlessAuthFailure(account);
       const threadId = threadIdFromStartResult(result);
       if (threadId) {
         this.threadAccounts.set(threadId, account.id);
@@ -480,7 +661,7 @@ export class AccountPoolBridge extends EventEmitter {
   /** Rewind one stopped legacy turn without changing the thread id. */
   async rollbackLegacyLatest(threadId: string, expectedTurnId: string): Promise<unknown> {
     const account = await this.accountForRequest("thread/read", { threadId });
-    if (this.accountMaintenance.has(account.id)) throw new Error("该账号正在处理另一项会话维护，请稍后重试。");
+    if (this.accountMaintenance.has(account.id)) throw new LegacyRollbackConflictError("该账号正在处理另一项会话维护，请稍后重试。");
     let release!: () => void;
     const barrier = new Promise<void>((resolve) => { release = resolve; });
     this.accountMaintenance.set(account.id, barrier);
@@ -488,35 +669,35 @@ export class AccountPoolBridge extends EventEmitter {
     let stopped = false;
     try {
       if (account.activeRequests || account.bridge.getPendingServerRequests().length) {
-        throw new Error("该账号还有正在处理的请求或审批，请稍后重试撤回。");
+        throw new LegacyRollbackConflictError("该账号还有正在处理的请求或审批，请稍后重试撤回。");
       }
       const loaded = asRecord(await account.bridge.request("thread/loaded/list", {}, 30_000));
       const loadedIds = Array.isArray(loaded.data) ? loaded.data.filter((id): id is string => typeof id === "string") : [];
       for (const loadedId of loadedIds) {
         const snapshot = asRecord(asRecord(await account.bridge.request("thread/read", { threadId: loadedId, includeTurns: false }, 30_000)).thread);
         if (asRecord(snapshot.status).type !== "idle") {
-          throw new Error("该账号还有运行中的会话，不能为撤回而重启 Codex 子进程。");
+          throw new LegacyRollbackConflictError("该账号还有运行中的会话，请等这些任务结束后重试；草稿和附件仍保留。");
         }
         const goal = asRecord(await account.bridge.request("thread/goal/get", { threadId: loadedId }, 30_000));
         if (asRecord(goal.goal).status === "active") {
-          throw new Error("该账号还有持续目标在运行，请稍后重试撤回。");
+          throw new LegacyRollbackConflictError("该账号还有持续目标在运行，请稍后重试撤回。");
         }
         const queue = asRecord(await account.bridge.request("thread/queue/list", { threadId: loadedId, limit: 1 }, 30_000));
         if (Array.isArray(queue.data) && queue.data.length) {
-          throw new Error("该账号还有排队消息，请稍后重试撤回。");
+          throw new LegacyRollbackConflictError("该账号还有排队消息，请稍后重试撤回。");
         }
       }
       const before = asRecord(asRecord(await account.bridge.request("thread/read", { threadId, includeTurns: true }, 60_000)).thread);
       const turns = Array.isArray(before.turns) ? before.turns.map(asRecord) : [];
       const last = turns.at(-1);
       if (before.historyMode !== "legacy" || !last || last.id !== expectedTurnId) {
-        throw new Error("只能撤回当前 legacy 会话的最后一轮；请刷新后重试。");
+        throw new LegacyRollbackConflictError("只能撤回当前会话的最后一轮；请刷新后重试。");
       }
       if (!["completed", "failed", "interrupted"].includes(String(last.status))) {
-        throw new Error("最后一轮仍在运行，请等待完成或先终止回答。");
+        throw new LegacyRollbackConflictError("最后一轮仍在运行，请等待完成或先终止回答。");
       }
       if (!Array.isArray(last.items) || !last.items.some((item) => asRecord(item).type === "userMessage")) {
-        throw new Error("最后一轮不是用户提问，不能自动撤回。");
+        throw new LegacyRollbackConflictError("最后一轮不是用户提问，不能自动撤回。");
       }
       if (typeof before.path !== "string" || !before.path) throw new Error("Codex 未提供该会话的日志路径。");
       await account.bridge.stopAndWait();
@@ -530,7 +711,7 @@ export class AccountPoolBridge extends EventEmitter {
         throw new Error("撤回标记未被当前 Codex 正确重放，正在恢复原记录。");
       }
       marker = null;
-      account.health = "ready";
+      this.markReadyUnlessAuthFailure(account);
       return { thread: after };
     } catch (error) {
       let recoveryError: unknown = null;
@@ -680,12 +861,16 @@ export class AccountPoolBridge extends EventEmitter {
           return;
         }
         const previous = account.cache;
-        // Refresh authentication first, then read quota. Running all three
-        // calls in parallel races an expired access token against its refresh
-        // and leaves the quota card blank until the next cache cycle.
+        const credential = this.currentCredentialVersion(account);
+        this.updateCredentialVersion(account, credential);
+        // Host quota polling only reads account state. Native Codex owns token
+        // staleness refresh and recovery during actual model requests.
         const [accountSettled] = await Promise.allSettled([
-          this.invokeAccount(account, "account/read", { refreshToken: true }, 12_000)
+          this.invokeAccount(account, "account/read", { refreshToken: false }, 12_000)
         ]);
+        this.updateCredentialVersion(account, this.currentCredentialVersion(account));
+        const accountRead = accountSettled.status === "fulfilled" ? asRecord(accountSettled.value) : null;
+        const missingAuth = accountRead?.account === null && accountRead.requiresOpenaiAuth !== false;
         const [limitsSettled, usageSettled] = await Promise.allSettled([
           this.invokeAccount(account, "account/rateLimits/read", undefined, 12_000),
           this.invokeAccount(account, "account/usage/read", undefined, 12_000)
@@ -694,6 +879,15 @@ export class AccountPoolBridge extends EventEmitter {
         const errors = results.flatMap((result, index) => result.status === "rejected"
           ? [`${["account", "rateLimits", "usage"][index]}: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`]
           : []);
+        if (missingAuth) {
+          const error = `account: 登录失效${account.authFailureCode ? `（${account.authFailureCode}）` : ""}，请重新完成设备授权；反复刷新不能恢复已失效的凭据。`;
+          errors.unshift(error);
+          if (previous?.errors[0] !== error) {
+            this.emit("accountAuth", { accountId: account.id, code: account.authFailureCode ?? "account_missing", requiresLogin: true });
+          }
+        } else if (account.authFailureCode) {
+          errors.unshift(authFailureWarning(account.authFailureCode));
+        }
         account.cache = {
           // A transient proxy/OpenAI failure must not erase the last known-good
           // values. The error/health fields still expose that this refresh was
@@ -710,6 +904,7 @@ export class AccountPoolBridge extends EventEmitter {
         account.lastError = errors[0] ?? null;
       })).then(() => {
         this.accountRefreshCompletedAt = Date.now();
+        this.persistState();
       }).finally(() => {
         this.accountRefreshInFlight = null;
       });

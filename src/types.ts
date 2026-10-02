@@ -366,6 +366,32 @@ export interface ThreadReadResponse {
   history?: ThreadHistoryPage;
 }
 
+export interface SubagentThreadSummary {
+  id: string;
+  name: string;
+  parentThreadId: string;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  state: string;
+  updatedAt?: number | string | null;
+  createdAt?: string | null;
+  lastTaskAt?: string | null;
+}
+
+export interface SubagentDirectoryPage {
+  total: number;
+  activeCount: number;
+  historyCount: number;
+  unknownCount: number;
+  matchedCount?: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+}
+export interface SubagentDirectoryResponse {
+  data: SubagentThreadSummary[];
+  page?: SubagentDirectoryPage;
+}
+
 export interface ThreadHistoryPage {
   totalItems: number;
   returnedItems: number;
@@ -416,6 +442,7 @@ export interface LiveTurnState {
 }
 
 export interface LiveToolItem {
+  collaboration?: Record<string, unknown>;
   sourceItemId?: string;
   itemId: string;
   threadId: string | null;

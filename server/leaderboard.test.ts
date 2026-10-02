@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { apiLeaderboardCycleWindow, mergeAccountLeaderboards, usageInLeaderboardCycle, userIdFromSessionCwd } from "./routes.js";
+import path from "node:path";
+import { serverConfig } from "./config.js";
+import { apiLeaderboardCycleWindow, applyAccruedTrackedQuota, mergeAccountLeaderboards, usageInLeaderboardCycle, userIdFromSessionCwd } from "./routes.js";
 
 const tokens = (totalTokens: number) => ({
   inputTokens: totalTokens,
@@ -11,6 +13,14 @@ const tokens = (totalTokens: number) => ({
 });
 
 describe("API-provider leaderboard usage", () => {
+  it("shows accrued tracked quota rather than diluting it with token share", () => {
+    const board = { currentCycle: { users: [{ userId: "quotaUser", quotaPercent: 29.7 }, { userId: "other", quotaPercent: 10 }] } } as never;
+    const sources = [{ id: "0901", kind: "codex-account", quota: { rateLimits: { primary: { resetsAt: 1000000 } } } }] as never;
+    const ledger = { "0901": { resetAt: 1000002, userCycleQuotaPercent: 78 } } as never;
+    const result = applyAccruedTrackedQuota(board, sources, ledger, "quotaUser");
+    expect(result.currentCycle.users[0].quotaPercent).toBe(78);
+    expect(result.currentCycle.users[1].quotaPercent).toBe(10);
+  });
   it("counts API events by timestamp in the visible GPT quota window", () => {
     const window = apiLeaderboardCycleWindow([
       { resetAt: 1_000_000, resetWindowMins: 60 },
@@ -32,11 +42,12 @@ describe("API-provider leaderboard usage", () => {
   });
 
   it("recognizes a registered user's legacy home directory without guessing arbitrary folders", () => {
-    const isKnown = (id: string) => id === "zyr";
-    const workspaceRoot = "/home/ls/codex_zerotier_remote/users";
-    expect(userIdFromSessionCwd("/home/ls/zyr/forgeloop", isKnown, workspaceRoot)).toBe("zyr");
-    expect(userIdFromSessionCwd("/home/ls/unknown/project", isKnown, workspaceRoot)).toBeNull();
-    expect(userIdFromSessionCwd("/home/ls/codex_zerotier_remote/users/gyj/project", isKnown, workspaceRoot)).toBe("gyj");
+    const isKnown = (id: string) => id === "member-a";
+    const usersRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT || path.join(serverConfig.dataDir, "users");
+    const homeRoot = path.dirname(path.dirname(usersRoot));
+    expect(userIdFromSessionCwd(path.join(homeRoot, "member-a", "project"), isKnown)).toBe("member-a");
+    expect(userIdFromSessionCwd(path.join(homeRoot, "unknown", "project"), isKnown)).toBeNull();
+    expect(userIdFromSessionCwd(path.join(usersRoot, "qaUser", "project"), isKnown)).toBe("qaUser");
   });
 
   it("falls back to seven days when no GPT reset is available", () => {

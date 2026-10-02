@@ -733,6 +733,12 @@ async function parseThreadFromJsonl(
     }
 
     if (record.type === "event_msg") {
+      if (payload.type === "thread_rolled_back" && Number.isSafeInteger(payload.num_turns) && Number(payload.num_turns) > 0) {
+        const ids = [...turns.keys()].slice(-Number(payload.num_turns));
+        for (const id of ids) turns.delete(id);
+        currentTurnId = null;
+        continue;
+      }
       if (payload.type === "task_started" && typeof payload.turn_id === "string") {
         currentTurnId = payload.turn_id;
         const turn = ensureTurn(currentTurnId);

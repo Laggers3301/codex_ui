@@ -1,0 +1,78 @@
+.threadActivityStrip, .subagentToolCard { --activity-content: color-mix(in srgb, var(--ui-content-muted) 94%, var(--ui-content)); color: var(--ui-content-muted); color: var(--activity-content); }
+.threadActivityStrip { width: 100%; min-width: 0; font-size: 12px; }
+.composerBody > .composerThreadActivity { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0; min-width: 0; order: 5; }
+.composerBody > .composerThreadActivity:empty { display: none; }
+.composerBody > .composerThreadActivity:not(:empty) {
+  padding-bottom: 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--ui-content) 12%, transparent);
+}
+.composerRunNotice { padding: 5px 2px; color: var(--ui-content-muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.threadActivityHeading { display: flex; align-items: center; gap: 7px; padding: 7px 2px; min-width: 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.threadActivityIcon { display: inline-flex; width: 16px; height: 16px; flex: 0 0 16px; align-items: center; justify-content: center; }
+.threadActivityIcon svg { display: block; width: 16px; height: 16px; }
+.activityChevron { display: inline-flex; transition: transform var(--ui-popover-motion-duration, .42s) var(--ui-popover-motion-ease, cubic-bezier(.16,1,.3,1)); }
+.activityChevron.open { transform: rotate(180deg); }
+.subagentRows { padding: 3px 2px 9px; max-height: 160px; overflow-y: auto; }
+.subagentActivity > .toolReveal { width: 100%; }
+.subagentHistoryButton, .subagentMoreActivity { border-radius: 8px; transition: background-color var(--ui-popover-fade-duration) var(--ui-popover-motion-ease), color var(--ui-popover-fade-duration) var(--ui-popover-motion-ease); }
+.subagentHistoryButton { width: 100%; padding: 5px 2px; }
+.subagentHistoryButton:disabled { cursor: default; opacity: 1; }
+.subagentHistoryUncertain { margin-left: auto; font-size: 11px; }
+.subagentMoreActivity { padding: 5px 2px; border: 0; background: transparent; color: var(--ui-content-muted); font: inherit; cursor: pointer; }
+@media (hover: hover) { .subagentHistoryButton:hover:not(:disabled), .subagentMoreActivity:hover { background: var(--ui-hover); } }
+.subagentRow { display: flex; align-items: center; gap: 7px; width: 100%; min-width: 0; padding: 5px 0; border: 0; background: transparent; color: inherit; font: inherit; font-size: 12px; line-height: 1.45; text-align: left; cursor: pointer; }
+.subagentRow:disabled { cursor: default; opacity: 1; }
+.subagentSummary { margin: 3px 0 8px 13px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; color: inherit; }
+.subagentName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.subagentModel { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagentState { white-space: nowrap; font-size: 11px; }
+.subagentRow .subagentState { display: inline-flex; align-items: center; gap: 3px; }
+.subagentRow .subagentState.state-completed { color: var(--ui-diff-comment-text); }
+.subagentRow .subagentState.state-failed { color: var(--red); }
+.subagentRunningShimmer {
+  color: transparent !important;
+  -webkit-text-fill-color: transparent;
+  background-image: var(--ui-work-shimmer-gradient);
+  background-size: 200% 100%;
+  background-repeat: repeat-x;
+  background-clip: text;
+  -webkit-background-clip: text;
+  animation: v2-seamless-shimmer 2.35s linear infinite;
+}
+.subagentCompletionIcon, .subagentCompletionIcon svg { display: block; width: 12px; height: 12px; }
+.subagentRow { border-radius: 7px; transition: background-color var(--ui-popover-fade-duration) var(--ui-popover-motion-ease); }
+.subagentRow:hover:not(:disabled) { background: var(--ui-hover); }
+.subagentDot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: 0 0 6px; }
+.subagentDot.state-running { background: var(--teal); animation: subagentPulse 1.7s ease-in-out infinite; }
+.subagentDot.state-completed { background: var(--ui-diff-comment-text); }
+.subagentDot.state-failed { background: var(--red); }
+.subagentToolCard { padding: 7px 0; font-size: 12px; }
+.messageItem.kind-tool.subagentMessage { display: block; max-height: none; padding: 0; overflow: visible; cursor: default; }
+.messageItem.kind-tool.subagentMessage::before, .messageItem.kind-tool.subagentMessage::after { display: none; }
+.subagentOperation { display: flex; align-items: center; gap: 7px; }
+.subagentMessageDelivery .subagentOperation { min-width: 0; white-space: nowrap; }
+.subagentDeliveryAction { flex: none; }
+.subagentRecipients { display: flex; align-items: center; gap: 7px; min-width: 0; overflow: hidden; }
+.subagentRecipient { display: inline-flex; align-items: center; gap: 5px; min-width: 0; padding: 0; border: 0; border-radius: 5px; background: transparent; color: inherit; font: inherit; line-height: inherit; text-align: left; }
+button.subagentRecipient { cursor: pointer; transition: background-color var(--ui-popover-fade-duration) var(--ui-popover-motion-ease); }
+button.subagentRecipient:hover { background: var(--ui-hover); }
+button.subagentRecipient:focus-visible { outline: 2px solid var(--ui-content-muted); outline-offset: 2px; }
+.subagentRecipient > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subagentToolCard p { margin: 7px 0 2px; overflow-wrap: anywhere; font-size: inherit; }
+.goalProgressRow { --goal-hover-background: rgb(255 255 255 / 4%); display: flex; align-items: center; gap: 3px; min-width: 0; }
+:root[data-theme="light"] .goalProgressRow { --goal-hover-background: rgb(0 0 0 / 3.5%); }
+.goalProgressRow > button { border-radius: 8px; transition: background-color var(--ui-popover-fade-duration, .3s) var(--ui-popover-motion-ease, cubic-bezier(.16,1,.3,1)); }
+.goalProgressRow .threadActivityHeading { flex: 1; overflow: hidden; }
+.goalObjective { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.goalProgressStatus { flex-shrink: 0; }
+.goalProgressRow > button:not(.threadActivityHeading) { display: inline-flex; align-items: center; justify-content: center; min-width: 28px; min-height: 28px; padding: 4px; border: 0; background: transparent; color: inherit; cursor: pointer; }
+.goalProgressRow > .threadActivityHeading { justify-content: flex-start; }
+.threadActivityHeading:focus-visible, .subagentRow:focus-visible, .goalProgressRow > button:focus-visible { outline: 2px solid var(--ui-content-muted); outline-offset: 2px; border-radius: 7px; }
+@media (hover: hover) { .goalProgressRow > button:hover:not(:disabled) { background-color: var(--goal-hover-background); } }
+.goalProgressRow > button:disabled { opacity: .45; cursor: default; }
+.goalProgressDetails { padding: 2px 2px 9px; max-height: 160px; overflow-y: auto; }
+.goalProgressDetails p { margin: 0 0 5px; overflow-wrap: anywhere; }
+.goalProgressDetails [role=alert] { color: var(--red); }
+@keyframes subagentPulse { 50% { opacity: .45; } }
+@media (max-width:720px) { .subagentModel { max-width: 86px; } .goalObjective { display: none; } .goalProgressRow > button { min-width: 30px; min-height: 30px; } }
+@media (prefers-reduced-motion:reduce) { .subagentDot.state-running { animation: none; } .subagentRunningShimmer { animation: none; background: none; color: inherit !important; -webkit-text-fill-color: currentColor; } .activityChevron, .goalProgressRow > button, .subagentHistoryButton, .subagentMoreActivity { transition: none; } }

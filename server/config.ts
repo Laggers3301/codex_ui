@@ -20,8 +20,8 @@ function positiveNumberFromEnv(value: string | undefined, fallback: number): num
 
 export const serverConfig = {
   host: process.env.CODEX_WEB_HOST ?? "0.0.0.0",
-  port: Number(process.env.CODEX_WEB_PORT ?? 4573),
-  projectRoot: path.resolve(process.env.CODEX_WEB_PROJECT_ROOT ?? "/Volumes/DevDrive/program"),
+  port: Number(process.env.CODEX_WEB_PORT ?? 4576),
+  projectRoot: path.resolve(process.env.CODEX_WEB_PROJECT_ROOT ?? process.cwd()),
   dataDir: path.resolve(process.env.CODEX_WEB_DATA_DIR ?? ".codex-web"),
   codexBin: process.env.CODEX_WEB_CODEX_BIN ?? "codex",
   accountPoolFile: process.env.CODEX_WEB_ACCOUNT_POOL_FILE ?? "",
@@ -29,18 +29,18 @@ export const serverConfig = {
   authUser: process.env.CODEX_WEB_AUTH_USER ?? "",
   authPassword: process.env.CODEX_WEB_AUTH_PASSWORD ?? "",
   authMode: process.env.CODEX_WEB_AUTH_MODE ?? "member",
-  defaultAuthPassword: process.env.CODEX_WEB_DEFAULT_PASSWORD ?? "ls",
+  defaultAuthPassword: process.env.CODEX_WEB_DEFAULT_PASSWORD ?? "",
   authUsersFile: process.env.CODEX_WEB_AUTH_USERS_FILE ?? "",
   // Other Codex Web instances that contribute to the shared token leaderboard.
   leaderboardPeers: csvFromEnv(process.env.CODEX_WEB_LEADERBOARD_PEERS),
   leaderboardPeerToken: process.env.CODEX_WEB_LEADERBOARD_PEER_TOKEN ?? "",
-  leaderboardAccountLabel: process.env.CODEX_WEB_LEADERBOARD_ACCOUNT_LABEL ?? "260707",
+  leaderboardAccountLabel: process.env.CODEX_WEB_LEADERBOARD_ACCOUNT_LABEL ?? "default",
   leaderboardPeerLabels: csvFromEnv(process.env.CODEX_WEB_LEADERBOARD_PEER_LABELS),
-  trackedQuotaUser: (process.env.CODEX_WEB_TRACKED_QUOTA_USER ?? "lzc").trim(),
+  trackedQuotaUser: (process.env.CODEX_WEB_TRACKED_QUOTA_USER ?? "").trim(),
   trackedQuotaDailyLimitPercent: positiveNumberFromEnv(process.env.CODEX_WEB_TRACKED_QUOTA_DAILY_LIMIT_PERCENT, 50),
-  trackedQuotaAllowedAccountId: (process.env.CODEX_WEB_TRACKED_QUOTA_ALLOWED_ACCOUNT_ID ?? "260901").trim(),
-  trackedQuotaTimeZone: process.env.CODEX_WEB_TRACKED_QUOTA_TIME_ZONE ?? "Asia/Shanghai",
-  // Configured only on little-right.  The browser never receives this SSH
+  trackedQuotaAllowedAccountId: (process.env.CODEX_WEB_TRACKED_QUOTA_ALLOWED_ACCOUNT_ID ?? "").trim(),
+  trackedQuotaTimeZone: process.env.CODEX_WEB_TRACKED_QUOTA_TIME_ZONE ?? "UTC",
+  // Configured only on the receiving instance. The browser never receives this SSH
   // destination; it is used server-side after the logged-in user is resolved.
   handoffSourceHost: process.env.CODEX_WEB_HANDOFF_SOURCE_HOST ?? "",
   handoffSourceUser: process.env.CODEX_WEB_HANDOFF_SOURCE_USER ?? "",

@@ -63,6 +63,416 @@ function candidate(
 }
 
 describe("account-pool routing policy", () => {
+  it("retries transient account-state read failures without rotating credentials", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-01T00:00:00Z"));
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-retry-"));
+    const authPath = path.join(temporary, "auth.json");
+    const fixture = JSON.stringify({ tokens: { refresh_token: "fixture-only" } });
+    fs.writeFileSync(authPath, fixture, { mode: 0o600 });
+    class RetryBridge extends QuotaCodexBridge {
+      fail = true;
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        if (method === "account/read" && this.fail) {
+          this.requests.push({ method, params });
+          throw new Error("temporary transport timeout");
+        }
+        return super.request(method, params);
+      }
+    }
+    const fake = new RetryBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => fake as unknown as CodexBridge);
+    try {
+      expect((await pool.refreshAccountData(true))[0].health).toBe("degraded");
+      expect(fs.readFileSync(authPath, "utf8")).toBe(fixture);
+      fake.fail = false;
+      vi.setSystemTime(Date.now() + 61_000);
+      expect((await pool.refreshAccountData(true))[0].health).toBe("ready");
+      expect(fake.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([{ refreshToken: false }, { refreshToken: false }]);
+      expect(fs.readFileSync(authPath, "utf8")).toBe(fixture);
+    } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("coalesces twenty concurrent quota readers into one account-state read", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-concurrent-"));
+    const fake = new QuotaCodexBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => fake as unknown as CodexBridge);
+    try {
+      const authEvents: Array<{ code: string }> = [];
+      pool.on("accountAuth", event => authEvents.push(event));
+      const results = await Promise.all(Array.from({ length: 20 }, () => pool.refreshAccountData(true)));
+      expect(results.every(r => r[0].health === "ready")).toBe(true);
+      expect(fake.requests.filter(r => r.method === "account/read")).toHaveLength(1);
+      expect(fake.requests.filter(r => r.method === "account/rateLimits/read")).toHaveLength(1);
+      expect(authEvents).toEqual([]);
+    } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("rejects duplicate credential directories and copied OAuth refresh sessions", () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-duplicate-auth-"));
+    const a = path.join(temporary, "a"), b = path.join(temporary, "b");
+    fs.mkdirSync(a); fs.mkdirSync(b);
+    const create = (homes: string[]) => new AccountPoolBridge({ accounts: homes.map((codexHome, index) => ({ id: `a${index}`, label: `a${index}`, codexHome })), stateFile: "state.json" }, temporary, () => new FakeCodexBridge() as unknown as CodexBridge);
+    try {
+      expect(() => create([a, a])).toThrow("share one credential directory");
+      for (const home of [a, b]) fs.writeFileSync(path.join(home, "auth.json"), JSON.stringify({ tokens: { refresh_token: "fixture-only" } }));
+      expect(() => create([a, b])).toThrow("share one OAuth refresh session");
+    } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+  it("keeps account reads non-rotating across repeated forced quota refreshes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-01T00:00:00Z"));
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-cadence-"));
+    const fake = new QuotaCodexBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => fake as unknown as CodexBridge);
+    try {
+      await pool.refreshAccountData(true);
+      for (let i = 0; i < 3; i++) {
+        vi.setSystemTime(Date.now() + 6_000);
+        await pool.refreshAccountData(true);
+      }
+      expect(fake.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([
+        { refreshToken: false }, { refreshToken: false }, { refreshToken: false }, { refreshToken: false }
+      ]);
+    } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("keeps last known credits across restart and labels failed reads as cached", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-credit-restart-"));
+    class CreditsBridge extends QuotaCodexBridge {
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        const response = await super.request(method, params);
+        if (method === "account/rateLimits/read") return { rateLimits: { primary: { usedPercent: 100 }, credits: { balance: "62500", hasCredits: true, unlimited: false } } };
+        return response;
+      }
+    }
+    const config = { accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" };
+    const firstBridge = new CreditsBridge();
+    const first = new AccountPoolBridge(config, temporary, () => firstBridge as unknown as CodexBridge);
+    let second: AccountPoolBridge | undefined;
+    try {
+      await first.refreshAccountData(true);
+      first.stop();
+      const nextBridge = new CreditsBridge(); nextBridge.failLimits = true;
+      second = new AccountPoolBridge(config, temporary, () => nextBridge as unknown as CodexBridge);
+      const snapshot = await second.refreshAccountData(true);
+      expect(snapshot[0].limits).toMatchObject({ rateLimits: { credits: { balance: "62500" } } });
+      expect(snapshot[0].errors.some(error => error.startsWith("rateLimits:"))).toBe(true);
+      expect(snapshot[0].health).toBe("degraded");
+    } finally { first.stop(); second?.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("reports a missing account, preserves terminal auth state and detects new device credentials", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-01T00:00:00Z"));
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-relogin-"));
+    fs.writeFileSync(path.join(temporary, "auth.json"), JSON.stringify({ tokens: { refresh_token: "fixture-old" } }), { mode: 0o600 });
+    class LoginBridge extends QuotaCodexBridge {
+      signedIn = false;
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        if (method === "account/read" && !this.signedIn) {
+          this.requests.push({ method, params });
+          this.emit("stderr", 'Failed to refresh token: refresh_token_reused');
+          return { account: null, requiresOpenaiAuth: true };
+        }
+        return super.request(method, params);
+      }
+    }
+    const fake = new LoginBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => fake as unknown as CodexBridge);
+    try {
+      const first = await pool.refreshAccountData(true);
+      expect(first[0].health).toBe("degraded");
+      expect(first[0].lastError).toContain("refresh_token_reused");
+      vi.setSystemTime(Date.now() + 16 * 60_000);
+      await pool.refreshAccountData(true);
+      expect(fake.requests.filter(r => r.method === "account/read").at(-1)?.params).toEqual({ refreshToken: false });
+      fake.signedIn = true;
+      fs.writeFileSync(path.join(temporary, "auth.json"), JSON.stringify({ tokens: { refresh_token: "fixture-new" } }), { mode: 0o600 });
+      vi.setSystemTime(Date.now() + 6_000);
+      const recovered = await pool.refreshAccountData(true);
+      expect(fake.requests.filter(r => r.method === "account/read").at(-1)?.params).toEqual({ refreshToken: false });
+      expect(recovered[0].health).toBe("ready");
+      expect(recovered[0].errors).toEqual([]);
+    } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("persists a terminal refresh failure without exposing its credential fingerprint", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-failure-state-"));
+    const authPath = path.join(temporary, "auth.json");
+    const statePath = path.join(temporary, "state.json");
+    fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: "fixture-only" } }), { mode: 0o600 });
+    class TerminalRefreshBridge extends QuotaCodexBridge {
+      persistedAtFailure: unknown;
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        if (method === "account/read") {
+          this.requests.push({ method, params });
+          this.emit("stderr", "Failed to refresh token: refresh_token_reused");
+          this.persistedAtFailure = JSON.parse(fs.readFileSync(statePath, "utf8"));
+          return { account: { type: "chatgpt", planType: "pro" } };
+        }
+        return super.request(method, params);
+      }
+    }
+    const config = { accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" };
+    const firstBridge = new TerminalRefreshBridge();
+    const first = new AccountPoolBridge(config, temporary, () => firstBridge as unknown as CodexBridge);
+    let second: AccountPoolBridge | undefined;
+    const publicAuthEvents: unknown[] = [];
+    first.on("accountAuth", event => publicAuthEvents.push(event));
+    try {
+      const firstSnapshot = await first.refreshAccountData(true);
+      expect(firstSnapshot[0].health).toBe("degraded");
+      expect(firstSnapshot[0].errors[0]).toContain("refresh_token_reused");
+      const persistedFailure = (firstBridge.persistedAtFailure as { authFailures: Record<string, { code: string; credentialVersion: number; credentialFingerprint?: string }> }).authFailures.a;
+      expect(persistedFailure).toMatchObject({ code: "refresh_token_reused", credentialVersion: fs.statSync(authPath).mtimeMs });
+      expect(persistedFailure.credentialFingerprint).toMatch(/^[a-f\d]{64}$/i);
+      const stateText = fs.readFileSync(statePath, "utf8");
+      expect(stateText).not.toContain("fixture-only");
+      expect(stateText).not.toContain("\"tokens\"");
+      expect(JSON.stringify({ snapshot: firstSnapshot, events: publicAuthEvents })).not.toContain(persistedFailure.credentialFingerprint);
+      first.stop();
+
+      const nextBridge = new QuotaCodexBridge();
+      second = new AccountPoolBridge(config, temporary, () => nextBridge as unknown as CodexBridge);
+      const nextSnapshot = await second.refreshAccountData(true);
+      expect(nextBridge.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([{ refreshToken: false }]);
+      expect(nextSnapshot[0].health).toBe("degraded");
+      expect(nextSnapshot[0].errors[0]).toContain("refresh_token_reused");
+    } finally { first.stop(); second?.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("clears a persisted terminal refresh failure when the refresh-session identity changes", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-failure-version-"));
+    const authPath = path.join(temporary, "auth.json");
+    const statePath = path.join(temporary, "state.json");
+    const writeAuth = (marker: string) => fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: marker } }), { mode: 0o600 });
+    writeAuth("fixture-old");
+    class TerminalRefreshBridge extends QuotaCodexBridge {
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        if (method === "account/read") {
+          this.requests.push({ method, params });
+          this.emit("stderr", "Failed to refresh token: refresh_token_expired");
+          return { account: { type: "chatgpt", planType: "pro" } };
+        }
+        return super.request(method, params);
+      }
+    }
+    const config = { accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" };
+    const first = new AccountPoolBridge(config, temporary, () => new TerminalRefreshBridge() as unknown as CodexBridge);
+    let second: AccountPoolBridge | undefined;
+    try {
+      await first.refreshAccountData(true);
+      first.stop();
+      const oldMtime = fs.statSync(authPath).mtime;
+      writeAuth("fixture-new");
+      fs.utimesSync(authPath, oldMtime, oldMtime);
+      expect(fs.statSync(authPath).mtime.getTime()).toBe(oldMtime.getTime());
+
+      const nextBridge = new QuotaCodexBridge();
+      second = new AccountPoolBridge(config, temporary, () => nextBridge as unknown as CodexBridge);
+      const snapshot = await second.refreshAccountData(true);
+      expect(nextBridge.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([{ refreshToken: false }]);
+      expect(snapshot[0].health).toBe("ready");
+      expect(snapshot[0].errors).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(statePath, "utf8")).authFailures).toEqual({});
+    } finally { first.stop(); second?.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("does not clear a terminal refresh failure when the auth file is touched or reformatted with the same token", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-failure-touch-"));
+    const authPath = path.join(temporary, "auth.json");
+    const statePath = path.join(temporary, "state.json");
+    fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: "fixture-same" } }), { mode: 0o600 });
+    class TerminalRefreshBridge extends QuotaCodexBridge {
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        if (method === "account/read") {
+          this.requests.push({ method, params });
+          this.emit("stderr", "Failed to refresh token: refresh_token_reused");
+          return { account: { type: "chatgpt", planType: "pro" } };
+        }
+        return super.request(method, params);
+      }
+    }
+    const config = { accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" };
+    const first = new AccountPoolBridge(config, temporary, () => new TerminalRefreshBridge() as unknown as CodexBridge);
+    let second: AccountPoolBridge | undefined;
+    try {
+      await first.refreshAccountData(true);
+      first.stop();
+      const oldTime = fs.statSync(authPath).mtime;
+      fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: "fixture-same" } }, null, 2), { mode: 0o600 });
+      const touchedTime = new Date(Math.max(Date.now(), oldTime.getTime() + 2_000));
+      fs.utimesSync(authPath, touchedTime, touchedTime);
+
+      const nextBridge = new QuotaCodexBridge();
+      second = new AccountPoolBridge(config, temporary, () => nextBridge as unknown as CodexBridge);
+      const snapshot = await second.refreshAccountData(true);
+      expect(nextBridge.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([{ refreshToken: false }]);
+      expect(snapshot[0].health).toBe("degraded");
+      expect(snapshot[0].errors[0]).toContain("refresh_token_reused");
+      expect(JSON.parse(fs.readFileSync(statePath, "utf8")).authFailures.a.credentialFingerprint).toMatch(/^[a-f\d]{64}$/i);
+    } finally { first.stop(); second?.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("migrates legacy numeric failures only on an exact mtime match and binds current token identity", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-failure-legacy-version-"));
+    const authPath = path.join(temporary, "auth.json");
+    const statePath = path.join(temporary, "state.json");
+    fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: "fixture-legacy" } }), { mode: 0o600 });
+    fs.writeFileSync(statePath, JSON.stringify({ authFailures: { a: {
+      code: "refresh_token_reused", credentialVersion: fs.statSync(authPath).mtimeMs
+    } } }));
+    const fake = new QuotaCodexBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => fake as unknown as CodexBridge);
+    try {
+      const snapshot = await pool.refreshAccountData(true);
+      expect(snapshot[0].health).toBe("degraded");
+      const saved = JSON.parse(fs.readFileSync(statePath, "utf8")).authFailures.a;
+      expect(saved.credentialFingerprint).toMatch(/^[a-f\d]{64}$/i);
+      expect(fake.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([{ refreshToken: false }]);
+    } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("fails closed for malformed credential identity metadata", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-failure-unknown-"));
+    const authPath = path.join(temporary, "auth.json");
+    const statePath = path.join(temporary, "state.json");
+    fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: "fixture-before" } }), { mode: 0o600 });
+    fs.writeFileSync(statePath, JSON.stringify({ authFailures: { a: {
+      code: "refresh_token_invalidated", credentialVersion: "unknown", credentialFingerprint: "malformed"
+    } } }));
+    const fake = new QuotaCodexBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => fake as unknown as CodexBridge);
+    let next: AccountPoolBridge | undefined;
+    try {
+      const first = await pool.refreshAccountData(true);
+      expect(first[0].health).toBe("degraded");
+      expect(JSON.parse(fs.readFileSync(statePath, "utf8")).authFailures.a.credentialFingerprint).toBeNull();
+      pool.stop();
+
+      fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: "fixture-after" } }), { mode: 0o600 });
+      const touched = new Date(Date.now() + 2_000);
+      fs.utimesSync(authPath, touched, touched);
+      const nextBridge = new QuotaCodexBridge();
+      next = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => nextBridge as unknown as CodexBridge);
+      const second = await next.refreshAccountData(true);
+      expect(second[0].health).toBe("degraded");
+      expect(nextBridge.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([{ refreshToken: false }]);
+    } finally { pool.stop(); next?.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("uses the active API-key identity instead of a stale OAuth token when auth mode is API key", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-failure-apikey-"));
+    const authPath = path.join(temporary, "auth.json");
+    const statePath = path.join(temporary, "state.json");
+    fs.writeFileSync(authPath, JSON.stringify({ auth_mode: "api_key", OPENAI_API_KEY: "fixture-api-old", tokens: { refresh_token: "fixture-stale-refresh" } }), { mode: 0o600 });
+    class TerminalRefreshBridge extends QuotaCodexBridge {
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        if (method === "account/read") {
+          this.requests.push({ method, params });
+          this.emit("stderr", "Failed to refresh token: refresh_token_reused");
+          return { account: { type: "chatgpt", planType: "pro" } };
+        }
+        return super.request(method, params);
+      }
+    }
+    const config = { accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" };
+    const first = new AccountPoolBridge(config, temporary, () => new TerminalRefreshBridge() as unknown as CodexBridge);
+    let second: AccountPoolBridge | undefined;
+    try {
+      await first.refreshAccountData(true);
+      first.stop();
+      const oldMtime = fs.statSync(authPath).mtime;
+      fs.writeFileSync(authPath, JSON.stringify({ auth_mode: "api_key", OPENAI_API_KEY: "fixture-api-new", tokens: { refresh_token: "fixture-stale-refresh" } }), { mode: 0o600 });
+      fs.utimesSync(authPath, oldMtime, oldMtime);
+      const nextBridge = new QuotaCodexBridge();
+      second = new AccountPoolBridge(config, temporary, () => nextBridge as unknown as CodexBridge);
+      const snapshot = await second.refreshAccountData(true);
+      expect(snapshot[0].health).toBe("ready");
+      expect(snapshot[0].errors).toEqual([]);
+      expect(nextBridge.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([{ refreshToken: false }]);
+      expect(JSON.parse(fs.readFileSync(statePath, "utf8")).authFailures).toEqual({});
+    } finally { first.stop(); second?.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("does not bind an in-flight terminal error to credentials replaced during that request", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-failure-race-"));
+    const authPath = path.join(temporary, "auth.json");
+    const statePath = path.join(temporary, "state.json");
+    fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: "fixture-old" } }), { mode: 0o600 });
+    class ReplaceDuringRefreshBridge extends QuotaCodexBridge {
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        if (method === "account/read") {
+          this.requests.push({ method, params });
+          this.emit("stderr", "Failed to refresh token: refresh_token_reused");
+          const oldMtime = fs.statSync(authPath).mtime;
+          fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: "fixture-new" } }), { mode: 0o600 });
+          fs.utimesSync(authPath, oldMtime, oldMtime);
+          return { account: { type: "chatgpt", planType: "pro" } };
+        }
+        return super.request(method, params);
+      }
+    }
+    const fake = new ReplaceDuringRefreshBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => fake as unknown as CodexBridge);
+    try {
+      const snapshot = await pool.refreshAccountData(true);
+      expect(snapshot[0].health).toBe("ready");
+      expect(snapshot[0].errors).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(statePath, "utf8")).authFailures).toEqual({});
+    } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("loads pre-auth-failure state files without requiring the new field", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-state-legacy-"));
+    const statePath = path.join(temporary, "state.json");
+    fs.writeFileSync(statePath, JSON.stringify({ threadAccounts: { "thread-1": "a" }, quotaSnapshots: { a: { limits: {}, usage: {} } } }));
+    const fake = new QuotaCodexBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => fake as unknown as CodexBridge);
+    try {
+      const snapshot = await pool.refreshAccountData(true);
+      expect(snapshot[0].health).toBe("ready");
+      expect(fake.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([{ refreshToken: false }]);
+    } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("ignores persisted auth failure labels outside the canonical terminal-code allowlist", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-state-code-"));
+    const authPath = path.join(temporary, "auth.json");
+    const statePath = path.join(temporary, "state.json");
+    fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: "fixture-only" } }), { mode: 0o600 });
+    fs.writeFileSync(statePath, JSON.stringify({ authFailures: { a: { code: "unrecognized_error", credentialVersion: fs.statSync(authPath).mtimeMs } } }));
+    const fake = new QuotaCodexBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => fake as unknown as CodexBridge);
+    try {
+      const snapshot = await pool.refreshAccountData(true);
+      expect(snapshot[0].health).toBe("ready");
+      expect(fake.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([{ refreshToken: false }]);
+    } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("keeps terminal auth health degraded after a successful generic RPC and ready status event", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-health-latch-"));
+    fs.writeFileSync(path.join(temporary, "auth.json"), JSON.stringify({ tokens: { refresh_token: "fixture-only" } }), { mode: 0o600 });
+    const fake = new QuotaCodexBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => fake as unknown as CodexBridge);
+    try {
+      fake.emit("stderr", "Failed to refresh token: refresh_token_invalidated");
+      fake.emit("status", { state: "ready" });
+      await expect(pool.request("thread/read", { threadId: "known-thread" })).resolves.toEqual({});
+      await expect(pool.request("account/read", { refreshToken: true })).resolves.toMatchObject({ account: { type: "chatgpt" } });
+      await expect(pool.requestOnThreadAccount("known-thread", "account/read", { refreshToken: true })).resolves.toMatchObject({ account: { type: "chatgpt" } });
+      const snapshot = await pool.refreshAccountData(true);
+      expect(fake.requests.filter(r => r.method === "account/read").map(r => r.params)).toEqual([
+        { refreshToken: false }, { refreshToken: false }, { refreshToken: false }
+      ]);
+      expect(snapshot[0].health).toBe("degraded");
+      expect(snapshot[0].lastError).toContain("refresh_token_invalidated");
+      expect(snapshot[0].errors[0]).toContain("refresh_token_invalidated");
+    } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
   it("routes PTY input to the starting account before command/exec finishes", async () => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-pty-routing-"));
     const accountA = path.join(temporary, "a");
@@ -104,15 +514,15 @@ describe("account-pool routing policy", () => {
     try {
       const pool = new AccountPoolBridge({
         accounts: [
-          { id: "260803", label: "260803", codexHome: accountA },
-          { id: "260901", label: "260901", codexHome: accountB }
+          { id: "account-a", label: "account-a", codexHome: accountA },
+          { id: "account-c", label: "account-c", codexHome: accountB }
         ],
         stateFile: "state.json"
       }, temporary, () => bridges[nextBridge++] as unknown as CodexBridge);
-      await pool.startThreadOnAccount("260901", { model: "gpt-6-sol" });
+      await pool.startThreadOnAccount("account-c", { model: "gpt-6-sol" });
       expect(bridges[0].requests).toHaveLength(0);
       expect(bridges[1].requests).toContainEqual({ method: "thread/start", params: { model: "gpt-6-sol" } });
-      expect(pool.getKnownThreadAccount("new-thread")?.id).toBe("260901");
+      expect(pool.getKnownThreadAccount("new-thread")?.id).toBe("account-c");
       pool.stop();
     } finally {
       fs.rmSync(temporary, { recursive: true, force: true });
@@ -139,10 +549,10 @@ describe("account-pool routing policy", () => {
 
   it("always gives a new thread to the healthy account with more remaining quota", () => {
     const selected = selectAccountCandidate([
-      candidate("260803", 65, { activeRequests: 8, assignedThreadCount: 100 }),
-      candidate("260707", 53)
+      candidate("account-a", 65, { activeRequests: 8, assignedThreadCount: 100 }),
+      candidate("account-legacy", 53)
     ]);
-    expect(selected.id).toBe("260803");
+    expect(selected.id).toBe("account-a");
   });
 
   it("routes a new thread only to an account whose catalog lists the requested model", async () => {
@@ -246,7 +656,7 @@ describe("account-pool routing policy", () => {
     }
   });
 
-  it("refreshes authentication for every enabled account without a browser poll", async () => {
+  it("keeps startup, timers, changed credentials, and twenty forced quota reads non-rotating", async () => {
     vi.useFakeTimers();
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-auth-keeper-"));
     const accountA = path.join(temporary, "account-a");
@@ -275,13 +685,29 @@ describe("account-pool routing policy", () => {
       expect(bridges).toHaveLength(2);
       for (const bridge of bridges) {
         expect(bridge.requests.filter((request) => request.method === "account/read")).toEqual([
-          { method: "account/read", params: { refreshToken: true } }
+          { method: "account/read", params: { refreshToken: false } }
         ]);
       }
 
-      await vi.advanceTimersByTimeAsync(60_000);
+      // The deprecated cadence setting is accepted but does not create a
+      // host-side refresh timer. Advancing beyond several old intervals is inert.
+      await vi.advanceTimersByTimeAsync(20 * 60_000);
       for (const bridge of bridges) {
-        expect(bridge.requests.filter((request) => request.method === "account/read")).toHaveLength(2);
+        expect(bridge.requests.filter((request) => request.method === "account/read")).toHaveLength(1);
+      }
+
+      for (const home of [accountA, accountB]) {
+        const authPath = path.join(home, "auth.json");
+        fs.writeFileSync(authPath, JSON.stringify({ tokens: { refresh_token: "fixture-only" } }), { mode: 0o600 });
+        const stamp = Date.now();
+        fs.utimesSync(authPath, new Date(stamp), new Date(stamp));
+      }
+      await Promise.all(Array.from({ length: 20 }, () => pool.refreshAccountData(true)));
+      for (const bridge of bridges) {
+        expect(bridge.requests.filter((request) => request.method === "account/read")).toEqual([
+          { method: "account/read", params: { refreshToken: false } },
+          { method: "account/read", params: { refreshToken: false } }
+        ]);
       }
 
       pool.stop();

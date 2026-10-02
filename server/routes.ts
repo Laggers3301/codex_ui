@@ -12,6 +12,8 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
+import { LegacyRollbackConflictError } from "./legacyRollback.js";
+import { inheritedBillingTurnIds } from "./leaderboardForkUsage.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
 import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
@@ -41,11 +43,12 @@ import {
 import { importStagedUserHandoff, type ImportedUserHandoff } from "./userHandoff.js";
 import { pushPublicKey } from "./webPush.js";
 import { advanceTrackedQuotaLedger, type TrackedQuotaLedgerAccount } from "./trackedQuotaLedger.js";
+import { configuredSubagentRuntimeHomes, findSubagentDescendant, readSubagentDirectoryPage } from "./subagentHistory.js";
 
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
 // Default Codex cwd per logged-in user. This prevents generated artifacts from
-// accumulating in /home/ls while retaining historical shared-home projects.
+// accumulating in /home/<user> while retaining historical shared-home projects.
 const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
@@ -247,6 +250,7 @@ const fallbackCodexModels: Array<{
   efforts: ReasoningEffort[];
 }> = [
   { slug: "gpt-6-astra", displayName: "GPT-6-Astra", priority: 1, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
+  { slug: "gpt-6.1-sol", displayName: "GPT-6.1-Sol", priority: 1.5, efforts: ["max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-6-sol", displayName: "GPT-6-Sol", priority: 2, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-6-luna", displayName: "GPT-6-Luna", priority: 3, efforts: ["max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", priority: 4, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
@@ -323,7 +327,11 @@ export function modelProfilesFromCatalog(catalog: unknown): PublicModelProfile[]
     const displayName = typeof record.display_name === "string" ? record.display_name.trim() : slug;
     const visibility = typeof record.visibility === "string" ? record.visibility : "";
     const shellType = typeof record.shell_type === "string" ? record.shell_type : "";
-    const priority = typeof record.priority === "number" ? record.priority : 999;
+    // Codex requires integer priorities in its catalog. Keep the web picker
+    // ordering independent so GPT-6.1 Sol stays between Astra and Sol.
+    const priority = slug === "gpt-6.1-sol"
+      ? 1.5
+      : typeof record.priority === "number" ? record.priority : 999;
     // Codex 0.153 switched current models (including GPT-6 Astra) from the
     // legacy shell_command transport to unified_exec.  Both transports are
     // valid model-picker entries; rejecting the newer value silently replaced
@@ -572,6 +580,16 @@ async function readCodexQuota(bridge: CodexBridge): Promise<PublicCodexQuota> {
 }
 
 async function readCachedCodexQuota(bridge: CodexBridge, forceRefresh = false): Promise<PublicCodexQuota> {
+  if (isAccountPoolBridge(bridge)) {
+    // Legacy clients still use /quota. Route them through the pool's same
+    // single-flight and native-owned auth instead of forcing a separate OAuth
+    // refresh or assembling account/limits/usage from different accounts.
+    const snapshots = await bridge.refreshAccountData(forceRefresh);
+    const selected = snapshots.find(entry => entry.selectedForNewThreads && entry.kind !== "api-provider")
+      ?? snapshots.find(entry => entry.kind !== "api-provider");
+    if (!selected) throw new Error("No OpenAI account is available for quota details.");
+    return sanitizeCodexQuota(selected.account, selected.limits, selected.usage, selected.errors);
+  }
   const now = Date.now();
   if (!forceRefresh && codexQuotaCache && codexQuotaCache.expiresAt > now) {
     return codexQuotaCache.data;
@@ -732,6 +750,7 @@ type LeaderboardFileSummary = {
   startAt: number | null;
   usage: LeaderboardFileUsage[];
   granularity?: "day" | "event";
+  billingVersion?: number;
 };
 
 type LeaderboardFileCachePayload = {
@@ -967,21 +986,17 @@ function countField(record: Record<string, unknown>, camel: string, snake: strin
   return safeCount(record[camel]) ?? safeCount(record[snake]) ?? 0;
 }
 
-export function userIdFromSessionCwd(
-  cwd: string | null,
-  isKnownUser?: (userId: string) => boolean,
-  workspaceRoot = userWorkspaceRoot
-): string | null {
+export function userIdFromSessionCwd(cwd: string | null, isKnownUser?: (userId: string) => boolean): string | null {
   if (!cwd) {
     return null;
   }
-  const normalizedRoot = path.resolve(workspaceRoot);
+  const normalizedRoot = path.resolve(userWorkspaceRoot);
   const normalizedCwd = path.resolve(cwd);
   if (normalizedCwd.startsWith(`${normalizedRoot}${path.sep}`)) {
     const [firstSegment] = path.relative(normalizedRoot, normalizedCwd).split(path.sep);
     return firstSegment?.trim() || null;
   }
-  // Some existing users run Codex directly in /home/ls/<login> rather than
+  // Some existing users run Codex directly in /home/<login> rather than
   // the managed users root. Only trust this layout for a registered login.
   const homeRoot = path.dirname(path.dirname(normalizedRoot));
   if (isKnownUser && normalizedCwd.startsWith(`${homeRoot}${path.sep}`)) {
@@ -991,19 +1006,23 @@ export function userIdFromSessionCwd(
   return null;
 }
 
-function sessionCwdFromFileStart(filePath: string): string | null {
+function sessionMetadataFromFileStart(filePath: string): Record<string, unknown> | null {
   const buffer = Buffer.alloc(64 * 1024);
   const fd = fs.openSync(filePath, "r");
   try {
     const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
     const firstLine = buffer.toString("utf8", 0, bytes).split("\n", 1)[0];
-    const record = JSON.parse(firstLine) as { type?: string; payload?: { cwd?: unknown } };
-    return record.type === "session_meta" ? stringOrNull(record.payload?.cwd) : null;
+    const record = JSON.parse(firstLine) as { type?: string; payload?: Record<string, unknown> };
+    return record.type === "session_meta" ? record.payload ?? null : null;
   } catch {
     return null;
   } finally {
     fs.closeSync(fd);
   }
+}
+
+function sessionCwdFromFileStart(filePath: string): string | null {
+  return stringOrNull(sessionMetadataFromFileStart(filePath)?.cwd);
 }
 
 function aggregateBucketFor(map: Map<string, AggregateBucket>, userId: string): AggregateBucket {
@@ -1218,6 +1237,23 @@ export function mergeAccountLeaderboards(boards: PublicCodexLeaderboard[], sourc
   };
 }
 
+/** The leaderboard and quota panel must show the same accrued estimate;
+ * dividing again by other users' tokens would dilute previously assigned use. */
+export function applyAccruedTrackedQuota(
+  board: PublicCodexLeaderboard,
+  sources: LeaderboardAccountSource[],
+  ledger: Record<string, TrackedQuotaLedgerAccount>,
+  userId: string
+): PublicCodexLeaderboard {
+  const matched = sources.filter(source => source.kind !== "api-provider" && ledger[source.id]
+    && source.quota.rateLimits?.primary?.resetsAt != null
+    && Math.abs(ledger[source.id].resetAt - source.quota.rateLimits.primary.resetsAt) <= leaderboardResetDriftSeconds);
+  if (!matched.length) return board;
+  const accrued = round2(matched.reduce((sum, source) => sum + ledger[source.id].userCycleQuotaPercent, 0));
+  return { ...board, currentCycle: { ...board.currentCycle, users: board.currentCycle.users.map(user =>
+    sameTrackedUser(user.userId, userId) ? { ...user, quotaPercent: accrued } : user) } };
+}
+
 async function mergePeerLeaderboards(local: PublicCodexLeaderboard): Promise<PublicCodexLeaderboard> {
   if (!serverConfig.leaderboardPeers.length || !serverConfig.leaderboardPeerToken) {
     return local;
@@ -1257,7 +1293,7 @@ async function mergePeerLeaderboards(local: PublicCodexLeaderboard): Promise<Pub
   };
 }
 
-async function summarizeLeaderboardFile(
+export async function summarizeLeaderboardFile(
   filePath: string,
   store: ProjectStore,
   resolveSessionOwner: (sessionId: string) => string | null,
@@ -1271,6 +1307,8 @@ async function summarizeLeaderboardFile(
   let effort: string | null = null;
   let startAt: number | null = null;
   let tokenEventIndex = 0;
+  let currentTurnId: string | null = null;
+  let inheritedTurns = new Set<string>();
   const knownUsers = new Map<string, boolean>();
   const isKnownUser = (id: string): boolean => {
     if (!knownUsers.has(id)) knownUsers.set(id, store.getUser(id) !== null);
@@ -1292,9 +1330,16 @@ async function summarizeLeaderboardFile(
     if (type === "session_meta") {
       sessionId = stringOrNull(payload.session_id) ?? stringOrNull(payload.id) ?? sessionId;
       userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd), isKnownUser);
+      const parentId = stringOrNull(payload.forked_from_id);
+      if (parentId && parentId !== sessionId) {
+        const parentPath = await findThreadJsonlPathById(parentId);
+        if (!parentPath) throw new Error(`分支来源 ${parentId} 的日志不可用，不能可靠去除继承用量。`);
+        inheritedTurns = await inheritedBillingTurnIds(parentPath);
+      }
       continue;
     }
     if (type === "turn_context") {
+      currentTurnId = stringOrNull(payload.turn_id) ?? currentTurnId;
       userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd), isKnownUser);
       model = stringOrNull(payload.model) ?? model;
       effort = stringOrNull(payload.effort)
@@ -1302,7 +1347,11 @@ async function summarizeLeaderboardFile(
         ?? effort;
       continue;
     }
+    if (type === "event_msg" && payload.type === "task_started") {
+      currentTurnId = stringOrNull(payload.turn_id) ?? currentTurnId;
+    }
     if (type !== "event_msg" || stringOrNull(payload.type) !== "token_count") continue;
+    if (currentTurnId && inheritedTurns.has(currentTurnId)) continue;
 
     const recordTimestamp = stringOrNull(record.timestamp);
     const parsedTimestampMs = recordTimestamp ? Date.parse(recordTimestamp) : Number.NaN;
@@ -1344,7 +1393,7 @@ async function summarizeLeaderboardFile(
     }
   }
 
-  return { size: stat.size, mtimeMs: stat.mtimeMs, startAt, usage: Array.from(usageByKey.values()), granularity: preciseTimestamps ? "event" : "day" };
+  return { size: stat.size, mtimeMs: stat.mtimeMs, startAt, usage: Array.from(usageByKey.values()), granularity: preciseTimestamps ? "event" : "day", billingVersion: 2 };
 }
 
 async function readCodexLeaderboard(
@@ -1391,6 +1440,12 @@ async function readCodexLeaderboard(
     try {
       const stat = fs.statSync(filePath);
       let summary = leaderboardFileCache.get(filePath);
+      if (summary && summary.billingVersion !== 2 && !sessionMetadataFromFileStart(filePath)?.forked_from_id) {
+        // Existing non-fork summaries remain valid: avoid reparsing the full
+        // historical corpus merely to correct copied fork records.
+        summary.billingVersion = 2;
+        cacheChanged = true;
+      }
       const needsCurrentCycleDailyBreakdown = requireDailyBreakdown && Boolean(
         summary
         && currentCycleStartAt !== null
@@ -1398,7 +1453,7 @@ async function readCodexLeaderboard(
         && summary.usage.some((entry) => entry.dayKey === undefined)
       );
       const needsEventTimestamps = source.kind === "api-provider" && summary?.granularity !== "event";
-      if (!summary || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs || needsCurrentCycleDailyBreakdown || needsEventTimestamps) {
+      if (!summary || summary.billingVersion !== 2 || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs || needsCurrentCycleDailyBreakdown || needsEventTimestamps) {
         summary = await summarizeLeaderboardFile(filePath, store, resolveSessionOwner, source.kind === "api-provider");
         leaderboardFileCache.set(filePath, summary);
         cacheChanged = true;
@@ -1477,7 +1532,8 @@ async function readCachedCodexLeaderboard(
     );
     const boards: PublicCodexLeaderboard[] = [];
     for (const source of sources) boards.push(await readCodexLeaderboard(source, store, apiCycleWindow));
-    return boards.length === 1 ? boards[0] : mergeAccountLeaderboards(boards, sources);
+    const local = boards.length === 1 ? boards[0] : mergeAccountLeaderboards(boards, sources);
+    return applyAccruedTrackedQuota(local, sources, readTrackedQuotaLedger(), serverConfig.trackedQuotaUser);
   })()
     .then((local) => includePeers ? mergePeerLeaderboards(local) : local)
     .then((data) => {
@@ -1506,7 +1562,7 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
     id: serverConfig.leaderboardAccountLabel,
     label: serverConfig.leaderboardAccountLabel,
     kind: "codex-account",
-    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/ls", ".codex"), "sessions"),
+    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? process.cwd(), ".codex"), "sessions"),
     quota: await readCachedCodexQuota(bridge, forceRefresh)
   }];
 }
@@ -1553,7 +1609,7 @@ async function buildTrackedQuotaUsage(
       const summary = leaderboardFileCache.get(filePath);
       if (!summary) continue;
       for (const entry of summary.usage) {
-        if (!entry.dayKey || cycle.resetAt === null || entry.resetAt !== cycle.resetAt) continue;
+        if (!entry.dayKey || cycle.resetAt === null || entry.resetAt === null || Math.abs(entry.resetAt - cycle.resetAt) > leaderboardResetDriftSeconds) continue;
         if (sameTrackedUser(entry.userId, trackedUser)) {
           dailyUserTotals.set(entry.dayKey, (dailyUserTotals.get(entry.dayKey) ?? 0) + entry.totalTokens);
         }
@@ -2254,6 +2310,7 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 }
 
 function errorStatus(error: unknown): number {
+  if (error instanceof LegacyRollbackConflictError) return 409;
   if (error instanceof PathPolicyError || error instanceof z.ZodError || error instanceof ThreadContextConfigError) {
     if (error instanceof PathPolicyError && error.message === "File does not exist.") {
       return 404;
@@ -2486,6 +2543,9 @@ export function sanitizeThreadPayloadForClient<T>(value: T): T {
       const item = asRecord(itemValue);
       const itemType = typeof item.type === "string" ? item.type.toLowerCase() : "";
       const role = typeof item.role === "string" ? item.role.toLowerCase() : "";
+      if (isContextCompactionItem(item)) {
+        return false;
+      }
       if (
         containsContextCompaction
         && (role === "assistant" || itemType.includes("agent"))
@@ -2663,7 +2723,7 @@ async function filterOwnedThreadList(
       continue;
     }
     const fullThread = await readOwnedThreadForList(bridge, threadId);
-    // Ownership is the access boundary. A legacy session may retain /home/ls as
+    // Ownership is the access boundary. A legacy session may retain /home/<user> as
     // its historical cwd after the user's default workspace is moved.
     if (fullThread) {
       byId.set(threadId, listItemSummaryFromThread(fullThread));
@@ -2688,7 +2748,7 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
   fs.mkdirSync(rootPath, { recursive: true, mode: 0o700 });
 
   // List the personal workspace first: a newly opened page selects it by
-  // default. Existing projects (including historical /home/ls conversations)
+  // default. Existing projects (including historical /home/<user> conversations)
   // are deliberately retained below it.
   const workspace = store.getProjectByRootPath(rootPath, userId) ?? store.createProject({
     name: "我的工作区",
@@ -3643,6 +3703,89 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     }
   });
 
+  app.get<{ Params: { id: string; threadId: string }; Querystring: { view?: string; q?: string; cursor?: string; limit?: string } }>("/api/projects/:id/threads/:threadId/subagents", async (request, reply) => {
+    try {
+      reply.header("Cache-Control", "no-store");
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const query = request.query ?? {};
+      const view = query.view ?? "all";
+      if (!(["all", "active", "history"].includes(view)) || (query.q !== undefined && query.q.length > 256)
+        || (query.limit !== undefined && !/^\d+$/.test(query.limit)) || (query.cursor !== undefined && query.cursor.length > 1024)) {
+        return reply.code(400).send({ error: "Invalid subagent directory query." });
+      }
+      const limit = query.limit === undefined ? 40 : Number(query.limit);
+      if (limit < 1 || limit > 100) return reply.code(400).send({ error: "limit must be between 1 and 100." });
+      try {
+        return await readSubagentDirectoryPage(request.params.threadId, configuredSubagentRuntimeHomes(request.params.threadId), {
+          view: view as "all" | "active" | "history", q: query.q, cursor: query.cursor, limit,
+          resolveSessionFile: (id, sessionsRoot) => findThreadJsonlPathById(id, sessionsRoot)
+        });
+      } catch (error) {
+        return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+      }
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { id: string; threadId: string; agentThreadId: string }; Querystring: { before?: string; cursor?: string; fresh?: string; limit?: string } }>("/api/projects/:id/threads/:threadId/subagents/:agentThreadId", async (request, reply) => {
+    try {
+      reply.header("Cache-Control", "no-store");
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const input = threadReadQuerySchema.parse(request.query ?? {});
+      const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId));
+      if (!record) return reply.code(404).send({ error: "Subagent thread not found." });
+      const sessionsRoot = path.join(record.runtimeHome, "sessions");
+      const filePath = await findThreadJsonlPathById(record.id, sessionsRoot);
+      if (!filePath) return reply.code(404).send({ error: "Subagent history file not found." });
+      const indexedPage = await readIndexedThreadPage(filePath, record.id, {
+        before: input.before,
+        cursor: input.cursor,
+        limit: input.limit,
+        backgroundRefresh: !input.fresh && input.before === 0 && !input.cursor
+      });
+      const result = sanitizeThreadPayloadForClient({ thread: indexedPage.thread });
+      deferLargeToolOutputs(asRecord(result).thread);
+      return { thread: asRecord(result).thread, history: indexedPage.history };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { id: string; threadId: string; agentThreadId: string; itemId: string } }>("/api/projects/:id/threads/:threadId/subagents/:agentThreadId/items/:itemId/output", async (request, reply) => {
+    try {
+      reply.header("Cache-Control", "private, max-age=300");
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId));
+      if (!record) return reply.code(404).send({ error: "Subagent thread not found." });
+      const sessionsRoot = path.join(record.runtimeHome, "sessions");
+      const filePath = await findThreadJsonlPathById(record.id, sessionsRoot);
+      const indexedItem = filePath ? await readIndexedThreadItem(filePath, record.id, request.params.itemId) : null;
+      if (!indexedItem) return reply.code(404).send({ error: "Tool output was not found in the thread index." });
+      const output = typeof indexedItem.aggregatedOutput === "string"
+        ? indexedItem.aggregatedOutput
+        : typeof indexedItem.output === "string" ? indexedItem.output : "";
+      return { data: { output, bytes: Buffer.byteLength(output) } };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.put<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/context-config", async (request, reply) => {
     try {
       const userId = userIdFromRequest(request, store);
@@ -3957,12 +4100,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       }
       const { turnId } = z.object({ turnId: z.string().min(1) }).strict().parse(request.body ?? {});
       const summary = await bridge.request("thread/read", { threadId: request.params.threadId, includeTurns: false }, 30_000);
-      if (asRecord(asRecord(summary).thread).historyMode !== "paginated") {
-        return reply.code(409).send({
-          code: "LEGACY_ROLLBACK_UNAVAILABLE",
-          error: "这条会话使用 Codex 默认的 legacy 历史格式；当前运行的 Codex 版本没有可安全撤回此格式最后一轮的接口。原记录未改动。"
-        });
-      }
+      const historyMode = asRecord(asRecord(summary).thread).historyMode;
       const goalState = await bridge.request("thread/goal/get", { threadId: request.params.threadId }, 30_000) as { goal?: { status?: string } | null };
       if (goalState?.goal?.status === "active") {
         return reply.code(409).send({ error: "当前 Goal 仍在自动续跑；请先暂停或结束 Goal，再编辑最后一条提问。" });
@@ -3970,6 +4108,26 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const queued = await bridge.request("thread/queue/list", { threadId: request.params.threadId, limit: 1 }, 30_000) as { data?: unknown[] };
       if (queued?.data?.length) {
         return reply.code(409).send({ error: "当前会话还有排队消息；请先处理排队消息，再编辑最后一条提问。" });
+      }
+      if (historyMode === "legacy" && isAccountPoolBridge(bridge)) {
+        // The guarded compatibility path stops only an idle owning runtime,
+        // appends the Codex replay marker, and verifies/reverses it on failure.
+        // Do not call paginated turns/list or revert for a legacy rollout.
+        const result = await bridge.rollbackLegacyLatest(request.params.threadId, turnId);
+        store.touchThreadOwner(request.params.threadId);
+        const rolloutPath = asRecord(asRecord(result).thread).path;
+        if (typeof rolloutPath === "string") {
+          // Complete the local history projection before acknowledging edit.
+          // A projection error must not imply that the successful rollback
+          // failed and invite the client to roll back a second turn.
+          await warmThreadIndex(rolloutPath, request.params.threadId).catch((error) => {
+            console.warn("Could not refresh history after legacy rollback", { threadId: request.params.threadId, error });
+          });
+        }
+        return { data: result };
+      }
+      if (historyMode !== "paginated") {
+        return reply.code(409).send({ error: "当前运行时不支持安全撤回此会话；草稿和附件仍保留。" });
       }
       const latest = await bridge.request("thread/turns/list", {
         threadId: request.params.threadId,
