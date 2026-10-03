@@ -1,4 +1,5 @@
 import type { ProjectStore } from "./db.js";
+import { browserMcpForThread } from "./browserRoutes.js";
 
 export interface GoalBridge { request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown>; }
 export type GoalStore = Pick<ProjectStore, "getThreadOwner" | "getProject" | "userCanAccessThread">;
@@ -78,7 +79,7 @@ export async function setGoalAndStartIfIdle(input: GoalSetInput): Promise<{ goal
     let snapshot = await bridge.request("thread/read", { threadId, includeTurns: false }, 30_000);
     let state = turnState(snapshot, threadId);
     if (state.state === "scheduled" && statusType(asRecord(asRecord(snapshot).thread)) === "notLoaded") {
-      await bridge.request("thread/resume", { threadId, cwd: owner.rootPath, model: owner.modelOverride ?? project.defaultModel, approvalPolicy: project.defaultApprovalPolicy, sandbox: project.defaultSandbox }, 30_000);
+      await bridge.request("thread/resume", { threadId, config: browserMcpForThread(threadId), cwd: owner.rootPath, model: owner.modelOverride ?? project.defaultModel, approvalPolicy: project.defaultApprovalPolicy, sandbox: project.defaultSandbox }, 30_000);
       snapshot = await bridge.request("thread/read", { threadId, includeTurns: false }, 30_000);
       state = turnState(snapshot, threadId);
     }

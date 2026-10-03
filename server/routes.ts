@@ -15,6 +15,7 @@ import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { LegacyRollbackConflictError } from "./legacyRollback.js";
 import { inheritedBillingTurnIds } from "./leaderboardForkUsage.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
+import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
 import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
 import { createCrossAccountForkSnapshot } from "./crossAccountFork.js";
@@ -44,6 +45,7 @@ import { importStagedUserHandoff, type ImportedUserHandoff } from "./userHandoff
 import { pushPublicKey } from "./webPush.js";
 import { advanceTrackedQuotaLedger, type TrackedQuotaLedgerAccount } from "./trackedQuotaLedger.js";
 import { configuredSubagentRuntimeHomes, findSubagentDescendant, readSubagentDirectoryPage } from "./subagentHistory.js";
+import { queueScheduledPrompt, resumeThreadIfUnloaded, ScheduleConflictError, ScheduledTaskStore, type ScheduleRule } from "./scheduledTasks.js";
 
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
@@ -166,6 +168,7 @@ const createProjectSchema = z.object({
   defaultSandbox: sandboxSchema.optional(),
   defaultApprovalPolicy: approvalSchema.optional()
 });
+const createWorkspaceDirectorySchema = z.object({ parentPath: z.string().min(1).max(4096), name: z.string().max(128) }).strict();
 const createWorktreeSchema = z.object({ name: z.string().trim().min(1).max(80).optional(), repositoryPath: z.string().min(1).max(4096).optional() });
 
 const updateProjectSchema = z.object({
@@ -1562,7 +1565,7 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
     id: serverConfig.leaderboardAccountLabel,
     label: serverConfig.leaderboardAccountLabel,
     kind: "codex-account",
-    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? process.cwd(), ".codex"), "sessions"),
+    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/<user>", ".codex"), "sessions"),
     quota: await readCachedCodexQuota(bridge, forceRefresh)
   }];
 }
@@ -2310,7 +2313,7 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 }
 
 function errorStatus(error: unknown): number {
-  if (error instanceof LegacyRollbackConflictError) return 409;
+  if (error instanceof LegacyRollbackConflictError || error instanceof ScheduleConflictError) return 409;
   if (error instanceof PathPolicyError || error instanceof z.ZodError || error instanceof ThreadContextConfigError) {
     if (error instanceof PathPolicyError && error.message === "File does not exist.") {
       return 404;
@@ -2743,9 +2746,60 @@ function userWorkspacePath(userId: string): string {
   return path.join(userWorkspaceRoot, safeFolderSegment(userId, "user"));
 }
 
+function isWithinDirectory(rootPath: string, targetPath: string): boolean {
+  const relative = path.relative(rootPath, targetPath);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/** Ensure the personal workspace itself is a real, non-symlink directory. */
+function ensureUserWorkspaceDirectory(userId: string): string {
+  fs.mkdirSync(userWorkspaceRoot, { recursive: true, mode: 0o700 });
+  const base = fs.realpathSync(userWorkspaceRoot);
+  const expected = path.join(base, safeFolderSegment(userId, "user"));
+  try {
+    const current = fs.lstatSync(expected);
+    if (current.isSymbolicLink() || !current.isDirectory()) throw new PathPolicyError("Personal workspace must be a real directory.");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    fs.mkdirSync(expected, { mode: 0o700 });
+  }
+  const canonical = fs.realpathSync(expected);
+  if (canonical !== expected) throw new PathPolicyError("Personal workspace must stay inside its user directory.");
+  return canonical;
+}
+
+function assertNoSymlinkPath(rootPath: string, targetPath: string): void {
+  const root = path.resolve(rootPath), target = path.resolve(targetPath);
+  if (!isWithinDirectory(root, target)) throw new PathPolicyError(`Project path must stay under ${root}.`);
+  let current = root;
+  const parts = path.relative(root, target).split(path.sep).filter(Boolean);
+  for (let index = 0; index < parts.length; index += 1) {
+    current = path.join(current, parts[index]);
+    try {
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink()) throw new PathPolicyError("Project path cannot pass through a symbolic link.");
+      if (index < parts.length - 1 && !stat.isDirectory()) throw new PathPolicyError("Project path parent is not a directory.");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+      throw error;
+    }
+  }
+}
+
+function ensureUserWorkspaceProjectDirectory(userId: string, inputPath: string, create: boolean): string {
+  const root = ensureUserWorkspaceDirectory(userId);
+  const candidate = path.resolve(inputPath);
+  assertNoSymlinkPath(root, candidate);
+  const projectPath = ensureProjectDirectory(candidate, { create, allowedRoot: root, allowOutsideRoot: false });
+  assertNoSymlinkPath(root, projectPath);
+  if (fs.realpathSync(projectPath) !== projectPath || !isWithinDirectory(root, projectPath)) {
+    throw new PathPolicyError("Project path must resolve inside the personal workspace.");
+  }
+  return projectPath;
+}
+
 function ensureProjectsForUser(store: ProjectStore, userId: string) {
-  const rootPath = userWorkspacePath(userId);
-  fs.mkdirSync(rootPath, { recursive: true, mode: 0o700 });
+  const rootPath = ensureUserWorkspaceDirectory(userId);
 
   // List the personal workspace first: a newly opened page selects it by
   // default. Existing projects (including historical /home/<user> conversations)
@@ -2796,7 +2850,58 @@ function deferLargeToolOutputs(threadValue: unknown): void {
   }
 }
 
-export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore, options: { backgroundIndexing?: boolean } = {}): void {
+export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore, options: { backgroundIndexing?: boolean; browserTools?: boolean } = {}): void {
+  const scheduledTasks = new ScheduledTaskStore(path.join(serverConfig.dataDir, "scheduled-tasks.json"));
+  let scheduleTimer: ReturnType<typeof setInterval> | undefined;
+  const scheduleRuleSchema = z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("once"), at: z.string().datetime(), timezone: z.string().min(1).max(128) }).strict(),
+    z.object({ kind: z.literal("interval"), intervalMinutes: z.number().int(), timezone: z.string().min(1).max(128) }).strict(),
+    z.object({ kind: z.enum(["daily", "weekdays"]), time: z.string(), timezone: z.string().min(1).max(128) }).strict(),
+    z.object({ kind: z.literal("weekly"), time: z.string(), weekdays: z.array(z.number().int()), timezone: z.string().min(1).max(128) }).strict()
+  ]);
+  const scheduleCreateSchema = z.object({ title: z.string().trim().max(160).optional(), prompt: z.string().trim().min(1).max(20_000), schedule: scheduleRuleSchema, enabled: z.boolean().optional() }).strict();
+  app.get<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/schedules", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store); const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      return { data: scheduledTasks.list(userId, project.id, request.params.threadId) };
+    } catch (error) { return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/schedules", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store); const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      const input = scheduleCreateSchema.parse(request.body);
+      const task = scheduledTasks.create({ userId, projectId: project.id, threadId: request.params.threadId, title: input.title || input.prompt.slice(0, 80), prompt: input.prompt, schedule: input.schedule as ScheduleRule, enabled: input.enabled ?? true });
+      return reply.code(201).send({ data: task });
+    } catch (error) { return reply.code(errorStatus(error) === 500 ? 400 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.patch<{ Params: { id: string; threadId: string; scheduleId: string } }>("/api/projects/:id/threads/:threadId/schedules/:scheduleId", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store); const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      const owned = scheduledTasks.list(userId, project.id, request.params.threadId).some(task => task.id === request.params.scheduleId);
+      if (!owned) return reply.code(404).send({ error: "Scheduled task not found." });
+      const schema = z.object({ title: z.string().trim().max(160).optional(), prompt: z.string().trim().min(1).max(20_000).optional(), schedule: scheduleRuleSchema.optional(), enabled: z.boolean().optional() }).strict();
+      const previous = scheduledTasks.list(userId, project.id, request.params.threadId).find(task => task.id === request.params.scheduleId)!;
+      const task = scheduledTasks.update(request.params.scheduleId, userId, schema.parse(request.body));
+      return { data: task, ...(previous.history.at(-1)?.status === "queued" ? { warning: "An already queued run cannot be recalled by editing or pausing this schedule." } : {}) };
+    } catch (error) { return reply.code(errorStatus(error) === 500 ? 400 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.delete<{ Params: { id: string; threadId: string; scheduleId: string } }>("/api/projects/:id/threads/:threadId/schedules/:scheduleId", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store); const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      const owned = scheduledTasks.list(userId, project.id, request.params.threadId).some(task => task.id === request.params.scheduleId);
+      if (!owned) return reply.code(404).send({ error: "Scheduled task not found." });
+      const alreadyQueued = scheduledTasks.list(userId, project.id, request.params.threadId).find(task => task.id === request.params.scheduleId)?.history.at(-1)?.status === "queued";
+      scheduledTasks.delete(request.params.scheduleId, userId); return { ok: true, ...(alreadyQueued ? { warning: "An already queued run cannot be recalled by deleting its schedule." } : {}) };
+    } catch (error) { return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
   const pushSubscriptionSchema = z.object({
     endpoint: z.string().url().max(2048),
     keys: z.object({ p256dh: z.string().min(32).max(256), auth: z.string().min(8).max(128) }).strict()
@@ -2834,7 +2939,37 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     }
   });
   let searchRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  const safelyDispatchScheduledTasks = () => {
+    void dispatchScheduledTasks().catch(error => {
+      console.error("[scheduled-tasks.tick.error]", error instanceof Error ? error.message : String(error));
+    });
+  };
+  const dispatchScheduledTasks = async () => {
+    for (const task of scheduledTasks.due()) {
+      const dueAt = Date.parse(task.nextRunAt ?? "");
+      const runId = scheduledTasks.claim(task.id, dueAt);
+      if (!runId) continue;
+      try {
+        const owner = store.getThreadOwner(task.threadId);
+        const project = store.getProject(task.projectId, task.userId);
+        if (!owner || !project || owner.userId !== task.userId || owner.projectId !== task.projectId || !store.userCanAccessThread(task.threadId, task.userId, task.projectId)) throw new Error("Scheduled thread is no longer available to its owner.");
+        await assertTrackedUserQuotaAvailable(bridge, store, task.userId, task.threadId);
+        // Rehydrate only when not loaded, by ID with no model/policy overrides.
+        // This works with a closed browser/server restart without changing the
+        // thread's account, active turn, or original settings.
+        await resumeThreadIfUnloaded(bridge, task.threadId, owner.rootPath, browserMcpForThread(task.threadId));
+        const result = await queueScheduledPrompt(bridge, task, runId);
+        store.touchThreadOwner(task.threadId);
+        scheduledTasks.finish(task.id, runId, undefined, Date.now(), !result.queued, result.warning);
+      } catch (error) {
+        scheduledTasks.finish(task.id, runId, error instanceof Error ? error.message : String(error));
+      }
+    }
+  };
   app.addHook("onReady", async () => {
+    scheduleTimer = setInterval(safelyDispatchScheduledTasks, 5_000);
+    scheduleTimer.unref();
+    safelyDispatchScheduledTasks();
     if (options.backgroundIndexing === false) return;
     startChatSearch();
     const refresh = () => {
@@ -2845,7 +2980,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     searchRefreshTimer = setInterval(refresh, 15_000);
     searchRefreshTimer.unref();
   });
-  app.addHook("onClose", async () => { if (searchRefreshTimer) clearInterval(searchRefreshTimer); });
+  app.addHook("onClose", async () => { if (searchRefreshTimer) clearInterval(searchRefreshTimer); if (scheduleTimer) clearInterval(scheduleTimer); });
 
   app.get<{ Querystring: { q?: string; offset?: string; limit?: string; projectId?: string } }>("/api/search/threads", async (request, reply) => {
     const userId = userIdFromRequest(request, store);
@@ -3277,55 +3412,61 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
   app.get("/api/projects", async (request) => {
     const userId = userIdFromRequest(request, store);
+    const projects = ensureProjectsForUser(store, userId);
     return {
-      data: ensureProjectsForUser(store, userId),
-      projectRoot: serverConfig.projectRoot,
-      allowOutsideProjectRoot: serverConfig.allowOutsideProjectRoot,
-      systemDirectoryPickerAvailable: systemDirectoryPickerAvailableForRequest(request),
+      data: projects,
+      projectRoot: ensureUserWorkspaceDirectory(userId),
+      allowOutsideProjectRoot: false,
+      systemDirectoryPickerAvailable: false,
       threadContextFeatureEnabled
     };
   });
 
   app.get<{ Querystring: { path?: string } }>("/api/system/directories", async (request, reply) => {
     try {
-      return {
-        data: listBrowsableDirectories(request.query.path, serverConfig.projectRoot, {
-          allowOutsideRoot: serverConfig.allowOutsideProjectRoot
-        })
-      };
+      const userId = userIdFromRequest(request, store);
+      const rootPath = ensureUserWorkspaceDirectory(userId);
+      const data = listBrowsableDirectories(request.query.path, rootPath, { allowOutsideRoot: false });
+      if (data.rootPath !== rootPath) throw new PathPolicyError("Directory path must stay in the personal workspace.");
+      return { data };
     } catch (error) {
       return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
     }
   });
 
-  app.post("/api/system/select-directory", async (request, reply) => {
-    if (!systemDirectoryPickerAvailableForRequest(request)) {
-      return reply.code(501).send({
-        error: "system-directory-picker-unavailable",
-        message: "System directory picker is only available when this service is opened locally on the host machine."
-      });
-    }
-
+  app.post("/api/system/directories", async (request, reply) => {
     try {
-      const script = [
-        `set defaultFolder to POSIX file ${JSON.stringify(serverConfig.projectRoot)}`,
-        'set selectedFolder to choose folder with prompt "选择本地项目目录" default location defaultFolder',
-        "POSIX path of selectedFolder"
-      ].join("\n");
-      const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 120_000 });
-      const selectedPath = stdout.trim().replace(/\/+$/, "");
-      const rootPath = resolveProjectPath(selectedPath || serverConfig.projectRoot, serverConfig.projectRoot, {
-        allowOutsideRoot: serverConfig.allowOutsideProjectRoot
-      });
-      return { data: { rootPath } };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.includes("User canceled")) {
-        return reply.code(499).send({ error: "Directory selection was canceled." });
+      const userId = userIdFromRequest(request, store);
+      const input = createWorkspaceDirectorySchema.parse(request.body);
+      const name = input.name.trim();
+      if (!name || name === "." || name === ".." || /[\\/\u0000-\u001f\u007f]/.test(name)) {
+        throw new PathPolicyError("请输入文件夹名称，不能包含路径分隔符、控制字符或使用 . 和 ..。");
       }
-      return reply.code(errorStatus(error)).send({ error: message });
+      const rootPath = ensureUserWorkspaceDirectory(userId);
+      const parent = listBrowsableDirectories(input.parentPath, rootPath, { allowOutsideRoot: false });
+      if (parent.rootPath !== rootPath || !isWithinDirectory(rootPath, parent.currentPath)) {
+        throw new PathPolicyError("Parent directory must stay inside the personal workspace.");
+      }
+      assertNoSymlinkPath(rootPath, parent.currentPath);
+      const target = path.join(parent.currentPath, name);
+      assertNoSymlinkPath(rootPath, target);
+      fs.mkdirSync(target, { recursive: false, mode: 0o700 });
+      assertNoSymlinkPath(rootPath, target);
+      const canonicalTarget = fs.realpathSync(target);
+      if (!isWithinDirectory(rootPath, canonicalTarget) || canonicalTarget !== target) {
+        throw new PathPolicyError("Created directory must stay inside the personal workspace.");
+      }
+      return reply.code(201).send({ data: { path: canonicalTarget } });
+    } catch (error) {
+      const exists = (error as NodeJS.ErrnoException)?.code === "EEXIST";
+      return reply.code(exists ? 409 : errorStatus(error)).send({ error: exists ? "已存在同名文件夹。" : error instanceof Error ? error.message : String(error) });
     }
   });
+
+  app.post("/api/system/select-directory", async (_request, reply) => reply.code(501).send({
+    error: "system-directory-picker-unavailable",
+    message: "Native directory selection is disabled; use the personal workspace directory picker."
+  }));
 
   app.post("/api/projects", async (request, reply) => {
     try {
@@ -3334,10 +3475,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       if (!store.getUser(userId)) {
         return reply.code(404).send({ error: "User not found." });
       }
-      const rootPath = ensureProjectDirectory(input.rootPath, {
-        create: input.createDirectory,
-        allowOutsideRoot: serverConfig.allowOutsideProjectRoot
-      });
+      const rootPath = ensureUserWorkspaceProjectDirectory(userId, input.rootPath, Boolean(input.createDirectory));
       const existingProject = store.getProjectByRootPath(rootPath, userId);
       if (existingProject) {
         return { data: existingProject };
@@ -3941,6 +4079,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       }
       const routing = poolBridge?.getBranchRoutingDecision(request.params.threadId, model, allowedAccountId ?? undefined) ?? null;
       const nativeFork = !routing || routing.mode === "native";
+      const browserMcp = options.browserTools ? mintBrowserMcpConfig(userId, targetProject.id) : null;
       const forkParams = {
         threadId: request.params.threadId,
         lastTurnId: input.turnId,
@@ -3949,7 +4088,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         approvalPolicy: targetProject.defaultApprovalPolicy,
         sandbox: targetProject.defaultSandbox,
         threadSource: "user",
-        config: contextConfig,
+        config: { ...contextConfig, ...browserMcp?.config },
         excludeTurns: true,
         deferGoalContinuation: true
       };
@@ -3998,6 +4137,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         model,
         reasoningEffort
       });
+      if (browserMcp?.bindingId) bindBrowserMcpThread(browserMcp.bindingId, createdThreadId, store);
       const targetAccount = poolBridge?.getKnownThreadAccount(createdThreadId)
         ?? (routing ? { id: routing.targetAccount.id, label: routing.targetAccount.label } : null);
       const name = branchTitle(
@@ -4074,6 +4214,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       await assertTrackedUserQuotaAvailable(bridge, store, userId, request.params.threadId);
       await bridge.request("thread/resume", {
         threadId: request.params.threadId,
+        config: browserMcpForThread(request.params.threadId),
         cwd: project.rootPath,
         approvalPolicy: project.defaultApprovalPolicy,
         sandbox: project.defaultSandbox
@@ -4145,6 +4286,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       // filesystem changes made during that turn.
       await bridge.request("thread/resume", {
         threadId: request.params.threadId,
+        config: browserMcpForThread(request.params.threadId),
         cwd: project.rootPath,
         approvalPolicy: project.defaultApprovalPolicy,
         sandbox: project.defaultSandbox

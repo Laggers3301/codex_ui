@@ -14,6 +14,8 @@ import { registerRoutes } from "./routes.js";
 import { DocumentCompiler } from "./documentCompiler.js";
 import { registerDocumentWorkbenchRoutes } from "./documentWorkbench.js";
 import { attachSocketServer } from "./socket.js";
+import { BrowserService } from "./browserService.js";
+import { registerBrowserRoutes, browserMcpAuthorized } from "./browserRoutes.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -74,6 +76,7 @@ app.addHook("onRequest", async (request, reply) => {
   if (isPublicPath(pathname)) {
     return;
   }
+  if (pathname === "/api/browser/mcp" && browserMcpAuthorized(request.headers)) return;
 
   // A peer can request only its local leaderboard snapshot with the shared
   // internal token; browser login cookies never leave this machine.
@@ -121,9 +124,12 @@ await app.register(multipart, {
   }
 });
 
-registerRoutes(app, bridge as CodexBridge, store);
+registerRoutes(app, bridge as CodexBridge, store, { browserTools: true });
 const documentCompiler = new DocumentCompiler();
 registerDocumentWorkbenchRoutes(app, store, { compiler: documentCompiler });
+const browserService = new BrowserService();
+registerBrowserRoutes(app, store, browserService);
+app.addHook("onClose", async () => { await browserService.dispose(); });
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char] ?? char));
@@ -316,7 +322,7 @@ app.setNotFoundHandler((request, reply) => {
   return reply.type(mimeTypes[extension] ?? "application/octet-stream").send(fs.createReadStream(responsePath));
 });
 
-attachSocketServer(app.server, bridge as CodexBridge, store);
+attachSocketServer(app.server, bridge as CodexBridge, store, browserService);
 
 let shuttingDown = false;
 async function shutdownServer(signal: string) {
@@ -326,6 +332,7 @@ async function shutdownServer(signal: string) {
   shuttingDown = true;
   try {
     app.log.info({ signal }, "Shutting down Codex Web Console");
+    await browserService.dispose();
     bridge.stop();
     store.close();
     process.exit(0);

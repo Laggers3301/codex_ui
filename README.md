@@ -9,6 +9,7 @@ React/Vite frontend and Fastify backend for a multi-user Codex app-server pool. 
 - `tests/`: browser fixtures and scroll checks.
 - `scripts/`: build/vendor preparation, runtime supervision, document-tool installation, skill installation, schema, database-inspection, and export helpers.
 - `skills/latex-word-authoring/`: selection-aware LaTeX/Word authoring and conversion workflows.
+- `skills/remote-folders/`, `remote-folder-*`, `remote-folders.mjs`: conversation-scoped remote directory selection, mounting, browsing and explicit reconnection.
 - `maintenance/pool-watchdog.mjs`: local backend/tunnel health and cgroup memory-pressure monitoring; deployment-specific accounts and maintenance snapshots are not shipped.
 - `account-pool.example.json`: placeholder-only pool format. Keep the real config outside Git.
 
@@ -30,3 +31,7 @@ Never commit a real pool file, Codex home, token, browser/session cookie, SSH ke
 Document compilation/conversion requires local tools configured through `DOCUMENT_*` environment variables. The optional Linux installer is `scripts/setup-document-tools.sh`; `DOCUMENT_TOOLS_ROOT` controls its isolated installation directory. Install the authoring skill into your own configured runtimes with `CODEX_WEB_ACCOUNT_POOL_FILE=/private/pool.json node scripts/install-document-authoring-skill.mjs`.
 
 Browser checks use Playwright (`npx playwright install chromium`). Live QA scripts require an explicitly authorized QA user/workspace/thread through their `DOCUMENT_QA_*` or `SUBAGENT_*` variables; they contain no production login or session identifiers.
+
+The unified right workspace contains independently opened file previews, diffs, terminal sessions, subagent history, a multi-tab browser and conversation-owned scheduled tasks. Browser automation uses isolated per-user/conversation contexts, guarded network access, and approval for model-controlled mutations. Schedules are saved by the backend and enqueue turns in their original conversations without requiring an open webpage.
+
+Remote directories require Linux FUSE/SSHFS, existing SSH key authorization and trusted host keys. Install the SFTP dependency with `python3 -m pip install --target .remote-folder-deps -r remote-folder-requirements.txt`. Set the same `CODEX_WEB_USER_WORKSPACE_ROOT` on the backend and UI proxy; both default to `$CODEX_WEB_DATA_DIR/users`. Opening the webpage does not connect SSH or open the remote panel; manual Refresh/Retry restores only saved directories in the current conversation, preserving their access mode. Private registries and mount contents remain outside this repository.

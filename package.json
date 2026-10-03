@@ -8,7 +8,7 @@
     "dev:server": "tsx watch server/index.ts",
     "dev:client": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && node scripts/build.mjs",
-    "test": "vitest run src server && node --test scripts/install-document-authoring-skill.test.mjs scripts/preserve-auth-failures.test.cjs",
+    "test": "vitest run src server && node --test scripts/install-document-authoring-skill.test.mjs scripts/preserve-auth-failures.test.cjs remote-folders.test.mjs && python3 remote-folder-control.test.py",
     "serve": "tsx server/index.ts",
     "generate:codex-schema": "node scripts/generate-codex-schema.mjs"
   },
@@ -41,6 +41,7 @@
     "lucide-react": "^0.468.0",
     "mermaid": "^11.17.2",
     "pdfjs-dist": "5.7.284",
+    "playwright-core": "1.63.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",

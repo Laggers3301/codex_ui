@@ -65,6 +65,7 @@
       <button type="button" data-action="archive-list"><span class="v2MenuIcon" data-icon="archive-list"></span><span><strong>归档会话</strong><small>查看并恢复已归档对话</small></span></button>
       <button type="button" data-action="archive-current"><span class="v2MenuIcon" data-icon="archive-current"></span><span><strong>归档当前会话</strong><small>从列表收起，随时可恢复</small></span></button>
       <button type="button" data-action="terminal"><span class="v2MenuIcon" data-icon="terminal"></span><span><strong>交互终端</strong><small>在当前工作区运行命令</small></span></button>
+      <button type="button" data-action="browser"><span class="v2MenuIcon" data-icon="browser"></span><span><strong>浏览器</strong><small>与 AI 一起查看和操作网页</small></span></button>
       <button type="button" data-action="hooks"><span class="v2MenuIcon" data-icon="hooks"></span><span><strong>Hooks 状态</strong><small>检查与审核当前工作区</small></span></button>
       <span class="v2MenuSection">设置与用量</span>
       <button type="button" data-action="settings"><span class="v2MenuIcon" data-icon="settings"></span><span><strong>设备与导出设置</strong><small>配置文件发送和对话导出</small></span></button>
@@ -73,7 +74,7 @@
     </div>
 
     <script type="module">
-      import { Plus, FolderUpload, Target, Application, Send, ChartPie, Setting, Time, Trophy, Plan, Branch, History, FileCollection, Terminal, FileEditing } from "@icon-park/svg";
+      import { Plus, FolderUpload, Target, Application, Send, ChartPie, Setting, Time, Trophy, Plan, Branch, History, FileCollection, Terminal, FileEditing, Browser } from "@icon-park/svg";
       (() => {
         const plusMenu = document.getElementById("v2PlusMenu");
         let plusCloseTimer = 0;
@@ -121,7 +122,7 @@
         const iconMarkup = (icon, size = 18) => icon({ ...iconOptions, size })
           .replace(/^<\?xml[^>]*>/, "")
           .replace("<svg ", '<svg aria-hidden="true" focusable="false" ');
-        const menuIcons = { upload: FolderUpload, goal: Target, plan: Plan, skills: Application, send: Send, context: ChartPie, writing: FileEditing, worktree: Branch, "archive-list": History, "archive-current": FileCollection, terminal: Terminal, hooks: Setting, settings: Setting, quota: Time, leaderboard: Trophy };
+        const menuIcons = { upload: FolderUpload, goal: Target, plan: Plan, skills: Application, send: Send, context: ChartPie, writing: FileEditing, worktree: Branch, "archive-list": History, "archive-current": FileCollection, terminal: Terminal, browser: Browser, hooks: Setting, settings: Setting, quota: Time, leaderboard: Trophy };
         plusMenu.querySelectorAll("[data-icon]").forEach((slot) => {
           const icon = menuIcons[slot.dataset.icon];
           if (icon) slot.innerHTML = iconMarkup(icon);
@@ -195,7 +196,7 @@
               planButton.querySelector('small').textContent = planEnabled ? '已开启；点击关闭' : '先审方案，再决定是否执行';
               const hasProject = Boolean(document.querySelector('.projectTitle .recordMapping'));
               const hasThread = document.querySelector('.composer[data-has-thread="true"]') !== null;
-              for (const action of ['writing', 'worktree', 'archive-list', 'archive-current', 'terminal', 'hooks']) {
+              for (const action of ['writing', 'worktree', 'archive-list', 'archive-current', 'terminal', 'browser', 'hooks']) {
                 plusMenu.querySelector(`[data-action="${action}"]`).disabled = !hasProject || (action === 'archive-current' && !hasThread);
               }
               plusMenu.querySelector('[data-action="worktree"] small').textContent = hasThread ? '隔离改动并接力当前会话' : '创建隔离的工作区会话';
@@ -223,7 +224,7 @@
           if (action === "plan") document.querySelector('.composer .v2PlanModeBridge')?.click();
           if (action === "context") clickExisting(".v2ContextStatusButton", /上下文|会话状态/);
           if (action === "goal") window.dispatchEvent(new CustomEvent("codex:compose-goal"));
-          if (["writing", "worktree", "archive-list", "archive-current", "terminal", "hooks"].includes(action)) window.dispatchEvent(new CustomEvent("codex:workspace-action", { detail: action }));
+          if (["writing", "worktree", "archive-list", "archive-current", "terminal", "browser", "hooks"].includes(action)) window.dispatchEvent(new CustomEvent("codex:workspace-action", { detail: action }));
           closePlusMenu();
         });
 

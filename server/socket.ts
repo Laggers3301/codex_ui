@@ -6,7 +6,6 @@ import type { IncomingHttpHeaders } from "node:http";
 import type { Server as HttpServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
-import { serverConfig } from "./config.js";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
@@ -17,6 +16,8 @@ import { journalItem } from "./timelineJournal.js";
 import { RequestDeduper } from "./requestDeduper.js";
 import { getOwnedThreadGoal, setGoalAndStartIfIdle } from "./goalExecution.js";
 import { documentContextInput, documentReferenceFromInput } from "./documentContext.js";
+import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
+import type { BrowserService, BrowserState } from "./browserService.js";
 import {
   continuationRecoveryPrompt,
   contextRecoveryPrompt,
@@ -52,7 +53,7 @@ const threadStartContextConfigSchema = z.object({
 const contextProbeBytes = 512 * 1024;
 const contextPrecompactThreshold = 0.85;
 const contextFullThreshold = 0.98;
-const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
+const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? "/home/<user>/codex_zerotier_remote/users";
 const DEFAULT_COMPACT_TIMEOUT_MS = 600_000;
 
 function compactTimeoutMs(): number {
@@ -452,8 +453,13 @@ function runDedupedPrompt<T>(
   );
 }
 
-export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, store: ProjectStore): WebSocketServer {
+export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, store: ProjectStore, browserService?: BrowserService): WebSocketServer {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const browserChanged = (event: { userId: string; threadId: string; state: BrowserState }) => {
+    sendToUser(wss, event.userId, { type: "browser.state", data: { threadId: event.threadId, projectId: store.getThreadOwner(event.threadId)?.projectId, state: event.state } });
+  };
+  browserService?.on("changed", browserChanged);
+  wss.on("close", () => browserService?.off("changed", browserChanged));
   const liveStates = new Map<string, LiveStateStore>();
   const processOwners = new Map<string, string>();
   const processSockets = new Map<string, WebSocket>();
@@ -530,6 +536,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       await bridge.request("thread/resume", {
         threadId,
         cwd: threadOwner.rootPath,
+        config: browserMcpForThread(threadId),
         model: threadOwner.modelOverride ?? project.defaultModel,
         approvalPolicy: project.defaultApprovalPolicy,
         sandbox: project.defaultSandbox
@@ -619,6 +626,12 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     const turnId = notificationTurnId(message);
     const threadIdForWatchdog = notificationThreadId(message);
     const accountId = notificationAccountId(message);
+    if (threadIdForWatchdog && message.method === "turn/completed") {
+      const status = asRecord(asRecord(message.params).turn).status;
+      if ((status === "interrupted" || status === "failed") && browserService?.get(owner, threadIdForWatchdog)) {
+        void browserService.control(owner, threadIdForWatchdog, "human").catch(() => undefined);
+      }
+    }
     if (turnId && threadIdForWatchdog && message.method === "turn/started") {
       turnWatchdog.start(owner, accountId, threadIdForWatchdog, turnId);
     }
@@ -954,7 +967,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     });
 
     ws.on("message", (raw) => {
-      void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission);
+      void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission, browserService);
     });
     ws.on("close", () => {
       for (const [processId, socket] of processSockets) {
@@ -984,7 +997,8 @@ async function handleClientMessage(
   sessionUserId: string,
   raw: string,
   startNextQueuedTurn: (owner: string, threadId: string) => Promise<void>,
-  steerQueuedSubmission: (owner: string, threadId: string, expectedTurnId: string, queuedSubmissionId: string) => Promise<unknown>
+  steerQueuedSubmission: (owner: string, threadId: string, expectedTurnId: string, queuedSubmissionId: string) => Promise<unknown>,
+  browserService?: BrowserService
 ): Promise<void> {
   let message: SocketClientMessage;
   try {
@@ -1026,6 +1040,7 @@ async function handleClientMessage(
           model,
           reasoningEffort,
           async () => {
+            const browserMcp = browserService ? mintBrowserMcpConfig(sessionUserId, project.id) : null;
             const startParams = {
               cwd: project.rootPath,
               model,
@@ -1033,6 +1048,7 @@ async function handleClientMessage(
               sandbox: pickString(message.sandbox, project.defaultSandbox),
               threadSource: "user",
               config: {
+                ...browserMcp?.config,
                 ...threadContextConfigOverrides(requestedContextConfig),
                 ...await scopedHookTrustConfig(bridge, store, sessionUserId, project)
               },
@@ -1054,6 +1070,7 @@ async function handleClientMessage(
               model,
               reasoningEffort
             });
+            if (browserMcp?.bindingId) bindBrowserMcpThread(browserMcp.bindingId, threadId, store);
             if (requestedContextConfig) {
               store.setThreadContextConfig(threadId, sessionUserId, {
                 profile: requestedContextConfig.profile,
@@ -1135,6 +1152,7 @@ async function handleClientMessage(
                 approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
                 sandbox: pickString(message.sandbox, project.defaultSandbox),
                 config: {
+                  ...(browserService ? mintBrowserMcpConfig(sessionUserId, owner?.projectId ?? project.id, threadId).config : {}),
                   ...threadContextConfigOverrides(contextConfig, contextWindowMeasuredForConfig(contextConfig, contextUsage)),
                   ...await scopedHookTrustConfig(bridge, store, sessionUserId, project, threadId)
                 },

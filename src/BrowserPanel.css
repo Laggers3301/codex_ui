@@ -1,0 +1,60 @@
+.browserPanel { position: relative; display: flex; flex: 0 0 0; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: var(--ui-diff-surface); color: var(--ui-content); opacity: 0; transform: translateX(22px) scale(.985); clip-path: inset(0 0 0 100%); pointer-events: none; transition: flex-grow .38s cubic-bezier(.22,1,.36,1), flex-basis .38s cubic-bezier(.22,1,.36,1), opacity .25s ease, transform .38s cubic-bezier(.22,1,.36,1), clip-path .38s cubic-bezier(.22,1,.36,1); }
+.browserPanel.open { flex: 1 1 0; min-width: 0; min-height: 0; opacity: 1; transform: none; clip-path: inset(0); pointer-events: auto; }
+.rightPanelWithBrowser { min-height: 0; overflow: hidden; }
+.rightPanelWithBrowser > .browserPanel { flex: 1 1 0; min-height: 240px; overflow-y: auto; }
+.diffReviewPanel.rightPanelWithBrowser > .rightPaneSubagents,
+.diffReviewPanel.rightPanelWithBrowser > .rightPaneDiff { flex: 1 1 0; min-height: 120px; }
+.rightPanelWithBrowser > .browserPanel:not(.open) { flex: 0 0 0; min-height: 0; }
+.browserPanelHeader { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 8px; min-height: 44px; padding: 7px 11px; border-bottom: 1px solid var(--ui-divider); color: var(--ui-content); font-size: 12px; }
+.browserPanelStatus,.browserPanelHeaderActions { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
+.browserPanelStatus { color: var(--ui-content-muted); white-space: nowrap; }
+.browserPanelGlyph,.browserPanelGlyph svg { display: block; width: 16px; height: 16px; flex: none; }
+.browserPanelStatus.active { color: #3b82f6; }
+.browserPanelHeaderActions { gap: 3px; }
+.browserPanelHeader button,.browserAddress button,.browserManualControls button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 28px; padding: 4px 7px; border: 0; border-radius: 7px; background: transparent; color: inherit; font: inherit; font-size: 11px; cursor: pointer; }
+.browserPanel button:hover:not(:disabled) { background: var(--ui-hover); }
+.browserPanel button:disabled { opacity: .4; cursor: default; }
+.browserPanelHeader .browserPanelStop { color: var(--ui-content-muted); }
+.browserPanelHeader .browserPanelClose { width: 28px; padding: 0; }
+.browserAddress { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; padding: 7px 10px; border-bottom: 1px solid var(--ui-divider); }
+.browserTabBar { display: flex; flex: 0 0 auto; align-items: center; gap: 4px; padding: 6px 10px 0; min-width: 0; }
+.browserTabs { display: flex; position: relative; min-width: 0; flex: 1; gap: 3px; overflow-x: auto; scrollbar-width: thin; }
+.browserTab { display: flex; align-items: center; flex: 0 1 155px; min-width: 95px; max-width: 185px; border-radius: 7px; background: transparent; color: var(--ui-content-muted); animation: browserTabEnter .32s cubic-bezier(.22,1,.36,1) both; transition: background .22s ease, color .22s ease, opacity .22s ease, transform .28s cubic-bezier(.22,1,.36,1); }
+.browserTab.selected { background: var(--ui-hover); color: var(--ui-content); }
+.browserTab.closing { opacity: 0; transform: translateY(5px) scale(.94); pointer-events: none; }
+.browserTab button,.browserNewTab { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 6px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; font-size: 11px; cursor: pointer; }
+.browserTab > [role=tab] { flex: 1; min-width: 0; justify-content: flex-start; }
+.browserTab > [role=tab] span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.browserTab .browserTabClose { flex: 0 0 22px; width: 22px; padding: 4px; margin-right: 2px; }
+.browserNewTab { flex: 0 0 28px; width: 28px; height: 28px; color: var(--ui-content-muted); }
+@keyframes browserTabEnter { from { opacity: 0; transform: translateY(6px) scale(.96); } to { opacity: 1; transform: none; } }
+.browserAddress > button { width: 27px; color: var(--ui-content-muted); }
+.browserAddress input,.browserManualControls input { flex: 1; width: 0; min-width: 0; padding: 7px 9px; border: 0; border-radius: 7px; outline: 0; background: var(--ui-hover); color: var(--ui-content); font-family: inherit; font-size: 12px; line-height: 1.4; }
+.browserAddress input:focus,.browserManualControls input:focus { box-shadow: inset 0 0 0 1px var(--ui-divider); }
+.browserAddress .browserGo { width: auto; padding-inline: 10px; background: var(--ui-hover); }
+.browserViewport { position: relative; display: grid; flex: 1 1 auto; min-height: 100px; place-items: center; margin: 10px; overflow: hidden; border: 1px solid var(--ui-divider); border-radius: 9px; background: var(--ui-hover); }
+.browserViewport { outline: 2px solid transparent; outline-offset: -2px; transition: outline-color .32s cubic-bezier(.22,1,.36,1); }
+.browserViewport.agentActive { outline-color: #3b82f6; }
+.browserViewport.manual { cursor: crosshair; }
+.browserViewport img { display: block; width: 100%; height: 100%; object-fit: contain; user-select: none; }
+.browserEmpty { display: flex; align-items: center; justify-content: center; gap: 9px; padding: 20px; color: var(--ui-content-muted); font-size: 12px; text-align: center; }
+.browserLoadingOverlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgb(0 0 0 / 15%); color: white; pointer-events: none; }
+.browserCursor { position: absolute; z-index: 2; color: #2684ff; filter: drop-shadow(0 1px 2px #000); pointer-events: none; transform: translate(-3px,-2px); }
+.browserActivity { flex: 0 0 auto; padding: 0 12px 8px; color: var(--ui-content-muted); font-size: 11px; overflow-wrap: anywhere; }
+.browserActivity.error { color: var(--red, #ef4444); }
+.browserApproval { display: grid; flex: 0 0 auto; gap: 5px; margin: 8px 10px 0; padding: 10px; border: 1px solid #d8a437; border-radius: 9px; background: var(--ui-hover); font-size: 12px; }
+.browserApproval > span { color: var(--ui-content-muted); overflow-wrap: anywhere; }
+.browserApproval > div { display: flex; justify-content: flex-end; gap: 5px; }
+.browserApproval button { display: inline-flex; align-items: center; gap: 4px; padding: 5px 8px; border: 0; border-radius: 6px; background: var(--ui-diff-surface); color: var(--ui-content); font: inherit; cursor: pointer; }
+.browserManualControls { display: flex; flex: 0 0 auto; flex-wrap: wrap; align-items: center; gap: 5px; padding: 0 10px max(10px, env(safe-area-inset-bottom)); }
+.browserManualControls form { display: flex; flex: 1 1 180px; gap: 5px; }
+.browserManualControls form button { background: var(--ui-hover); }
+.browserKeys { position: relative; }
+.browserKeys > span { position: absolute; z-index: 4; right: 0; bottom: 100%; display: flex; gap: 3px; padding: 5px; border: 1px solid var(--ui-divider); border-radius: 8px; background: var(--ui-diff-surface); box-shadow: 0 5px 18px rgb(0 0 0 / 18%); }
+.browserKeys > span button { white-space: nowrap; }
+.browserManualControls small { flex: 1 0 100%; color: var(--ui-content-muted); font-size: 10px; }
+.browserSpin { animation: browserSpin .8s linear infinite; }
+@keyframes browserSpin { to { transform: rotate(360deg); } }
+.browserPanel :focus-visible { outline: 2px solid var(--ui-content-muted); outline-offset: 2px; }
+@media (max-width: 700px) { .browserPanel { position: absolute; z-index: 30; inset: 0 0 0 auto; width: 100dvw; max-width: 100%; min-width: 0; flex: none; } .browserPanelHeader { padding-top: max(7px, env(safe-area-inset-top)); } .browserAddress input,.browserManualControls input { font-size: 16px; } }
+@media (prefers-reduced-motion: reduce) { .browserPanel,.browserTab { transition-duration: .01ms; animation-duration: .01ms; } .browserSpin { animation-duration: 1.5s; } }

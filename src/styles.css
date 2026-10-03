@@ -6674,15 +6674,17 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .quotaPopoverRows strong { overflow-wrap: anywhere; color: #d7d9d4; font-size: 14px !important; font-weight: 400; line-height: 20px; white-space: normal; }
 
 .accountPoolPopover {
-  width: min(350px, calc(100vw - 24px));
+  width: max-content;
+  min-width: min(350px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
   padding-top: 8px;
   border-color: #41433f;
   background: rgba(38, 39, 38, .98);
   box-shadow: 0 20px 58px rgba(0, 0, 0, .54);
 }
 .accountPoolTabs {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(var(--account-columns, 3), minmax(0, 1fr));
   gap: 6px;
   padding: 0 0 3px;
   border-bottom: 0;
@@ -6693,8 +6695,8 @@ body:has(.globalSearchScrim) .v2AccountDock {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  min-width: 92px;
-  max-width: 126px;
+  min-width: 0;
+  max-width: none;
   padding: 5px 8px;
   min-height: 38px;
   border: 1px solid rgba(235, 238, 231, .12);
@@ -6715,7 +6717,11 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .accountPoolTab.current::after { content: ""; position: absolute; top: 5px; right: 5px; width: 5px; height: 5px; border-radius: 50%; background: #63d999; box-shadow: 0 0 0 3px rgba(99, 217, 153, .11); }
 .accountPoolTab.degraded { opacity: .58; }
 .accountPoolTab span { overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.accountPoolTab strong { font-size: 13px; }
+.accountPoolTab strong { flex: none; font-size: 13px; white-space: nowrap; }
+.accountPoolPopover :is(.quotaPopoverRows, .accountPoolSelectedMeta) { contain: inline-size; }
+@media (max-width: 480px) {
+  .accountPoolTab { gap: 6px; padding-inline: 6px; }
+}
 .accountPoolSelectedMeta { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 12px; margin-top: 10px; padding: 10px 2px 0; border: 0 !important; border-top: 1px solid #393b37 !important; color: #a8aba4; font-size: 12px; }
 .accountHealthDot { width: 7px; height: 7px; border-radius: 999px; background: #8f938b; }
 .accountHealthDot.ready { background: #5fd08a; box-shadow: 0 0 0 3px rgba(95, 208, 138, .12); }
@@ -7442,7 +7448,7 @@ body:has(.globalSearchScrim) .v2AccountDock {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: inherit;
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+  font-family: var(--pool-ui-font);
   font-size: 12px !important;
   line-height: 18px !important;
   -webkit-text-size-adjust: 100%;

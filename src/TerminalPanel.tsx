@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { X } from "lucide-react";
+import { X } from "./PanelIcons";
 import { codexSocket } from "./codexSocket";
 import "@xterm/xterm/css/xterm.css";
 import "./TerminalPanel.css";

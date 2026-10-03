@@ -46,6 +46,84 @@ export function getApiUserId(): string {
   return currentUserId;
 }
 
+export interface RemoteFolder {
+  id: string;
+  name: string;
+  host: string;
+  remotePath: string;
+  mountPath: string;
+  readOnly: boolean;
+  scope: "conversation" | "account";
+}
+
+export interface RemoteFolderEntry {
+  name: string;
+  path: string;
+  kind: "directory" | "file" | "symlink" | "other";
+}
+
+async function remoteFolderRequest<T>(path: string, options?: RequestInit): Promise<T> {
+  const expectedUserId = currentUserId;
+  const result = await request<T & { ownerUserId: string }>(path, { ...options, cache: "no-store" });
+  if (currentUserId !== expectedUserId || result.ownerUserId !== expectedUserId) {
+    throw new Error("远程目录的账号与当前页面不一致，请刷新网页后重试。");
+  }
+  return result;
+}
+
+export function listRemoteFolders(threadId: string | null, signal?: AbortSignal): Promise<{ data: RemoteFolder[]; workspacePath: string }> {
+  const params = new URLSearchParams();
+  if (threadId) params.set("threadId", threadId);
+  return remoteFolderRequest(`/api/remote-folders?${params}`, { signal });
+}
+
+export function createWorkspaceDirectory(parentPath: string, name: string): Promise<{ data: { path: string } }> {
+  return request("/api/system/directories", { method: "POST", body: JSON.stringify({ parentPath, name }) });
+}
+
+export function listRemoteFolderEntries(id: string, relativePath: string, threadId: string | null, signal?: AbortSignal): Promise<{ data: { entries: RemoteFolderEntry[]; truncated: boolean } }> {
+  const params = new URLSearchParams({ path: relativePath });
+  if (threadId) params.set("threadId", threadId);
+  return remoteFolderRequest(`/api/remote-folders/${encodeURIComponent(id)}/entries?${params}`, { signal });
+}
+
+export interface RemoteFolderCatalog {
+  hosts: Array<{ id: string; name: string; windows: boolean }>;
+  recent: Array<{ id: string; name: string; hostId: string; path: string }>;
+}
+
+export interface RemoteDirectoryPage {
+  path: string | null;
+  displayPath: string;
+  parent: string | null;
+  directories: Array<{ name: string; path: string }>;
+  truncated: boolean;
+}
+
+export function remoteFolderCatalog(signal?: AbortSignal): Promise<{ data: RemoteFolderCatalog }> {
+  return remoteFolderRequest("/api/remote-folders/catalog", { signal });
+}
+
+export function browseRemoteComputer(hostId: string, path: string | null, signal?: AbortSignal): Promise<{ data: RemoteDirectoryPage }> {
+  return remoteFolderRequest("/api/remote-folders/browse", { method: "POST", body: JSON.stringify({ hostId, path }), signal });
+}
+
+export function attachRemoteFolder(threadId: string, hostId: string, path: string, signal?: AbortSignal): Promise<{ data: { id: string } }> {
+  return remoteFolderRequest("/api/remote-folders/attach", { method: "POST", body: JSON.stringify({ threadId, hostId, path }), signal });
+}
+
+export function closeRemoteFolder(threadId: string, folderId: string): Promise<{ data: { ok: boolean } }> {
+  return remoteFolderRequest(`/api/remote-folders/${encodeURIComponent(folderId)}/close`, { method: "POST", body: JSON.stringify({ threadId }) });
+}
+
+export function reconnectRemoteFolder(threadId: string, folderId: string, signal?: AbortSignal): Promise<{ data: { id: string } }> {
+  return remoteFolderRequest(`/api/remote-folders/${encodeURIComponent(folderId)}/reconnect`, { method: "POST", body: JSON.stringify({ threadId }), signal });
+}
+
+export function transferRemoteFolderDraft(draftId: string, threadId: string): Promise<{ data: { ok: boolean } }> {
+  return remoteFolderRequest("/api/remote-folders/transfer", { method: "POST", body: JSON.stringify({ draftId, threadId }) });
+}
+
 export function getPushPublicKey(): Promise<{ data: { publicKey: string } }> {
   return request("/api/push/key");
 }

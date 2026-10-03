@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import { Minus, Plus } from "lucide-react";
+import { Minus, Plus } from "./PanelIcons";
 import { PreviewZoom } from "./PreviewZoom";
 
 // Session-memory-only, content-addressed LRU: never serve an old rendering

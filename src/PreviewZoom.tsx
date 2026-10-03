@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Minus, Plus } from "lucide-react";
+import { Minus, Plus } from "./PanelIcons";
 
 export function PreviewZoom({ children, frame = false }: { children: ReactNode; frame?: boolean }) {
   const stageRef = useRef<HTMLDivElement>(null);

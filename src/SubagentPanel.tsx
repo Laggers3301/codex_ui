@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ArrowLeft, Close, Refresh } from "@icon-park/svg";
+import { ArrowLeft, X, RefreshCcw } from "./PanelIcons";
 import { listSubagentThreads, readSubagentThread } from "./api";
 import { agentState, agentStateLabel, isActiveAgent, type AgentEntry } from "./subagentPresentation";
 import { groupSubagentRecordItems, mergeSubagentHistory, type SubagentRecordGroup } from "./subagentHistory";
@@ -13,8 +13,8 @@ import { SubagentDirectoryList } from "./SubagentDirectoryList";
 import type { SubagentDirectoryPage } from "./types";
 
 function Glyph({ name }: { name: "back" | "close" | "refresh" }) {
-  const svg = ({ back: ArrowLeft, close: Close, refresh: Refresh }[name])({ theme: "outline", size: 16, strokeWidth: 3, fill: "currentColor" }).replace(/^<\?xml[^>]*>/, "");
-  return <span className="threadActivityIcon" aria-hidden="true" dangerouslySetInnerHTML={{ __html: svg }} />;
+  const Glyph = { back: ArrowLeft, close: X, refresh: RefreshCcw }[name];
+  return <span className="threadActivityIcon" aria-hidden="true"><Glyph /></span>;
 }
 const shortName = (name: string) => name.replace(/^\/root\//, "");
 const canonical = (name: string) => shortName(name).replace(/^\//, "");

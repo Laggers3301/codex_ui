@@ -2,6 +2,9 @@ import { Fragment, createContext, isValidElement, memo, useCallback, useContext,
 import { createPortal } from "react-dom";
 import { lazy, Suspense } from "react";
 import { PreviewZoom } from "./PreviewZoom";
+import { X as PanelClose, FileText as PanelFile, ChevronDown as PanelDown, MoreHorizontal as PanelMore } from "./PanelIcons";
+import { RemoteFolderSidebar, fileReferenceText } from "./RemoteFolderSidebar";
+import { transferRemoteFolderDraft } from "./api";
 const DocumentPreview = lazy(() => import("./DocumentPreview"));
 const DocumentWorkbench = lazy(() => import("./writing/DocumentWorkbench"));
 import type { WritingProject, WritingSelection } from "./writing/types";
@@ -59,8 +62,11 @@ import { ToolReveal } from "./ToolReveal";
 import { skillReadSummary } from "./skillReadSummary";
 import { GoalProgress } from "./GoalProgress";
 import { useThreadGoal } from "./threadGoal";
+import { useThreadSchedules } from "./threadSchedules";
+import { ThreadSchedules, threadScheduleSummary } from "./ThreadSchedules";
 import { SubagentActivity, SubagentToolCard } from "./SubagentActivity";
 import { SubagentPanel } from "./SubagentPanel";
+import { SubagentAvatar } from "./SubagentAvatar";
 import { SelectionAskAction, type SelectionAskActionHandle } from "./SelectionAskAction";
 import { collectAgents, parseAgentOperation, reconcileSubagents } from "./subagentPresentation";
 import { useSubagentDirectory } from "./subagentDirectory";
@@ -73,6 +79,7 @@ import remend from "remend";
 import type { PluggableList } from "unified";
 import {
   createProject,
+  createWorkspaceDirectory,
   branchThread,
   editLatestThreadTurn,
   deleteProject,
@@ -126,6 +133,8 @@ import {
 } from "./api";
 import { codexSocket } from "./codexSocket";
 import { TerminalPanel } from "./TerminalPanel";
+import { BrowserPanel } from "./BrowserPanel";
+import { RightWorkspace, WorkspaceOverview, WorkspaceIcon, type WorkspaceTab, type WorkspaceSection } from "./RightWorkspace";
 import { normalizeGfmTableBoundaries, normalizeMathMarkdown, stripInterruptArtifacts } from "./markdown";
 import { createRevealPass, emptyRevealSnapshot, StreamRevealSpan } from "./streamReveal";
 import { exactSearchTurn, waitForSearchTarget } from "./searchNavigation";
@@ -614,6 +623,7 @@ interface PromptRequestContext {
   reasoningEffort: ReasoningEffort;
   sentPromptText: string;
   visibleText: string;
+  remoteDraftId?: string;
 }
 
 interface QueuedSubmission {
@@ -894,7 +904,25 @@ function RunnablePreviewFrame({ preview }: { preview: RunnablePreview }) {
 }
 
 function displayOutputText(value: unknown, maxLength = 60000): string {
-  const text = safeText(value);
+  let text = safeText(value);
+  // The native MCP result also contains the screenshot for the model. Keep
+  // encoded pixels out of the readable tool log; the right pane shows the image.
+  if (text.includes("Untrusted web page content.") && text.includes('"content"')) {
+    try {
+      const result = JSON.parse(text);
+      if (Array.isArray(result.content)) {
+        const readable = result.content.filter((part: { type?: string }) => part?.type === "text")
+          .map((part: { text?: string }) => {
+            try {
+              const page = JSON.parse(part.text || "");
+              if (typeof page.url === "string" && typeof page.text === "string") return `${page.title || "网页"}\n${page.url}\n\n${page.text}\n\n网页截图已传给模型，可在右栏查看。`;
+            } catch { /* Non-snapshot tool text remains unchanged. */ }
+            return part.text || "";
+          }).filter(Boolean).join("\n");
+        if (readable) text = readable;
+      }
+    } catch { /* A streaming/truncated output is not necessarily JSON yet. */ }
+  }
   if (text.length <= maxLength) {
     return text;
   }
@@ -1181,7 +1209,7 @@ function FileChangeReview({ changes, onComment }: {
       let oldLine = 0;
       let newLine = 0;
       return <section className={`fileChangeReviewFile${expanded ? " expanded" : ""}`} key={fileKey}>
-        <header><button type="button" className="fileChangeReviewToggle" aria-expanded={expanded} aria-label={`${expanded ? "收起" : "展开"} ${file.path || "未命名文件"} 的变更`} title={file.path} onClick={() => setExpandedFiles((current) => ({ ...current, [fileKey]: !expanded }))}><FileText size={14} /><span className="fileChangeReviewPath"><strong>{compactFileLabel(file.path) || "未命名文件"}</strong><span>{file.path.replace(/\\/g, "/").split("/").slice(0, -1).join("/")}</span></span><small>{file.kind}</small><ChevronDown className="fileChangeReviewChevron" size={15} /></button></header>
+        <header><button type="button" className="fileChangeReviewToggle" aria-expanded={expanded} aria-label={`${expanded ? "收起" : "展开"} ${file.path || "未命名文件"} 的变更`} title={file.path} onClick={() => setExpandedFiles((current) => ({ ...current, [fileKey]: !expanded }))}><PanelFile size={14} /><span className="fileChangeReviewPath"><strong>{compactFileLabel(file.path) || "未命名文件"}</strong><span>{file.path.replace(/\\/g, "/").split("/").slice(0, -1).join("/")}</span></span><small>{file.kind}</small><PanelDown className="fileChangeReviewChevron" size={15} /></button></header>
         <div className="fileChangeReviewContent"><div className="fileChangeReviewContentInner">{file.diff ? <div className="fileChangeReviewLines">
           {(showAllFiles[fileKey] ? lines : lines.slice(0, 500)).map((line, index) => {
             const hunk = line.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/);
@@ -3461,7 +3489,7 @@ function QuotaPopover({ quota, pool, loading, closing }: { quota: CodexQuota | n
     <section className={`quotaPopover accountPoolPopover ${closing ? "closing" : ""}`} role="status" aria-label="Codex 多账号额度详情" aria-hidden={closing} inert={closing}>
       {pool && quotaAccounts.length ? (
         <>
-          <div className="accountPoolTabs" role="tablist" aria-label="Codex 账号额度">
+          <div className="accountPoolTabs" style={{ "--account-columns": Math.min(3, quotaAccounts.length) } as CSSProperties} role="tablist" aria-label="Codex 账号额度">
             {quotaAccounts.map((account) => (
               <button
                 className={`accountPoolTab ${account.id === selectedAccount?.id ? "active" : ""} ${account.health !== "ready" ? "degraded" : ""} ${account.id === currentThreadAccount?.id ? "current" : ""} ${(remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent) ?? 100) <= 10 ? "lowQuota" : ""}`}
@@ -4241,6 +4269,8 @@ export function App() {
   const [savingThreadOrder, setSavingThreadOrder] = useState(false);
   const [selectedThread, setSelectedThread] = useState<ThreadSummary | null>(null);
   const threadGoal = useThreadGoal(selectedThread?.id ?? null, selectedUserId);
+  const threadSchedules = useThreadSchedules(selectedProjectId, selectedThread?.id ?? "");
+  const [scheduleEditor, setScheduleEditor] = useState<{ id: string | null; key: number }>({ id: null, key: 0 });
   const [writingSession, setWritingSession] = useState<{ project: WritingProject; userId: string; initialPath?: string } | null>(null);
   const [writingClosing, setWritingClosing] = useState(false);
   const [writingChatVisible, setWritingChatVisible] = useState(false);
@@ -4265,6 +4295,20 @@ export function App() {
   const [directoryBrowserOpen, setDirectoryBrowserOpen] = useState(false);
   const [directoryBrowser, setDirectoryBrowser] = useState<DirectoryListResponse | null>(null);
   const [directoryBrowserLoading, setDirectoryBrowserLoading] = useState(false);
+  const [directoryCreateOpen, setDirectoryCreateOpen] = useState(false);
+  const [directoryNewName, setDirectoryNewName] = useState("");
+  const [directoryCreating, setDirectoryCreating] = useState(false);
+  const [directoryCreateError, setDirectoryCreateError] = useState("");
+  const directoryBrowserRequestRef = useRef(0);
+  useEffect(() => {
+    directoryBrowserRequestRef.current += 1;
+    setDirectoryBrowser(null);
+    setDirectoryBrowserOpen(false);
+    setDirectoryCreateOpen(false);
+    setDirectoryCreating(false);
+    setDirectoryNewName("");
+    setDirectoryCreateError("");
+  }, [selectedUserId]);
   const [pendingDeleteProjectId, setPendingDeleteProjectId] = useState<string | null>(null);
   const [renamingProject, setRenamingProject] = useState<Project | null>(null);
   const [projectRenameDraft, setProjectRenameDraft] = useState("");
@@ -4290,6 +4334,58 @@ export function App() {
   const [hookSaving, setHookSaving] = useState(false);
   const [terminalProjectId, setTerminalProjectId] = useState<string | null>(null);
   const [terminalVisible, setTerminalVisible] = useState(false);
+  const [rightWorkspaceOpen, setRightWorkspaceOpen] = useState(false);
+  const [rightWorkspaceTab, setRightWorkspaceTab] = useState("overview");
+  const rightWorkspaceOpenRef = useRef(rightWorkspaceOpen);
+  rightWorkspaceOpenRef.current = rightWorkspaceOpen;
+  const [rightUtilityTabs, setRightUtilityTabs] = useState<string[]>([]);
+  const [remoteDraftVersion, setRemoteDraftVersion] = useState(0);
+  const remoteDraftStorageKey = `codex-remote-folder-draft:${selectedUserId}:${selectedProjectId}`;
+  const remoteDraftId = useMemo(() => {
+    const saved = window.sessionStorage.getItem(remoteDraftStorageKey);
+    if (saved && /^draft-[a-zA-Z0-9_-]+$/.test(saved)) return saved;
+    const id = `draft-${requestToken()}`;
+    window.sessionStorage.setItem(remoteDraftStorageKey, id);
+    return id;
+  }, [remoteDraftStorageKey, remoteDraftVersion]);
+  const remoteConnectionsInProgress = useRef(new Set<string>());
+  const [previewDocked, setPreviewDocked] = useState(true);
+  const [previewMount, setPreviewMount] = useState<HTMLDivElement | null>(null);
+  const showRightWindow = useCallback((id: string) => {
+    setRightWorkspaceTab(id);
+    setRightWorkspaceOpen(true);
+    if (["remote", "goal", "schedules", "outputs", "sources"].includes(id)) setRightUtilityTabs(current => current.includes(id) ? current : [...current, id]);
+  }, []);
+  useEffect(() => {
+    setRightWorkspaceOpen(false);
+    setRightWorkspaceTab("overview");
+    setRightUtilityTabs([]);
+  }, [selectedUserId, selectedThread?.id, remoteDraftId]);
+  useEffect(() => {
+    const toggle = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "b") {
+        event.preventDefault(); setRightWorkspaceOpen(open => !open);
+      }
+    };
+    window.addEventListener("keydown", toggle);
+    return () => window.removeEventListener("keydown", toggle);
+  }, []);
+  const [browserReview, setBrowserReview] = useState<{ projectId: string; threadId: string | null; navigation?: { id: string; url: string } } | null>(null);
+  const [browserVisible, setBrowserVisible] = useState(false);
+  const [browserNeedsApproval, setBrowserNeedsApproval] = useState(false);
+  const browserCloseTimerRef = useRef<number | null>(null);
+  const browserOpenFramesRef = useRef<number[]>([]);
+  const browserAttentionRef = useRef("");
+  useEffect(() => {
+    for (const frame of browserOpenFramesRef.current) window.cancelAnimationFrame(frame);
+    if (browserCloseTimerRef.current !== null) window.clearTimeout(browserCloseTimerRef.current);
+    browserCloseTimerRef.current = null;
+    setBrowserReview(null);
+    setBrowserVisible(false);
+    setBrowserNeedsApproval(false);
+    browserAttentionRef.current = "";
+    return () => { for (const frame of browserOpenFramesRef.current) window.cancelAnimationFrame(frame); };
+  }, [selectedUserId, selectedThread?.id]);
   const terminalCloseTimerRef = useRef<number | null>(null);
   const [threadCopyNotice, setThreadCopyNotice] = useState<string | null>(null);
   const [renamingThread, setRenamingThread] = useState<ThreadSummary | null>(null);
@@ -4431,6 +4527,7 @@ export function App() {
   const [liveTurnDiffs, setLiveTurnDiffs] = useState<Record<string, string>>({});
   const [diffReview, setDiffReview] = useState<{ title: string; changes: unknown[]; focusPath?: string; reviewTurnId?: string } | null>(null);
   const [diffPanelVisible, setDiffPanelVisible] = useState(false);
+  useEffect(() => { if (diffPanelVisible) showRightWindow("diff"); }, [diffPanelVisible, showRightWindow]);
   const [diffPanelResizing, setDiffPanelResizing] = useState(false);
   const [diffPanelWidth, setDiffPanelWidth] = useState(() => storedNumber("codex-web-diff-panel-width", 560, 350, 900));
   const diffPanelCloseTimerRef = useRef<number | null>(null);
@@ -4439,6 +4536,30 @@ export function App() {
   const subagentPanelCloseTimerRef = useRef<number | null>(null);
   const subagentPanelFramesRef = useRef<number[]>([]);
   const subagentPanelReturnFocusRef = useRef<HTMLElement | null>(null);
+  const rightOwnerRef = useRef(selectedUserId);
+  useLayoutEffect(() => {
+    // A hidden tab still contains real data: clear account-owned windows before
+    // painting the next identity, not just the currently visible panel.
+    if (rightOwnerRef.current === selectedUserId) return;
+    rightOwnerRef.current = selectedUserId;
+    if (terminalCloseTimerRef.current !== null) window.clearTimeout(terminalCloseTimerRef.current);
+    setTerminalProjectId(null);
+    setTerminalVisible(false);
+  }, [selectedUserId]);
+  useLayoutEffect(() => {
+    if (diffPanelCloseTimerRef.current !== null) window.clearTimeout(diffPanelCloseTimerRef.current);
+    if (filePreviewCloseTimerRef.current !== null) window.clearTimeout(filePreviewCloseTimerRef.current);
+    filePreviewRequestIdRef.current += 1;
+    setDiffReview(null);
+    setDiffPanelVisible(false);
+    setRunnablePreview(null);
+    setFilePreview(null);
+    setFilePreviewLoading(false);
+    setFilePreviewError("");
+    setFilePreviewClosing(false);
+    setFilePreviewObjectUrl(current => { if (current) URL.revokeObjectURL(current); return ""; });
+    setImageGallery(null);
+  }, [selectedUserId, selectedThread?.id]);
   useEffect(() => {
     for (const frame of subagentPanelFramesRef.current) window.cancelAnimationFrame(frame);
     if (subagentPanelCloseTimerRef.current !== null) window.clearTimeout(subagentPanelCloseTimerRef.current);
@@ -5202,6 +5323,8 @@ export function App() {
   }
 
   function resetToNewThread(clearPrompt = false) {
+    window.sessionStorage.removeItem(remoteDraftStorageKey);
+    setRemoteDraftVersion((version) => version + 1);
     try { window.sessionStorage.removeItem(`codex-web-active-diff:${selectedUserId}`); } catch { /* Storage can be disabled. */ }
     threadViewTokenRef.current += 1;
     newThreadDraftModeRef.current = true;
@@ -6948,9 +7071,18 @@ export function App() {
         if (terminalCloseTimerRef.current !== null) window.clearTimeout(terminalCloseTimerRef.current);
         setTerminalProjectId(selectedProject.id);
         window.requestAnimationFrame(() => setTerminalVisible(true));
+        showRightWindow("terminal");
       }
       if (action === "hooks") void showProjectHooks();
       if (action === "writing") openWriting();
+      if (action === "browser") {
+        if (browserCloseTimerRef.current !== null) window.clearTimeout(browserCloseTimerRef.current);
+        for (const frame of browserOpenFramesRef.current) window.cancelAnimationFrame(frame);
+        setBrowserReview({ projectId: selectedProject.id, threadId: selectedThread?.id ?? null });
+        browserOpenFramesRef.current = [window.requestAnimationFrame(() => { browserOpenFramesRef.current.push(window.requestAnimationFrame(() => setBrowserVisible(true))); })];
+        showRightWindow("browser");
+      }
+      if (action === "remote-files") showRightWindow("remote");
     };
     window.addEventListener("codex:workspace-action", handleWorkspaceAction);
     return () => window.removeEventListener("codex:workspace-action", handleWorkspaceAction);
@@ -6963,6 +7095,7 @@ export function App() {
       if (!response.data.some((user) => user.id === selectedUserId)) {
         const fallback = response.data.find((user) => user.id === response.defaultUserId) ?? response.data[0];
         if (fallback) {
+          setApiUserId(fallback.id);
           setSelectedUserId(fallback.id);
         }
       }
@@ -7336,7 +7469,7 @@ export function App() {
       setSelectedThread(null);
       setThreads([]);
       setSelectedProjectId(existingProject.id);
-      return;
+      return true;
     }
 
     try {
@@ -7353,33 +7486,62 @@ export function App() {
       setSelectedProjectId(response.data.id);
       setSelectedThread(null);
       setThreads([]);
+      return true;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
+      return false;
     }
   }
 
   async function openDirectoryBrowser(directoryPath?: string) {
+    const requestId = ++directoryBrowserRequestRef.current;
     setDirectoryBrowser(null);
+    setDirectoryCreateOpen(false);
+    setDirectoryNewName("");
+    setDirectoryCreateError("");
     setDirectoryBrowserLoading(true);
     setDirectoryBrowserOpen(true);
     setError("");
     try {
       const response = await listDirectories(directoryPath);
+      if (directoryBrowserRequestRef.current !== requestId) return;
       setDirectoryBrowser(response.data);
     } catch (caught) {
+      if (directoryBrowserRequestRef.current !== requestId) return;
       setDirectoryBrowserOpen(false);
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
-      setDirectoryBrowserLoading(false);
+      if (directoryBrowserRequestRef.current === requestId) setDirectoryBrowserLoading(false);
     }
+  }
+
+  async function createDirectoryInBrowser() {
+    if (!directoryBrowser || directoryCreating || !directoryNewName.trim()) return;
+    const scope = selectedUserId;
+    const requestId = directoryBrowserRequestRef.current;
+    setDirectoryCreating(true);
+    setDirectoryCreateError("");
+    try {
+      const response = await createWorkspaceDirectory(directoryBrowser.currentPath, directoryNewName.trim());
+      if (getApiUserId() !== scope || directoryBrowserRequestRef.current !== requestId) return;
+      await openDirectoryBrowser(response.data.path);
+    } catch (caught) {
+      if (getApiUserId() === scope && directoryBrowserRequestRef.current === requestId) setDirectoryCreateError(caught instanceof Error ? caught.message : String(caught));
+    } finally { if (getApiUserId() === scope) setDirectoryCreating(false); }
+  }
+
+  function closeDirectoryBrowser() {
+    directoryBrowserRequestRef.current += 1;
+    setDirectoryBrowserOpen(false);
+    setDirectoryBrowserLoading(false);
+    setDirectoryCreating(false);
   }
 
   async function connectCurrentDirectory() {
     if (!directoryBrowser) {
       return;
     }
-    await connectProjectDirectory(directoryBrowser.currentPath);
-    setDirectoryBrowserOpen(false);
+    if (await connectProjectDirectory(directoryBrowser.currentPath)) closeDirectoryBrowser();
   }
 
   async function chooseDirectory() {
@@ -7387,7 +7549,7 @@ export function App() {
     setError("");
     try {
       if (!systemDirectoryPickerAvailable) {
-        await openDirectoryBrowser(projectRoot);
+        await openDirectoryBrowser();
         return;
       }
       const response = await selectDirectory();
@@ -7628,6 +7790,8 @@ export function App() {
       return;
     }
     setImageGallery(null);
+    setPreviewDocked(true);
+    showRightWindow("preview");
     setFilePreviewLoading(true);
     setImagePreviewMode("fit");
     setFilePreviewError("");
@@ -7652,7 +7816,7 @@ export function App() {
     } finally {
       if (requestId === filePreviewRequestIdRef.current) setFilePreviewLoading(false);
     }
-  }, [selectedProject?.id]);
+  }, [selectedProject?.id, showRightWindow]);
 
   useEffect(() => () => {
     if (filePreviewCloseTimerRef.current !== null) window.clearTimeout(filePreviewCloseTimerRef.current);
@@ -7661,11 +7825,11 @@ export function App() {
   useEffect(() => {
     if (!(filePreview || filePreviewLoading || filePreviewError || runnablePreview)) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") { event.preventDefault(); closeFilePreview(); }
+      if (event.key === "Escape" && (!previewDocked || rightWorkspaceOpen && rightWorkspaceTab === "preview")) { event.preventDefault(); closeFilePreview(); }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [Boolean(filePreview || filePreviewLoading || filePreviewError || runnablePreview), filePreviewClosing]);
+  }, [Boolean(filePreview || filePreviewLoading || filePreviewError || runnablePreview), filePreviewClosing, previewDocked, rightWorkspaceOpen, rightWorkspaceTab]);
 
   const activeImageTarget = imageGallery?.targets[imageGallery.index] ?? "";
   const activeImageUrl = imageGallery && activeImageTarget ? rawFileUrlForProject(imageGallery.projectId, activeImageTarget) : "";
@@ -8454,6 +8618,10 @@ export function App() {
     if ((!isQuestionAnswer && uploadingFiles) || editingLastPrompt || editingCommitRef.current || !selectedProject || (!promptText && (isQuestionAnswer || !uploadedFiles.length))) {
       return false;
     }
+    if (remoteConnectionsInProgress.current.has(selectedThread?.id ?? remoteDraftId)) {
+      setError("正在打开所选远程目录，请稍候再发送。");
+      return false;
+    }
     if (isQuestionAnswer && editingPromptDraft) {
       setError("请先完成或取消当前提问的编辑，再回答选择题。");
       return false;
@@ -8535,6 +8703,7 @@ export function App() {
       viewToken: requestViewToken,
       projectId: selectedProject.id,
       threadId: selectedThread?.id ?? null,
+      remoteDraftId: selectedThread ? undefined : remoteDraftId,
       model: selectedModelProfile.model,
       reasoningEffort: selectedModelProfile.effort,
       sentPromptText,
@@ -8994,6 +9163,22 @@ export function App() {
       return;
     }
 
+    if (message.type === "browser.state") {
+      const event = message.data as { threadId?: string; projectId?: string; state?: { status?: string; pendingApproval?: { id?: string } } } | undefined;
+      if (event) window.dispatchEvent(new CustomEvent("codex:browser-state", { detail: event }));
+      if (event?.threadId === selectedThreadRef.current?.id) setBrowserNeedsApproval(Boolean(event?.state?.pendingApproval));
+      const attention = event?.state?.pendingApproval?.id || (event?.state?.status === "starting" ? "starting" : "");
+      if (event?.threadId === selectedThreadRef.current?.id && event?.projectId && attention && browserAttentionRef.current !== `${event.threadId}:${attention}`) {
+        browserAttentionRef.current = `${event.threadId}:${attention}`;
+        if (browserCloseTimerRef.current !== null) window.clearTimeout(browserCloseTimerRef.current);
+        for (const frame of browserOpenFramesRef.current) window.cancelAnimationFrame(frame);
+        setBrowserReview({ projectId: event.projectId, threadId: event.threadId! });
+        if (!rightWorkspaceOpenRef.current) showRightWindow("browser");
+        browserOpenFramesRef.current = [window.requestAnimationFrame(() => { browserOpenFramesRef.current.push(window.requestAnimationFrame(() => setBrowserVisible(true))); })];
+      }
+      return;
+    }
+
     if (message.type === "codex.serverRequest") {
       const request = message.data as { id?: string | number; method?: string; params?: Record<string, unknown> } | undefined;
       if (request?.id !== undefined && (request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")) {
@@ -9297,6 +9482,11 @@ export function App() {
         }
       }
       if (newThread?.id) {
+        if (requestContext?.remoteDraftId) {
+          void transferRemoteFolderDraft(requestContext.remoteDraftId, newThread.id).then(() => {
+            window.dispatchEvent(new Event("codex:remote-folders-changed"));
+          }).catch((caught) => setError(`远程目录保存失败，请在右侧重新选择：${caught instanceof Error ? caught.message : String(caught)}`));
+        }
         if (requestContext?.threadId === null) {
           setNewThreadContextPin("");
           setNewThreadContextConfig(emptyThreadContextConfig());
@@ -9662,6 +9852,7 @@ export function App() {
   };
   function openSubagentReview(initialAgent?: string, initialView?: "active" | "history") {
     if (!selectedProject?.id || !selectedThread?.id) return;
+    showRightWindow("agents");
     if (subagentPanelCloseTimerRef.current !== null) window.clearTimeout(subagentPanelCloseTimerRef.current);
     for (const frame of subagentPanelFramesRef.current) window.cancelAnimationFrame(frame);
     subagentPanelReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -9714,6 +9905,7 @@ export function App() {
       });
   }
   const openDiffReview = (changes: unknown[], title = "文件变更", turnId?: string, itemId?: string, threadId = selectedThread?.id, focusPath?: string) => {
+    showRightWindow("diff");
     if (diffPanelCloseTimerRef.current !== null) window.clearTimeout(diffPanelCloseTimerRef.current);
     if (threadId && turnId && itemId) {
       try {
@@ -10485,8 +10677,103 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
   const visibleQueuedSubmission = queuedSubmissions[0]
     ?? (lastQueuedSubmission?.threadId === selectedThread?.id ? lastQueuedSubmission?.entry : null);
 
+  const workspaceFiles = useMemo(() => {
+    if (!selectedThread || !selectedProject) return [];
+    const files = new Map<string, GeneratedFileCandidate>();
+    for (const turn of [...displayedConversationTurns].reverse()) for (const item of turn.items) {
+      if (itemKind(item) !== "agent") continue;
+      for (const match of itemText(item).matchAll(/\[[^\]\n]+\]\(([^\s)]+)\)/g)) {
+        const target = fileTargetFromHref(match[1]);
+        if (target && files.size < 80 && !files.has(target)) files.set(target, { target, allowOutsideProject: false, turnId: turn.id });
+      }
+    }
+    for (const file of generatedFileCandidatesFromThread({ ...selectedThread, turns: [...displayedConversationTurns].reverse() }, selectedProject.rootPath)) if (!files.has(file.target)) files.set(file.target, file);
+    return [...files.values()];
+  }, [selectedThread?.id, selectedProject?.id, displayedConversationTurns]);
+  const workspaceSources = useMemo(() => {
+    const found = new Map<string, { url: string; title: string }>();
+    for (const turn of displayedConversationTurns.slice(-40).reverse()) for (const item of turn.items) {
+      if (itemKind(item) !== "agent") continue;
+      for (const match of itemText(item).matchAll(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g)) {
+        if (found.size >= 80) break;
+        try { const url = new URL(match[2]); if (!url.username && !url.password && !found.has(url.href)) found.set(url.href, { url: url.href, title: match[1] }); } catch { /* Ignore incomplete streaming links. */ }
+      }
+    }
+    return [...found.values()];
+  }, [displayedConversationTurns]);
+  const latestWorkspaceChanges = useMemo(() => {
+    for (const turn of [...displayedConversationTurns].reverse()) {
+      const changes = turnFileChanges(turn, liveTurnDiffs[turn.id]);
+      if (changes.length) return { changes, turnId: turn.id };
+    }
+    return null;
+  }, [displayedConversationTurns, liveTurnDiffs]);
+  const launchWorkspaceAction = (action: string) => window.dispatchEvent(new CustomEvent("codex:workspace-action", { detail: action }));
+  const closeUtilityWindow = (id: string) => setRightUtilityTabs(current => current.filter(tab => tab !== id));
+  const openSourceWindow = (url: string) => {
+    if (!selectedProject || !selectedThread) return;
+    if (browserCloseTimerRef.current !== null) window.clearTimeout(browserCloseTimerRef.current);
+    setBrowserReview({ projectId: selectedProject.id, threadId: selectedThread.id, navigation: { id: crypto.randomUUID(), url } });
+    setBrowserVisible(true);
+    showRightWindow("browser");
+  };
+  const workspaceSections: WorkspaceSection[] = [
+    { title: "定时任务", entries: [
+      ...threadSchedules.schedules.slice(0, 4).map(task => ({ id: task.id, title: task.title, detail: threadScheduleSummary(task), icon: "schedules" as const, onOpen: () => { setScheduleEditor(current => ({ id: task.id, key: current.key + 1 })); showRightWindow("schedules"); } })),
+      { id: "schedule-new", title: "新建定时任务", icon: "plus", disabled: !selectedThread, onOpen: () => { setScheduleEditor(current => ({ id: null, key: current.key + 1 })); showRightWindow("schedules"); } }
+    ], more: threadSchedules.schedules.length > 4 ? { label: "查看全部定时任务", onOpen: () => showRightWindow("schedules") } : undefined },
+    { title: "工作窗口", entries: [
+      { id: "remote", title: "远程文件", icon: "remote", onOpen: () => showRightWindow("remote") },
+      { id: "browser", title: "浏览器", icon: "browser", onOpen: () => launchWorkspaceAction("browser"), disabled: !selectedProject },
+      { id: "terminal", title: "交互终端", icon: "terminal", onOpen: () => launchWorkspaceAction("terminal"), disabled: !selectedProject },
+      { id: "diff", title: "文件变更", icon: "diff", badge: latestWorkspaceChanges ? String(latestWorkspaceChanges.changes.length) : undefined, onOpen: () => latestWorkspaceChanges ? openDiffReview(latestWorkspaceChanges.changes, "本轮文件变更", latestWorkspaceChanges.turnId, `turn-changes:${latestWorkspaceChanges.turnId}`) : openDiffReview([], "文件变更"), disabled: !selectedThread },
+      { id: "writing", title: "LaTeX / Word 写作", icon: "writing", onOpen: () => openWriting(), disabled: !selectedProject }
+    ] },
+    { title: "输出内容", entries: workspaceFiles.slice(0, 4).map(file => ({ id: file.target, title: compactFileLabel(file.target), icon: "outputs", onOpen: () => void openFilePreview(file.target) })), more: workspaceFiles.length > 4 ? { label: "查看全部输出", onOpen: () => showRightWindow("outputs") } : undefined },
+    { title: "当前任务", entries: threadGoal.goal ? [{ id: "goal", title: threadGoal.goal.objective, detail: threadGoal.goal.status === "active" ? "持续目标 · 执行中" : `持续目标 · ${threadGoal.goal.status}`, icon: "goal", onOpen: () => showRightWindow("goal") }] : [] },
+    { title: "子代理", entries: conversationAgents.slice(0, 4).map(agent => ({ id: agent.id, title: agent.name.split("/").filter(Boolean).at(-1) || agent.name, detail: agent.model, icon: "agents", leading: <SubagentAvatar name={agent.name} />, badge: ({ running: "运行中", waiting: "等待中", dispatched: "已派发", completed: "已完成", failed: "失败", interrupted: "已停止", unknown: "待确认" })[agent.state], onOpen: () => openSubagentReview(agent.id) })), more: { label: "查看全部子代理", onOpen: () => openSubagentReview(undefined, "history") } },
+    { title: "来源", entries: workspaceSources.slice(0, 4).map(source => ({ id: source.url, title: source.title, detail: new URL(source.url).hostname, icon: "sources", onOpen: () => openSourceWindow(source.url) })), more: workspaceSources.length > 4 ? { label: "查看全部来源", onOpen: () => showRightWindow("sources") } : undefined }
+  ];
+  const rightTabs: WorkspaceTab[] = [];
+  if (diffReview) rightTabs.push({ id: "diff", title: "文件变更", icon: "diff", onClose: closeDiffReview, closing: !diffPanelVisible, content: <section className={`rightPaneDiff${diffPanelVisible ? " open" : ""}`}><header className="diffReviewPanelHeader">
+    <div><h2>{diffReview.focusPath || diffReview.title}</h2><small>{diffReview.reviewTurnId ? "Codex 原生审查" : diffReview.focusPath ? "当前文件" : `${diffReview.changes.length} 个文件`}</small></div>
+    {!diffReview.reviewTurnId && nativeFeaturesReady ? <button className="nativeReviewStartButton" type="button" disabled={startingNativeReview || !selectedThread || Boolean(selectedActiveTurnId)} title="用 Codex 原生审查当前工作区的未提交改动" onClick={() => void startNativeReview()}>{startingNativeReview ? "审查中…" : "代码审查"}</button> : null}
+    <button type="button" aria-label="收起文件变更面板" title="关闭" onClick={closeDiffReview}><PanelClose size={18} /></button>
+    </header><div className="diffReviewPanelBody">{diffReview.reviewTurnId ? (() => {
+      const reviewTurn = displayedConversationTurns.find(turn => turn.id === diffReview.reviewTurnId);
+      const reviewText = reviewTurn?.items.filter(item => itemKind(item) === "agent").map(item => stripInterruptArtifacts(itemText(item)).trim()).filter(Boolean).join("\n\n") ?? "";
+      const progress = reviewTurn?.items.filter(item => itemKind(item) === "reasoning").map(item => reasoningItemDisplayText(item).trim()).filter(Boolean).at(-1)?.slice(0, 180);
+      return reviewText ? <div className="nativeReviewResult"><div className="nativeReviewResultLabel">审查结果 · 原始意见</div><MarkdownMessage text={reviewText.replace(/^Full review comments:/m, "审查意见：")} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /></div>
+        : <div className="nativeReviewPending" role="status"><span className="nativeReviewActivity" aria-hidden="true" />{reviewTurn?.completedAt ? "本次审查没有文字结果，请查看会话记录。" : progress ? `正在审查 · ${progress}` : "正在审查；原生审查通常在完成后一次性返回意见。"}</div>;
+    })() : diffReview.changes.length ? <FileChangeReview changes={diffReview.focusPath ? diffReview.changes.filter(change => fileChangePath(change) === diffReview.focusPath) : diffReview.changes} onComment={addInlineReviewComment} /> : <p className="subagentPanelEmpty">当前已加载的消息中没有文件变更。</p>}</div></section> });
+  if (subagentReview) rightTabs.push({ id: "agents", title: "子代理", icon: "agents", closing: !subagentPanelVisible, onClose: closeSubagentReview, content: <SubagentPanel key={`${selectedUserId}:${subagentReview.requestId}`} projectId={subagentReview.projectId} parentThreadId={subagentReview.threadId} initialAgent={subagentReview.initialAgent} initialView={subagentReview.initialView} visible={subagentPanelVisible && rightWorkspaceOpen && rightWorkspaceTab === "agents"} parentRunning={subagentReview.threadId === selectedThread?.id && Boolean(selectedActiveTurnId)} knownAgents={knownSubagentStates} onClose={closeSubagentReview} renderItem={renderSubagentThreadItem} renderBundle={renderSubagentToolBundle} /> });
+  if (browserReview) rightTabs.push({ id: "browser", title: "浏览器", icon: "browser", attention: browserNeedsApproval, closing: !browserVisible, onClose: () => {
+    setBrowserVisible(false);
+    if (browserCloseTimerRef.current !== null) window.clearTimeout(browserCloseTimerRef.current);
+    browserCloseTimerRef.current = window.setTimeout(() => { setBrowserReview(null); browserCloseTimerRef.current = null; }, 390);
+  }, content: <BrowserPanel key={`${selectedUserId}:${browserReview.threadId ?? "new"}`} projectId={browserReview.projectId} threadId={browserReview.threadId} navigation={browserReview.navigation} visible={browserVisible && rightWorkspaceOpen && rightWorkspaceTab === "browser"} pauseOnHide={!browserVisible || !rightWorkspaceOpen} onClose={() => setRightWorkspaceOpen(false)} /> });
+  if (terminalProjectId) rightTabs.push({ id: "terminal", title: "终端", icon: "terminal", closing: !terminalVisible, onClose: () => {
+    setTerminalVisible(false);
+    if (terminalCloseTimerRef.current !== null) window.clearTimeout(terminalCloseTimerRef.current);
+    terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390);
+  }, content: <TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={false} onClose={() => { setTerminalVisible(false); terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390); }} /> });
+  for (const id of rightUtilityTabs) {
+    const title = ({ remote: "远程文件", goal: "持续目标", schedules: "定时任务", outputs: "输出内容", sources: "来源" })[id] ?? id;
+    rightTabs.push({ id, title, icon: id as "remote" | "goal" | "schedules" | "outputs" | "sources", onClose: () => closeUtilityWindow(id), content:
+      id === "remote" ? <RemoteFolderSidebar key={`remote-folders-${selectedUserId}-${selectedThread?.id ?? openingThreadId ?? remoteDraftId}`} userId={selectedUserId} threadId={selectedThread?.id ?? openingThreadId ?? remoteDraftId} isDraft={!selectedThread && !openingThreadId} visible={rightWorkspaceOpen && rightWorkspaceTab === "remote"} onClose={() => setRightWorkspaceOpen(false)}
+        onBusyChange={busy => { const scope = selectedThread?.id ?? openingThreadId ?? remoteDraftId; if (busy) remoteConnectionsInProgress.current.add(scope); else remoteConnectionsInProgress.current.delete(scope); }}
+        onReference={filePath => { setPrompt(current => `${current.trimEnd()}${current.trim() ? "\n\n" : ""}${fileReferenceText(filePath)} `); requestAnimationFrame(() => composerRef.current?.querySelector<HTMLElement>("[contenteditable=true]")?.focus()); }}
+        onConnect={() => { setPrompt(current => `${current.trimEnd()}${current.trim() ? "\n\n" : ""}$remote-folders 将远程目录绑定到当前对话，并显示在右侧文件栏：`); if (window.matchMedia("(max-width:900px)").matches) setRightWorkspaceOpen(false); requestAnimationFrame(() => composerRef.current?.querySelector<HTMLElement>("[contenteditable=true]")?.focus()); }} />
+      : id === "goal" ? <div className="rightWorkspaceGoal"><h2>持续目标</h2>{threadGoal.goal ? <><p>{threadGoal.goal.objective}</p><GoalProgress controller={threadGoal} running={conversationRunState === "running"} /></> : <p>当前会话没有持续目标。可从输入框的 + 菜单创建。</p>}</div>
+      : id === "schedules" ? <ThreadSchedules key={`${selectedUserId}:${selectedThread?.id}:${scheduleEditor.key}`} controller={threadSchedules} initialScheduleId={scheduleEditor.id} onClose={() => closeUtilityWindow("schedules")} />
+      : <div className="rightWorkspaceList"><h2>{title}</h2><p>来自当前已加载的会话记录</p>{id === "outputs" ? workspaceFiles.map(file => <button className="rightWorkspaceEntry" type="button" key={file.target} onClick={() => void openFilePreview(file.target)}><WorkspaceIcon name="outputs" /><span><strong>{compactFileLabel(file.target)}</strong><small>{file.target}</small></span></button>) : workspaceSources.map(source => <button className="rightWorkspaceEntry" type="button" key={source.url} onClick={() => openSourceWindow(source.url)}><WorkspaceIcon name="sources" /><span><strong>{source.title}</strong><small>{new URL(source.url).hostname}</small></span></button>)}</div>
+    });
+  }
+  if (filePreview || filePreviewLoading || filePreviewError || runnablePreview) rightTabs.push({ id: "preview", title: runnablePreview?.title || filePreview?.name || "文件预览", icon: "preview", closing: filePreviewClosing, onClose: closeFilePreview, content: <div className="rightWorkspacePreviewMount" ref={setPreviewMount}>{!previewDocked ? <button type="button" className="rightWorkspaceEntry" onClick={() => setPreviewDocked(true)}>预览已全屏打开 · 返回右栏</button> : null}</div> });
+  const placeFilePreview = (content: ReactNode) => previewDocked ? previewMount ? createPortal(content, previewMount) : null : content;
+
   return (
-    <RunnablePreviewContext.Provider value={setRunnablePreview}>
+    <RunnablePreviewContext.Provider value={preview => { setRunnablePreview(preview); setPreviewDocked(true); showRightWindow("preview"); }}>
     <main
       className={`appShell${temporaryAsk ? " temporaryPanelOpen" : ""}`}
       style={{
@@ -10872,7 +11159,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 <h2 id="directory-browser-title">选择项目目录</h2>
                 <p>{directoryBrowser?.currentPath ?? projectRoot}</p>
               </div>
-              <button className="iconButton" type="button" onClick={() => setDirectoryBrowserOpen(false)} title="关闭">
+              <button className="iconButton" type="button" onClick={closeDirectoryBrowser} title="关闭">
                 <X size={16} />
               </button>
             </div>
@@ -10881,20 +11168,28 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 className="iconTextButton"
                 type="button"
                 onClick={() => void openDirectoryBrowser(directoryBrowser?.parentPath ?? directoryBrowser?.rootPath)}
-                disabled={directoryBrowserLoading || !directoryBrowser?.parentPath}
+                disabled={directoryBrowserLoading || directoryCreating || !directoryBrowser?.parentPath}
               >
                 上级
               </button>
+              <button className="iconTextButton" type="button" disabled={directoryBrowserLoading || !directoryBrowser || directoryCreating} onClick={() => { setDirectoryCreateOpen(open => !open); setDirectoryCreateError(""); }}><FolderPlus size={15} />新建文件夹</button>
               <button
                 className="iconButton"
                 type="button"
                 onClick={() => void openDirectoryBrowser(directoryBrowser?.currentPath)}
-                disabled={directoryBrowserLoading}
+                disabled={directoryBrowserLoading || directoryCreating}
                 title="刷新"
               >
                 <RefreshCcw size={15} />
               </button>
             </div>
+            <ToolReveal open={directoryCreateOpen}><form className="directoryCreateForm" onSubmit={event => { event.preventDefault(); void createDirectoryInBrowser(); }}>
+              <label htmlFor="directory-new-name">文件夹名称</label>
+              <div><input id="directory-new-name" type="text" value={directoryNewName} maxLength={120} placeholder="例如：我的项目" autoComplete="off" spellCheck={false} disabled={directoryCreating} onChange={event => setDirectoryNewName(event.target.value)} />
+                <button className="iconTextButton primary" type="submit" disabled={directoryCreating || !directoryNewName.trim()}>{directoryCreating ? "创建中…" : "创建"}</button>
+                <button className="iconTextButton" type="button" disabled={directoryCreating} onClick={() => setDirectoryCreateOpen(false)}>取消</button></div>
+              {directoryCreateError ? <p role="alert">{directoryCreateError}</p> : null}
+            </form></ToolReveal>
             <div className="directoryList">
               {directoryBrowserLoading ? <div className="directoryEmpty">加载中</div> : null}
               {!directoryBrowserLoading && directoryBrowser?.directories.length === 0 ? (
@@ -10906,7 +11201,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   type="button"
                   key={entry.path}
                   onClick={() => void openDirectoryBrowser(entry.path)}
-                  disabled={directoryBrowserLoading}
+                  disabled={directoryBrowserLoading || directoryCreating}
                 >
                   <FolderOpen size={16} />
                   <span>
@@ -10917,14 +11212,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               ))}
             </div>
             <div className="dialogActions">
-              <button className="iconTextButton" type="button" onClick={() => setDirectoryBrowserOpen(false)}>
+              <button className="iconTextButton" type="button" onClick={closeDirectoryBrowser}>
                 取消
               </button>
               <button
                 className="iconTextButton primary"
                 type="button"
                 onClick={() => void connectCurrentDirectory()}
-                disabled={directoryBrowserLoading || !directoryBrowser}
+                disabled={directoryBrowserLoading || directoryCreating || !directoryBrowser}
               >
                 连接当前目录
               </button>
@@ -11373,6 +11668,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 { value: "untrusted", label: "不可信命令询问", detail: "仅危险操作需要确认" }
               ]}
             />
+            <button className="rightWorkspaceToggle" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} title={rightWorkspaceOpen ? "隐藏右栏（Ctrl+Shift+B）" : "显示右栏（Ctrl+Shift+B）"} aria-expanded={rightWorkspaceOpen} onClick={() => setRightWorkspaceOpen(open => !open)}><WorkspaceIcon name="panel" /></button>
           </div>
         </header>
 
@@ -11401,7 +11697,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         ) : null}
 
 
-        <div className={`workspace${diffPanelVisible || terminalVisible || subagentPanelVisible ? " diffPanelOpen" : ""}${diffPanelResizing ? " diffPanelResizing" : ""}`} style={{ gridTemplateColumns: `${threadListCollapsed ? 56 : threadListWidth}px 0px minmax(0, 1fr) auto` }}>
+        <div className={`workspace${rightWorkspaceOpen ? " diffPanelOpen" : ""}${diffPanelResizing ? " diffPanelResizing" : ""}`} style={{ gridTemplateColumns: `${threadListCollapsed ? 56 : threadListWidth}px 0px minmax(0, 1fr) auto` }}>
           <nav className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
             <div className="v2ProjectDock">
               <div className="v2BrandRow">
@@ -11865,8 +12161,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 <nav
                   className="promptNavigator"
                   aria-label="本会话提示词导航"
-                  aria-hidden={diffPanelVisible || terminalVisible || subagentPanelVisible}
-                  inert={diffPanelVisible || terminalVisible || subagentPanelVisible}
+                  aria-hidden={rightWorkspaceOpen}
+                  inert={rightWorkspaceOpen}
                   onMouseLeave={() => hoverPromptNavigation(null)}
                 >
                   <span className="promptNavigatorLabel" aria-hidden="true">提示</span>
@@ -12674,43 +12970,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             </div>
           </section>
           </div>
-          {diffReview || terminalProjectId || subagentReview ? <aside className={`diffReviewPanel${terminalProjectId && (diffReview || subagentReview) ? " rightPanelSplit" : ""}${subagentReview && diffReview ? " rightPanelWithAgents" : ""}`} style={{ width: diffPanelVisible || terminalVisible || subagentPanelVisible ? diffPanelWidth : 0 }} aria-label="工作区右侧面板">
-            <div className="diffReviewResizeHandle" role="separator" aria-orientation="vertical" aria-label="拖动调整变更面板宽度" onMouseDown={(event) => {
+          <RightWorkspace scope={`${selectedUserId}:${selectedThread?.id ?? "new"}`} open={rightWorkspaceOpen} active={rightWorkspaceTab} width={diffPanelWidth} tabs={rightTabs}
+            overview={<WorkspaceOverview sections={workspaceSections} />} onSelect={setRightWorkspaceTab} onHide={() => setRightWorkspaceOpen(false)}
+            onResize={event => {
               setDiffPanelResizing(true);
               beginRightPanelResize(event, diffPanelWidth, setDiffPanelWidth, "codex-web-diff-panel-width", 350, Math.min(900, window.innerWidth - (threadListCollapsed ? 56 : threadListWidth) - 320));
               window.addEventListener("mouseup", () => setDiffPanelResizing(false), { once: true });
             }} />
-            {diffReview ? <section className={`rightPaneDiff${diffPanelVisible ? " open" : ""}`}><header className="diffReviewPanelHeader">
-              <div><h2>{diffReview.focusPath || diffReview.title}</h2><small>{diffReview.reviewTurnId ? "Codex 原生审查" : diffReview.focusPath ? "当前文件" : `${diffReview.changes.length} 个文件`}</small></div>
-              {!diffReview.reviewTurnId && nativeFeaturesReady ? <button className="nativeReviewStartButton" type="button" disabled={startingNativeReview || !selectedThread || Boolean(selectedActiveTurnId)} title="用 Codex 原生审查当前工作区的未提交改动" onClick={() => void startNativeReview()}>{startingNativeReview ? "审查中…" : "代码审查"}</button> : null}
-              <button type="button" aria-label="收起文件变更面板" title="收起" onClick={closeDiffReview}><X size={18} /></button>
-            </header>
-            <div className="diffReviewPanelBody">{diffReview.reviewTurnId ? (() => {
-              const reviewTurn = displayedConversationTurns.find((turn) => turn.id === diffReview.reviewTurnId);
-              const reviewText = reviewTurn?.items
-                .filter((item) => itemKind(item) === "agent")
-                .map((item) => stripInterruptArtifacts(itemText(item)).trim())
-                .filter(Boolean)
-                .join("\n\n") ?? "";
-              const reviewProgress = reviewTurn?.items
-                .filter((item) => itemKind(item) === "reasoning")
-                .map((item) => reasoningItemDisplayText(item).trim())
-                .filter(Boolean)
-                .at(-1)?.slice(0, 180);
-              return reviewText
-                ? <div className="nativeReviewResult"><div className="nativeReviewResultLabel">审查结果 · 原始意见</div><MarkdownMessage text={reviewText.replace(/^Full review comments:/m, "审查意见：")} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /></div>
-                : <div className="nativeReviewPending" role="status"><span className="nativeReviewActivity" aria-hidden="true" />{reviewTurn?.completedAt ? "本次审查没有文字结果，请查看会话记录。" : reviewProgress ? `正在审查 · ${reviewProgress}` : "正在审查；原生审查通常在完成后一次性返回意见。"}</div>;
-            })() : <FileChangeReview changes={diffReview.focusPath ? diffReview.changes.filter((change) => fileChangePath(change) === diffReview.focusPath) : diffReview.changes} onComment={addInlineReviewComment} />}</div></section> : null}
-            {subagentReview ? <SubagentPanel key={`${selectedUserId}:${subagentReview.requestId}`} projectId={subagentReview.projectId} parentThreadId={subagentReview.threadId} initialAgent={subagentReview.initialAgent} initialView={subagentReview.initialView} visible={subagentPanelVisible} parentRunning={subagentReview.threadId === selectedThread?.id && Boolean(selectedActiveTurnId)} knownAgents={knownSubagentStates} onClose={closeSubagentReview} renderItem={renderSubagentThreadItem} renderBundle={renderSubagentToolBundle} /> : null}
-            {terminalProjectId ? <TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={Boolean(diffReview || subagentReview)} onClose={() => {
-              setTerminalVisible(false);
-              if (terminalCloseTimerRef.current !== null) window.clearTimeout(terminalCloseTimerRef.current);
-              terminalCloseTimerRef.current = window.setTimeout(() => {
-                setTerminalProjectId(null);
-                terminalCloseTimerRef.current = null;
-              }, 390);
-            }} /> : null}
-          </aside> : null}
         </div>
       </section>
 
@@ -12776,14 +13042,15 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </div>
         </div>
       ) : null}
-      {filePreview || filePreviewLoading || filePreviewError || runnablePreview ? (
-        <div className={`imageViewer documentViewer${filePreviewClosing ? " closing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="file-preview-title" onMouseDown={event => { if (event.target === event.currentTarget) closeFilePreview(); }}>
+      {filePreview || filePreviewLoading || filePreviewError || runnablePreview ? placeFilePreview(
+        <div className={`imageViewer documentViewer${previewDocked ? " dockedDocumentViewer" : ""}${filePreviewClosing ? " closing" : ""}`} role={previewDocked ? "region" : "dialog"} aria-modal={previewDocked ? undefined : true} aria-labelledby="file-preview-title" onMouseDown={event => { if (!previewDocked && event.target === event.currentTarget) closeFilePreview(); }}>
           <section className="documentViewerPanel">
             <header className="imageViewerHeader">
               <div className="imageViewerTitle" title={filePreview?.relativePath}>
                 <strong id="file-preview-title">{runnablePreview?.title ?? filePreview?.name ?? "文件预览"}</strong>
               </div>
               <div className="imageViewerHeaderActions">
+                <button className="imageViewerRoundButton" type="button" aria-label={previewDocked ? "全屏预览" : "返回右栏"} title={previewDocked ? "全屏预览" : "返回右栏"} onClick={() => setPreviewDocked(value => !value)}><WorkspaceIcon name="layout" /></button>
                 {!runnablePreview && filePreview?.kind === "text" && !filePreview.truncated && /\.(?:html?|mmd|mermaid)$/i.test(filePreview.name) ? (
                   <button className="iconTextButton" type="button" onClick={() => setRunnablePreview({ kind: /\.(?:mmd|mermaid)$/i.test(filePreview.name) ? "mermaid" : "html", title: filePreview.name, source: filePreview.content ?? "" })}>运行</button>
                 ) : null}
@@ -12796,7 +13063,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   </div>
                 ) : null}
                 {filePreview && !runnablePreview ? <div className="imageViewerActionWrap">
-                  <button className="imageViewerRoundButton" type="button" aria-label="文件操作" title="下载、分享或 SSH 发送" aria-expanded={imageViewerActionsOpen} onClick={() => setImageViewerActionsOpen(current => !current)}><MoreHorizontal size={20} /></button>
+                  <button className="imageViewerRoundButton" type="button" aria-label="文件操作" title="下载、分享或 SSH 发送" aria-expanded={imageViewerActionsOpen} onClick={() => setImageViewerActionsOpen(current => !current)}><PanelMore size={20} /></button>
                   <div className={`imageViewerActionMenu${imageViewerActionsOpen ? " open" : ""}`} aria-hidden={!imageViewerActionsOpen}>
                     {/\.(tex|docx)$/i.test(filePreview.name) ? <button type="button" disabled={!imageViewerActionsOpen} onClick={() => { const path = filePreview.relativePath; closeFilePreview(); openWriting(path); }}>在写作工作台中打开</button> : null}
                     <button type="button" disabled={!imageViewerActionsOpen || sharingBrowserFile} onClick={() => { setImageViewerActionsOpen(false); void shareOrDownloadPreviewFile(); }}>{sharingBrowserFile ? "准备中…" : "下载 / 分享"}</button>
@@ -12805,7 +13072,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   </div>
                 </div> : null}
                 <button className="imageViewerRoundButton" type="button" onClick={closeFilePreview} aria-label="关闭文件预览" title="关闭（Esc）">
-                  <X size={20} />
+                  <PanelClose size={20} />
                 </button>
               </div>
             </header>
