@@ -105,6 +105,14 @@ export function mintBrowserMcpConfig(userId: string, projectId: string, threadId
       url: `http://127.0.0.1:${serverConfig.port}${MCP_PATH}`,
       http_headers: { "x-codex-browser-token": token },
       startup_timeout_sec: 10, tool_timeout_sec: 180, enabled: true
+    }, "mcp_servers.codex_schedules": {
+      url: `http://127.0.0.1:${serverConfig.port}/api/schedules/mcp`,
+      http_headers: { "x-codex-browser-token": token },
+      startup_timeout_sec: 10, tool_timeout_sec: 30, enabled: true
+    }, "mcp_servers.codex_feishu": {
+      url: `http://127.0.0.1:${serverConfig.port}/api/feishu/mcp`,
+      http_headers: { "x-codex-browser-token": token },
+      startup_timeout_sec: 10, tool_timeout_sec: 45, enabled: true
     } }
   };
 }
@@ -127,6 +135,13 @@ export function bindBrowserMcpThread(bindingId: string, threadId: string, store:
 export function browserMcpAuthorized(headers: Record<string, unknown>): boolean {
   const token = headers["x-codex-browser-token"];
   return verifyToken(Array.isArray(token) ? token[0] : token) !== null;
+}
+
+/** Trusted identity for other console MCP tools. Never accept a user ID from tool arguments. */
+export function consoleMcpScope(headers: Record<string, unknown>): Binding | null {
+  const value = headers["x-codex-browser-token"];
+  const verified = verifyToken(Array.isArray(value) ? value[0] : value);
+  return verified ? { userId: verified.userId, projectId: verified.projectId, threadId: verified.threadId } : null;
 }
 
 class BrowserRouteError extends Error {

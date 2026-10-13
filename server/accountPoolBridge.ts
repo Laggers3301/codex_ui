@@ -1,11 +1,14 @@
 import { EventEmitter } from "node:events";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexBridge } from "./codexBridge.js";
 import { serverConfig } from "./config.js";
+import { ensureDefaultAgentLanguage } from "./agentLanguage.js";
+import { responsesCompatibleModelCatalog } from "./modelCatalogCompatibility.js";
 import { appendLegacyRollbackMarker, removeAppendedRollbackMarker, LegacyRollbackConflictError, type AppendedRollbackMarker } from "./legacyRollback.js";
+import { installedRuntimeVersion, isNewerRuntime, runtimeIsIdle, runtimeSelectionPath, writeRuntimeSelection } from "./runtimeUpgrade.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -79,6 +82,26 @@ interface AccountRuntime {
   authFailureFingerprint: string | null;
 }
 
+export interface ModelCatalogTarget {
+  id: string;
+  codexHome: string;
+  catalogPath: string;
+}
+
+export type ModelCatalogApplyResult = "reloaded" | "busy" | "unchanged";
+
+const MODEL_CATALOG_FILENAME = "model-catalog-gpt-5.6-sol-long-context.json";
+
+function writeFileAtomically(filePath: string, contents: string): void {
+  const temporary = `${filePath}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, contents, { mode: 0o600, flag: "wx" });
+    fs.renameSync(temporary, filePath);
+  } finally {
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+  }
+}
+
 function authCredentialIdentity(auth: JsonRecord): string | null {
   const tokens = asRecord(auth.tokens);
   const mode = String(auth.auth_mode ?? auth.authMode ?? "").toLowerCase();
@@ -123,7 +146,7 @@ function permanentAuthCode(message: string): AuthFailureCode | null {
 }
 
 function authFailureWarning(code: AuthFailureCode): string {
-  return `account: OAuth refresh unavailable (${code}); credentials need replacement.`;
+  return `account: 自动续期凭据不可用（${code}），需重新授权恢复续期；不代表现有访问令牌或最新额度读取已失效。`;
 }
 
 function asRecord(value: unknown): JsonRecord {
@@ -215,16 +238,17 @@ function processIdFromParams(params: unknown): string | null {
 }
 
 export function accountAppServerArgs(codexHome: string): string[] {
-  const modelCatalogPath = path.join(codexHome, "model-catalog-gpt-5.6-sol-long-context.json");
+  ensureDefaultAgentLanguage(codexHome);
+  const modelCatalogPath = path.join(codexHome, MODEL_CATALOG_FILENAME);
   const args = ["app-server", "--listen", "stdio://"];
   if (fs.existsSync(modelCatalogPath)) {
-    args.push("-c", `model_catalog_json=${JSON.stringify(modelCatalogPath)}`);
+    args.push("-c", `model_catalog_json=${JSON.stringify(responsesCompatibleModelCatalog(modelCatalogPath))}`);
   }
   return args;
 }
 
 function accountSupportedModels(codexHome: string): Set<string> | null {
-  const modelCatalogPath = path.join(codexHome, "model-catalog-gpt-5.6-sol-long-context.json");
+  const modelCatalogPath = path.join(codexHome, MODEL_CATALOG_FILENAME);
   try {
     const catalog = JSON.parse(fs.readFileSync(modelCatalogPath, "utf8")) as { models?: unknown[] };
     const models = Array.isArray(catalog.models) ? catalog.models : [];
@@ -279,6 +303,10 @@ export class AccountPoolBridge extends EventEmitter {
   private nextServerRequestId = 1;
   private readonly bridgeFactory: (codexHome: string, accountId: string) => CodexBridge;
   private readonly accountMaintenance = new Map<string, Promise<void>>();
+  private runtimeUpgradeTimer: ReturnType<typeof setInterval> | undefined;
+  private runtimeUpgradeChecking = false;
+  private readonly rejectedRuntimeVersions = new Set<string>();
+  private readonly pendingCredentialReloads = new Set<string>();
 
   private markReadyUnlessAuthFailure(account: AccountRuntime): void {
     if (account.authFailureCode) {
@@ -291,6 +319,7 @@ export class AccountPoolBridge extends EventEmitter {
   }
 
   private updateCredentialVersion(account: AccountRuntime, next: { stamp: number; fingerprint: string | null }): void {
+    if (next.fingerprint && next.fingerprint !== account.credentialFingerprint) this.pendingCredentialReloads.add(account.id);
     account.authFileStamp = next.stamp;
     account.credentialFingerprint = next.fingerprint;
     if (!account.authFailureCode || !account.authFailureFingerprint || !next.fingerprint) return;
@@ -301,6 +330,28 @@ export class AccountPoolBridge extends EventEmitter {
 
   private currentCredentialVersion(account: AccountRuntime): { stamp: number; fingerprint: string | null } {
     return authCredentialSnapshot(account.codexHome);
+  }
+
+  /** New device authorization must replace native in-memory credentials too.
+   * Wait for complete idleness; never interrupt a model turn or rotate tokens.
+   */
+  private async reloadChangedCredentialsIfIdle(account: AccountRuntime): Promise<void> {
+    if (!this.pendingCredentialReloads.has(account.id) || this.accountMaintenance.has(account.id)) return;
+    let release!: () => void;
+    this.accountMaintenance.set(account.id, new Promise<void>(resolve => { release = resolve; }));
+    try {
+      if (account.activeRequests || account.bridge.getPendingServerRequests().length || !await runtimeIsIdle(account.bridge)) return;
+      await account.bridge.stopAndWait();
+      const replacement = this.bridgeFactory(account.codexHome, account.id);
+      account.bridge = replacement; this.forwardEvents(account, replacement);
+      await replacement.start();
+      this.pendingCredentialReloads.delete(account.id);
+      account.cache = null;
+      this.emit("accountRuntime", { accountId: account.id, event: "credentials_reloaded" });
+    } catch {
+      // Keep the pending marker. A missing/unsupported idle check cannot justify
+      // disrupting running work; later polling retries without changing auth.json.
+    } finally { this.accountMaintenance.delete(account.id); release(); }
   }
 
   static fromFile(filePath: string): AccountPoolBridge {
@@ -513,11 +564,169 @@ export class AccountPoolBridge extends EventEmitter {
       throw new Error("No Codex account in the pool could start.");
     }
     await this.refreshAccountData(false);
+    if (process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE === "1" && !this.runtimeUpgradeTimer) {
+      this.runtimeUpgradeTimer = setInterval(() => { void this.checkRuntimeUpgrade(); }, 60_000);
+      this.runtimeUpgradeTimer.unref();
+    }
   }
 
   stop(): void {
+    if (this.runtimeUpgradeTimer) clearInterval(this.runtimeUpgradeTimer);
+    this.runtimeUpgradeTimer = undefined;
     for (const account of this.accounts) {
       account.bridge.stop();
+    }
+  }
+
+  /** Rolling upgrade under the same request barrier as catalog maintenance. */
+  async applyRuntimeVersionIfIdle(accountId: string, version: string): Promise<"busy" | "unchanged" | "reloaded"> {
+    const account = this.accountsById.get(accountId);
+    if (!account) throw new Error("Unknown account");
+    const current = installedRuntimeVersion(account.codexHome, serverConfig.codexBin);
+    if (!isNewerRuntime(version,current)) return "unchanged";
+    if (account.authFailureCode || this.accountMaintenance.has(account.id)) return "busy";
+    let release!: () => void;
+    this.accountMaintenance.set(account.id,new Promise<void>(resolve => {release=resolve;}));
+    const file=runtimeSelectionPath(account.codexHome);
+    const previous=fs.existsSync(file)?fs.readFileSync(file,"utf8"):null;
+    let stopped=false;
+    try {
+      if (account.activeRequests || account.bridge.getPendingServerRequests().length) return "busy";
+      if (!await runtimeIsIdle(account.bridge)) return "busy";
+      // Incoming requests are waiting at the barrier; goals/queues/terminals
+      // were checked natively, so no model turn is interrupted here.
+      await account.bridge.stopAndWait(); stopped=true;
+      writeRuntimeSelection(account.codexHome,version);
+      const replacement=this.bridgeFactory(account.codexHome,account.id);
+      account.bridge=replacement;this.forwardEvents(account,replacement);
+      await replacement.start(); stopped=false;
+      this.markReadyUnlessAuthFailure(account);
+      this.emit("accountRuntime",{accountId:account.id,event:"runtime_upgraded",version});
+      return "reloaded";
+    } catch(error) {
+      if(stopped) {
+        await account.bridge.stopAndWait();
+        if(previous===null) fs.rmSync(file,{force:true});
+        else writeFileAtomically(file,previous);
+        const recovery=this.bridgeFactory(account.codexHome,account.id);
+        account.bridge=recovery;this.forwardEvents(account,recovery);
+        await recovery.start();
+      }
+      throw error;
+    } finally {this.accountMaintenance.delete(account.id);release();}
+  }
+
+  private async checkRuntimeUpgrade(): Promise<void> {
+    if(this.runtimeUpgradeChecking) return;
+    this.runtimeUpgradeChecking=true;
+    try {
+      const root=fileURLToPath(new URL("../../",import.meta.url));
+      const file=path.join(root,"bin/runtime-candidate.json");
+      if(!fs.existsSync(file)) return;
+      const candidate=JSON.parse(fs.readFileSync(file,"utf8"));
+      if(candidate.validated!==true || !/^\d+\.\d+\.\d+$/.test(candidate.version)) return;
+      const binary=path.join(root,`bin/codex-${candidate.version}/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex`);
+      fs.accessSync(binary,fs.constants.X_OK);
+      for(const account of this.accounts) {
+        const key=`${account.id}:${candidate.version}`;
+        if(this.rejectedRuntimeVersions.has(key)) continue;
+        try {
+          const result=await this.applyRuntimeVersionIfIdle(account.id,candidate.version);
+          if(result==="reloaded") console.info("Codex runtime updated",{accountId:account.id,version:candidate.version});
+        } catch(error) {
+          this.rejectedRuntimeVersions.add(key);
+          console.warn("Codex runtime update deferred after failure",{accountId:account.id,version:candidate.version,error:error instanceof Error?error.message:"runtime failure"});
+        }
+      }
+    } catch(error) { console.warn("Codex update candidate unavailable",{error:error instanceof Error?error.message:"runtime failure"}); }
+    finally {this.runtimeUpgradeChecking=false;}
+  }
+
+  modelCatalogTargets(): ModelCatalogTarget[] {
+    return this.accounts
+      .filter((account) => account.kind === "codex-account")
+      .map((account) => ({
+        id: account.id,
+        codexHome: account.codexHome,
+        catalogPath: path.join(account.codexHome, MODEL_CATALOG_FILENAME)
+      }));
+  }
+
+  /**
+   * Install a validated catalog and replace only this account's app-server.
+   * New requests wait on the maintenance barrier, while running turns cause a
+   * busy result so the caller can retry without interrupting user work.
+   */
+  async applyModelCatalogIfIdle(accountId: string, catalogText: string): Promise<ModelCatalogApplyResult> {
+    const account = this.accountsById.get(accountId);
+    if (!account || account.kind !== "codex-account") throw new Error(`Unknown Codex account: ${accountId}`);
+    if (this.accountMaintenance.has(account.id)) return "busy";
+
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    this.accountMaintenance.set(account.id, barrier);
+    const catalogPath = path.join(account.codexHome, MODEL_CATALOG_FILENAME);
+    let previousCatalog: string | null = null;
+    let catalogInstalled = false;
+    let runtimeStopped = false;
+    try {
+      previousCatalog = fs.existsSync(catalogPath) ? fs.readFileSync(catalogPath, "utf8") : null;
+      if (previousCatalog === catalogText) return "unchanged";
+      if (account.activeRequests || account.bridge.getPendingServerRequests().length) return "busy";
+
+      const loaded = asRecord(await account.bridge.request("thread/loaded/list", {}, 15_000));
+      if (!Array.isArray(loaded.data)) throw new Error("Codex did not return its loaded-thread list.");
+      const loadedIds = loaded.data.filter((value): value is string => typeof value === "string" && Boolean(value));
+      const statuses = await Promise.all(loadedIds.map(async (threadId) => {
+        const response = asRecord(await account.bridge.request("thread/read", { threadId, includeTurns: false }, 15_000));
+        return String(asRecord(asRecord(response.thread).status).type ?? "");
+      }));
+      if (statuses.some((status) => status !== "idle")) return "busy";
+
+      if (previousCatalog !== null) writeFileAtomically(`${catalogPath}.auto-backup`, previousCatalog);
+      writeFileAtomically(catalogPath, catalogText);
+      catalogInstalled = true;
+      // Generate the 0.159.2 Responses compatibility copy before constructing
+      // the replacement bridge so its immutable launch arguments use it.
+      responsesCompatibleModelCatalog(catalogPath);
+
+      const previousBridge = account.bridge;
+      await previousBridge.stopAndWait();
+      runtimeStopped = true;
+      const replacement = this.bridgeFactory(account.codexHome, account.id);
+      account.bridge = replacement;
+      this.forwardEvents(account, replacement);
+      await replacement.start();
+      runtimeStopped = false;
+      account.supportedModels = accountSupportedModels(account.codexHome);
+      this.markReadyUnlessAuthFailure(account);
+      this.emit("accountRuntime", { accountId: account.id, event: "model_catalog_reloaded" });
+      return "reloaded";
+    } catch (error) {
+      if (catalogInstalled) {
+        try {
+          // A failed start may still have spawned a child or armed its native
+          // restart loop, so always stop the currently assigned bridge before
+          // restoring the previous catalog.
+          await account.bridge.stopAndWait();
+          runtimeStopped = true;
+          if (previousCatalog === null) fs.unlinkSync(catalogPath);
+          else writeFileAtomically(catalogPath, previousCatalog);
+          if (previousCatalog !== null) responsesCompatibleModelCatalog(catalogPath);
+          const recovery = this.bridgeFactory(account.codexHome, account.id);
+          account.bridge = recovery;
+          this.forwardEvents(account, recovery);
+          await recovery.start();
+          runtimeStopped = false;
+          account.supportedModels = accountSupportedModels(account.codexHome);
+        } catch (recoveryError) {
+          throw new Error(`模型目录更新失败，旧目录恢复也未完成：${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`);
+        }
+      }
+      throw error;
+    } finally {
+      this.accountMaintenance.delete(account.id);
+      release();
     }
   }
 
@@ -615,6 +824,10 @@ export class AccountPoolBridge extends EventEmitter {
 
   hasAccount(accountId: string): boolean {
     return this.accountsById.has(accountId);
+  }
+
+  getAccountMemoryHeadroom(accountId: string): number | null {
+    return this.accountsById.get(accountId)?.bridge.getMemoryHeadroom() ?? null;
   }
 
   async resolveThreadAccount(threadId: string): Promise<{ id: string; label: string }> {
@@ -863,6 +1076,7 @@ export class AccountPoolBridge extends EventEmitter {
         const previous = account.cache;
         const credential = this.currentCredentialVersion(account);
         this.updateCredentialVersion(account, credential);
+        await this.reloadChangedCredentialsIfIdle(account);
         // Host quota polling only reads account state. Native Codex owns token
         // staleness refresh and recovery during actual model requests.
         const [accountSettled] = await Promise.allSettled([

@@ -20,7 +20,7 @@ it("counts new work, not token telemetry copied into a fork with new timestamps"
     const fork = path.join(root, `rollout-${forkId}.jsonl`);
     await fs.writeFile(fork, rows([{ type: "session_meta", payload: { id: forkId, forked_from_id: parentId } }, ...turn("inherited", 100), ...turn("new", 25)]));
     const { summarizeLeaderboardFile } = await import("./routes.js");
-    const summary = await summarizeLeaderboardFile(fork, { getUser: () => ({}) } as never, () => "quotaUser");
+    const summary = await summarizeLeaderboardFile(fork, { getUser: () => ({}) } as never, () => "sample-user");
     expect(summary.usage.reduce((sum, row) => sum + row.totalTokens, 0)).toBe(25);
     expect(summary.billingVersion).toBe(2);
   } finally {

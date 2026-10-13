@@ -6,16 +6,21 @@ import multipart from "@fastify/multipart";
 import compress from "@fastify/compress";
 import Fastify from "fastify";
 import { CodexBridge } from "./codexBridge.js";
-import { AccountPoolBridge } from "./accountPoolBridge.js";
+import { AccountPoolBridge, isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders, changeUserPassword, clearSessionCookie, createSessionCookie, verifyCredentials } from "./auth.js";
 import { serverConfig } from "./config.js";
 import { ProjectStore } from "./db.js";
-import { registerRoutes } from "./routes.js";
+import { invalidateModelCatalogCache, registerRoutes } from "./routes.js";
+import { ModelCatalogAutoUpdater } from "./modelCatalogAutoUpdate.js";
 import { DocumentCompiler } from "./documentCompiler.js";
 import { registerDocumentWorkbenchRoutes } from "./documentWorkbench.js";
 import { attachSocketServer } from "./socket.js";
 import { BrowserService } from "./browserService.js";
 import { registerBrowserRoutes, browserMcpAuthorized } from "./browserRoutes.js";
+import { registerPetRoutes } from "./pets.js";
+import { registerUiUpdateRoutes } from "./uiUpdates.js";
+import { registerSpeechRoutes } from "./speech.js";
+import { registerFeishuRoutes } from "./feishu.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -52,7 +57,7 @@ function gzipVariant(filePath: string): string {
   return gzipPath;
 }
 
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: { serializers: { req(req) { return { method: req.method, url: req.url?.startsWith("/api/feishu/callback") ? "/api/feishu/callback" : req.url, hostname: req.hostname, remoteAddress: req.ip }; } } } });
 await app.register(compress, { global: true, threshold: 1024 });
 
 function requestPath(url: string | undefined): string {
@@ -76,7 +81,7 @@ app.addHook("onRequest", async (request, reply) => {
   if (isPublicPath(pathname)) {
     return;
   }
-  if (pathname === "/api/browser/mcp" && browserMcpAuthorized(request.headers)) return;
+  if ((pathname === "/api/browser/mcp" || pathname === "/api/schedules/mcp" || pathname === "/api/feishu/mcp") && browserMcpAuthorized(request.headers)) return;
 
   // A peer can request only its local leaderboard snapshot with the shared
   // internal token; browser login cookies never leave this machine.
@@ -109,6 +114,14 @@ const store = new ProjectStore();
 const bridge = serverConfig.accountPoolFile
   ? AccountPoolBridge.fromFile(serverConfig.accountPoolFile)
   : new CodexBridge();
+const modelCatalogUpdater = isAccountPoolBridge(bridge)
+  ? new ModelCatalogAutoUpdater(
+      bridge,
+      serverConfig.modelCatalogRefreshIntervalMs,
+      { info: (details, message) => app.log.info(details, message), warn: (details, message) => app.log.warn(details, message) },
+      invalidateModelCatalogCache
+    )
+  : null;
 bridge.on("accountAuth", (diagnostic: { accountId: string; code: string; requiresLogin: boolean }) => {
   if (diagnostic.requiresLogin) app.log.warn(diagnostic, "Account authentication requires device login");
   else app.log.info(diagnostic, "Account authentication lifecycle");
@@ -129,6 +142,10 @@ const documentCompiler = new DocumentCompiler();
 registerDocumentWorkbenchRoutes(app, store, { compiler: documentCompiler });
 const browserService = new BrowserService();
 registerBrowserRoutes(app, store, browserService);
+registerPetRoutes(app);
+registerUiUpdateRoutes(app);
+registerSpeechRoutes(app);
+registerFeishuRoutes(app);
 app.addHook("onClose", async () => { await browserService.dispose(); });
 
 function escapeHtml(value: string): string {
@@ -168,7 +185,7 @@ function authLayout(title: string, body: string): string {
 
 app.get("/login", async (_request, reply) => {
   const page = authLayout("登录 Codex Remote", `<h1>登录 Codex Remote</h1>
-    <p>加入 ZeroTier 网络后，用自己的姓名登录。初始密码是 <code>ls</code>，登录后可以修改密码。</p>
+    <p>加入 ZeroTier 网络后，用自己的姓名登录。初始密码由管理员提供，登录后可以修改密码。</p>
     <form id="form">
       <label>用户名 / 姓名</label>
       <input name="username" autocomplete="username" required autofocus />
@@ -202,7 +219,7 @@ app.post("/api/auth/login", async (request, reply) => {
   const username = typeof body?.username === "string" ? body.username.trim() : "";
   const password = typeof body?.password === "string" ? body.password : "";
   if (!username || !verifyCredentials(username, password)) {
-    return reply.code(401).send({ error: "用户名或密码不正确。首次登录请使用自己的姓名和初始密码 ls。" });
+    return reply.code(401).send({ error: "用户名或密码不正确。首次登录请使用管理员提供的凭据。" });
   }
   return reply.header("Set-Cookie", createSessionCookie(username)).send({ ok: true, username });
 });
@@ -246,7 +263,7 @@ app.get("/change-password", async (request, reply) => {
   const safeUsername = escapeHtml(username);
   const page = authLayout("修改 Codex Remote 密码", `<h1>修改密码</h1>
     <p>当前登录用户：<code>${safeUsername}</code></p>
-    <p>初始密码是 <code>ls</code>。修改后请用新密码重新登录。</p>
+    <p>初始密码由管理员提供。修改后请用新密码重新登录。</p>
     <form id="form">
       <label>当前密码</label>
       <input name="currentPassword" type="password" autocomplete="current-password" required />
@@ -333,6 +350,7 @@ async function shutdownServer(signal: string) {
   try {
     app.log.info({ signal }, "Shutting down Codex Web Console");
     await browserService.dispose();
+    modelCatalogUpdater?.stop();
     bridge.stop();
     store.close();
     process.exit(0);
@@ -352,3 +370,4 @@ process.on("SIGTERM", () => {
 
 await bridge.start();
 await app.listen({ host: serverConfig.host, port: serverConfig.port });
+modelCatalogUpdater?.start();

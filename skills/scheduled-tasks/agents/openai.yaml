@@ -1,0 +1,6 @@
+interface:
+  display_name: "定时任务"
+  short_description: "用自然语言预约会话任务，查询和修改本人各会话的计划、暂停与恢复执行"
+  default_prompt: "使用 $scheduled-tasks 管理我的会话定时任务。"
+policy:
+  allow_implicit_invocation: true

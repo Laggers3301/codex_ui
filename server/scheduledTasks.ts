@@ -15,6 +15,12 @@ export interface ScheduledTask {
   history: Array<{ id: string; scheduledAt: string; status: "dispatching" | "queued" | "failed" | "skipped" | "completed"; error?: string; warning?: string }>;
 }
 export class ScheduleConflictError extends Error {}
+export function executionSettingsOverrides(settings: { sandbox: "read-only" | "workspace-write" | "danger-full-access"; approvalPolicy: string } | null | undefined): { permissions: string; approvalPolicy: string } | undefined {
+  if (!settings) return undefined;
+  const profile = { "read-only": ":read-only", "workspace-write": ":workspace", "danger-full-access": ":danger-full-access" }[settings.sandbox];
+  if (!profile) throw new Error("Unknown saved permission mode.");
+  return { permissions: profile, approvalPolicy: settings.approvalPolicy };
+}
 type State = { tasks: ScheduledTask[] };
 const MAX_PER_THREAD = 20;
 const MAX_PER_USER = 100;
@@ -97,6 +103,7 @@ export class ScheduledTaskStore {
   }
   private save() { const tmp = `${this.file}.${process.pid}.tmp`; fs.writeFileSync(tmp, JSON.stringify(this.state), { mode: 0o600 }); fs.renameSync(tmp, this.file); }
   list(userId: string, projectId: string, threadId: string) { return this.state.tasks.filter(t => t.userId === userId && t.projectId === projectId && t.threadId === threadId).map(t => structuredClone(t)); }
+  listForUser(userId: string) { return this.state.tasks.filter(t => t.userId === userId).map(t => structuredClone(t)); }
   create(input: Omit<ScheduledTask, "id" | "createdAt" | "updatedAt" | "status" | "nextRunAt" | "history">): ScheduledTask {
     if (this.state.tasks.filter(t => t.userId === input.userId).length >= MAX_PER_USER || this.state.tasks.filter(t => t.userId === input.userId && t.threadId === input.threadId).length >= MAX_PER_THREAD) throw new Error("Scheduled task limit reached.");
     validateScheduleRule(input.schedule);
@@ -162,15 +169,21 @@ export async function resumeThreadIfUnloaded(
   },
   threadId: string,
   cwd: string,
-  config?: unknown
+  config?: unknown,
+  execution?: { permissions: string; approvalPolicy: string }
 ): Promise<boolean> {
   const request = bridge.requestOnThreadAccount
     ? (method: string, params?: unknown, timeoutMs?: number) => bridge.requestOnThreadAccount!(threadId, method, params, timeoutMs)
     : (method: string, params?: unknown, timeoutMs?: number) => bridge.request(method, params, timeoutMs);
   const loaded = await request("thread/loaded/list", {}, 30_000) as { data?: string[] };
-  if (loaded.data?.includes(threadId)) return false;
-  // thread/resume by ID reloads its native persisted history. Omitting model,
-  // sandbox and approval overrides preserves the conversation's own settings.
-  await request("thread/resume", { threadId, cwd, config, excludeTurns: true }, 30_000);
+  if (loaded.data?.includes(threadId)) {
+    // resume does not apply overrides to an already-loaded actor. Native
+    // settings/update sets subsequent-turn policy without interrupting it.
+    if (execution) await request("thread/settings/update", { threadId, ...execution }, 30_000);
+    return false;
+  }
+  // A cold resume with omitted permissions can revert to :workspace. Restore
+  // only an explicitly saved owner choice, never infer full access for others.
+  await request("thread/resume", { threadId, cwd, config, excludeTurns: true, ...execution }, 30_000);
   return true;
 }

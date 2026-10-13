@@ -52,6 +52,9 @@ const configuredCodexSessionRoots = [...new Set([
     .filter(Boolean)
 ].map((entry) => path.resolve(entry)))];
 const sessionPathIndexTtlMs = 60_000;
+export function threadHistoryRuntimeHomes(): string[] {
+  return [...new Set(configuredCodexSessionRoots.map(root=>path.dirname(root)))];
+}
 const cachedSessionPathIndexes = new Map<string, { expiresAt: number; paths: Map<string, string> }>();
 const buildingSessionPathIndexes = new Map<string, Promise<Map<string, string>>>();
 

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Root-only phases on the old controller, reached over the physical LAN.
+set -Eeuo pipefail
+umask 077
+state=/var/lib/codex-zt-migration-example
+home=/var/lib/zerotier-one
+case "${1:-}" in
+prepare)
+  [[ ! -e "$state" ]] || { echo 'Migration state already exists' >&2; exit 1; }
+  [[ "$(cut -d: -f1 "$home/identity.public")" == 0000000000 ]] || exit 1
+  install -d -m700 "$state"
+  cp -a "$home" "$state/original-home"
+  systemctl is-enabled zerotier-watchdog.timer > "$state/watchdog-enabled" || true
+  systemctl is-active zerotier-watchdog.timer > "$state/watchdog-active" || true
+  install -d -m700 "$state/new-client"
+  zerotier-idtool generate "$state/new-client/identity.secret" "$state/new-client/identity.public"
+  tar -C "$home" -czf "$state/controller-precopy.tar.gz" identity.secret identity.public controller.d
+  install -d -m700 -o example -g example /srv/codex-ui/backups/zt-migration-example
+  install -m600 -o example -g example "$state/controller-precopy.tar.gz" /srv/codex-ui/backups/zt-migration-example/controller-precopy.tar.gz
+  printf 'oldNode=0000000000\nnewClientNode=%s\n' "$(cut -d: -f1 "$state/new-client/identity.public")"
+  ;;
+quiesce)
+  [[ -d "$state/original-home" && ! -e "$state/committed" ]] || exit 1
+  /usr/bin/node /usr/local/lib/codex-zt-controller-inventory.mjs
+  # If orchestration disappears, stop the local replacement before restoring
+  # the original identity. Never bring two copies online together.
+  systemd-run --unit=codex-zt-migration-rollback --on-active=5m \
+    /usr/local/sbin/codex-zt-migration-remote rollback
+  systemctl stop zerotier-watchdog.timer zerotier-watchdog.service
+  systemctl stop zerotier-one.service
+  systemctl mask --runtime zerotier-one.service
+  [[ "$(systemctl show zerotier-one.service -p MainPID --value)" == 0 ]] || exit 1
+  touch "$state/quiesced"
+  # Refresh rollback state after the daemon has completely stopped.
+  cp -a "$home/." "$state/original-home/"
+  tar -czf "$state/controller-final.tar.gz" -C "$home" identity.secret identity.public controller.d -C "$state" inventory.json new-client/identity.public
+  install -m600 -o example -g example "$state/controller-final.tar.gz" /srv/codex-ui/backups/zt-migration-example/controller-final.tar.gz
+  echo 'Old controller stopped; final snapshot available.'
+  ;;
+client)
+  [[ -e "$state/quiesced" && ! -e "$state/committed" ]] || exit 1
+  [[ "$(systemctl show zerotier-one.service -p MainPID --value)" == 0 ]] || exit 1
+  if [[ -e "$home/controller.d" ]]; then mv "$home/controller.d" "$state/retired-controller.d"; fi
+  install -m600 -o zerotier-one -g zerotier-one "$state/new-client/identity.secret" "$home/identity.secret"
+  install -m600 -o zerotier-one -g zerotier-one "$state/new-client/identity.public" "$home/identity.public"
+  # All original client configuration, network join files and API token stay.
+  systemctl unmask --runtime zerotier-one.service
+  systemctl start zerotier-one.service
+  echo 'Old machine restarted as a client with its new identity.'
+  ;;
+commit)
+  [[ -e "$state/quiesced" ]] || exit 1
+  zerotier-cli -j listnetworks | /usr/bin/python3 -c 'import json,sys;n=json.load(sys.stdin);assert any(x.get("id")=="0000000000000000" and x.get("status")=="OK" and "192.0.2.20/24" in x.get("assignedAddresses",[]) for x in n)'
+  [[ "$(cut -d: -f1 "$home/identity.public")" != 0000000000 ]] || exit 1
+  touch "$state/committed"
+  systemctl stop codex-zt-migration-rollback.timer
+  if grep -qx active "$state/watchdog-active"; then systemctl start zerotier-watchdog.timer; fi
+  echo 'Migration committed; old client address verified; watchdog restored.'
+  ;;
+rollback)
+  [[ -d "$state/original-home" && ! -e "$state/committed" ]] || exit 0
+  # The narrowly-scoped helper is installed before the cutover is permitted.
+  sudo -u example ssh -o BatchMode=yes -o ConnectTimeout=8 -o HostKeyAlias=192.0.2.10 example@192.0.2.10 \
+    sudo -n /usr/local/sbin/codex-stop-migrated-controller
+  systemctl stop zerotier-watchdog.timer zerotier-watchdog.service
+  systemctl stop zerotier-one.service
+  [[ ! -e "$state/failed-client-home" ]] || { echo 'Rollback already staged; manual verification needed' >&2; exit 1; }
+  mv "$home" "$state/failed-client-home"
+  cp -a "$state/original-home" "$home"
+  systemctl unmask --runtime zerotier-one.service
+  systemctl start zerotier-one.service
+  if grep -qx active "$state/watchdog-active"; then systemctl start zerotier-watchdog.timer; fi
+  touch "$state/rolled-back"
+  echo 'Original controller restored.'
+  ;;
+*) echo 'Usage: zt-migration-remote.sh prepare|quiesce|client|commit|rollback' >&2; exit 2 ;;
+esac

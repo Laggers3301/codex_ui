@@ -1,0 +1,53 @@
+/* Match the actual plugin skill picker, not the more transparent composer.
+   styles.css: .skillPickerScrim > .skillPickerPopover and its light override. */
+.feishuScrim { position: fixed; inset: 0; z-index: 2100; display: grid; place-items: center; padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); background: rgba(8, 9, 8, .42); -webkit-backdrop-filter: blur(5px); backdrop-filter: blur(5px); animation: feishuFade 220ms ease both; }
+.feishuDialog { width: min(520px, 100%); max-height: min(760px, 86dvh); display: flex; flex-direction: column; color: var(--ui-content); background: linear-gradient(150deg, rgba(48, 50, 47, .78), rgba(34, 36, 34, .87)); backdrop-filter: blur(20px) saturate(1.08); -webkit-backdrop-filter: blur(20px) saturate(1.08); border: 0; border-radius: 20px; box-shadow: 0 28px 80px rgba(0, 0, 0, .4); font: 420 14px/1.5 var(--pool-ui-font, sans-serif); animation: feishuRise 300ms var(--ui-popover-motion-ease, cubic-bezier(.16,1,.3,1)) both; outline: none; }
+:root[data-theme="light"] .feishuDialog { background: linear-gradient(145deg, rgba(255,255,255,.89), rgba(246,248,245,.93)); box-shadow: 0 20px 54px rgba(48, 55, 47, .16); color: var(--ui-heading); }
+.feishuDialog header { display: flex; align-items: center; justify-content: space-between; padding: 16px 18px 8px; }
+.feishuDialog header div, .feishuActions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.feishuDialog button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 6px 10px; border: 0; border-radius: 9px; font: inherit; color: inherit; background: color-mix(in srgb, currentColor 6%, transparent); cursor: pointer; transition: background 180ms ease, opacity 180ms ease; }
+.feishuDialog button:hover { background: color-mix(in srgb, currentColor 10%, transparent); }
+.feishuDialog button:disabled { opacity: .5; cursor: default; }
+.feishuBody { padding: 0 18px 18px; overflow: auto; min-height: 0; }
+.feishuBody p { margin: 10px 0; }
+.feishuHint, .feishuScopes, .feishuProposal small { opacity: .7; }
+.feishuScopes { overflow-wrap: anywhere; }
+.feishuError { color: var(--text-danger, #e66c74); }
+.feishuProposal { margin: 14px 0; padding: 12px; border-radius: 12px; background: color-mix(in srgb, currentColor 5%, transparent); }
+.feishuProposal strong { font-weight: 500; }
+.feishuProposal small { display: block; font-size: inherit; overflow-wrap: anywhere; margin: 4px 0; }
+.feishuPreview, .feishuProposal pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto; margin: 10px 0; }
+.feishuBody summary { cursor: pointer; margin-top: 10px; color: var(--ui-heading); font-weight: 500; }
+.feishuBody > details > summary { font: inherit; }
+.feishuBody details { color: var(--ui-content-muted); }
+.feishuBody a { color: var(--ui-accent, #6b92d4); text-decoration: underline; text-underline-offset: 3px; }
+.feishuBody > details { border-top: 1px solid var(--ui-divider); padding-top: 4px; margin-top: 14px; }
+.feishuDialog header { color: var(--ui-heading); border-bottom: 1px solid var(--ui-divider); margin-bottom: 4px; padding-bottom: 12px; }
+.feishuSectionTitle { color: var(--ui-heading); font: inherit; }
+.feishuPending { margin-top: 14px; padding-top: 4px; border-top: 1px solid var(--ui-divider); }
+.feishuDialog.feishuDocked { width: 100%; height: 100%; max-height: none; border-radius: 0; box-shadow: none; animation: none; background: var(--ui-composer-glass-background); }
+:root[data-theme="light"] .feishuDialog.feishuDocked { background: var(--ui-composer-glass-background); box-shadow: none; }
+.feishuPermissionGroups { margin-top: 14px; }
+.feishuPermissionGroup { display: grid; gap: 8px; margin-top: 12px; }
+.feishuPermissionTags { display: flex; flex-wrap: wrap; gap: 6px; }
+.feishuPermissionTag, .feishuActions button { padding: 3px 9px; border-radius: 8px; font: inherit; color: var(--ui-content-muted); background: color-mix(in srgb, var(--ui-content) 8%, transparent); }
+.feishuActions button:hover { background: color-mix(in srgb, var(--ui-content) 12%, transparent); }
+.feishuDisclosure > summary { list-style: none; display: flex; align-items: center; gap: 8px; }
+.feishuDisclosure > summary::-webkit-details-marker { display: none; }
+.feishuDisclosure > summary::before { content: ""; width: 6px; height: 6px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(-45deg); transition: transform 320ms var(--ui-popover-motion-ease, cubic-bezier(.16,1,.3,1)); flex: 0 0 auto; }
+.feishuDisclosure[data-expanded="true"] > summary::before { transform: rotate(45deg); }
+.feishuDisclosureCollapse { display: grid; grid-template-rows: 0fr; opacity: 0; transform: translateY(-5px); transition: grid-template-rows 340ms var(--ui-popover-motion-ease, cubic-bezier(.16,1,.3,1)), opacity 240ms ease, transform 340ms var(--ui-popover-motion-ease, cubic-bezier(.16,1,.3,1)); }
+.feishuDisclosure[data-expanded="true"] > .feishuDisclosureCollapse { grid-template-rows: 1fr; opacity: 1; transform: translateY(0); }
+.feishuDisclosureContent { min-height: 0; overflow: hidden; }
+.feishuScrim.closing { animation: feishuFade 340ms ease reverse both; pointer-events: none; }
+.feishuScrim.closing .feishuDialog { animation: feishuLeave 340ms cubic-bezier(.32,0,.67,0) both; }
+.feishuSpin { animation: feishuRotate 850ms linear infinite; }
+@keyframes feishuFade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes feishuRise { from { opacity: 0; transform: translateY(18px) scale(.98); } to { opacity: 1; transform: none; } }
+@keyframes feishuLeave { from { opacity: 1; transform: translateY(0) scale(1); } to { opacity: 0; transform: translateY(22px) scale(.975); } }
+@keyframes feishuRotate { to { transform: rotate(360deg); } }
+.featureUpdateNotice { position: fixed; z-index: 2200; top: max(72px, env(safe-area-inset-top)); left: 50%; transform: translateX(-50%); width: min(460px, calc(100vw - 32px)); display: flex; align-items: center; gap: 12px; padding: 12px 16px; color: var(--text); background: var(--ui-composer-glass-background); backdrop-filter: blur(28px); -webkit-backdrop-filter: blur(28px); border-radius: 14px; box-shadow: var(--ui-glass-shadow); font-size: 14px; line-height: 1.5; animation: feishuFade 240ms ease both; }
+.featureUpdateNotice button { border: 0; color: inherit; background: transparent; display: grid; place-items: center; cursor: pointer; padding: 5px; }
+.featureUpdateNotice.closing { animation: feishuFade 240ms ease reverse both; pointer-events: none; }
+@media (prefers-reduced-motion: reduce) { .feishuScrim, .feishuDialog, .feishuSpin { animation: none !important; } }
+@media (prefers-reduced-motion: reduce) { .feishuDisclosureCollapse, .feishuDisclosure > summary::before { transition: none; } }

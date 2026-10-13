@@ -1,0 +1,29 @@
+[Unit]
+Description=Codex dedicated ZeroTier network controller
+After=network-online.target codex-zt-api-firewall.service
+Requires=codex-zt-api-firewall.service
+Wants=network-online.target
+ConditionPathExists=/var/lib/zerotier-codex-controller/cutover-ready
+
+[Service]
+Type=simple
+User=zerotier-one
+Group=zerotier-one
+ExecStart=/usr/sbin/zerotier-one -U -p19993 /var/lib/zerotier-codex-controller
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+KillMode=control-group
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zerotier-codex-controller
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+MemoryHigh=192M
+MemoryMax=256M
+TasksMax=64
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

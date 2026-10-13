@@ -11,7 +11,7 @@ it("waits for the protected turn, restarts outside that turn, and resumes only t
   vi.useFakeTimers();
   const script = fileURLToPath(new URL("../scripts/restart-account-pool.cjs", import.meta.url));
   const protectedThread = "11111111-1111-4111-8111-111111111111";
-  const otherThread = "22222222-2222-4222-8222-222222222222";
+  const otherThread = "33badf5c-68ac-44a7-b93c-5fc14da60279";
   let protectedBusy = true, restarted = false;
   const sent: Array<{ threadId: string; prompt: string }> = [];
   const writes: string[] = [];
@@ -25,7 +25,7 @@ it("waits for the protected turn, restarts outside that turn, and resumes only t
       const payload = options.headers.cookie.split("=")[1].split(".")[0];
       this.user = JSON.parse(Buffer.from(payload, "base64url").toString()).u;
       queueMicrotask(() => this.emit("message", JSON.stringify({ type: "hello", data: { liveState: { activeTurns:
-        this.user === "qaUser" ? (protectedBusy ? [{ threadId: protectedThread }] : []) : (restarted ? [] : [{ threadId: otherThread }])
+        this.user === "qa-user" ? (protectedBusy ? [{ threadId: protectedThread }] : []) : (restarted ? [] : [{ threadId: otherThread }])
       } } })));
     }
     close() {}
@@ -38,28 +38,30 @@ it("waits for the protected turn, restarts outside that turn, and resumes only t
   class FakeDB {
     prepare(sql: string) {
       return {
-        get: () => sql.includes("SELECT user_id") ? { user_id: "qaUser" } : { project_id: "fixture-project" },
-        all: () => [{ id: "qaUser" }, { id: "other" }]
+        get: () => sql.includes("SELECT user_id") ? { user_id: "qa-user" } : { project_id: "fixture-project" },
+        all: () => [{ id: "qa-user" }, { id: "other" }]
       };
     }
     close() { complete(); }
   }
   const mockedRequire = (name: string) => {
-    if (name === "node:fs") return { readFileSync: (file: string) => file.endsWith("session-secret") ? "fixture-session-secret" : JSON.stringify({ accounts: [], stateFile: "pool-state.json" }), writeFileSync: (_file: string, text: string) => writes.push(text) };
-    if (name === "./preserve-auth-failures.cjs") return { captureAuthFailures: () => [], persistAuthFailures: () => 0 };
+    if (name === "node:fs") return {
+      readFileSync: (file: string) => file.endsWith("account-pool.json") ? JSON.stringify({ accounts: [], stateFile: "fixture-state.json" }) : file.endsWith("fixture-state.json") ? "{}" : "fixture-session-secret",
+      writeFileSync: (_file: string, text: string) => writes.push(text)
+    };
     if (name === "node:path") return path;
     if (name === "node:crypto") return crypto;
     if (name === "node:sqlite") return { DatabaseSync: FakeDB };
     if (name === "node:module") return { createRequire: () => () => FakeSocket };
+    if (name === "./preserve-auth-failures.cjs") return { captureAuthFailures: () => [], persistAuthFailures: () => 0 };
     if (name === "node:child_process") return { execFileSync: (command: string, args: string[]) => {
-      expect(protectedBusy).toBe(false);
       if (command === "journalctl") return "";
+      expect(protectedBusy).toBe(false);
       expect(command).toBe("systemctl");
       expect(args[0]).toBe("--user");
-      expect(args[2]).toBe("codex-account-pool-4576.service");
       expect(["stop", "start"]).toContain(args[1]);
+      expect(args[2]).toBe("codex-account-pool-4576.service");
       if (args[1] === "start") restarted = true;
-      return "";
     } };
     throw new Error(`Unexpected dependency ${name}`);
   };

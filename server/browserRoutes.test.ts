@@ -45,6 +45,15 @@ describe("browser routes and MCP scope", () => {
     const app = Fastify();
     try {
       registerBrowserRoutes(app, store as any, service as any);
+      const { registerFeishuRoutes, FeishuService } = await import("./feishu.js");
+      registerFeishuRoutes(app, new FeishuService(path.join(temporary, "feishu-private")));
+      const pendingConfig = mintBrowserMcpConfig("alice", "p").config as any;
+      const feishuHeaders = pendingConfig["mcp_servers.codex_feishu"].http_headers;
+      const feishu = (method: string, params?: unknown, headers = feishuHeaders) => app.inject({ method: "POST", url: "/api/feishu/mcp", headers, payload: { jsonrpc: "2.0", id: 1, method, params } });
+      expect((await feishu("initialize")).json().result.serverInfo.name).toBe("codex-feishu");
+      expect((await feishu("tools/list")).json().result.tools[0].name).toBe("feishu_office");
+      expect((await feishu("tools/call", { name: "feishu_office", arguments: { action: "status" } })).json().result.isError).toBe(true);
+      expect((await feishu("tools/list", {}, { "x-codex-browser-token": "forged" })).statusCode).toBe(401);
       const aliceCookie = createSessionCookie("alice").split(";")[0];
       const bobCookie = createSessionCookie("bob").split(";")[0];
 

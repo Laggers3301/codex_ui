@@ -1,5 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { BrowserService } from "./browserService.js";
+import { BrowserService, isTopLevelBrowserNavigation } from "./browserService.js";
+
+describe("browser navigation classification", () => {
+  it("handles a popup before its frame exists without weakening origin checks", () => {
+    expect(isTopLevelBrowserNavigation({ isNavigationRequest: () => true, frame: () => { throw new Error("Frame not yet created"); } })).toBe(true);
+    expect(isTopLevelBrowserNavigation({ isNavigationRequest: () => true, frame: () => ({ parentFrame: () => null }) })).toBe(true);
+    expect(isTopLevelBrowserNavigation({ isNavigationRequest: () => true, frame: () => ({ parentFrame: () => ({}) }) })).toBe(false);
+    expect(isTopLevelBrowserNavigation({ isNavigationRequest: () => false, frame: () => { throw new Error("Must not read frame"); } })).toBe(false);
+  });
+});
 
 // Explicit opt-in because these checks launch a real sandboxed Chromium in a
 // resource-limited scope. They never use account credentials or send model calls.
@@ -20,6 +29,20 @@ describe.skipIf(process.env.BROWSER_INTEGRATION !== "1")("isolated browser inter
     expect(service.get("bob", "thread-a")).toBeNull();
     expect(service.frame("bob", "thread-a")).toBeNull();
   });
+  it("reports denied popup navigation without bypassing guards or exposing URL tokens", async () => {
+    const blockedService = new BrowserService();
+    try {
+      await blockedService.open("alice", "thread-blocked");
+      const blockedPage = (blockedService as any).sessions.get("alice\0thread-blocked").page;
+      await expect(blockedPage.goto("https://unapproved.example/?token=secret-fixture")).rejects.toThrow();
+      const denied = blockedService.get("alice", "thread-blocked")!;
+      expect(denied.error).toContain("https://unapproved.example");
+      expect(denied.error).not.toContain("secret-fixture");
+      expect(denied.mode).toBe("agent");
+      await expect(blockedPage.goto("http://127.0.0.1/")).rejects.toThrow();
+      expect(blockedService.get("alice", "thread-blocked")!.error).toContain("Private destinations");
+    } finally { await blockedService.dispose(); }
+  }, 30_000);
   it("does not click before approval and cancels pending actions on takeover", async () => {
     const pending = service.action("alice", "thread-a", { action: "click", selector: "#save" }, "agent");
     // Attach a rejection handler immediately; takeover deliberately rejects it.

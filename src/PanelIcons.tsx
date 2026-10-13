@@ -7,8 +7,8 @@ import {
   HardDisk as IpHardDisk, LayoutOne as IpLayoutOne, Link as IpLink, List as IpList,
   LoadingFour as IpLoading, More as IpMore, Pause as IpPause, PeoplesTwo as IpPeople,
   Play as IpPlay, Plus as IpPlus, ReduceOne as IpMinus, Refresh as IpRefresh,
-  RightBar as IpRightBar, Target as IpTarget, Terminal as IpTerminal,
-  Time as IpClock, Edit as IpEdit, Delete as IpTrash
+  RightBar as IpRightBar, Search as IpSearch, Target as IpTarget, Terminal as IpTerminal,
+  Time as IpClock, Edit as IpEdit, Delete as IpTrash, Copy as IpCopy, Branch as IpBranch, Microphone as IpMicrophone
 } from "@icon-park/svg";
 
 type Props = { size?: number; className?: string; fill?: string };
@@ -51,9 +51,13 @@ export const Plus = iconPark(IpPlus, "plus");
 export const RefreshCcw = iconPark(IpRefresh, "refresh");
 export const RotateCw = RefreshCcw;
 export const RightBar = iconPark(IpRightBar, "right-bar");
+export const Search = iconPark(IpSearch, "search");
 export const Target = iconPark(IpTarget, "target");
 export const Terminal = iconPark(IpTerminal, "terminal");
 export const X = iconPark(IpClose, "close");
 export const Clock = iconPark(IpClock, "time");
 export const Edit = iconPark(IpEdit, "edit");
 export const Trash = iconPark(IpTrash, "delete");
+export const Copy = iconPark(IpCopy, "copy");
+export const Branch = iconPark(IpBranch, "branch");
+export const Mic = iconPark(IpMicrophone, "microphone");

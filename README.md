@@ -1,5 +1,23 @@
 # Codex UI account pool
 
+## Latest source synchronization (2026-10-13)
+
+Includes recent frontend/backend updates: Feishu OAuth and confirmation workflows,
+voice dictation, pets, free-text tool questions, composer prediction, model-context
+defaults, archived tool outputs for large branches, browser recovery, resource guards,
+WebSocket/network recovery, and the quota-popover compositing seam fix.
+
+`maintenance/zerotier/` contains reusable controller management and migration
+templates, with private network identities and members excluded. See its README
+before deployment. Site-specific migrations, live acceptance outputs and credentials
+are intentionally not shipped. Public configuration uses neutral, environment-driven
+defaults; production configuration is unchanged by publishing this repository.
+
+Feishu credentials are configured once on the server using
+`scripts/configure-feishu.cjs`; users authorize independently. Keep the resulting
+private configuration outside Git. Speech GPU workers use `scripts/speech-worker.py`
+with private model/credential directories; no recordings or weights are shipped.
+
 React/Vite frontend and Fastify backend for a multi-user Codex app-server pool. This repository mirrors the application source; it does **not** contain any live accounts, credentials, sessions, uploads, databases, or deployment state.
 
 ## Source layout

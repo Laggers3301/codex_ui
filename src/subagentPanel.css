@@ -60,7 +60,7 @@
 .subagentRecord.switching { opacity: 0; transform: translateY(7px); pointer-events: none; }
 .subagentRecordRow { min-width: 0; }
 .subagentRecord .messageMarkdown { font-size: 14px; }
-.subagentRecord .subagentRecordUser { padding: 10px 12px; border-radius: 12px; background: var(--ui-hover); }
+.subagentRecord .subagentRecordUser { padding: 10px 12px; border-radius: 12px; background: var(--ui-user-message-background); }
 .subagentRecord .reasoningDisclosure { min-width: 0; }
 .subagentRecord .messageItem { margin: 0; min-width: 0; max-width: 100%; }
 .subagentRecord .outputBlock { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -82,3 +82,13 @@
 @media (max-width: 720px) { .subagentDirectoryModel { max-width: 95px; } .subagentDirectoryRow { padding: 12px 4px; } .subagentPanelHeader { padding-top: max(10px, env(safe-area-inset-top)); } .subagentRecordModel { max-width: 46%; } }
 @media (prefers-reduced-motion: reduce) { .rightPaneSubagents, .subagentRecord, .subagentPanelHeader button, .subagentSiblingTabs button, .subagentDirectoryRow { transition: none; } .subagentPanelLoading > span, .subagentHistoryLoading > span { animation: none; } .subagentActivityRunning .reasoningSummaryPreview { animation: none !important; background: none !important; color: var(--ui-content-muted) !important; -webkit-text-fill-color: currentColor !important; } }
 @media (prefers-reduced-motion: reduce) { .subagentLoadingLayer .threadOpeningIndicator, .subagentLoadingLayer .threadOpeningPulse i { animation: none; } }
+.subagentRecordAnswer .inlineImageUnavailable {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--ui-border-subtle);
+  border-radius: 8px;
+  color: var(--ui-content-muted);
+  font-size: 12px;
+}

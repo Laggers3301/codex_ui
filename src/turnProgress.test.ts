@@ -4,12 +4,12 @@ import { readTurnProgress, turnProgressText, updateTurnProgress } from "./turnPr
 describe("scoped turn progress", () => {
   it("keeps notices within their user/thread and rejects an old turn", () => {
     const old = { threadId: "a", turnId: "old", state: "no_progress", silentForMs: 130_000 };
-    const current = updateTurnProgress({}, "qaUser", old, "old");
-    expect(current["qaUser:a"]).toEqual(old);
+    const current = updateTurnProgress({}, "qa-user", old, "old");
+    expect(current["qa-user:a"]).toEqual(old);
     expect(current["other:a"]).toBeUndefined();
-    expect(updateTurnProgress(current, "qaUser", old, "new")).toBe(current);
-    expect(updateTurnProgress(current, "qaUser", { ...old, turnId: "new", state: "active" })).toBe(current);
-    expect(updateTurnProgress(current, "qaUser", { ...old, state: "active" })).toEqual({});
+    expect(updateTurnProgress(current, "qa-user", old, "new")).toBe(current);
+    expect(updateTurnProgress(current, "qa-user", { ...old, turnId: "new", state: "active" })).toBe(current);
+    expect(updateTurnProgress(current, "qa-user", { ...old, state: "active" })).toEqual({});
   });
   it("does not call an approval or collaboration wait a failed task", () => {
     expect(readTurnProgress({ threadId: "a" })).toBeNull();

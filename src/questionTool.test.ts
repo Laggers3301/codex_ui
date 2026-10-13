@@ -19,6 +19,25 @@ describe("question tool presentation", () => {
     expect(parseQuestionToolItem({ tool: "request_user_input_async", command })).toEqual([{ title: "现在重启吗？", options: ["允许重启", "稍后再说"] }]);
   });
 
+  it("renders free-text questions with missing or empty options", () => {
+    expect(parseQuestionTool("request_user_input_async", { questions: [{ title: "请提供验收脚本路径" }] }))
+      .toEqual([{ title: "请提供验收脚本路径", options: [] }]);
+    expect(parseQuestionTool("request_user_input_async", { questions: [{ title: "如何继续？", options: [] }] }))
+      .toEqual([{ title: "如何继续？", options: [] }]);
+    expect(parseQuestionTool("request_user_input_async", { questions: [{ title: "   " }] })).toBeNull();
+  });
+
+  it("does not treat an async accepted receipt as a user answer", () => {
+    const items = [
+      { id: "question", type: "toolCall" },
+      { id: "receipt", type: "toolCallOutput", output: '{"accepted":true}' },
+      { id: "continuation", type: "agentMessage" }
+    ];
+    expect(questionHasLaterUserMessage(items, "question")).toBe(false);
+    expect(questionHasLaterUserMessage([...items, { id: "reply", type: "userMessage" }], "question")).toBe(true);
+    expect(parseQuestionTool("request_user_input_async", { accepted: true })).toBeNull();
+  });
+
   it("stops presenting a question after a later user reply, including within the same turn", () => {
     const items = [
       { id: "first", type: "userMessage" },

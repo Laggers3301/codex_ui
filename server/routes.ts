@@ -12,19 +12,24 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
+import { ComposerPredictions } from "./composerPredictions.js";
 import { LegacyRollbackConflictError } from "./legacyRollback.js";
 import { inheritedBillingTurnIds } from "./leaderboardForkUsage.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
 import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
+import { registerScheduledTaskMcp } from "./scheduledTaskMcp.js";
 import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
 import { createCrossAccountForkSnapshot } from "./crossAccountFork.js";
+import { assertLargeBranchMemory, BranchConflictError, BranchGate, copyLargeThreadBranch, isLegacyRollout, largeThreadForkBytes } from "./largeThreadFork.js";
+import {toolArchiveRoot,toolArchivePath,readToolArchiveSummary,type ToolArchiveSummary} from "./toolOutputArchive.js";
 import { DEFAULT_USER_ID, type ProjectStore, type ThreadPresentation } from "./db.js";
 import { listBrowsableDirectories } from "./directoryBrowser.js";
 import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { isContextCompactionItem, isGenericContextLossReply } from "./contextRecovery.js";
 import { ensureProjectDirectory, PathPolicyError, resolveProjectFilePath, resolveProjectPath } from "./pathPolicy.js";
-import { findThreadJsonlPathById, paginateThreadPayload, readThreadFromJsonl, readThreadSummaryFromJsonl, threadJsonlMatchesSearch, threadJsonlPathFromError, threadJsonlSessionsRoot } from "./threadFallback.js";
+import { findThreadJsonlPathById, paginateThreadPayload, readThreadFromJsonl, readThreadSummaryFromJsonl, threadJsonlMatchesSearch, threadJsonlPathFromError, threadJsonlSessionsRoot, threadHistoryRuntimeHomes } from "./threadFallback.js";
+import {readArchivedThreadIndex} from "./archivedThreadIndex.js";
 import { isProjectLocalHook, listHooksForProject } from "./hookTrust.js";
 import { assertRepositoryWithinProject, createManagedWorktree, discoverGitRepositories, removeManagedWorktree } from "./worktree.js";
 import { locateIndexedThreadItem, readIndexedThreadItem, readIndexedThreadPage, warmThreadIndex } from "./threadEventIndex.js";
@@ -45,17 +50,18 @@ import { importStagedUserHandoff, type ImportedUserHandoff } from "./userHandoff
 import { pushPublicKey } from "./webPush.js";
 import { advanceTrackedQuotaLedger, type TrackedQuotaLedgerAccount } from "./trackedQuotaLedger.js";
 import { configuredSubagentRuntimeHomes, findSubagentDescendant, readSubagentDirectoryPage } from "./subagentHistory.js";
-import { queueScheduledPrompt, resumeThreadIfUnloaded, ScheduleConflictError, ScheduledTaskStore, type ScheduleRule } from "./scheduledTasks.js";
+import { executionSettingsOverrides, queueScheduledPrompt, resumeThreadIfUnloaded, ScheduleConflictError, ScheduledTaskStore, type ScheduleRule } from "./scheduledTasks.js";
 
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
 // Default Codex cwd per logged-in user. This prevents generated artifacts from
-// accumulating in /home/<user> while retaining historical shared-home projects.
+// accumulating in /home/example while retaining historical shared-home projects.
 const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
 const maxThreadHistoryPageSize = 240;
 const handoffInFlightUsers = new Set<string>();
+const branchGate = new BranchGate();
 type HandoffJobPhase = "connecting" | "transferring" | "extracting" | "importing" | "completed" | "failed";
 type HandoffImportResult = Awaited<ReturnType<typeof importStagedUserHandoff>>;
 interface HandoffJob {
@@ -207,7 +213,8 @@ const threadExportSchema = z.object({
 const threadBranchSchema = z.object({
   turnId: z.string().trim().min(1).max(256),
   prompt: z.string().trim().max(24_000).optional().default(""),
-  targetProjectId: z.string().uuid().optional()
+  targetProjectId: z.string().uuid().optional(),
+  archiveToolOutputs: z.boolean().optional().default(false)
 });
 
 const threadReadQuerySchema = z.object({
@@ -258,8 +265,7 @@ const fallbackCodexModels: Array<{
   { slug: "gpt-6-luna", displayName: "GPT-6-Luna", priority: 3, efforts: ["max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", priority: 4, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", priority: 7, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
-  { slug: "gpt-5.6-luna", displayName: "GPT-5.6-Luna", priority: 8, efforts: ["max", "xhigh", "high", "medium", "low"] },
-  { slug: "gpt-5.5", displayName: "GPT-5.5", priority: 12, efforts: ["xhigh", "high", "medium", "low"] }
+  { slug: "gpt-5.6-luna", displayName: "GPT-5.6-Luna", priority: 8, efforts: ["max", "xhigh", "high", "medium", "low"] }
 ];
 
 const effortLabels: Record<ReasoningEffort, string> = {
@@ -296,6 +302,10 @@ export type PublicModelProfile = {
 };
 
 let modelCatalogCache: { expiresAt: number; data: PublicModelProfile[] } | null = null;
+
+export function invalidateModelCatalogCache(): void {
+  modelCatalogCache = null;
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
@@ -999,7 +1009,7 @@ export function userIdFromSessionCwd(cwd: string | null, isKnownUser?: (userId: 
     const [firstSegment] = path.relative(normalizedRoot, normalizedCwd).split(path.sep);
     return firstSegment?.trim() || null;
   }
-  // Some existing users run Codex directly in /home/<login> rather than
+  // Some existing users run Codex directly in /home/example/<login> rather than
   // the managed users root. Only trust this layout for a registered login.
   const homeRoot = path.dirname(path.dirname(normalizedRoot));
   if (isKnownUser && normalizedCwd.startsWith(`${homeRoot}${path.sep}`)) {
@@ -1565,7 +1575,7 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
     id: serverConfig.leaderboardAccountLabel,
     label: serverConfig.leaderboardAccountLabel,
     kind: "codex-account",
-    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/<user>", ".codex"), "sessions"),
+    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/example", ".codex"), "sessions"),
     quota: await readCachedCodexQuota(bridge, forceRefresh)
   }];
 }
@@ -1575,7 +1585,7 @@ function sameTrackedUser(left: string, right: string): boolean {
 }
 
 export function allowedAccountForUser(userId: string): string | null {
-  return serverConfig.trackedQuotaAllowedAccountId && sameTrackedUser(userId, serverConfig.trackedQuotaUser)
+  return serverConfig.trackedQuotaEnforce && serverConfig.trackedQuotaAllowedAccountId && sameTrackedUser(userId, serverConfig.trackedQuotaUser)
     ? serverConfig.trackedQuotaAllowedAccountId
     : null;
 }
@@ -1695,7 +1705,7 @@ async function buildTrackedQuotaUsage(
     dailyLimitPercent: serverConfig.trackedQuotaDailyLimitPercent,
     unlimitedAccountId: serverConfig.trackedQuotaAllowedAccountId || null,
     todayQuotaPercent,
-    blocked: !serverConfig.trackedQuotaAllowedAccountId && todayQuotaPercent >= serverConfig.trackedQuotaDailyLimitPercent,
+    blocked: serverConfig.trackedQuotaEnforce && !serverConfig.trackedQuotaAllowedAccountId && todayQuotaPercent >= serverConfig.trackedQuotaDailyLimitPercent,
     accounts,
     days,
     updatedAt: new Date().toISOString(),
@@ -1765,7 +1775,7 @@ export async function assertTrackedUserQuotaAvailable(
   userId: string,
   threadId?: string
 ): Promise<void> {
-  if (!serverConfig.trackedQuotaUser || !sameTrackedUser(userId, serverConfig.trackedQuotaUser)) return;
+  if (!serverConfig.trackedQuotaEnforce || !serverConfig.trackedQuotaUser || !sameTrackedUser(userId, serverConfig.trackedQuotaUser)) return;
   const allowedAccountId = allowedAccountForUser(userId);
   if (allowedAccountId) {
     if (!isAccountPoolBridge(bridge) || !bridge.hasAccount(allowedAccountId)) {
@@ -1780,7 +1790,11 @@ export async function assertTrackedUserQuotaAvailable(
     return;
   }
   const usage = await readTrackedQuotaUsageForEnforcement(bridge, store);
-  if (usage.blocked) {
+  assertTrackedDailyQuotaWithinLimit(usage);
+}
+
+export function assertTrackedDailyQuotaWithinLimit(usage: Pick<PublicTrackedQuotaUsage,"userId"|"todayQuotaPercent"|"dailyLimitPercent">): void {
+  if (usage.todayQuotaPercent >= usage.dailyLimitPercent) {
     throw new Error(
       `${usage.userId} 今日估算额度占用已达 ${usage.todayQuotaPercent.toFixed(2)}%，超过每日 ${usage.dailyLimitPercent.toFixed(2)}% 上限；今日可查看历史，但不能继续发起回答。`
     );
@@ -2313,7 +2327,7 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 }
 
 function errorStatus(error: unknown): number {
-  if (error instanceof LegacyRollbackConflictError || error instanceof ScheduleConflictError) return 409;
+  if (error instanceof LegacyRollbackConflictError || error instanceof ScheduleConflictError || error instanceof BranchConflictError) return 409;
   if (error instanceof PathPolicyError || error instanceof z.ZodError || error instanceof ThreadContextConfigError) {
     if (error instanceof PathPolicyError && error.message === "File does not exist.") {
       return 404;
@@ -2726,7 +2740,7 @@ async function filterOwnedThreadList(
       continue;
     }
     const fullThread = await readOwnedThreadForList(bridge, threadId);
-    // Ownership is the access boundary. A legacy session may retain /home/<user> as
+    // Ownership is the access boundary. A legacy session may retain /home/example as
     // its historical cwd after the user's default workspace is moved.
     if (fullThread) {
       byId.set(threadId, listItemSummaryFromThread(fullThread));
@@ -2802,7 +2816,7 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
   const rootPath = ensureUserWorkspaceDirectory(userId);
 
   // List the personal workspace first: a newly opened page selects it by
-  // default. Existing projects (including historical /home/<user> conversations)
+  // default. Existing projects (including historical /home/example conversations)
   // are deliberately retained below it.
   const workspace = store.getProjectByRootPath(rootPath, userId) ?? store.createProject({
     name: "我的工作区",
@@ -2851,7 +2865,36 @@ function deferLargeToolOutputs(threadValue: unknown): void {
 }
 
 export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore, options: { backgroundIndexing?: boolean; browserTools?: boolean } = {}): void {
+  const predictions=isAccountPoolBridge(bridge)?new ComposerPredictions(bridge):null;
+  app.post<{Params:{id:string;threadId:string}}>("/api/projects/:id/threads/:threadId/prediction",async(request,reply)=>{
+    const userId=userIdFromRequest(request,store),owner=store.getThreadOwner(request.params.threadId);
+    if(!owner||owner.userId!==userId||owner.projectId!==request.params.id)return reply.code(403).send({error:"Thread does not belong to this user."});
+    const parsed=z.object({sourceTurnId:z.string().min(1).max(200),modelKey:z.string().max(120).optional()}).strict().safeParse(request.body);
+    if(!parsed.success)return reply.code(400).send({error:"Invalid prediction request."});
+    reply.header("Cache-Control","no-store");
+    if(!predictions)return {data:{text:null,sourceTurnId:parsed.data.sourceTurnId,eligible:false}};
+    const abort=new AbortController(),closed=()=>{if(!reply.raw.writableEnded)abort.abort();};reply.raw.once("close",closed);
+    try{return {data:await predictions.request(userId,owner.threadId,parsed.data.sourceTurnId,abort.signal,parsed.data.modelKey)};}
+    catch{return {data:{text:null,sourceTurnId:parsed.data.sourceTurnId,eligible:false}};}
+    finally{reply.raw.removeListener("close",closed);}
+  });
   const scheduledTasks = new ScheduledTaskStore(path.join(serverConfig.dataDir, "scheduled-tasks.json"));
+  app.get<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/execution-settings", async (request, reply) => {
+    const userId = userIdFromRequest(request, store), owner = store.getThreadOwner(request.params.threadId);
+    if (!owner || owner.userId !== userId || owner.projectId !== request.params.id) return reply.code(403).send({ error: "Thread execution settings do not belong to this user." });
+    return { data: store.getThreadExecutionSettings(owner.threadId, userId) };
+  });
+  app.patch<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/execution-settings", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store), owner = store.getThreadOwner(request.params.threadId);
+      if (!owner || owner.userId !== userId || owner.projectId !== request.params.id) return reply.code(403).send({ error: "Thread execution settings do not belong to this user." });
+      const input = z.object({ sandbox: sandboxSchema, approvalPolicy: z.enum(["never", "on-request", "untrusted"]) }).strict().parse(request.body);
+      await resumeThreadIfUnloaded(bridge, owner.threadId, owner.rootPath, browserMcpForThread(owner.threadId), executionSettingsOverrides(input));
+      store.setThreadExecutionSettings(owner.threadId, userId, input.sandbox, input.approvalPolicy);
+      return { data: input, appliesTo: "subsequent-turns" };
+    } catch (error) { return reply.code(errorStatus(error) === 500 ? 400 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  registerScheduledTaskMcp(app, store, scheduledTasks);
   let scheduleTimer: ReturnType<typeof setInterval> | undefined;
   const scheduleRuleSchema = z.discriminatedUnion("kind", [
     z.object({ kind: z.literal("once"), at: z.string().datetime(), timezone: z.string().min(1).max(128) }).strict(),
@@ -2954,10 +2997,10 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         const project = store.getProject(task.projectId, task.userId);
         if (!owner || !project || owner.userId !== task.userId || owner.projectId !== task.projectId || !store.userCanAccessThread(task.threadId, task.userId, task.projectId)) throw new Error("Scheduled thread is no longer available to its owner.");
         await assertTrackedUserQuotaAvailable(bridge, store, task.userId, task.threadId);
-        // Rehydrate only when not loaded, by ID with no model/policy overrides.
-        // This works with a closed browser/server restart without changing the
-        // thread's account, active turn, or original settings.
-        await resumeThreadIfUnloaded(bridge, task.threadId, owner.rootPath, browserMcpForThread(task.threadId));
+        // Restore this owner's explicit saved execution choice on cold load
+        // and native queue start; unspecified legacy tasks are not promoted.
+        await resumeThreadIfUnloaded(bridge, task.threadId, owner.rootPath, browserMcpForThread(task.threadId),
+          executionSettingsOverrides(store.getThreadExecutionSettings(task.threadId, task.userId)));
         const result = await queueScheduledPrompt(bridge, task, runId);
         store.touchThreadOwner(task.threadId);
         scheduledTasks.finish(task.id, runId, undefined, Date.now(), !result.queued, result.warning);
@@ -3709,6 +3752,37 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           };
         }
         const archived = request.query.archived === "true";
+        if (archived) {
+          const index=await readArchivedThreadIndex(threadHistoryRuntimeHomes(),ownedThreadIds);
+          let native=index.data as unknown[];
+          // Old runtimes without a usable state index get a bounded, DB-only
+          // fallback. Never request JSONL scanning/repair for this dialog.
+          if (!index.available && !locallyArchivedIds.size) {
+            let timer:ReturnType<typeof setTimeout>|undefined;
+            try {
+              const result=await Promise.race([
+                bridge.request("thread/list",{limit:500,archived:true,searchTerm:null,useStateDbOnly:true},5_000),
+                new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error("归档列表读取超时，请稍后重试。")),5_000);})
+              ]);
+              native=Array.isArray(asRecord(result).data)?asRecord(result).data as unknown[]:[];
+            } finally {if(timer)clearTimeout(timer);}
+          }
+          const data=new Map<string,unknown>();
+          for(const item of native){const id=threadIdFromListItem(item);if(id&&ownedThreadIds.has(id)){
+            data.set(id,item);store.setThreadLocallyArchived(id,userId,project.id,true);
+          }}
+          // Web archive flags remain authoritative if native metadata lags.
+          // Owner metadata is enough for a restore entry: no full-history load.
+          for(const id of locallyArchivedIds){
+            if(data.has(id))continue;
+            const owner=store.getThreadOwner(id);
+            if(owner&&owner.userId===userId&&owner.projectId===project.id)data.set(id,{
+              id,name:owner.displayName||"未命名会话",cwd:owner.rootPath,createdAt:owner.createdAt,updatedAt:owner.updatedAt
+            });
+          }
+          return {data:sortThreadsForUser(store,userId,[...data.values()]),nextCursor:null,backwardsCursor:null,
+            archiveIndexIncomplete:index.incomplete||(!index.available&&locallyArchivedIds.size>0)};
+        }
         const fast = request.query.fast !== "false" && !archived;
         warmOwnedThreadIndexes(ownedThreadIds);
         if (fast) {
@@ -4033,7 +4107,23 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     return { ok: true, data: unusedThread };
   });
 
+  app.get<{Params:{id:string;threadId:string};Querystring:{download?:string}}>("/api/projects/:id/threads/:threadId/tool-output-archive",async(request,reply)=>{
+    try{
+      const userId=userIdFromRequest(request,store);
+      if(!store.userCanAccessThread(request.params.threadId,userId,request.params.id))return reply.code(403).send({error:"Thread is not visible for this logged-in user."});
+      const root=toolArchiveRoot(serverConfig.dataDir,userId);
+      const summary=await readToolArchiveSummary(root,z.string().uuid().parse(request.params.threadId));
+      reply.header("Cache-Control","private, no-store");
+      if(request.query.download==="1"){
+        if(!summary)return reply.code(404).send({error:"工具结果附件不存在。"});
+        return reply.type("application/gzip").header("X-Content-Type-Options","nosniff").header("Content-Disposition",`attachment; filename="tool-results-${request.params.threadId}.jsonl.gz"`).header("Content-Length",String(summary.archiveBytes)).send(fs.createReadStream(toolArchivePath(root,request.params.threadId)));
+      }
+      return {data:summary};
+    }catch(error){return reply.code(errorStatus(error)).send({error:error instanceof Error?error.message:String(error)});}
+  });
+
   app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/branch", async (request, reply) => {
+    let releaseBranch: (() => void) | undefined;
     try {
       const userId = userIdFromRequest(request, store);
       const project = store.getProject(request.params.id, userId);
@@ -4044,6 +4134,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const input = threadBranchSchema.parse(request.body ?? {});
       const targetProject = input.targetProjectId ? store.getProject(input.targetProjectId, userId) : project;
       if (!targetProject) return reply.code(404).send({ error: "Target project not found." });
+      releaseBranch = branchGate.enter();
       // Resolve the source account and metadata cheaply first. Native forks do
       // not need to hydrate a potentially hundreds-of-megabytes history in
       // Node; Codex performs the exact fork inside the owning app-server.
@@ -4098,8 +4189,54 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       // no summary or reconstructed prompt is substituted for model history.
       let snapshot: Awaited<ReturnType<typeof createCrossAccountForkSnapshot>> | null = null;
       let started: unknown;
+      let streamedBranch = false;
+      let toolArchive:ToolArchiveSummary|undefined;
       try {
-        if (!poolBridge || !routing) {
+        const sourcePath = persistedSourcePath ?? stringOrNull(sourceThread.path) ?? stringOrNull(sourceThread.rolloutPath);
+        const sourceSessionsRoot = sourcePath ? threadJsonlSessionsRoot(sourcePath) : null;
+        const sourceSize = sourcePath ? (await fs.promises.stat(sourcePath)).size : 0;
+        const legacySource=(sourceSize>=largeThreadForkBytes||input.archiveToolOutputs)&&sourcePath?await isLegacyRollout(sourcePath):false;
+        if(input.archiveToolOutputs&&(!poolBridge||!routing||!sourcePath||!sourceSessionsRoot||!legacySource))throw new BranchConflictError("此历史格式暂不支持安全归档工具结果；原会话未修改。");
+        // User-authorized pool-wide policy: large compatible histories are
+        // archived before loading, not only after an out-of-memory rejection.
+        // Never mutate the source or rewrite an unsupported history format.
+        const archiveToolOutputs = input.archiveToolOutputs || (sourceSize >= largeThreadForkBytes && legacySource);
+        if (poolBridge && routing && sourcePath && sourceSessionsRoot && (sourceSize >= largeThreadForkBytes||input.archiveToolOutputs) && legacySource) {
+          // Archiving is bounded to one <=64MiB record at a time, but still
+          // requires host headroom before parsing/compressing any result.
+          if(archiveToolOutputs)assertLargeBranchMemory(64*1024*1024);
+          else assertLargeBranchMemory(sourceSize);
+          const accountHeadroom = poolBridge.getAccountMemoryHeadroom(routing.targetAccount.id);
+          if (!archiveToolOutputs&&accountHeadroom !== null) assertLargeBranchMemory(sourceSize, accountHeadroom);
+          const copied = await copyLargeThreadBranch({
+            sourcePath, sourceSessionsRoot, sourceThreadId: request.params.threadId,
+            lastTurnId: input.turnId, targetSessionsRoot: path.join(routing.targetAccount.codexHome, "sessions"),
+            cwd: targetProject.rootPath,
+            ...(archiveToolOutputs?{toolArchiveRoot:toolArchiveRoot(serverConfig.dataDir,userId)}:{})
+          });
+          if(archiveToolOutputs){
+            try{assertLargeBranchMemory(copied.copiedBytes);const headroom=poolBridge.getAccountMemoryHeadroom(routing.targetAccount.id);if(headroom!==null)assertLargeBranchMemory(copied.copiedBytes,headroom);}
+            catch(error){await fs.promises.unlink(copied.path);const archivePath=toolArchivePath(toolArchiveRoot(serverConfig.dataDir,userId),copied.threadId);await Promise.all([archivePath,`${archivePath}.json`].map(f=>fs.promises.unlink(f).catch(()=>{})));throw error;}
+            toolArchive=copied.toolArchive;
+          }
+          // Register the durable copy before native loading. Even a transport
+          // failure must not leave an inaccessible anonymous history file.
+          poolBridge.assignThreadsToAccount([copied.threadId], routing.targetAccount.id);
+          store.registerThreadOwner({ threadId: copied.threadId, userId, projectId: targetProject.id,
+            rootPath: targetProject.rootPath, model, reasoningEffort });
+          store.updateThreadDisplayName(copied.threadId, userId, branchTitle(
+            presentation?.displayName ?? stringOrNull(sourceThread.name) ?? "会话",
+            routing.targetAccount.label, routing.sourceAccount?.label ?? null
+          ));
+          started = await bridge.request("thread/resume", {
+            threadId: copied.threadId, path: copied.path, cwd: targetProject.rootPath, model,
+            approvalPolicy: targetProject.defaultApprovalPolicy, sandbox: targetProject.defaultSandbox,
+            config: { ...contextConfig, ...browserMcp?.config }, excludeTurns: true
+          }, 60_000);
+          streamedBranch = true;
+          console.info("branch.legacy_stream_import", { sourceThreadId: request.params.threadId,
+            threadId: copied.threadId, copiedBytes: copied.copiedBytes, targetAccountId: routing.targetAccount.id });
+        } else if (!poolBridge || !routing) {
           started = await bridge.request("thread/fork", forkParams, 60_000);
         } else if (nativeFork) {
           started = await poolBridge.forkThreadOnAccount(routing.targetAccount.id, forkParams, 60_000);
@@ -4141,7 +4278,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const targetAccount = poolBridge?.getKnownThreadAccount(createdThreadId)
         ?? (routing ? { id: routing.targetAccount.id, label: routing.targetAccount.label } : null);
       const name = branchTitle(
-        presentation?.displayName ?? stringOrNull(sourceThread.name) ?? stringOrNull(sourceThread.preview) ?? "会话",
+        `${presentation?.displayName ?? stringOrNull(sourceThread.name) ?? stringOrNull(sourceThread.preview) ?? "会话"}${toolArchive?"（精简工具）":""}`,
         targetAccount?.label ?? null,
         routing?.sourceAccount?.label ?? null
       );
@@ -4187,7 +4324,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           sourceThreadId: request.params.threadId,
           sourceTurnId: input.turnId,
           targetAccount,
-          branchMode: nativeFork ? "native" : "cross-account-native"
+          ...(toolArchive?{toolArchive}:{}),
+          branchMode: toolArchive ? "legacy-tool-archive" : streamedBranch ? "legacy-stream-import" : nativeFork ? "native" : "cross-account-native"
         }
       };
     } catch (error) {
@@ -4196,6 +4334,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         error: error instanceof Error ? error.message : String(error)
       });
       return reply.code(errorStatus(error) === 500 ? 502 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      releaseBranch?.();
     }
   });
 

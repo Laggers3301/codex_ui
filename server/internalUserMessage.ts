@@ -4,6 +4,7 @@ export function isInternalUserMessageText(value: string): boolean {
   const text = value.trimStart();
   return text.startsWith("<environment_context>")
     || text.startsWith("<codex_internal_context_recovery>")
+    || text.startsWith("<codex_internal_continuation_recovery>")
     || text.startsWith("<recommended_plugins>")
     || text.startsWith("<permissions instructions>")
     || text.startsWith("<app-context>")

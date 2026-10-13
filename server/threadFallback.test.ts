@@ -43,6 +43,29 @@ describe("forked JSONL recovery", () => {
     expect(threadJsonlSessionsRoot(path.join(root, "outside.jsonl"), sessionsRoot)).toBeNull();
   });
 
+  it("keeps the real user preview and hides continuation recovery across JSONL formats", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-fallback-continuation-"));
+    temporaryRoots.push(root);
+    const filePath = path.join(root, "rollout-thread.jsonl");
+    const recovery = "<codex_internal_continuation_recovery>\nContinue immediately\n</codex_internal_continuation_recovery>";
+    const records = [
+      { type: "session_meta", payload: { id: "thread" } },
+      { type: "turn_context", payload: { turn_id: "turn-1" } },
+      { type: "response_item", payload: { type: "message", role: "user", id: "prompt", content: [{ type: "input_text", text: "真正的用户问题" }] } },
+      { type: "turn_context", payload: { turn_id: "turn-2" } },
+      { type: "event_msg", payload: { type: "user_message", message: recovery } },
+      { type: "response_item", payload: { type: "message", role: "user", id: "internal", content: [{ type: "input_text", text: recovery }] } },
+      { type: "response_item", payload: { type: "message", role: "assistant", id: "answer", content: [{ type: "output_text", text: "最终答复" }] } }
+    ];
+    await fs.writeFile(filePath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    const summary = await readThreadSummaryFromJsonl(filePath, "thread", root);
+    expect(summary?.preview).toBe("真正的用户问题");
+    const recovered = await readThreadFromJsonl(filePath, "thread", root);
+    const items = (recovered.thread.turns as Array<{ items: Array<{ id: string }> }>).flatMap((turn) => turn.items);
+    expect(items.map((item) => item.id)).toEqual(["prompt", "answer"]);
+    expect(JSON.stringify(recovered)).not.toContain("codex_internal_continuation_recovery");
+  });
+
   it("keeps the branch metadata and hides the injected AGENTS prelude", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-fallback-fork-"));
     temporaryRoots.push(root);

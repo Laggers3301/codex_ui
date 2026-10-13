@@ -8,6 +8,17 @@ import { chromium, type Browser, type BrowserContext, type Page } from "playwrig
 import { z } from "zod";
 import { createBrowserProxy, validateBrowserUrl } from "./browserNetwork.js";
 
+export function isTopLevelBrowserNavigation(request: { isNavigationRequest(): boolean; frame(): { parentFrame(): unknown } }): boolean {
+  if (!request.isNavigationRequest()) return false;
+  try { return request.frame().parentFrame() === null; }
+  catch {
+    // Playwright cannot expose a popup's frame before its first navigation.
+    // Classify it as top-level so origin approval still applies, fail closed
+    // for unknown origins, and do not crash or reject known-origin popups.
+    return true;
+  }
+}
+
 export const browserActionSchema = z.object({
   action: z.enum(["navigate", "snapshot", "click", "type", "press", "scroll", "back", "forward", "reload", "new_tab", "switch_tab", "close_tab"]),
   tabId: z.string().uuid().optional(),
@@ -177,7 +188,7 @@ export class BrowserService extends EventEmitter {
       this.browserUnit = scoped ? `codex-browser-${randomUUID().slice(0, 8)}` : undefined;
       const command = scoped ? "/usr/bin/systemd-run" : executable;
       const spawnArgs = scoped ? ["--user", "--scope", "--collect", "--quiet", `--unit=${this.browserUnit}`,
-        "-p", "MemoryHigh=900M", "-p", "MemoryMax=1400M", "-p", "MemorySwapMax=128M", "-p", "CPUQuota=150%", "-p", "TasksMax=200", "--", executable, ...args] : args;
+        "-p", "MemoryHigh=900M", "-p", "MemoryMax=1400M", "-p", "MemorySwapMax=128M", "-p", "CPUQuota=150%", "-p", "TasksMax=512", "--", executable, ...args] : args;
       const child = spawn(command, spawnArgs, { stdio: ["ignore", "ignore", "pipe"], env: process.env });
       this.child = child;
       let stderr = "";
@@ -230,18 +241,32 @@ export class BrowserService extends EventEmitter {
         if (this.disposed || this.sessions.get(key) !== s || s.state.status === "closed") { await context.close(); throw new BrowserError(409, "浏览器已停止。"); }
         s.context = context;
         await context.route("**/*", async route => {
+          let unapprovedOrigin: string | undefined;
           try {
             const request = route.request();
             const target = validateBrowserUrl(request.url());
-            if (request.isNavigationRequest() && request.frame().parentFrame() === null && !s!.origins.has(target.origin)) {
+            if (isTopLevelBrowserNavigation(request) && !s!.origins.has(target.origin)) {
               if (s!.state.mode === "human") s!.origins.add(target.origin);
               else {
                 s!.approvedRedirectOrigin = target.origin;
+                unapprovedOrigin = target.origin;
                 throw new Error("请先批准打开这个新网站。");
               }
             }
             await route.continue();
-          } catch { await route.abort("blockedbyclient").catch(() => {}); }
+          } catch (error) {
+            const request = route.request();
+            if (isTopLevelBrowserNavigation(request)) {
+              // Keep the guard intact, but make popup/redirect denials visible.
+              // Only the origin is displayed; never expose URL token/query data.
+              s!.state.error = unapprovedOrigin
+                ? `网页跳转到了尚未批准的来源 ${unapprovedOrigin}，请完成该来源的授权后继续。`
+                : `导航被网络安全规则拦截：${this.errorText(error)}`;
+              s!.state.status = "error";
+              this.emitState(s!);
+            }
+            await route.abort("blockedbyclient").catch(() => {});
+          }
         });
         context.on("page", page => {
           // A requested tab or one popup from an approved click is allowed;

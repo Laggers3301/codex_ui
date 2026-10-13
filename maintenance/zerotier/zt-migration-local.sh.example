@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+home=/var/lib/zerotier-codex-controller
+state=/var/lib/codex-zt-controller-migration-example
+project=/srv/codex-ui
+node=/usr/bin/node
+case "${1:-}" in
+stage)
+  [[ $# == 2 && ! -e "$home" && ! -e "$state" ]] || exit 2
+  install -d -m700 "$home" "$state"
+  entries="$(tar -tzf "$2")"
+  if printf '%s\n' "$entries" | grep -Ev '^(identity\.(secret|public)|controller\.d(/.*)?)$'; then exit 1; fi
+  if printf '%s\n' "$entries" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then exit 1; fi
+  mv "$2" "$state/precopy.tar.gz"
+  chown root:root "$state/precopy.tar.gz"
+  chmod 600 "$state/precopy.tar.gz"
+  tar -xzf "$state/precopy.tar.gz" --no-same-owner -C "$home"
+  chown -R zerotier-one:zerotier-one "$home"
+  chmod 700 "$home"
+  install -m644 -o root -g root "$project/maintenance/codex-zerotier-controller.service" /etc/systemd/system/codex-zerotier-controller.service
+  install -m755 -o root -g root "$project/maintenance/codex-stop-migrated-controller.sh" /usr/local/sbin/codex-stop-migrated-controller
+  install -m700 -o root -g root "$project/maintenance/zt-controller-verify.mjs" /usr/local/lib/codex-zt-controller-verify.mjs
+  install -m440 -o root -g root "$project/maintenance/codex-zt-migration-stop.sudoers" /etc/sudoers.d/codex-zt-migration-stop
+  visudo -cf /etc/sudoers.d/codex-zt-migration-stop
+  systemctl daemon-reload
+  # The copied identity is never allowed onto the network during this test.
+  systemd-run --unit=codex-zt-controller-offline --collect --uid=zerotier-one \
+    --property=PrivateNetwork=yes --property=MemoryMax=256M --property=TasksMax=64 \
+    /usr/sbin/zerotier-one -U -p19993 "$home"
+  ready=0
+  for attempt in {1..20}; do
+    pid="$(systemctl show codex-zt-controller-offline.service -p MainPID --value)"
+    if [[ "$pid" != 0 ]] && nsenter -t "$pid" -n "$node" /usr/local/lib/codex-zt-controller-verify.mjs inspect; then ready=1; break; fi
+    sleep 1
+  done
+  systemctl stop codex-zt-controller-offline.service
+  [[ "$ready" == 1 ]] || exit 1
+  echo 'Offline controller verification completed; production controller unchanged.'
+  ;;
+start)
+  [[ $# == 2 && -d "$home" ]] || exit 2
+  systemctl is-active --quiet codex-zerotier-controller.service && exit 1
+  entries="$(tar -tzf "$2")"
+  if printf '%s\n' "$entries" | grep -Ev '^(identity\.(secret|public)|controller\.d(/.*)?|inventory\.json|new-client/identity\.public)$'; then exit 1; fi
+  if printf '%s\n' "$entries" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then exit 1; fi
+  mv "$2" "$state/final.tar.gz"
+  chown root:root "$state/final.tar.gz"
+  chmod 600 "$state/final.tar.gz"
+  tar -xzf "$state/final.tar.gz" --no-same-owner -C "$home"
+  chown -R zerotier-one:zerotier-one "$home"
+  touch "$home/cutover-ready"
+  # No current client identity, network file, or client service is touched.
+  systemctl enable --now codex-zerotier-controller.service
+  for attempt in {1..20}; do
+    if "$node" /usr/local/lib/codex-zt-controller-verify.mjs before-client; then exit 0; fi
+    sleep 1
+  done
+  exit 1
+  ;;
+client-config)
+  "$node" /usr/local/lib/codex-zt-controller-verify.mjs configure-old-client
+  ;;
+verify)
+  "$node" /usr/local/lib/codex-zt-controller-verify.mjs verify
+  zerotier-cli -j listnetworks | python3 -c 'import json,sys;x=json.load(sys.stdin);assert any(n.get("id")=="0000000000000000" and n.get("status")=="OK" and "192.0.2.10/24" in n.get("assignedAddresses",[]) for n in x)'
+  [[ "$(cut -d: -f1 /var/lib/zerotier-one/identity.public)" == 1111111111 ]] || exit 1
+  ;;
+*) echo 'Usage: zt-migration-local.sh stage <archive>|start <archive>|client-config|verify' >&2; exit 2 ;;
+esac

@@ -41,7 +41,7 @@ export function SubagentPanel({ projectId, parentThreadId, initialAgent, initial
   parentRunning: boolean;
   knownAgents: AgentEntry[];
   onClose: () => void;
-  renderItem: (item: ThreadItem, turn: Turn, agentId: string) => ReactNode;
+  renderItem: (item: ThreadItem, turn: Turn, agentId: string, liveAssistant?: boolean, assetBasePath?: string) => ReactNode;
   renderBundle: (items: ThreadItem[], turn: Turn, agentId: string, bundleId: string, lastActivity: boolean) => ReactNode;
 }) {
   const [agents, setAgents] = useState<SubagentThreadSummary[]>([]);
@@ -295,8 +295,17 @@ export function SubagentPanel({ projectId, parentThreadId, initialAgent, initial
     if (!view) return [];
     const scope = `${projectId}:${parentThreadId}:${view.thread.id}`;
     const previous = groupedHistory.current.scope === scope ? groupedHistory.current.rows : [];
+    const latestTurn = view.thread.turns.at(-1);
     return view.thread.turns.flatMap(turn => {
-      const nodes = new Map(coalesceToolOutputs(turn.items).map(item => [item, renderItem(item, turn, view.thread.id)]));
+      const items = coalesceToolOutputs(turn.items);
+      const latestAssistant = turn === latestTurn && agentState(turn.status) === "running" && !["completed", "failed", "interrupted"].includes(selectedState)
+        ? items.filter(item => {
+          const role = String(item.role ?? "").toLowerCase();
+          const type = String(item.type ?? "").toLowerCase();
+          return role === "assistant" || role === "agent" || type === "agentmessage" || type === "assistantmessage";
+        }).at(-1)
+        : undefined;
+      const nodes = new Map(items.map(item => [item, renderItem(item, turn, view.thread.id, item === latestAssistant, view.thread.cwd)]));
       const groups = groupSubagentRecordItems(turn.id, [...nodes].filter(([, node]) => node !== null && node !== undefined).map(([item]) => item), previous);
       return groups.map((row, index) => {
         const type = row.items[0].type.toLowerCase();

@@ -18,6 +18,12 @@ function positiveNumberFromEnv(value: string | undefined, fallback: number): num
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function nonNegativeIntegerFromEnv(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === "") return fallback;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 export const serverConfig = {
   host: process.env.CODEX_WEB_HOST ?? "0.0.0.0",
   port: Number(process.env.CODEX_WEB_PORT ?? 4576),
@@ -34,13 +40,15 @@ export const serverConfig = {
   // Other Codex Web instances that contribute to the shared token leaderboard.
   leaderboardPeers: csvFromEnv(process.env.CODEX_WEB_LEADERBOARD_PEERS),
   leaderboardPeerToken: process.env.CODEX_WEB_LEADERBOARD_PEER_TOKEN ?? "",
-  leaderboardAccountLabel: process.env.CODEX_WEB_LEADERBOARD_ACCOUNT_LABEL ?? "default",
+  leaderboardAccountLabel: process.env.CODEX_WEB_LEADERBOARD_ACCOUNT_LABEL ?? "",
   leaderboardPeerLabels: csvFromEnv(process.env.CODEX_WEB_LEADERBOARD_PEER_LABELS),
   trackedQuotaUser: (process.env.CODEX_WEB_TRACKED_QUOTA_USER ?? "").trim(),
+  // Usage accounting is independent from optional per-user restrictions.
+  trackedQuotaEnforce: process.env.CODEX_WEB_TRACKED_QUOTA_ENFORCE === "true",
   trackedQuotaDailyLimitPercent: positiveNumberFromEnv(process.env.CODEX_WEB_TRACKED_QUOTA_DAILY_LIMIT_PERCENT, 50),
   trackedQuotaAllowedAccountId: (process.env.CODEX_WEB_TRACKED_QUOTA_ALLOWED_ACCOUNT_ID ?? "").trim(),
-  trackedQuotaTimeZone: process.env.CODEX_WEB_TRACKED_QUOTA_TIME_ZONE ?? "UTC",
-  // Configured only on the receiving instance. The browser never receives this SSH
+  trackedQuotaTimeZone: process.env.CODEX_WEB_TRACKED_QUOTA_TIME_ZONE ?? "Asia/Shanghai",
+  // Configured only on little-right.  The browser never receives this SSH
   // destination; it is used server-side after the logged-in user is resolved.
   handoffSourceHost: process.env.CODEX_WEB_HANDOFF_SOURCE_HOST ?? "",
   handoffSourceUser: process.env.CODEX_WEB_HANDOFF_SOURCE_USER ?? "",
@@ -48,12 +56,17 @@ export const serverConfig = {
   handoffSourceLabel: process.env.CODEX_WEB_HANDOFF_SOURCE_LABEL ?? process.env.CODEX_WEB_INSTANCE_LABEL ?? "远端主机",
   handoffTargetCodexHome: process.env.CODEX_WEB_HANDOFF_TARGET_CODEX_HOME ?? "",
   handoffTargetAccountId: process.env.CODEX_WEB_HANDOFF_TARGET_ACCOUNT_ID ?? "",
-  handoffMaxBytes: positiveIntegerFromEnv(process.env.CODEX_WEB_HANDOFF_MAX_BYTES, 2 * 1024 * 1024 * 1024)
+  handoffMaxBytes: positiveIntegerFromEnv(process.env.CODEX_WEB_HANDOFF_MAX_BYTES, 2 * 1024 * 1024 * 1024),
+  // A value of 0 disables automatic OpenAI model-catalog refreshes.
+  modelCatalogRefreshIntervalMs: nonNegativeIntegerFromEnv(
+    process.env.CODEX_WEB_MODEL_CATALOG_REFRESH_INTERVAL_MS,
+    6 * 60 * 60 * 1000
+  )
 };
 
 export const defaults = {
   sandbox: "danger-full-access",
   approvalPolicy: "never",
-  model: "gpt-5.5",
+  model: "gpt-6.1-sol",
   reasoningEffort: "xhigh"
 } as const;

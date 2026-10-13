@@ -49,6 +49,10 @@ describe("socket watchdog runtime exits", () => {
       socket.once("error", reject);
     });
     try {
+      socket.send(JSON.stringify({type:"transport.ping"}));
+      await new Promise(resolve=>setTimeout(resolve,25));
+      expect(messages.some(message=>message.type==="transport.pong")).toBe(true);
+      expect(bridge.calls).toHaveLength(0);
       bridge.emit("notification", { method: "turn/started", accountId: "account-a", params: { threadId: "thread-a", turnId: "turn-a", turn: { id: "turn-a" } } });
       bridge.emit("notification", { method: "turn/started", accountId: "account-b", params: { threadId: "thread-b", turnId: "turn-b", turn: { id: "turn-b" } } });
       bridge.emit("status", { state: "exited", accountId: "account-a", code: 1 });

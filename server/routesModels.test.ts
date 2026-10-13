@@ -91,6 +91,17 @@ describe("sanitizeThreadPayloadForClient", () => {
     sanitizeThreadPayloadForClient(payload);
     expect(payload.thread.turns[0].items).toHaveLength(1);
   });
+
+  it("hides internal continuation messages from both text and content history", () => {
+    const payload = { thread: { turns: [{ id: "continuation", items: [
+      { id: "prompt", type: "userMessage", role: "user", text: "修复这个问题" },
+      { id: "recovery-text", type: "userMessage", role: "user", text: "  <codex_internal_continuation_recovery>\nContinue immediately" },
+      { id: "recovery-content", type: "userMessage", content: [{ type: "input_text", text: "<codex_internal_continuation_recovery>\nContinue immediately" }] },
+      { id: "answer", type: "agentMessage", role: "assistant", text: "问题修复了。" }
+    ] }] } };
+    sanitizeThreadPayloadForClient(payload);
+    expect(payload.thread.turns[0].items.map((item) => item.id)).toEqual(["prompt", "answer"]);
+  });
 });
 
 describe("modelProfilesFromCatalog", () => {

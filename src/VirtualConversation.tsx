@@ -3,6 +3,7 @@ import {
   Children,
   isValidElement,
   memo,
+  useCallback,
   useImperativeHandle,
   useLayoutEffect,
   useRef,
@@ -55,6 +56,9 @@ function VirtualConversationInner(
     node
   }));
   const scrollElementRef = useRef<HTMLDivElement | null>(null);
+  const bindScrollElement=useCallback((element:HTMLDivElement|null)=>{
+    scrollElementRef.current=element;setRefValue(containerRef,element);
+  },[containerRef]);
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
   const layoutModeRef = useRef({ threadKey, useFlowLayout: !virtualize && rows.length <= 240 });
@@ -418,10 +422,7 @@ function VirtualConversationInner(
       onTouchEnd={(event) => {
         onTouchEnd?.(event);
       }}
-      ref={(element) => {
-        scrollElementRef.current = element;
-        setRefValue(containerRef, element);
-      }}
+      ref={bindScrollElement}
     >
       {useFlowLayout ? (
         <div className="virtualConversationFlow">
@@ -460,4 +461,15 @@ function VirtualConversationInner(
   );
 }
 
-export const VirtualConversation = memo(forwardRef(VirtualConversationInner));
+const ThreadVirtualConversation = forwardRef(VirtualConversationInner);
+
+// Forks retain their source turn ids. Reusing this virtualizer across threads
+// leaves mounted rows with unchanged ResizeObserver sizes after measure() has
+// cleared their cached heights: long answers then overlap at 260px estimates.
+// Give each conversation its own DOM/measurement lifecycle. Within a thread,
+// history prepends keep the same instance and its stable scroll anchor.
+export const VirtualConversation = memo(forwardRef<VirtualConversationHandle, VirtualConversationProps>(
+  function VirtualConversation(props, ref) {
+    return <ThreadVirtualConversation key={props.threadKey} {...props} ref={ref} />;
+  }
+));

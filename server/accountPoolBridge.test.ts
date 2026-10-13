@@ -12,8 +12,9 @@ class FakeCodexBridge extends EventEmitter {
   readonly failingMethods = new Set<string>();
   stopped = false;
 
-  async start(): Promise<void> {}
+  async start(): Promise<void> { this.stopped = false; }
   stop(): void { this.stopped = true; }
+  async stopAndWait(): Promise<void> { this.stopped = true; }
   notify(): void {}
   getPendingServerRequests(): [] { return []; }
   respondToServerRequest(): void {}
@@ -63,6 +64,34 @@ function candidate(
 }
 
 describe("account-pool routing policy", () => {
+  it("reloads a changed device credential only after the account becomes idle, without refreshing or rewriting tokens", async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-10T00:00:00Z"));
+    const dir=fs.mkdtempSync(path.join(os.tmpdir(),"codex-credential-reload-"));
+    const file=path.join(dir,"auth.json");
+    fs.writeFileSync(file,JSON.stringify({tokens:{refresh_token:"old-fixture"}}));
+    class IdleBridge extends QuotaCodexBridge {
+      busy=true;
+      override async request(method:string,params?:unknown):Promise<unknown> {
+        if(method==="thread/loaded/list")return {data:this.busy?["running-thread"]:[]};
+        if(method==="thread/read")return {thread:{status:{type:"active"}}};
+        return super.request(method,params);
+      }
+    }
+    const old=new IdleBridge(), replacement=new IdleBridge();replacement.busy=false;
+    let creates=0;
+    const pool=new AccountPoolBridge({accounts:[{id:"a",label:"a",codexHome:dir}],stateFile:"state.json"},dir,()=> (++creates===1?old:replacement) as unknown as CodexBridge);
+    try {
+      await pool.refreshAccountData(true);
+      const fixture=JSON.stringify({tokens:{refresh_token:"new-fixture"}});fs.writeFileSync(file,fixture);
+      vi.setSystemTime(Date.now()+61000);await pool.refreshAccountData(true);
+      expect(old.stopped).toBe(false);expect(creates).toBe(1);
+      old.busy=false;vi.setSystemTime(Date.now()+61000);await pool.refreshAccountData(true);
+      expect(old.stopped).toBe(true);expect(creates).toBe(2);
+      expect(fs.readFileSync(file,"utf8")).toBe(fixture);
+      expect(replacement.requests.filter(x=>x.method==="account/read").map(x=>x.params)).toEqual([{refreshToken:false}]);
+      vi.setSystemTime(Date.now()+61000);await pool.refreshAccountData(true);expect(creates).toBe(2);
+    } finally {pool.stop();fs.rmSync(dir,{recursive:true,force:true});}
+  });
   it("retries transient account-state read failures without rotating credentials", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-10-01T00:00:00Z"));
@@ -469,6 +498,7 @@ describe("account-pool routing policy", () => {
       ]);
       expect(snapshot[0].health).toBe("degraded");
       expect(snapshot[0].lastError).toContain("refresh_token_invalidated");
+      expect(snapshot[0].lastError).toContain("不代表现有访问令牌");
       expect(snapshot[0].errors[0]).toContain("refresh_token_invalidated");
     } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
   });
@@ -514,15 +544,15 @@ describe("account-pool routing policy", () => {
     try {
       const pool = new AccountPoolBridge({
         accounts: [
-          { id: "account-a", label: "account-a", codexHome: accountA },
-          { id: "account-c", label: "account-c", codexHome: accountB }
+          { id: "100001", label: "100001", codexHome: accountA },
+          { id: "100003", label: "100003", codexHome: accountB }
         ],
         stateFile: "state.json"
       }, temporary, () => bridges[nextBridge++] as unknown as CodexBridge);
-      await pool.startThreadOnAccount("account-c", { model: "gpt-6-sol" });
+      await pool.startThreadOnAccount("100003", { model: "gpt-6-sol" });
       expect(bridges[0].requests).toHaveLength(0);
       expect(bridges[1].requests).toContainEqual({ method: "thread/start", params: { model: "gpt-6-sol" } });
-      expect(pool.getKnownThreadAccount("new-thread")?.id).toBe("account-c");
+      expect(pool.getKnownThreadAccount("new-thread")?.id).toBe("100003");
       pool.stop();
     } finally {
       fs.rmSync(temporary, { recursive: true, force: true });
@@ -532,6 +562,7 @@ describe("account-pool routing policy", () => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-model-catalog-"));
     try {
       expect(accountAppServerArgs(temporary)).toEqual(["app-server", "--listen", "stdio://"]);
+      expect(fs.readFileSync(path.join(temporary, "AGENTS.md"), "utf8")).toContain("默认以简体中文");
 
       const catalogPath = path.join(temporary, "model-catalog-gpt-5.6-sol-long-context.json");
       fs.writeFileSync(catalogPath, '{"models":[]}');
@@ -547,12 +578,126 @@ describe("account-pool routing policy", () => {
     }
   });
 
+  it("atomically applies a refreshed catalog only after the account is idle", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-model-refresh-"));
+    const catalogPath = path.join(temporary, "model-catalog-gpt-5.6-sol-long-context.json");
+    const previous = `${JSON.stringify({ models: [{ slug: "gpt-6.1-sol", visibility: "list" }] }, null, 2)}\n`;
+    const next = `${JSON.stringify({ models: [
+      { slug: "gpt-6.1-sol", visibility: "list" },
+      { slug: "gpt-6-luna", visibility: "list" }
+    ] }, null, 2)}\n`;
+    fs.writeFileSync(catalogPath, previous);
+    class IdleBridge extends FakeCodexBridge {
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        this.requests.push({ method, params });
+        if (method === "thread/loaded/list") return { data: [] };
+        if (method === "thread/start") return { thread: { id: "new-thread" } };
+        return {};
+      }
+    }
+    const bridges: IdleBridge[] = [];
+    const pool = new AccountPoolBridge({
+      accounts: [{ id: "account-a", label: "Account A", codexHome: temporary }],
+      stateFile: "state.json"
+    }, temporary, () => {
+      const bridge = new IdleBridge();
+      bridges.push(bridge);
+      return bridge as unknown as CodexBridge;
+    });
+    try {
+      expect(pool.modelCatalogTargets()).toEqual([{ id: "account-a", codexHome: temporary, catalogPath }]);
+      expect(await pool.applyModelCatalogIfIdle("account-a", next)).toBe("reloaded");
+      expect(fs.readFileSync(catalogPath, "utf8")).toBe(next);
+      expect(fs.readFileSync(`${catalogPath}.auto-backup`, "utf8")).toBe(previous);
+      expect(bridges).toHaveLength(2);
+      expect(bridges[0].stopped).toBe(true);
+      await pool.startThreadOnAccount("account-a", { model: "gpt-6-luna" });
+      expect(bridges[1].requests).toContainEqual({ method: "thread/start", params: { model: "gpt-6-luna" } });
+    } finally {
+      pool.stop();
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
+  it("defers a catalog reload while a loaded thread is running", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-model-refresh-busy-"));
+    const catalogPath = path.join(temporary, "model-catalog-gpt-5.6-sol-long-context.json");
+    fs.writeFileSync(catalogPath, '{"models":[{"slug":"gpt-6.1-sol","visibility":"list"}]}');
+    class BusyBridge extends FakeCodexBridge {
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        this.requests.push({ method, params });
+        if (method === "thread/loaded/list") return { data: ["running-thread"] };
+        if (method === "thread/read") return { thread: { status: { type: "active" } } };
+        return {};
+      }
+    }
+    const bridge = new BusyBridge();
+    const pool = new AccountPoolBridge({
+      accounts: [{ id: "account-a", label: "Account A", codexHome: temporary }],
+      stateFile: "state.json"
+    }, temporary, () => bridge as unknown as CodexBridge);
+    const before = fs.readFileSync(catalogPath, "utf8");
+    try {
+      expect(await pool.applyModelCatalogIfIdle("account-a", '{"models":[]}\n')).toBe("busy");
+      expect(fs.readFileSync(catalogPath, "utf8")).toBe(before);
+      expect(fs.existsSync(`${catalogPath}.auto-backup`)).toBe(false);
+    } finally {
+      pool.stop();
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
+  it("switches an idle runtime without changing its account credentials", async () => {
+    const temporary=fs.mkdtempSync(path.join(os.tmpdir(),"codex-runtime-idle-"));
+    fs.writeFileSync(path.join(temporary,"auth.json"),'fixture-not-real');
+    class IdleUpgradeBridge extends FakeCodexBridge {
+      override async request(method:string,params?:unknown) {
+        this.requests.push({method,params});
+        if(method==="thread/loaded/list")return {data:[]};
+        return {};
+      }
+    }
+    const instances:IdleUpgradeBridge[]=[];
+    const pool=new AccountPoolBridge({accounts:[{id:"a",label:"a",codexHome:temporary}],stateFile:"state.json"},temporary,()=>{const b=new IdleUpgradeBridge();instances.push(b);return b as unknown as CodexBridge;});
+    try {
+      expect(await pool.applyRuntimeVersionIfIdle("a","0.162.1")).toBe("reloaded");
+      expect(instances).toHaveLength(2);expect(instances[0].stopped).toBe(true);
+      expect(JSON.parse(fs.readFileSync(path.join(temporary,".web-runtime-version.json"),"utf8")).version).toBe("0.162.1");
+      expect(fs.readFileSync(path.join(temporary,"auth.json"),"utf8")).toBe('fixture-not-real');
+      expect(await pool.applyRuntimeVersionIfIdle("a","0.159.2")).toBe("unchanged");
+    }finally{pool.stop();fs.rmSync(temporary,{recursive:true,force:true});}
+  });
+
+  it("never stops running accounts and restores the previous version on startup failure", async () => {
+    for(const busy of [true,false]) {
+      const temporary=fs.mkdtempSync(path.join(os.tmpdir(),"codex-runtime-rollback-"));
+      fs.writeFileSync(path.join(temporary,".web-runtime-version.json"),JSON.stringify({version:"0.159.2"}));
+      class UpgradeBridge extends FakeCodexBridge {
+        constructor(readonly index:number){super();}
+        override async start(){if(!busy&&this.index===1)throw new Error("replacement failed");await super.start();}
+        override async request(method:string,params?:unknown) {
+          this.requests.push({method,params});
+          if(method==="thread/loaded/list")return {data:busy?["live"]:[]};
+          if(method==="thread/read")return {thread:{status:{type:"active"}}};
+          return {};
+        }
+      }
+      const instances:UpgradeBridge[]=[];
+      const pool=new AccountPoolBridge({accounts:[{id:"a",label:"a",codexHome:temporary}],stateFile:"state.json"},temporary,()=>{const b=new UpgradeBridge(instances.length);instances.push(b);return b as unknown as CodexBridge;});
+      try {
+        if(busy){expect(await pool.applyRuntimeVersionIfIdle("a","0.162.1")).toBe("busy");expect(instances[0].stopped).toBe(false);}
+        else{await expect(pool.applyRuntimeVersionIfIdle("a","0.162.1")).rejects.toThrow("replacement failed");expect(instances).toHaveLength(3);expect(instances[2].stopped).toBe(false);}
+        expect(JSON.parse(fs.readFileSync(path.join(temporary,".web-runtime-version.json"),"utf8")).version).toBe("0.159.2");
+      }finally{pool.stop();fs.rmSync(temporary,{recursive:true,force:true});}
+    }
+  });
+
   it("always gives a new thread to the healthy account with more remaining quota", () => {
     const selected = selectAccountCandidate([
-      candidate("account-a", 65, { activeRequests: 8, assignedThreadCount: 100 }),
-      candidate("account-legacy", 53)
+      candidate("100001", 65, { activeRequests: 8, assignedThreadCount: 100 }),
+      candidate("100004", 53)
     ]);
-    expect(selected.id).toBe("account-a");
+    expect(selected.id).toBe("100001");
   });
 
   it("routes a new thread only to an account whose catalog lists the requested model", async () => {

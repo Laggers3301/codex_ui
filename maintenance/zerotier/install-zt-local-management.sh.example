@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+project=/srv/codex-ui
+install -m755 -o root -g root "$project/maintenance/codex-zerotier-admin.py" /usr/local/sbin/codex-zerotier-admin
+install -m755 -o root -g root "$project/maintenance/codex-zt-api-firewall.sh" /usr/local/sbin/codex-zt-api-firewall
+install -m644 -o root -g root "$project/maintenance/codex-zt-api-firewall.service" /etc/systemd/system/codex-zt-api-firewall.service
+install -m644 -o root -g root "$project/maintenance/codex-zerotier-controller.service" /etc/systemd/system/codex-zerotier-controller.service
+install -m644 -o root -g root "$project/maintenance/codex-zerotier-controller-health.service" /etc/systemd/system/codex-zerotier-controller-health.service
+install -m644 -o root -g root "$project/maintenance/codex-zerotier-controller-health.timer" /etc/systemd/system/codex-zerotier-controller-health.timer
+backup=/var/lib/codex-zt-controller-migration-example/old-central-authorization-helper.sh
+if [[ ! -e "$backup" ]]; then
+  cp -a /srv/codex-ui/scripts/zt-codex-auth-member.sh "$backup"
+  chown root:root "$backup"
+  chmod 600 "$backup"
+fi
+install -m755 -o root -g root "$project/maintenance/zt-codex-auth-member-local.sh" /srv/codex-ui/scripts/zt-codex-auth-member.sh
+systemctl daemon-reload
+systemctl enable --now codex-zt-api-firewall.service
+systemctl enable --now codex-zerotier-controller-health.timer
+systemctl start codex-zerotier-controller-health.service
+/usr/local/sbin/codex-zerotier-admin status
+/usr/local/sbin/codex-zerotier-admin member 2222222222
+# Revoke the temporary stop-without-password grant after the remote rollback
+# timer has been cancelled; the root-owned emergency helper itself stays.
+[[ -f /etc/sudoers.d/codex-zt-migration-stop ]] && unlink /etc/sudoers.d/codex-zt-migration-stop
+echo 'Local authorization entrypoint and API watchdog installed.'

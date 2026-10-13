@@ -39,3 +39,16 @@ dist-writing-lab/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+output/
+backups/
+bin/
+identity.secret
+identity.public
+authtoken.secret
+controller.d/
+member-provision-backups/
+*.tar.gz
+codex-zerotier-controller.json
+*.jsonl
+*.secret
+*.crt

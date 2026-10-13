@@ -11,13 +11,9 @@ import { findThreadJsonlPathById } from "./threadFallback.js";
 export const userHandoffFormat = "codex-web-user-handoff";
 export const userHandoffVersion = 1;
 
-const handoffSourceAliases = new Map<string, string[]>([
-  ["wjm", ["jiaming"]],
-  ["jyh", ["jiangyuhua"]],
-  ["wxr", ["wangxuran"]],
-  ["wm", ["wuming", "吴明"]],
-  ["xjy", ["xujiayu", "x'j'y"]]
-]);
+const handoffSourceAliases = new Map<string, string[]>(
+  Object.entries(JSON.parse(process.env.CODEX_WEB_HANDOFF_SOURCE_ALIASES ?? "{}"))
+);
 
 export interface UserHandoffSession {
   threadId: string;
@@ -304,7 +300,7 @@ export async function importStagedUserHandoff(
   // A refreshed source handoff must not resurrect a conversation that was
   // deliberately replaced by a verified fork on the user's dedicated account.
   const migratedSourceIds = new Set<string>();
-  if (cleanUser === serverConfig.trackedQuotaUser && serverConfig.trackedQuotaAllowedAccountId) {
+  if (serverConfig.trackedQuotaEnforce && cleanUser === serverConfig.trackedQuotaUser && serverConfig.trackedQuotaAllowedAccountId) {
     const journalPath = path.join(serverConfig.dataDir, `${cleanUser}-${serverConfig.trackedQuotaAllowedAccountId}-migration.json`);
     try {
       const journal = JSON.parse(await fs.readFile(journalPath, "utf8")) as Record<string, { verified?: boolean; targetThreadId?: string }>;

@@ -23,6 +23,9 @@ export function useThreadGoal(threadId: string | null, userId: string) {
   const request = useCallback((type: string, extra: Record<string, unknown> = {}) => {
     const scope = scopeRef.current;
     if (!scope.threadId) return;
+    // Initial thread restoration can precede the socket handshake. Read-only
+    // state is fetched by the open subscription; never queue goal mutations.
+    if (type === "goal.get" && !codexSocket.isOpen) return;
     const token = typeof globalThis.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const requestId = `goal-${type.split(".")[1]}-${token}`;
     const timer = setTimeout(() => {
@@ -34,7 +37,11 @@ export function useThreadGoal(threadId: string | null, userId: string) {
     requests.current.set(requestId, { ...scope, threadId: scope.threadId, type, timer });
     if (type !== "goal.get") update({ pending: true, error: "" });
     try { codexSocket.send({ type, requestId, userId: scope.userId, threadId: scope.threadId, ...extra }); }
-    catch (caught) { clearTimeout(timer); requests.current.delete(requestId); update({ pending: false, error: caught instanceof Error ? caught.message : String(caught) }); }
+    catch (caught) {
+      clearTimeout(timer); requests.current.delete(requestId);
+      if (type === "goal.get" && !codexSocket.isOpen) return;
+      update({ pending: false, error: caught instanceof Error ? caught.message : String(caught) });
+    }
   }, [update]);
   useEffect(() => {
     update({ goal: null, error: "", pending: false });

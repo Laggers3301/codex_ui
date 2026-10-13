@@ -26,7 +26,9 @@ export function parseQuestionTool(toolName: string, input: unknown): ToolQuestio
           return typeof option === "string" ? option : typeof value.label === "string" ? value.label : "";
         }).map((value) => value.trim()).filter(Boolean)
       : [];
-    return typeof title === "string" && title.trim() && Array.isArray(question.options) ? { title: title.trim(), options } : null;
+    // Async questions may intentionally omit options: they are free-text prompts.
+    // The tool's {accepted:true} receipt is not an answer and is not parsed here.
+    return typeof title === "string" && title.trim() ? { title: title.trim(), options } : null;
   }).filter((question): question is ToolQuestion => question !== null);
   return questions.length ? questions : null;
 }

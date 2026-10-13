@@ -1,0 +1,12 @@
+[Unit]
+Description=Verify the dedicated Codex ZeroTier controller local API
+After=codex-zerotier-controller.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/codex-zerotier-admin health
+TimeoutStartSec=30
+MemoryMax=96M
+TasksMax=32
+NoNewPrivileges=true
+PrivateTmp=true

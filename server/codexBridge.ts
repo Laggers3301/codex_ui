@@ -2,6 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import readline from "node:readline";
+import fs from "node:fs";
+import path from "node:path";
 import { serverConfig } from "./config.js";
 import type { RpcEnvelope } from "./types.js";
 
@@ -154,11 +156,34 @@ export class CodexBridge extends EventEmitter {
     return Array.from(this.serverRequests.values());
   }
 
+  /** Budget of the owned account scope, including its active tools/children. */
+  getMemoryHeadroom(): number | null {
+    if (!this.launch.scope || !this.proc?.pid) return null;
+    try {
+      const relative = fs.readFileSync(`/proc/${this.proc.pid}/cgroup`, "utf8")
+        .split("\n").find(line => line.startsWith("0::"))?.slice(3);
+      if (!relative || !relative.includes(`/${this.launch.scope.unitPrefix}-`)) return 0;
+      const directory = path.join("/sys/fs/cgroup", relative);
+      const limit = fs.readFileSync(path.join(directory, "memory.max"), "utf8").trim();
+      if (limit === "max") return null;
+      const current = Number(fs.readFileSync(path.join(directory, "memory.current"), "utf8").trim());
+      const stats = fs.readFileSync(path.join(directory, "memory.stat"), "utf8");
+      const inactiveFile = Number(stats.match(/^inactive_file (\d+)/m)?.[1] ?? 0);
+      const dirtyFile = Number(stats.match(/^file_dirty (\d+)/m)?.[1] ?? 0)
+        + Number(stats.match(/^file_writeback (\d+)/m)?.[1] ?? 0);
+      const reclaimable = Math.min(current, Math.max(0, inactiveFile - dirtyFile));
+      return Math.max(0, Number(limit) - current + reclaimable);
+    } catch { return 0; } // Fail closed instead of risking a shared runtime OOM.
+  }
+
   private async spawnServer(): Promise<void> {
     const command = codexProcessCommand(this.launch);
+    const runtimeEnvironment = { ...(this.launch.env ?? process.env) };
+    // OAuth app credentials belong to the web backend, never to agent shells.
+    for (const key of Object.keys(runtimeEnvironment)) if (key.startsWith("FEISHU_")) delete runtimeEnvironment[key];
     this.proc = spawn(command.command, command.args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: this.launch.env ?? process.env,
+      env: runtimeEnvironment,
       shell: false
     });
 

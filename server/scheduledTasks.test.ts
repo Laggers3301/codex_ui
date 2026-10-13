@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { nextScheduleAt, queueScheduledPrompt, resumeThreadIfUnloaded, ScheduledTaskStore, validateScheduleRule } from "./scheduledTasks.js";
+import { executionSettingsOverrides, nextScheduleAt, queueScheduledPrompt, resumeThreadIfUnloaded, ScheduledTaskStore, validateScheduleRule } from "./scheduledTasks.js";
 
 const tempDirs: string[] = [];
 function store() { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "scheduled-tasks-")); tempDirs.push(dir); return { store: new ScheduledTaskStore(path.join(dir, "tasks.json")), file: path.join(dir, "tasks.json") }; }
@@ -10,6 +10,24 @@ afterEach(() => { for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursi
 const base = { userId: "u", projectId: "p", threadId: "t", title: "test", prompt: "hello", schedule: { kind: "interval" as const, intervalMinutes: 5, timezone: "UTC" }, enabled: true };
 
 describe("scheduled task persistence and claims", () => {
+  it("maps only explicit saved permission choices and never promotes a missing choice", () => {
+    expect(executionSettingsOverrides(null)).toBeUndefined();
+    expect(executionSettingsOverrides({ sandbox: "danger-full-access", approvalPolicy: "never" })).toEqual({ permissions: ":danger-full-access", approvalPolicy: "never" });
+    expect(executionSettingsOverrides({ sandbox: "read-only", approvalPolicy: "on-request" })).toEqual({ permissions: ":read-only", approvalPolicy: "on-request" });
+    expect(executionSettingsOverrides({ sandbox: "workspace-write", approvalPolicy: "never" })?.permissions).toBe(":workspace");
+  });
+  it("restores saved permissions explicitly on cold scheduler resume", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const execution = { permissions: ":danger-full-access", approvalPolicy: "never" };
+    await resumeThreadIfUnloaded({ request: async (method, params) => { calls.push([method, params]); return method === "thread/loaded/list" ? { data: [] } : {}; } }, "t", "/project", {}, execution);
+    expect(calls[1]).toEqual(["thread/resume", { threadId: "t", cwd: "/project", config: {}, excludeTurns: true, ...execution }]);
+  });
+  it("uses native settings/update for subsequent queued turns on a loaded actor", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const execution = { permissions: ":read-only", approvalPolicy: "on-request" };
+    expect(await resumeThreadIfUnloaded({ request: async (method, params) => { calls.push([method, params]); return method === "thread/loaded/list" ? { data: ["t"] } : {}; } }, "t", "/project", {}, execution)).toBe(false);
+    expect(calls).toEqual([["thread/loaded/list", {}], ["thread/settings/update", { threadId: "t", ...execution }]]);
+  });
   it("persists tasks and refuses duplicate claims", () => {
     const { store: s, file } = store();
     const task = s.create(base);

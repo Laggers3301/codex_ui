@@ -14,13 +14,14 @@ type BrowserState = {
 
 const apiHeaders = () => ({ "x-codex-web-user-id": getApiUserId(), "Content-Type": "application/json" });
 
-export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOnHide = true, onClose }: { projectId: string; threadId: string | null; visible: boolean; navigation?: { id: string; url: string }; pauseOnHide?: boolean; onClose: () => void }) {
+export function BrowserPanel({ projectId, threadId, visible, navigation, onClose }: { projectId: string; threadId: string | null; visible: boolean; navigation?: { id: string; url: string }; onClose: () => void }) {
   const [state, setState] = useState<BrowserState | null>(null);
   const [url, setUrl] = useState("");
   const [frame, setFrame] = useState("");
   const [loading, setLoading] = useState(false);
   const [interactionError, setInteractionError] = useState("");
   const [pollError, setPollError] = useState("");
+  const [frameRetry, setFrameRetry] = useState(0);
   const [text, setText] = useState("");
   const [showKeys, setShowKeys] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -42,6 +43,10 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
   const tabCloseTimers = useRef(new Set<number>());
   const wheelRef = useRef<{ x: number; y: number; dx: number; dy: number } | null>(null);
   const wheelTimer = useRef<number | null>(null);
+  const controlPending = useRef(false);
+  const [controlCoolingDown, setControlCoolingDown] = useState(false);
+  const controlCooldownTimer = useRef<number | null>(null);
+  useEffect(() => () => { if (controlCooldownTimer.current) window.clearTimeout(controlCooldownTimer.current); }, []);
   const prefix = threadId ? `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/browser` : "";
   stateRef.current = state;
   frameRef.current = frame;
@@ -126,14 +131,76 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
     setInteractionError("");
     try {
       if (stateRef.current?.mode !== "human") {
-        const takeover = await request("/control", { method: "POST", body: JSON.stringify({ mode: "human" }) });
-        if (takeover.data) commitState(takeover.data as BrowserState);
+        throw new Error("请先点击手动控制，再操作网页。");
       }
       const result = await request("/action", { method: "POST", body: JSON.stringify({ action, tabId: stateRef.current?.activeTabId, ...details }) });
       if (result.data?.state) commitState(result.data.state as BrowserState);
       return true;
     } catch (caught) { setInteractionError(caught instanceof Error ? caught.message : String(caught)); return false; }
   }, [request, commitState]);
+
+  // Fetch new pixels as soon as an action response/WebSocket updates the
+  // frame version, without waiting for the 800ms recovery/status poll.
+  useEffect(() => {
+    const currentState = stateRef.current;
+    if (!visible || !prefix || !currentState || currentState.frameVersion <= 0 || document.hidden) return;
+    const frameKey = `${currentState.threadId}:${currentState.id}:${currentState.activeTabId}:${currentState.frameVersion}`;
+    if (frameKey === appliedFrameKey.current) return;
+    let active = true;
+    let pendingBlobUrl = "";
+    let probe: HTMLImageElement | undefined;
+    let retryTimer = 0;
+    const controller = new AbortController();
+    const token = ++frameLoadToken.current;
+    loadingFrameKey.current = frameKey;
+    const fail = (message: string) => {
+      if (!active) return;
+      setPollError(message);
+      retryTimer = window.setTimeout(() => setFrameRetry(value => value + 1), 1000);
+    };
+    const timeout = window.setTimeout(() => { controller.abort(); fail("画面传输超时，正在重试…"); }, 6000);
+    void (async () => {
+      try {
+        const response = await fetch(`${prefix}/frame?v=${encodeURIComponent(String(currentState.frameVersion))}${currentState.activeTabId ? `&tabId=${encodeURIComponent(currentState.activeTabId)}` : ""}`, { credentials: "same-origin", cache: "no-store", signal: controller.signal, headers: { "x-codex-web-user-id": getApiUserId() } });
+        if (!response.ok) throw new Error(`截图暂不可用（${response.status}）`);
+        const blob = await response.blob();
+        if (!active) return;
+        pendingBlobUrl = URL.createObjectURL(blob);
+        probe = new Image();
+        probe.onload = () => {
+          window.clearTimeout(timeout);
+          const current = stateRef.current;
+          if (active && token === frameLoadToken.current && current?.id === currentState.id && current.threadId === currentState.threadId && current.activeTabId === currentState.activeTabId && current.frameVersion === currentState.frameVersion) {
+            const previous = frameRef.current;
+            appliedFrameKey.current = frameKey;
+            frameRef.current = pendingBlobUrl;
+            setFrame(pendingBlobUrl);
+            if (previous) URL.revokeObjectURL(previous);
+            pendingBlobUrl = "";
+            setPollError(current.error || "");
+          } else if (pendingBlobUrl) { URL.revokeObjectURL(pendingBlobUrl); pendingBlobUrl = ""; }
+          if (loadingFrameKey.current === frameKey) loadingFrameKey.current = "";
+        };
+        probe.onerror = () => { window.clearTimeout(timeout); fail("画面解码失败，正在重试…"); };
+        probe.src = pendingBlobUrl;
+      } catch (caught) {
+        window.clearTimeout(timeout);
+        if (!(caught instanceof DOMException && caught.name === "AbortError")) fail(caught instanceof Error ? caught.message : String(caught));
+      }
+    })();
+    return () => {
+      active = false; controller.abort(); window.clearTimeout(timeout); window.clearTimeout(retryTimer);
+      if (probe) { probe.onload = null; probe.onerror = null; }
+      if (pendingBlobUrl) URL.revokeObjectURL(pendingBlobUrl);
+      if (loadingFrameKey.current === frameKey) loadingFrameKey.current = "";
+    };
+  }, [visible, prefix, state?.id, state?.activeTabId, state?.frameVersion, frameRetry]);
+
+  useEffect(() => {
+    const wake = () => { if (!document.hidden) setFrameRetry(value => value + 1); };
+    document.addEventListener("visibilitychange", wake);
+    return () => document.removeEventListener("visibilitychange", wake);
+  }, []);
 
   useEffect(() => {
     if (!visible || !threadId) return;
@@ -165,40 +232,7 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
           frameLoadToken.current += 1;
           setFrame("");
         }
-        const frameKey = currentState ? `${currentState.threadId}:${currentState.id}:${currentState.activeTabId}:${currentState.frameVersion}` : "";
-        let frameIssue = "";
-        if (currentState && currentState.frameVersion > 0 && frameKey !== appliedFrameKey.current && frameKey !== loadingFrameKey.current) {
-          loadingFrameKey.current = frameKey;
-          const token = ++frameLoadToken.current;
-          try {
-            const imageResponse = await fetch(`${prefix}/frame?v=${encodeURIComponent(String(currentState.frameVersion))}${currentState.activeTabId ? `&tabId=${encodeURIComponent(currentState.activeTabId)}` : ""}`, { credentials: "same-origin", cache: "no-store", signal: pollController.signal, headers: { "x-codex-web-user-id": getApiUserId() } });
-            if (!imageResponse.ok) throw new Error(`截图暂不可用（${imageResponse.status}）`);
-            const blobUrl = URL.createObjectURL(await imageResponse.blob());
-            const probe = new Image();
-            const imageTimeout = window.setTimeout(() => {
-              URL.revokeObjectURL(blobUrl);
-              if (frameLoadToken.current === token) frameLoadToken.current += 1;
-              if (loadingFrameKey.current === frameKey) loadingFrameKey.current = "";
-            }, 6000);
-            probe.onload = () => {
-              window.clearTimeout(imageTimeout);
-              const current = stateRef.current;
-              const stillCurrent = active && token === frameLoadToken.current && current?.threadId === currentState.threadId && current.id === currentState.id && current.activeTabId === currentState.activeTabId && current.frameVersion === currentState.frameVersion;
-              if (stillCurrent) {
-                appliedFrameKey.current = frameKey;
-                setFrame(previous => { if (previous && previous !== blobUrl) URL.revokeObjectURL(previous); return blobUrl; });
-              } else URL.revokeObjectURL(blobUrl);
-              if (loadingFrameKey.current === frameKey) loadingFrameKey.current = "";
-            };
-            probe.onerror = () => { window.clearTimeout(imageTimeout); URL.revokeObjectURL(blobUrl); if (loadingFrameKey.current === frameKey) loadingFrameKey.current = ""; };
-            probe.src = blobUrl;
-          } catch (caught) {
-            if (loadingFrameKey.current === frameKey) loadingFrameKey.current = "";
-            if (active && !(caught instanceof DOMException && caught.name === "AbortError")) frameIssue = caught instanceof Error ? caught.message : String(caught);
-          }
-        }
         if (currentState?.error) setPollError(currentState.error);
-        else if (frameIssue) setPollError(frameIssue);
         else setPollError("");
       } catch (caught) { if (active && pollInteractionVersion === interactionVersion.current && !(caught instanceof DOMException && caught.name === "AbortError")) setPollError(caught instanceof Error ? caught.message : String(caught)); }
       finally { window.clearTimeout(timeout); if (controller === pollController) controller = null; polling = false; if (active) timer = window.setTimeout(poll, 800); }
@@ -222,10 +256,7 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
   }, [state?.activeTabId, state?.tabs?.length]);
   useEffect(() => () => { for (const timer of tabCloseTimers.current) window.clearTimeout(timer); tabCloseTimers.current.clear(); }, []);
 
-  useEffect(() => {
-    if (visible || !pauseOnHide || !threadId || !stateRef.current || stateRef.current.threadId !== threadId || stateRef.current.mode !== "agent") return;
-    void request("/control", { method: "POST", body: JSON.stringify({ mode: "human" }) }).catch(() => undefined);
-  }, [visible, pauseOnHide, request]);
+  // Pane visibility is presentation only, not a request to take control.
 
   const navigate = async (event?: React.FormEvent, requestedUrl?: string, newTab = false) => {
     event?.preventDefault();
@@ -259,10 +290,27 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
   }, [navigation?.id]);
 
   const control = async (mode: "human" | "agent") => {
+    if (controlPending.current) return;
+    controlPending.current = true;
+    setControlCoolingDown(true);
+    // A queued wheel event belongs to the previous manual-control session.
+    // Do not let it implicitly take control back after an explicit handoff.
+    if (wheelTimer.current) window.clearTimeout(wheelTimer.current);
+    wheelTimer.current = null;
+    wheelRef.current = null;
     setBusy(true); setInteractionError("");
     try { const result = await request("/control", { method: "POST", body: JSON.stringify({ mode }) }); if (result.data) commitState(result.data as BrowserState); }
     catch (caught) { setInteractionError(caught instanceof Error ? caught.message : String(caught)); }
-    finally { setBusy(false); }
+    finally {
+      setBusy(false);
+      // iOS repeated taps must not hit the opposite action replacing this
+      // button at the same coordinates immediately after the response.
+      controlCooldownTimer.current = window.setTimeout(() => {
+        controlPending.current = false;
+        setControlCoolingDown(false);
+        controlCooldownTimer.current = null;
+      }, 1000);
+    }
   };
 
   const stop = async () => {
@@ -282,6 +330,37 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
     finally { setBusy(false); }
   };
 
+  const recoverPage = async () => {
+    const previous = stateRef.current;
+    if (!previous?.url || busy || loading) return;
+    setBusy(true); setLoading(true); setInteractionError("");
+    try {
+      if (previous.mode !== "human") {
+        // An agent-mode crashed page cannot safely be taken over through the
+        // old renderer. The explicitly labelled button resets only THIS
+        // conversation's context; other browser/model sessions are untouched.
+        await request("", { method: "DELETE" });
+        commitState(null);
+        const opened = await request("/open", { method: "POST", body: JSON.stringify({ url: previous.url }) });
+        if (opened.data) commitState(opened.data as BrowserState);
+        return;
+      }
+      // Explicit user recovery: create a fresh renderer in the same context,
+      // retain login cookies, then close only the crashed tab. Never replay
+      // a previous click/type/submit action or restart the entire browser.
+      // /open stops loading the OLD page while taking control; that CDP call
+      // can hang after a renderer crash. Create the new tab directly instead.
+      const result = await request("/action", { method: "POST", body: JSON.stringify({ action: "new_tab", url: previous.url }) });
+      const restored = result.data?.state as BrowserState | undefined;
+      if (restored) commitState(restored);
+      if (previous.activeTabId && restored?.activeTabId !== previous.activeTabId && restored?.tabs?.some((tab) => tab.id === previous.activeTabId)) {
+        const closed = await request("/action", { method: "POST", body: JSON.stringify({ action: "close_tab", tabId: previous.activeTabId }) });
+        if (closed.data?.state) commitState(closed.data.state as BrowserState);
+      }
+    } catch (caught) { setInteractionError(caught instanceof Error ? caught.message : String(caught)); }
+    finally { setBusy(false); setLoading(false); }
+  };
+
   const approval = async (approved: boolean) => {
     if (!state?.pendingApproval) return;
     setInteractionError("");
@@ -290,7 +369,7 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
   };
 
   const clickFrame = (event: React.MouseEvent<HTMLImageElement>) => {
-    if (state?.mode !== "human" || !state.viewport.width || !state.viewport.height) return;
+    if (pageCrashed || state?.mode !== "human" || !state.viewport.width || !state.viewport.height) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const scale = Math.min(rect.width / state.viewport.width, rect.height / state.viewport.height);
     const renderedW = state.viewport.width * scale, renderedH = state.viewport.height * scale;
@@ -300,7 +379,7 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
   };
 
   const queueWheel = (event: React.WheelEvent<HTMLDivElement>) => {
-    if (state?.mode !== "human") return;
+    if (pageCrashed || state?.mode !== "human") return;
     event.preventDefault();
     const rect = event.currentTarget.getBoundingClientRect();
     const scale = state.viewport.width ? Math.min(rect.width / state.viewport.width, rect.height / state.viewport.height) : 1;
@@ -311,7 +390,7 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
     cur.dy = Math.max(-3000, Math.min(3000, cur.dy + event.deltaY / scale));
     wheelRef.current = cur;
     if (wheelTimer.current) window.clearTimeout(wheelTimer.current);
-    wheelTimer.current = window.setTimeout(() => { const point = wheelRef.current; wheelRef.current = null; if (point) void sendAction("scroll", { x: point.x, y: point.y, deltaX: Math.round(point.dx), deltaY: Math.round(point.dy) }); }, 100);
+    wheelTimer.current = window.setTimeout(() => { const point = wheelRef.current; wheelRef.current = null; wheelTimer.current = null; if (point && stateRef.current?.mode === "human") void sendAction("scroll", { x: point.x, y: point.y, deltaX: Math.round(point.dx), deltaY: Math.round(point.dy) }); }, 100);
   };
   useEffect(() => () => { if (wheelTimer.current) window.clearTimeout(wheelTimer.current); wheelRef.current = null; }, [prefix, visible]);
 
@@ -320,8 +399,8 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (!visible || (stateRef.current && stateRef.current.threadId !== threadId)) return;
-      if (event.key === "Escape" && stateRef.current?.mode === "agent") { event.preventDefault(); void control("human"); return; }
       if (!panelRef.current?.contains(event.target as Node)) return;
+      if (event.key === "Escape" && stateRef.current?.mode === "agent") { event.preventDefault(); void control("human"); return; }
       if (stateRef.current?.mode !== "human" || event.key === "Escape") return;
       if (!event.ctrlKey && !event.metaKey) return;
       const key = event.key.toLowerCase();
@@ -353,6 +432,7 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
   };
   const manual = state?.mode === "human";
   const panelError = interactionError || pollError || state?.error || "";
+  const pageCrashed = /Target crashed|页面.*崩溃/i.test(panelError);
   const viewportBounds = panelRef.current?.querySelector(".browserViewport")?.getBoundingClientRect();
   const imageScale = state && viewportBounds?.width && viewportBounds.height ? Math.min(viewportBounds.width / state.viewport.width, viewportBounds.height / state.viewport.height) : 1;
   const cursorStyle = agentCue && state?.cursor && viewportBounds ? {
@@ -363,8 +443,8 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
     <header className="browserPanelHeader">
       <span className={`browserPanelStatus${active ? " active" : ""}`}><Browser className="browserPanelGlyph" />{active ? "代理正在浏览" : manual ? "手动控制中" : state?.status === "starting" ? "正在连接…" : "浏览器"}</span>
       <span className="browserPanelHeaderActions">
-        {state && !manual && <button type="button" title="切换为手动控制" onClick={() => void control("human")} disabled={busy}><MousePointer2 size={15} />手动控制</button>}
-        {state && manual && <button type="button" title="将控制权交还给代理" onClick={() => void control("agent")} disabled={busy}><Play size={15} />交还代理</button>}
+        {state && !manual && <button key="take-control" type="button" title="切换为手动控制" onClick={() => void control("human")} disabled={busy || controlCoolingDown}><MousePointer2 size={15} />手动控制</button>}
+        {state && manual && <button key="return-control" type="button" title="将控制权交还给代理" onClick={() => void control("agent")} disabled={busy || controlCoolingDown}><Play size={15} />交还代理</button>}
         {state && <button className="browserPanelStop" type="button" onClick={() => void stop()} disabled={busy} title="关闭浏览器会话"><Pause size={15} />停止</button>}
         <button className="browserPanelClose" type="button" onClick={closePanel} title="隐藏浏览器" aria-label="关闭"><X size={17} /></button>
       </span>
@@ -394,7 +474,9 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, pauseOn
       {agentCue && state?.cursor && <span className="browserCursor" style={cursorStyle}><MousePointer2 size={20} fill="currentColor" /></span>}
       {loading && <span className="browserLoadingOverlay"><LoaderCircle className="browserSpin" size={19} /></span>}
     </div>
-    {(state?.activity || panelError) && <div className={`browserActivity${panelError ? " error" : ""}`}>{panelError || state?.activity}</div>}
+    {(state?.activity || panelError) && <div className={`browserActivity${panelError ? " error" : ""}${pageCrashed ? " crashed" : ""}`}>
+      {pageCrashed ? <><span>{manual ? "网页进程已崩溃，当前是最后一帧。恢复只重新打开网页，不重试之前的点击或输入。" : "网页进程已崩溃。重开仅重置本会话浏览器，可能需要重新登录，不重试之前的操作。"}</span><button type="button" onClick={() => void recoverPage()} disabled={busy || loading}><RotateCw size={14} />{loading ? "正在恢复…" : manual ? "恢复页面" : "重开（可能需登录）"}</button></> : panelError || state?.activity}
+    </div>}
     {manual && <div className="browserManualControls"><form onSubmit={submitText}><input value={text} onChange={event => setText(event.target.value)} placeholder="输入要在网页中键入的文字…" aria-label="要键入的文字" /><button type="submit" disabled={!text}>发送</button></form><div className="browserKeys"><button type="button" onClick={() => setShowKeys(value => !value)}>按键 <ChevronDown size={13} /></button>{showKeys && <span>{["Enter", "Tab", "Backspace", "Escape", "ArrowDown"].map(key => <button type="button" key={key} onClick={() => void sendAction("press", { key })}>{key}</button>)}</span>}</div><small>点击页面进行操作 · 使用滚轮滚动 · 按 Esc 暂停代理</small></div>}
   </aside>;
 }

@@ -1,0 +1,11 @@
+[Unit]
+Description=Restrict the Codex ZeroTier management API to local connections
+Before=codex-zerotier-controller.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/codex-zt-api-firewall
+
+[Install]
+WantedBy=multi-user.target

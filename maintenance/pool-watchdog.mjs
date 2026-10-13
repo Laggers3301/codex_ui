@@ -1,8 +1,10 @@
 import fs from "node:fs/promises";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { processes, identity } from "./resource-guardian.mjs";
+import {confirmedEdgeCount,probeWebSocket,networkEvidence,NetworkRecoveryPolicy,recoverNetwork} from './network-health.mjs';
+import {probeCloudRelay} from './cloud-relay-health.mjs';
+const networkRecovery=new NetworkRecoveryPolicy();
+let lastNetworkEvidence=null, lastNetworkEvidenceAt=0;
 
-const execFileAsync = promisify(execFile);
 const intervalMs = 15_000;
 const mb = (bytes) => Math.round(bytes / 1024 / 1024);
 let lastSignature = "";
@@ -31,11 +33,6 @@ async function localGet(url) {
   } catch (error) {
     return { status: 0, text: "", error: error instanceof Error ? error.name : "error" };
   }
-}
-
-function edgeConnections(response) {
-  const match = response.text.match(/^cloudflared_tunnel_ha_connections\s+(\d+)/m);
-  return match ? Number(match[1]) : 0;
 }
 
 async function workerScopes() {
@@ -73,59 +70,57 @@ async function workerScopes() {
 }
 
 async function topProcesses() {
-  let output = "";
-  try {
-    ({ stdout: output } = await execFileAsync("/usr/bin/ps", ["-eo", "pid=,rss=,comm=", "--sort=-rss"], {
-      timeout: 2_000, maxBuffer: 1024 * 1024
-    }));
-  } catch { return []; }
-  const result = [];
-  for (const line of output.trim().split("\n").slice(0, 12)) {
-    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
-    if (!match) continue;
-    const pid = Number(match[1]);
-    let cwd = "";
-    try { cwd = await fs.readlink(`/proc/${pid}/cwd`); } catch { /* process exited */ }
-    const owner = cwd.match(/\/users\/([A-Za-z0-9_-]+)(?:\/|$)/)?.[1] ?? null;
-    const category = cwd.includes("ms-python.vscode-pylance") ? "VS Code Pylance" : match[3];
-    result.push({ pid, name: category, rssMb: Math.round(Number(match[2]) / 1024), owner });
-  }
-  return result;
+  return (await processes()).sort((a, b) => b.rss - a.rss).slice(0, 12).map(identity);
 }
 
 async function sample() {
   if (sampling) return;
   sampling = true;
   try {
-    const [mem, pressure, backend, mainEdge, quicEdge, workers] = await Promise.all([
+    const [mem, pressure, backend, mainEdge, quicEdge, workers, frontend, backendWS, frontendWS, mainReady, quicReady, cloudRelay] = await Promise.all([
       readText("/proc/meminfo"),
       readText("/proc/pressure/memory"),
       localGet("http://127.0.0.1:4576/api/health"),
       localGet("http://127.0.0.1:20241/metrics"),
       localGet("http://127.0.0.1:20242/metrics"),
-      workerScopes()
+      workerScopes(),
+      localGet('http://127.0.0.1:4574/login'),
+      probeWebSocket('ws://127.0.0.1:4576/ws'),
+      probeWebSocket('ws://127.0.0.1:4574/ws'),
+      localGet('http://127.0.0.1:20241/ready'),
+      localGet('http://127.0.0.1:20242/ready'),
+      probeCloudRelay()
     ]);
     const availableMb = mb(memField(mem, "MemAvailable"));
     const swapFreeMb = mb(memField(mem, "SwapFree"));
     const fullPressure10 = pressureAverage(pressure);
-    const mainConnections = edgeConnections(mainEdge);
-    const quicConnections = edgeConnections(quicEdge);
+    const mainConnections = cloudRelay?(cloudRelay.ready===200?1:0):confirmedEdgeCount(mainEdge,mainReady);
+    const quicConnections = confirmedEdgeCount(quicEdge,quicReady);
     const newWorkerOom = previousWorkerOomKills !== null && workers.oomKills !== null
       && workers.oomKills > previousWorkerOomKills;
     previousWorkerOomKills = workers.oomKills;
     const backendHealthy = backend.status === 200 || backend.status === 401;
+    const snapshot={backendStatus:backend.status,backendWS:backendWS.ok,frontendStatus:frontend.status,frontendWS:frontendWS.ok,mainConnections,quicConnections,cloudRelay};
+    const recovery=networkRecovery.evaluate(snapshot);
+    if(Date.now()-lastNetworkEvidenceAt>=60000){lastNetworkEvidence=await networkEvidence();lastNetworkEvidenceAt=Date.now();}
+    if(recovery)console.warn(JSON.stringify({time:new Date().toISOString(),event:'network-recovery',snapshot,result:await recoverNetwork(recovery)}));
+    const disk = await fs.statfs('/');
+    const diskAvailableGiB = Math.round(disk.bavail * disk.bsize / 1024 ** 3);
+    const inodeAvailable = disk.ffree;
     const critical = availableMb < 768 || fullPressure10 >= 25 || !backendHealthy
-      || (mainConnections === 0 && quicConnections === 0);
+      || (mainConnections === 0 && !(quicConnections > 0)) || diskAvailableGiB < 32 || inodeAvailable < 1000;
     const warning = newWorkerOom || availableMb < 2_048 || fullPressure10 >= 10
       || (swapFreeMb < 200 && availableMb < 3_000)
-      || mainConnections < 4 || quicConnections < 4;
+      || !backendWS.ok || !frontendWS.ok || frontend.status!==200 || mainConnections===null
+      || (!cloudRelay&&mainConnections!==null&&mainConnections<4) || (quicConnections!==null&&quicConnections<4) || diskAvailableGiB < 64 || inodeAvailable < 10000;
     const level = critical ? "critical" : warning ? "warning" : "healthy";
-    const signature = `${level}:${backendHealthy}:${mainConnections}:${quicConnections}:${workers.oomKills}`;
+    const signature = `${level}:${backendHealthy}:${frontend.status}:${backendWS.ok}:${frontendWS.ok}:${mainConnections}:${quicConnections}:${workers.oomKills}`;
     const now = Date.now();
     if (signature !== lastSignature || now - lastReportAt > (level === "healthy" ? 300_000 : 60_000)) {
       const event = {
-        time: new Date(now).toISOString(), level, availableMb, swapFreeMb, fullPressure10,
-        backendStatus: backend.status, mainConnections, quicConnections,
+        time: new Date(now).toISOString(), level, availableMb, swapFreeMb, fullPressure10, diskAvailableGiB, inodeAvailable,
+        backendStatus: backend.status, mainConnections, quicConnections, cloudRelay,
+        frontendStatus:frontend.status,backendWebSocket:backendWS,frontendWebSocket:frontendWS,network:lastNetworkEvidence,
         workerSliceMb: workers.memoryMb, workerOomKills: workers.oomKills,
         workerHighEvents: workers.highEvents, workerScopes: workers.scopes
       };

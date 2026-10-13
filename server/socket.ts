@@ -9,11 +9,14 @@ import { z } from "zod";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
+import { serverConfig } from "./config.js";
 import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
 import { LiveStateStore } from "./liveState.js";
 import { notificationIsContextCompaction, RawCompactFilter } from "./rawNotificationFilter.js";
 import { journalItem } from "./timelineJournal.js";
 import { RequestDeduper } from "./requestDeduper.js";
+import { isDisconnectedStreamError, prepareDisconnectedThreadRetry } from "./disconnectedThreadRecovery.js";
+import { executionSettingsOverrides, resumeThreadIfUnloaded } from "./scheduledTasks.js";
 import { getOwnedThreadGoal, setGoalAndStartIfIdle } from "./goalExecution.js";
 import { documentContextInput, documentReferenceFromInput } from "./documentContext.js";
 import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
@@ -53,7 +56,7 @@ const threadStartContextConfigSchema = z.object({
 const contextProbeBytes = 512 * 1024;
 const contextPrecompactThreshold = 0.85;
 const contextFullThreshold = 0.98;
-const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? "/home/<user>/codex_zerotier_remote/users";
+const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 const DEFAULT_COMPACT_TIMEOUT_MS = 600_000;
 
 function compactTimeoutMs(): number {
@@ -81,6 +84,7 @@ type SocketRequestGuards = {
   startingThreads: Set<string>;
   /** Turns created for a real user task, as opposed to maintenance compaction. */
   recoverableTurnIds: Set<string>;
+  disconnectedThreads: Set<string>;
 };
 
 function send(ws: WebSocket, message: SocketServerMessage): void {
@@ -133,7 +137,12 @@ async function promptInput(bridge: CodexBridge, threadId: string, cwd: string, p
     if (!path) throw new Error(`技能 ${name} 在当前会话所属账号不可用，请刷新技能列表。`);
     return { type: "skill", name, path };
   });
-  return [...textInput(prompt), ...references, ...context];
+  // Preserve the compact skill references in native history as well as typed
+  // inputs. The UI extracts these into chips; skill instructions stay hidden.
+  const prefix = names.map((name) => `$${name}`).join(" ");
+  const existing = skillNamesFromPrompt(prompt);
+  const historyPrompt = names.every((name) => existing.includes(name)) ? prompt : `${prefix}\n${prompt}`;
+  return [...textInput(historyPrompt), ...references, ...context];
 }
 
 /**
@@ -184,6 +193,10 @@ function pickSandbox(value: unknown, fallback: Project["defaultSandbox"]): Proje
     return value;
   }
   return fallback;
+}
+
+function pickApprovalPolicy(value: unknown, fallback: Project["defaultApprovalPolicy"]): Project["defaultApprovalPolicy"] {
+  return value === "never" || value === "on-request" || value === "untrusted" ? value : fallback;
 }
 
 function pickReasoningEffort(value: unknown, fallback: Project["defaultReasoningEffort"]): Project["defaultReasoningEffort"] {
@@ -475,7 +488,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     promptDeduper: new RequestDeduper({ ttlMs: 8_000, maxEntries: 2_048 }),
     activeTurnsByThread: new Map(),
     startingThreads: new Set(),
-    recoverableTurnIds: new Set()
+    recoverableTurnIds: new Set(),
+    disconnectedThreads: new Set()
   };
   const turnWatchdog = new TurnWatchdog();
   const startingQueuedThreads = new Set<string>();
@@ -489,6 +503,12 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const queuedSubmissionId = queued.data?.[0]?.id;
       if (!queuedSubmissionId || guards.activeTurnsByThread.has(threadId)) return;
       await assertTrackedUserQuotaAvailable(bridge, store, owner, threadId);
+      const execution = executionSettingsOverrides(store.getThreadExecutionSettings(threadId, owner));
+      if (execution) {
+        const root = store.getThreadOwner(threadId)?.rootPath;
+        if (!root) throw new Error("Queued thread owner was removed.");
+        await resumeThreadIfUnloaded(bridge, threadId, root, browserMcpForThread(threadId), execution);
+      }
       const result = await bridge.request("thread/queue/start", { threadId, queuedSubmissionId });
       rememberAcceptedTurn(guards, threadId, `queued:${queuedSubmissionId}`, result);
       store.touchThreadOwner(threadId);
@@ -526,7 +546,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     options?: { prompt?: string; plan?: { rootTurnId: string; count: number } }
   ): Promise<void> => {
     const retryCount = contextRecoveryRetries.get(threadId) ?? 0;
-    if (retryCount >= 2 || guards.activeTurnsByThread.has(threadId)) return;
+    if (retryCount >= 2 || guards.activeTurnsByThread.has(threadId) || guards.startingThreads.has(threadId)) return;
     const threadOwner = store.getThreadOwner(threadId);
     const project = threadOwner ? store.getProject(threadOwner.projectId, owner) : null;
     if (!threadOwner || !project) return;
@@ -541,6 +561,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         approvalPolicy: project.defaultApprovalPolicy,
         sandbox: project.defaultSandbox
       }, 30_000);
+      // A newer user turn may start while resume/quota checks are awaiting RPC.
+      // Never race it with a background recovery turn.
+      if (guards.activeTurnsByThread.has(threadId) || guards.startingThreads.has(threadId)) return;
       const requestId = `context-recovery:${priorTurnId}:${retryCount + 1}`;
       const turn = await bridge.request("turn/start", {
         threadId,
@@ -627,7 +650,13 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     const threadIdForWatchdog = notificationThreadId(message);
     const accountId = notificationAccountId(message);
     if (threadIdForWatchdog && message.method === "turn/completed") {
-      const status = asRecord(asRecord(message.params).turn).status;
+      const completedTurn = asRecord(asRecord(message.params).turn);
+      const status = completedTurn.status;
+      if (status === "failed" && isDisconnectedStreamError(completedTurn.error)) {
+        guards.disconnectedThreads.add(threadIdForWatchdog);
+      } else if (status === "completed") {
+        guards.disconnectedThreads.delete(threadIdForWatchdog);
+      }
       if ((status === "interrupted" || status === "failed") && browserService?.get(owner, threadIdForWatchdog)) {
         void browserService.control(owner, threadIdForWatchdog, "human").catch(() => undefined);
       }
@@ -761,8 +790,10 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const hasToolAfterLatestAgent = Number.isFinite(latestAgentOrder)
         ? completedItems.some((item) => item.type === "toolCall" && Number(item.timelineOrder) > latestAgentOrder)
         : false;
+      const turnStatus = pickString(asRecord(asRecord(message.params).turn).status);
       const nextPlanCount = (completedPlan?.count ?? 0) + 1;
-      const needsPlanContinuation = nextPlanCount <= 2
+      const needsPlanContinuation = turnStatus === "completed"
+        && nextPlanCount <= 2
         && isPlanOnlyContinuationReply(latestAgentText)
         && !hasToolAfterLatestAgent;
       const runtimeExited = asRecord(message.params).runtimeExited === true;
@@ -800,10 +831,10 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
           ), 0);
         } else if (completedRecovery || completedPlan) {
           contextRecoveryRetries.delete(threadId);
+          setTimeout(() => void startNextQueuedTurn(owner, threadId), 0);
         } else {
           setTimeout(() => void startNextQueuedTurn(owner, threadId), 0);
         }
-        const turnStatus = pickString(asRecord(asRecord(message.params).turn).status);
         const finishedWatchdogTurn = turnWatchdog.finish(owner, accountId, threadId, turnId);
         if (finishedWatchdogTurn) {
           const progressState = turnStatus === "failed" ? "failed" : turnStatus === "interrupted" ? "interrupted" : "completed";
@@ -1011,6 +1042,10 @@ async function handleClientMessage(
   const requestId = message.requestId ?? randomUUID();
   try {
     switch (message.type) {
+      case "transport.ping": {
+        send(ws, { type: "transport.pong", ok: true });
+        break;
+      }
       case "live.state": {
         send(ws, { type: "live.state", requestId, ok: true, data: liveState.snapshot() });
         break;
@@ -1070,6 +1105,8 @@ async function handleClientMessage(
               model,
               reasoningEffort
             });
+            store.setThreadExecutionSettings(threadId, sessionUserId,
+              pickSandbox(message.sandbox, project.defaultSandbox), pickApprovalPolicy(message.approvalPolicy, project.defaultApprovalPolicy));
             if (browserMcp?.bindingId) bindBrowserMcpThread(browserMcp.bindingId, threadId, store);
             if (requestedContextConfig) {
               store.setThreadContextConfig(threadId, sessionUserId, {
@@ -1130,6 +1167,9 @@ async function handleClientMessage(
         const modelDefaults = ownerProject ?? project;
         const model = owner?.modelOverride ?? modelDefaults.defaultModel;
         const reasoningEffort = owner?.reasoningEffortOverride ?? modelDefaults.defaultReasoningEffort;
+        const savedExecution = store.getThreadExecutionSettings(threadId, sessionUserId);
+        const executionSandbox = pickSandbox(message.sandbox, savedExecution?.sandbox ?? modelDefaults.defaultSandbox);
+        const executionApproval = pickApprovalPolicy(message.approvalPolicy, savedExecution?.approvalPolicy ?? modelDefaults.defaultApprovalPolicy);
         const data = await runDedupedPrompt(
           guards,
           sessionUserId,
@@ -1145,12 +1185,13 @@ async function handleClientMessage(
               const contextConfig = store.getThreadContextConfig(threadId, sessionUserId)
                 ?? defaultThreadContextConfig(threadId);
               const contextUsage = await readThreadContextUsage(threadId, contextConfig);
+              await prepareDisconnectedThreadRetry(bridge, guards.disconnectedThreads, threadId);
               await bridge.request("thread/resume", {
                 threadId,
                 cwd: project.rootPath,
                 model,
-                approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
-                sandbox: pickString(message.sandbox, project.defaultSandbox),
+                approvalPolicy: executionApproval,
+                sandbox: executionSandbox,
                 config: {
                   ...(browserService ? mintBrowserMcpConfig(sessionUserId, owner?.projectId ?? project.id, threadId).config : {}),
                   ...threadContextConfigOverrides(contextConfig, contextWindowMeasuredForConfig(contextConfig, contextUsage)),
@@ -1160,13 +1201,14 @@ async function handleClientMessage(
                   ? contextPinDeveloperInstructions(store.getThreadContextPin(threadId, sessionUserId)?.text ?? "")
                   : undefined
               }, 30_000);
+              store.setThreadExecutionSettings(threadId, sessionUserId, executionSandbox, executionApproval);
               const turn = await bridge.request("turn/start", {
                 threadId,
                 input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames, message.documentReference),
                 collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
                 cwd: project.rootPath,
-                approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
-                sandboxPolicy: sandboxPolicy(project, pickSandbox(message.sandbox, project.defaultSandbox)),
+                approvalPolicy: executionApproval,
+                sandboxPolicy: sandboxPolicy(project, executionSandbox),
                 model,
                 effort: reasoningEffort,
                 config: {
@@ -1226,6 +1268,22 @@ async function handleClientMessage(
         const prompt = pickString(message.prompt).trim();
         if (!threadId || !prompt) throw new Error("threadId and prompt are required.");
         assertThreadOwnedBy(store, threadId, sessionUserId);
+        if (message.sandbox !== undefined || message.approvalPolicy !== undefined) {
+          const owner = store.getThreadOwner(threadId)!;
+          const project = store.getProject(owner.projectId, sessionUserId);
+          if (!project) throw new Error("Queued thread project is no longer available.");
+          const saved = store.getThreadExecutionSettings(threadId, sessionUserId);
+          store.setThreadExecutionSettings(threadId, sessionUserId,
+            pickSandbox(message.sandbox, saved?.sandbox ?? project.defaultSandbox),
+            pickApprovalPolicy(message.approvalPolicy, saved?.approvalPolicy ?? project.defaultApprovalPolicy));
+        }
+        const execution = executionSettingsOverrides(store.getThreadExecutionSettings(threadId, sessionUserId));
+        if (execution) {
+          const root = store.getThreadOwner(threadId)!.rootPath;
+          // Native queue/add can start immediately while idle, so policy must
+          // be restored before enqueueing, not only in queue/start's callback.
+          await resumeThreadIfUnloaded(bridge, threadId, root, browserMcpForThread(threadId), execution);
+        }
         const result = await guards.requestDeduper.run(
           { userId: sessionUserId, requestId },
           async () => bridge.request("thread/queue/add", { threadId, input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", prompt, message.skillNames, message.documentReference), clientUserMessageId: requestId }),

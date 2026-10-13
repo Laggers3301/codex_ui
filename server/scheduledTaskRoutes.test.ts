@@ -18,7 +18,8 @@ describe("scheduled task routes", () => {
     const app = Fastify();
     try {
       const [{ registerRoutes }, { createSessionCookie }] = await Promise.all([import("./routes.js"), import("./auth.js")]);
-      registerRoutes(app, { request: async () => ({}) } as any, store, { backgroundIndexing: false });
+      const nativeCalls: Array<{ method: string; params: any }> = [];
+      registerRoutes(app, { request: async (method: string, params: any) => { nativeCalls.push({ method, params }); return method === "thread/loaded/list" ? { data: ["alice-thread"] } : {}; } } as any, store, { backgroundIndexing: false });
       const alice = { cookie: createSessionCookie("alice").split(";")[0] };
       const bob = { cookie: createSessionCookie("bob").split(";")[0] };
       const url = `/api/projects/${project.id}/threads/alice-thread/schedules`;
@@ -36,6 +37,24 @@ describe("scheduled task routes", () => {
       expect((await app.inject({ method: "DELETE", url: taskUrl, headers: alice })).statusCode).toBe(200);
       expect((await app.inject({ method: "GET", url, headers: alice })).json().data).toEqual([]);
       expect((await app.inject({ method: "POST", url, headers: alice, payload: { prompt: "too often", schedule: { kind: "interval", intervalMinutes: 4, timezone: "UTC" } } })).statusCode).toBe(400);
+      const executionUrl = url.replace(/schedules$/, "execution-settings");
+      expect((await app.inject({ method: "GET", url: executionUrl, headers: alice })).json().data).toBeNull();
+      const before = nativeCalls.length;
+      expect((await app.inject({ method: "PATCH", url: executionUrl, headers: bob, payload: { sandbox: "danger-full-access", approvalPolicy: "never" } })).statusCode).toBe(403);
+      expect(nativeCalls.length).toBe(before);
+      const changed = await app.inject({ method: "PATCH", url: executionUrl, headers: alice, payload: { sandbox: "read-only", approvalPolicy: "on-request" } });
+      expect(changed.statusCode).toBe(200);
+      expect(changed.json()).toMatchObject({ data: { sandbox: "read-only", approvalPolicy: "on-request" }, appliesTo: "subsequent-turns" });
+      expect(nativeCalls.at(-1)).toEqual({ method: "thread/settings/update", params: { threadId: "alice-thread", permissions: ":read-only", approvalPolicy: "on-request" } });
+      expect((await app.inject({ method: "GET", url: executionUrl, headers: alice })).json().data.sandbox).toBe("read-only");
+      expect((await app.inject({ method: "GET", url: executionUrl, headers: bob })).statusCode).toBe(403);
+      const predictionUrl=url.replace(/schedules$/,"prediction");
+      const callsBeforePrediction=nativeCalls.length;
+      expect((await app.inject({method:"POST",url:predictionUrl,headers:bob,payload:{sourceTurnId:"turn"}})).statusCode).toBe(403);
+      expect((await app.inject({method:"POST",url:predictionUrl.replace("alice-thread","other-thread"),headers:alice,payload:{sourceTurnId:"turn"}})).statusCode).toBe(403);
+      expect((await app.inject({method:"POST",url:predictionUrl,headers:alice,payload:{sourceTurnId:"turn",access_token:"forbidden"}})).statusCode).toBe(400);
+      expect((await app.inject({method:"POST",url:predictionUrl,headers:alice,payload:{sourceTurnId:"turn"}})).json().data.eligible).toBe(false);
+      expect(nativeCalls.length).toBe(callsBeforePrediction);
     } finally { await app.close(); store.close(); fs.rmSync(temporary, { recursive: true, force: true }); }
   });
 });

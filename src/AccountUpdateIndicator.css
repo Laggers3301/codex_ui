@@ -1,0 +1,65 @@
+.accountUpdateIndicator {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  margin-left: 7px;
+  border-radius: 50%;
+  background: #ef6470;
+  box-shadow: 0 0 0 2px color-mix(in srgb, #ef6470 16%, transparent);
+  opacity: 0;
+  transform: scale(.72);
+  transition: opacity 220ms ease, transform 260ms ease;
+  pointer-events: none;
+}
+
+.v2AccountTrigger {
+  position: relative;
+}
+.feishuPluginEntry { position: relative; }
+.feishuPluginEntry > .accountUpdateIndicator { position: absolute; right: -2px; top: 1px; margin: 0; }
+
+.accountUpdateIndicator[data-visible="true"] {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.v2PrimaryNav button > .accountUpdateIndicator {
+  /* The nav has two grid columns. A third in-flow child creates an extra row,
+     even when opacity is zero. Keep the badge out of layout entirely. */
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  margin-top: -3.5px;
+  width: 7px;
+  height: 7px;
+  min-height: 7px;
+  line-height: 0 !important;
+  flex: 0 0 7px;
+  margin-left: 5px;
+}
+
+.v2PrimaryNav button:has(> .accountUpdateIndicator) {
+  position: relative;
+}
+
+body:has(.threadList.collapsed) .v2PrimaryNav button > .accountUpdateIndicator {
+  position: absolute;
+  left: 29px;
+  right: auto;
+  top: 5px;
+  margin: 0;
+}
+
+body:has(.threadList.collapsed) .v2AccountTrigger .accountUpdateIndicator {
+  position: absolute;
+  top: 4px;
+  left: 28px;
+  margin: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .accountUpdateIndicator {
+    transition: none;
+  }
+}

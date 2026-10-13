@@ -4,26 +4,54 @@ export class CodexSocket {
   private socket: WebSocket | null = null;
   private reconnectTimer: number | null = null;
   private reconnectDelayMs = 1_000;
+  private connectDeadline: number | null = null;
+  private heartbeatTimer: number | null = null;
+  private awaitingHeartbeatAt = 0;
+  private wakeListenersInstalled = false;
   private listeners = new Set<(message: SocketMessage) => void>();
   private statusListeners = new Set<(status: "connecting" | "open" | "closed") => void>();
 
+  get isOpen(): boolean {
+    return this.socket?.readyState === WebSocket.OPEN;
+  }
+
   connect(): void {
+    if (!this.wakeListenersInstalled) {
+      this.wakeListenersInstalled = true;
+      const wake = () => { if (document.visibilityState === "hidden") return; if (this.socket?.readyState === WebSocket.OPEN) this.probe(); else this.connect(); };
+      window.addEventListener("online", wake);
+      window.addEventListener("focus", wake);
+      document.addEventListener("visibilitychange", wake);
+    }
     if (this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) {
       return;
+    }
+
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
 
     this.setStatus("connecting");
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
     const socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
     this.socket = socket;
+    this.clearConnectionTimers();
+    this.connectDeadline = window.setTimeout(() => { if (this.socket === socket && socket.readyState === WebSocket.CONNECTING) this.recover(socket); }, 10_000);
 
     socket.addEventListener("open", () => {
+      if (this.socket !== socket) return;
       this.reconnectDelayMs = 1_000;
+      if (this.connectDeadline !== null) window.clearTimeout(this.connectDeadline);
+      this.connectDeadline = null;
+      this.heartbeatTimer = window.setInterval(() => this.probe(), 5_000);
       this.setStatus("open");
     });
     socket.addEventListener("message", (event) => {
+      if (this.socket !== socket) return;
       try {
         const message = JSON.parse(event.data) as SocketMessage;
+        if (message.type === "transport.pong") { this.awaitingHeartbeatAt = 0; return; }
         for (const listener of this.listeners) {
           listener(message);
         }
@@ -34,18 +62,45 @@ export class CodexSocket {
       }
     });
     socket.addEventListener("close", () => {
-      if (this.socket === socket) {
-        this.socket = null;
-      }
+      if (this.socket !== socket) return;
+      this.socket = null;
+      this.clearConnectionTimers();
       this.setStatus("closed");
       this.scheduleReconnect();
     });
     socket.addEventListener("error", () => {
+      if (this.socket !== socket) return;
       // Browsers do not always emit close promptly on a broken Wi-Fi route.
       // Explicitly close to start the normal reconnect path instead of requiring
       // a manual page refresh.
-      socket.close();
+      this.recover(socket);
     });
+  }
+
+  private clearConnectionTimers(): void {
+    if (this.connectDeadline !== null) window.clearTimeout(this.connectDeadline);
+    if (this.heartbeatTimer !== null) window.clearInterval(this.heartbeatTimer);
+    this.connectDeadline = this.heartbeatTimer = null;
+    this.awaitingHeartbeatAt = 0;
+  }
+
+  private recover(socket: WebSocket): void {
+    if (this.socket !== socket) return;
+    this.socket = null; this.clearConnectionTimers();
+    // A stalled browser close handshake must not block the next connection.
+    try { socket.close(); } catch { /* reconnect below */ }
+    this.setStatus("closed"); this.scheduleReconnect();
+  }
+
+  private probe(): void {
+    const socket = this.socket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (this.awaitingHeartbeatAt) {
+      if (Date.now() - this.awaitingHeartbeatAt >= 10_000) this.recover(socket);
+      return;
+    }
+    this.awaitingHeartbeatAt = Date.now();
+    try { socket.send(JSON.stringify({ type: "transport.ping" })); } catch { this.recover(socket); }
   }
 
   send(message: Record<string, unknown>): void {

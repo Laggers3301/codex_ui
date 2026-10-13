@@ -240,7 +240,7 @@ export class ProjectStore {
   constructor(dbPath = path.join(serverConfig.dataDir, "codex-web.sqlite")) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
-    // The live account-a mirror briefly writes this database from a second
+    // The live 100001 mirror briefly writes this database from a second
     // process. WAL keeps ordinary reads available during that write, while a
     // bounded busy timeout turns the remaining write/write race into a short
     // wait instead of an intermittent HTTP 500/502 "database is locked".
@@ -258,6 +258,27 @@ export class ProjectStore {
       endpoint TEXT PRIMARY KEY, user_id TEXT NOT NULL, subscription_json TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS thread_execution_settings (
+      thread_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+      sandbox_mode TEXT NOT NULL, approval_policy TEXT NOT NULL, updated_at TEXT NOT NULL
+    )`);
+  }
+
+  getThreadExecutionSettings(threadId: string, userId: string): { sandbox: Project["defaultSandbox"]; approvalPolicy: Project["defaultApprovalPolicy"] } | null {
+    const row = this.db.prepare(`SELECT s.sandbox_mode, s.approval_policy FROM thread_execution_settings s
+      JOIN thread_owners o ON o.thread_id = s.thread_id AND o.user_id = s.user_id
+      WHERE s.thread_id = ? AND s.user_id = ?`).get(threadId, userId) as { sandbox_mode: Project["defaultSandbox"]; approval_policy: Project["defaultApprovalPolicy"] } | undefined;
+    return row ? { sandbox: row.sandbox_mode, approvalPolicy: row.approval_policy } : null;
+  }
+
+  setThreadExecutionSettings(threadId: string, userId: string, sandbox: Project["defaultSandbox"], approvalPolicy: Project["defaultApprovalPolicy"]): void {
+    if (this.getThreadOwner(threadId)?.userId !== userId) throw new Error("Thread permissions do not belong to this user.");
+    if (!["read-only", "workspace-write", "danger-full-access"].includes(sandbox)
+      || !["never", "on-request", "untrusted", "on-failure"].includes(approvalPolicy)) throw new Error("Invalid thread execution settings.");
+    this.db.prepare(`INSERT INTO thread_execution_settings VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(thread_id) DO UPDATE SET user_id=excluded.user_id, sandbox_mode=excluded.sandbox_mode,
+      approval_policy=excluded.approval_policy, updated_at=excluded.updated_at`)
+      .run(threadId, userId, sandbox, approvalPolicy, new Date().toISOString());
   }
 
   savePushSubscription(userId: string, subscription: { endpoint: string; keys: { p256dh: string; auth: string } }): void {
