@@ -1,0 +1,480 @@
+{
+  "name": "lzc-runtime-fixes-20261014",
+  "createdAt": "2026-10-15T08:09:28.021701+00:00",
+  "localBranch": "lzc",
+  "repository": "https://github.com/lll123github/codex_ui.git",
+  "storageBranchHead": "94bb85553efc4fd0259bd6a07d0185518fbeac3d",
+  "targetLayout": [
+    "backend/server/",
+    "frontend/src/",
+    "frontend/tests/",
+    "maintenance/",
+    "scripts/"
+  ],
+  "baseline": "2026-10-14 本轮修改前的运行源码及原始修改记录；存放补丁的旧 Git main 不是应用基线。",
+  "scope": [
+    "原生同步问答及等待状态恢复",
+    "刷新后计划模式恢复与退出",
+    "会话右键菜单层级",
+    "明确模型过载时每 60 秒重试、最多 10 次及取消/恢复",
+    "错误分类、页面错误详情及资源保护",
+    "对应测试及本轮维护脚本源码",
+    "导出验证发现的服务关闭后排队回调保护（仅修改补丁，未修改运行源码）"
+  ],
+  "excluded": [
+    "其他会话后续改动",
+    "完整运行源码快照",
+    "运行数据、会话记录、凭据与部署 manifest",
+    "构建产物及自动部署注册配置"
+  ],
+  "patch": {
+    "file": "lzc-runtime-fixes-20261014.patch",
+    "sha256": "ef1856bd8ee39cc23cf27b2abf9741ee2689438339d6ee4ce65de6c97688a01a",
+    "bytes": 168474,
+    "codeDiffSha256": "6a94b41d03229fff81f01c837c66b6e41ad481a1d9b50f2f0d13eab61cd5b40a"
+  },
+  "files": [
+    {
+      "path": "backend/server/accountPoolBridge.ts",
+      "change": "modify",
+      "validationBeforeSha256": "a66d3f15df2567ad8d4776926d3f2f458e3f72a699aae6ce0c1f9da6238e44ea",
+      "afterSha256": "afb4162a659f307a8fee1ad7d192a22de0018fb6f3397067dd75018d4d94e5d5",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "backend/server/appErrors.ts",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "19c559883dfedf8788d49a72a439e5d1193ccde1dc782e6063f2e81819f39c1c",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "backend/server/codexBridge.ts",
+      "change": "modify",
+      "validationBeforeSha256": "3650f49afc6b1272f7741597c596d0d0d3bf0fbbe4f1de893eb44f9ea6bde3d4",
+      "afterSha256": "ad14a17899a4ffba830ac799c55e0421cb92e36ebc572585783a496ca2dd6c61",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "backend/server/db.ts",
+      "change": "modify",
+      "validationBeforeSha256": "2f16eccc4af1369e0badd59d28512e6cceaf32c9cf2d803ff0e6525b8a97fb40",
+      "afterSha256": "964ddd8f87612a9cc1cf1972db9f0c4d278057ee6aebbf96e1c769ab91c23ef3",
+      "provenance": {
+        "kind": "recorded-hunks-reversed",
+        "note": "通过逆向本轮原始修改记录恢复修改前内容；未修改的周边内容取自整理时源码，不声称是原始历史文件快照。"
+      }
+    },
+    {
+      "path": "backend/server/internalUserMessage.ts",
+      "change": "modify",
+      "validationBeforeSha256": "e4ae2a6cb5111da142edb537a71037b17a0e3c5f079d3ce3e1bad7d0e5a24863",
+      "afterSha256": "14bab8e5416e41ec5529605e025f7095197b096fa7d3ebc52c8a53e9ca8c97a5",
+      "provenance": {
+        "kind": "recorded-hunks-reversed",
+        "note": "通过逆向本轮原始修改记录恢复修改前内容；未修改的周边内容取自整理时源码，不声称是原始历史文件快照。"
+      }
+    },
+    {
+      "path": "backend/server/socket.ts",
+      "change": "modify",
+      "validationBeforeSha256": "d51ef9009db45ba7982de9cd1043203a329e6fa56637578f7c8e673917fb56c6",
+      "afterSha256": "a4773b0ab03ef666b3c9d3c3dbf3e05fe90b37fbdaf3c1d5addeb1a0e032f4ad",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "backend/server/socketCollaborationMode.test.ts",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "d51e7b92b30ce2861935576694cc49a33ecde9345f3ef24b90e23ca70e8a65d4",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "backend/server/socketRetry.test.ts",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "10061cf99c9d3932008a548586401e998092e1fc7b864969cb860b607ab8c1f8",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "backend/server/socketUserInput.test.ts",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "645a57d4d7bdb1613efaaf5964857c2f9e25ed83739a841aba2280c8fa3c9b4e",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "backend/server/threadEventIndex.test.ts",
+      "change": "modify",
+      "validationBeforeSha256": "9663c73d57f319ebfaaac2cb29dacd59110e34ff7525f579fb33446ae627002c",
+      "afterSha256": "c93a39a32c4844768922760de277b82283ef6600ad18c64c4141c2ac826af77c",
+      "provenance": {
+        "kind": "recorded-hunks-reversed",
+        "note": "通过逆向本轮原始修改记录恢复修改前内容；未修改的周边内容取自整理时源码，不声称是原始历史文件快照。"
+      }
+    },
+    {
+      "path": "backend/server/threadEventIndex.ts",
+      "change": "modify",
+      "validationBeforeSha256": "aa730c39d4b92b986e4115cffad5ffed3029c04ec1f99ad252e3296a758a5a04",
+      "afterSha256": "866bedb0b029501637fbea43ad72fae0c6452775d77297a0b7fc76b3cf8ca896",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "plan-mode-fix-20261014"
+      }
+    },
+    {
+      "path": "backend/server/threadFallback.ts",
+      "change": "modify",
+      "validationBeforeSha256": "82cb9609fcc68493f1624529ea09f20160967ff8fc8e42224cee01d9b7ada080",
+      "afterSha256": "b7011d45dd54960b01f8e269767d06166720e6b31d0daad2b1790bff27974ebc",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "plan-mode-fix-20261014"
+      }
+    },
+    {
+      "path": "backend/server/turnRetry.test.ts",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "d898b5373fecaacca8234e970884ba936576b863df69d92d67a373318739ac16",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "backend/server/turnRetry.ts",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "3a630ac35a3acc1a6914f5b7b1bbdf6bcf0128aeb3eb3b25ca30875afe4f7cb2",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "backend/server/turnWatchdog.test.ts",
+      "change": "modify",
+      "validationBeforeSha256": "5e1029ea7f3ada539cfa0d8def3cef81962f422d40f9399ed99e174f58df671e",
+      "afterSha256": "abe90c19fbd3fc774b4b0ee0359556a50e6f6bb523fdf123ef6cd948d0054795",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "backend/server/turnWatchdog.ts",
+      "change": "modify",
+      "validationBeforeSha256": "27387fd98916bf5780e68db3b643626f38190bf0e257ff62c1708cece16a4c90",
+      "afterSha256": "0a50a0ccec5d2be583f5f5673b37efdae759e49d7ff427b0b9593b2621110985",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "backend/server/uiUpdates.test.ts",
+      "change": "modify",
+      "validationBeforeSha256": "6b1a075771b2b7f1c5dfad7c5c466ffac89649e491cc1ae9d3dd0f4a25738152",
+      "afterSha256": "3c99bbcfdc47a67ad8c83a4bf8c3b2d54197dd07a8201d24f5203eb227921a45",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "backend/server/uiUpdates.ts",
+      "change": "modify",
+      "validationBeforeSha256": "64bd780d35f5d9b72fb04bb4d294c2b2cdc6cc766663302eb8e999c04157beba",
+      "afterSha256": "f73efab8813a145034c5966f5975296854d99b88339edaa98cea9d399854939c",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "backend/server/userInput.ts",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "ce47229167e05ec8e8cc5a29845a550257c1a92a7db0717dbe663c0c882f5d5d",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "backend/server/userInputLifecycle.test.ts",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "696cfc55015183e4c3d95d641b0a11f618ed99cd73fae7f801d667bc8af951f5",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "frontend/src/AccountUpdateIndicator.tsx",
+      "change": "modify",
+      "validationBeforeSha256": "735b32807dc367736a1f09f22b3fd0d2e536efdcc619c722e589770f24669b5d",
+      "afterSha256": "e1d3803cda52dc3df1b5367d310daf8f48008391be46cc36cbafa4fd95dab673",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "frontend/src/App.tsx",
+      "change": "modify",
+      "validationBeforeSha256": "7e85502f8be632802f037019bd31eba0b076b3413d0dc5657fc65e9ef12c4f20",
+      "afterSha256": "0c18c48300cd49de5f3f19bd3bd018671cfa2a8ec89d970213a62bca420d9821",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "frontend/src/ToolQuestionCard.tsx",
+      "change": "modify",
+      "validationBeforeSha256": "c2d8c077aebbaf201e9afc92c374b4bfa8731944c9132de5576ca2140fda3b41",
+      "afterSha256": "1c9c21195be4c1109d9577f78dd95df39d1fe2e01c145b77a3f4f02a106827b5",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "frontend/src/TurnRecoveryNotice.css",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "56d8e8020f325f1429da44e0c29ec1b2d2cb710f3be33a2a882f009f72218315",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "frontend/src/TurnRecoveryNotice.tsx",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "2b4dbc4e1976799c177900d0d9dba5e8824d91afd9cd00283973ef8646816da4",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "frontend/src/questionTool.test.ts",
+      "change": "modify",
+      "validationBeforeSha256": "448634c38f807df804fdf22cdfd3a39bb206c74b75c4c26db1c0532f4fe49cb5",
+      "afterSha256": "fc8e4b815c510a431da7ac0e721d4ad7b79924ad6157faa995da975cb8d81cf3",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "frontend/src/questionTool.ts",
+      "change": "modify",
+      "validationBeforeSha256": "8f66a2ebf9b7384fd431af6c003e239827a9769ebcaee1c74ff3ad6bc31b4e3f",
+      "afterSha256": "4ec019ad58bf255cfa523265f5f5c7e1aa34299bc1c2a3f3cb2f6e7975fbcfdd",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "frontend/src/styles.css",
+      "change": "modify",
+      "validationBeforeSha256": "d9f77874f3ea6f67c8da06b045a6fcbb74ff4bb868941e6bb136bda688b3c568",
+      "afterSha256": "1e989ebd8717b32143b9228871f3f28ea60806406564580809cfc813e0bcc07a",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "plan-mode-fix-20261014"
+      }
+    },
+    {
+      "path": "frontend/src/turnProgress.test.ts",
+      "change": "modify",
+      "validationBeforeSha256": "7e48c36d299a769c0cfb9dcf0f33f59bd8d4a9cd182b1035b2df78f701667fc4",
+      "afterSha256": "9f671ff83f756ea7836e18624eb64d2489befa8ed6c0b6c35097c49697d846cb",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "frontend/src/turnProgress.ts",
+      "change": "modify",
+      "validationBeforeSha256": "bb31bf27d127da2db371a8df272154788c1223211f2182b43325a511d8c2f1d0",
+      "afterSha256": "a40ffbaf07b2b97aeef2e8d8b069b0e5b1a69c87a281ae9f6ce54b81e7a599f9",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    },
+    {
+      "path": "frontend/src/types.ts",
+      "change": "modify",
+      "validationBeforeSha256": "e1c4ad66ea8565f85bdbd55ed3f25dbc585b0eedbf87e45d819a48f4b4260023",
+      "afterSha256": "3a94323a65352c7dee85ec57fd28094c7a6cae317b47314fec7e5fb407da38e3",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "plan-mode-fix-20261014"
+      }
+    },
+    {
+      "path": "frontend/src/useConversationPlanMode.ts",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "7941f6c34bc794310e0267d7416592f1bcd85ac143fc087c176f24e367a94134",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "frontend/tests/nativeQuestion.playwright.mjs",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "a9511186e1bc5bedcdab10be7c922c245d68fe133ff0fde8642eb9a59534b2e2",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "frontend/tests/planMode.playwright.mjs",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "ababd6580e6ada961941ae9855c2f989cfa368afad241fda7263a4a0ccd59cd7",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "maintenance/deploy-user-input-when-idle.mjs",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "9a57f07be3cf11e7c638553f81763bbb890367f2b153371dfef251696f56a6d1",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "maintenance/deploy-user-input-when-idle.test.mjs",
+      "change": "add",
+      "validationBeforeSha256": null,
+      "afterSha256": "963132d19c7f16b29dd8cbb2956af2cf777dd09c1824d0dca76139407093bbf1",
+      "provenance": {
+        "kind": "new-file-from-recorded-edits"
+      }
+    },
+    {
+      "path": "scripts/publish-ui-update.cjs",
+      "change": "modify",
+      "validationBeforeSha256": "4bf914c6fc01079e26e22c2b3f2008f12375562be747dc7583e2dfedba9fb987",
+      "afterSha256": "51e6b5363449fd19357e7e7454fcd2d6773c766de75424a49de9be5f182db163",
+      "provenance": {
+        "kind": "pre-change-backup",
+        "backupSet": "question-fix-20261014"
+      }
+    }
+  ],
+  "validation": {
+    "completedAt": "2026-10-15T08:11:35.921513+00:00",
+    "patch": {
+      "applyCheck": true,
+      "reverseCheck": true,
+      "reapplyCheck": true,
+      "allFileHashesMatch": true,
+      "filesChecked": 37,
+      "whitespaceCheck": true
+    },
+    "regression": {
+      "backend": {
+        "testFiles": 10,
+        "testsPassed": 64,
+        "exitCode": 0,
+        "unhandledErrors": 0
+      },
+      "frontend": {
+        "testFiles": 2,
+        "testsPassed": 10,
+        "exitCode": 0
+      },
+      "maintenance": {
+        "testsPassed": 2,
+        "exitCode": 0
+      },
+      "totalTestsPassed": 76
+    },
+    "typecheck": {
+      "compatibilityContextBackendExitCode": 0,
+      "compatibilityContextFrontendExitCode": 0,
+      "context": {
+        "reason": "隔离源码副本的周边文件包含其他会话后续更新；本轮补丁保留原始修改范围，不纳入这些后续功能。",
+        "originalFullTypecheck": {
+          "backendExitCode": 2,
+          "frontendExitCode": 2,
+          "differences": [
+            "codexBridgeScope.test.ts 引用后续内存策略导出的 memoryPressureWindow",
+            "TurnRecoveryNotice.test.ts 引用后续浮层界面导出的 isFreshRecoveryNotice",
+            "sidebarThreadLists.ts 使用后续 ThreadListResponse.hiddenThreadIds 字段"
+          ]
+        },
+        "compatibilityValidationOnly": {
+          "excludedLaterTests": [
+            "backend/server/codexBridgeScope.test.ts",
+            "frontend/src/TurnRecoveryNotice.test.ts"
+          ],
+          "preservedUnrelatedOptionalField": "frontend/src/types.ts: ThreadListResponse.hiddenThreadIds"
+        },
+        "patchChangedForCompatibilityValidation": false,
+        "requiresRecipientTypecheckAfterMerge": true
+      }
+    },
+    "browser": "本次导出未重新运行浏览器测试；本轮原开发阶段的浏览器验证已通过。",
+    "attributionUpdate": {
+      "codeDiffUnchanged": true,
+      "originalCodeDiffSha256": "6a94b41d03229fff81f01c837c66b6e41ad481a1d9b50f2f0d13eab61cd5b40a",
+      "authorHeaderAdded": true,
+      "gitApplyCheck": true,
+      "gitApplyReverseCheck": true,
+      "gitMailinfoAuthorParsed": true
+    }
+  },
+  "deliveryState": {
+    "mode": "git-branch",
+    "branch": "lzc",
+    "remote": "origin",
+    "remoteRef": "refs/heads/lzc",
+    "content": "本轮补丁、合并说明与校验清单",
+    "artifactsOnly": true,
+    "deployed": false
+  },
+  "author": {
+    "name": "林子川",
+    "email": "1577212376@qq.com",
+    "scope": "本轮补丁署名与补丁包交付提交作者；原有历史提交作者不变。"
+  },
+  "remoteConfiguration": {
+    "worktree": "/home/ls/codex_zerotier_remote/users/lzc/codex-ui-lzc",
+    "remote": "origin",
+    "fetchUrl": "https://github.com/lll123github/codex_ui.git",
+    "pushUrl": "https://github.com/lll123github/codex_ui.git",
+    "scope": "worktree",
+    "method": "worktree-specific URL rewrite",
+    "sharedOriginPreserved": "https://github.com/Laggers3301/codex_ui.git"
+  },
+  "updatedAt": "2026-10-15T08:56:50.784352+00:00"
+}

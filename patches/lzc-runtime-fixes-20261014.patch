@@ -1,0 +1,2632 @@
+From: 林子川 <1577212376@qq.com>
+Subject: [PATCH] fix: recover native questions, Plan mode and overloaded turns
+
+diff --git a/backend/server/accountPoolBridge.ts b/backend/server/accountPoolBridge.ts
+index 7215c3fa416ce3d106e6b3276d2b462500a42592..11c04fd03cdb8f36a331c2cd4bc78ddaca635d6c 100644
+--- a/backend/server/accountPoolBridge.ts
++++ b/backend/server/accountPoolBridge.ts
+@@ -429,6 +429,16 @@
+ 
+   private forwardEvents(account: AccountRuntime, bridge: CodexBridge): void {
+     bridge.on("notification", (message) => {
++      if (asRecord(message).method === "serverRequest/resolved") {
++        const params = asRecord(asRecord(message).params);
++        const routed = [...this.serverRequestAccounts].find(([, route]) => route.bridge === bridge && route.originalId === params.requestId);
++        // Answers are resolved locally when written. The native notification
++        // also clears questions cancelled by a completed/interrupted turn.
++        if (!routed) return;
++        this.serverRequestAccounts.delete(routed[0]);
++        this.emit("notification", { ...asRecord(message), params: { ...params, requestId: routed[0] }, accountId: account.id, accountLabel: account.label });
++        return;
++      }
+       this.emit("notification", { ...asRecord(message), accountId: account.id, accountLabel: account.label });
+     });
+     bridge.on("serverRequest", (request) => {
+diff --git a/backend/server/appErrors.ts b/backend/server/appErrors.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b08b7fafc81a2eae8a982bcfbe10c1b5ab1af1f9
+--- /dev/null
++++ b/backend/server/appErrors.ts
+@@ -0,0 +1,26 @@
++export interface PublicAppError { code: string; message: string; originalMessage: string; retryable: boolean; at: string }
++
++function safeMessage(value: unknown): string {
++  const text = typeof value === "string" ? value : value instanceof Error ? value.message : "未知错误";
++  return text.replace(/Bearer\s+[^\s"']+/gi, "Bearer [已隐藏]")
++    .replace(/\b(sk-[\w-]{12,}|(?:access_token|refresh_token|api_key|password)\s*[=:]\s*[^\s,;"']+)/gi, "[凭据已隐藏]").slice(0, 4000);
++}
++
++export class AppError extends Error {
++  constructor(public code: string, message: string, public originalMessage = message, public retryable = false) { super(message); this.name = "AppError"; }
++  toPublic(): PublicAppError { return { code: this.code, message: this.message, originalMessage: safeMessage(this.originalMessage), retryable: this.retryable, at: new Date().toISOString() }; }
++  static from(value: unknown): AppError {
++    if (value instanceof AppError) return value;
++    const row = value && typeof value === "object" ? value as Record<string, unknown> : {};
++    const original = safeMessage(row.message ?? value);
++    const nativeCode = String(row.code ?? row.codexErrorInfo ?? row.codex_error_info ?? "");
++    const signature = `${nativeCode} ${original}`;
++    if (/server_?overloaded|selected model is at capacity/i.test(signature)) return new AppError("model_overloaded", "模型服务暂时过载，已完成的步骤会沿用。", original, true);
++    if (/memory_pressure/i.test(signature)) return new AppError("memory_pressure", "运行资源不足，任务已暂停。请稍后继续。", original);
++    if (/runtime_terminated|app-server exited/i.test(signature)) return new AppError("runtime_terminated", "运行进程意外退出，请查看错误详情后继续。", original);
++    if (/usage_?limit|quota|credits|rate limit/i.test(signature)) return new AppError("quota_or_rate_limit", "服务额度或请求频率受限，请查看错误详情。", original);
++    if (/unauthorized|authentication|invalid.*token|401\b/i.test(signature)) return new AppError("authentication_failed", "账号认证失败，请查看错误详情。", original);
++    if (/context.*(exhaust|exceed|full)|CONTEXT_EXHAUSTED/i.test(signature)) return new AppError("context_exhausted", "会话上下文已满，请使用续接会话。", original);
++    return new AppError(nativeCode || "request_failed", "本轮处理失败，请查看错误详情。", original);
++  }
++}
+diff --git a/backend/server/codexBridge.ts b/backend/server/codexBridge.ts
+index e12919fb17520e5777e217f1978414b7d2d50a26..eab9ec00404f68d76cf976f82d9fec1226bbad0e 100644
+--- a/backend/server/codexBridge.ts
++++ b/backend/server/codexBridge.ts
+@@ -6,6 +6,7 @@
+ import path from "node:path";
+ import { serverConfig } from "./config.js";
+ import type { RpcEnvelope } from "./types.js";
++import { AppError } from "./appErrors.js";
+ 
+ /**
+  * The process used as the JSON-RPC transport for a Codex app-server.
+@@ -80,6 +81,8 @@
+   private readyPromise: Promise<void> | null = null;
+   private restarting = false;
+   private stopped = false;
++  private resourceMonitor: ReturnType<typeof setInterval> | null = null;
++  private pressureReported = false;
+ 
+   constructor(private readonly launch: CodexBridgeLaunchOptions = {
+     command: serverConfig.codexBin,
+@@ -100,6 +103,8 @@
+   }
+ 
+   stop(): void {
++    if (this.resourceMonitor) clearInterval(this.resourceMonitor);
++    this.resourceMonitor = null;
+     this.stopped = true;
+     this.proc?.kill();
+     this.proc = null;
+@@ -129,6 +134,10 @@
+ 
+   async request(method: string, params?: unknown, timeoutMs = 120_000): Promise<unknown> {
+     await this.start();
++    if (["turn/start", "thread/start", "thread/queue/start", "thread/queue/add"].includes(method)) {
++      const headroom = this.getMemoryHeadroom();
++      if (headroom !== null && headroom < 512 * 1024 * 1024) throw new AppError("memory_pressure", "运行资源不足，暂时无法开始新任务。", "memory_pressure: 运行时可用内存不足 512 MiB，已阻止新增任务。");
++    }
+     return this.sendRequest(method, params, timeoutMs);
+   }
+ 
+@@ -164,15 +173,17 @@
+         .split("\n").find(line => line.startsWith("0::"))?.slice(3);
+       if (!relative || !relative.includes(`/${this.launch.scope.unitPrefix}-`)) return 0;
+       const directory = path.join("/sys/fs/cgroup", relative);
+-      const limit = fs.readFileSync(path.join(directory, "memory.max"), "utf8").trim();
+-      if (limit === "max") return null;
+-      const current = Number(fs.readFileSync(path.join(directory, "memory.current"), "utf8").trim());
+-      const stats = fs.readFileSync(path.join(directory, "memory.stat"), "utf8");
+-      const inactiveFile = Number(stats.match(/^inactive_file (\d+)/m)?.[1] ?? 0);
+-      const dirtyFile = Number(stats.match(/^file_dirty (\d+)/m)?.[1] ?? 0)
+-        + Number(stats.match(/^file_writeback (\d+)/m)?.[1] ?? 0);
+-      const reclaimable = Math.min(current, Math.max(0, inactiveFile - dirtyFile));
+-      return Math.max(0, Number(limit) - current + reclaimable);
++      const budgets: number[] = [];
++      for (const group of [directory, path.dirname(directory)]) {
++        const limits = ["memory.high", "memory.max"].map(file => fs.readFileSync(path.join(group, file), "utf8").trim()).filter(value => value !== "max").map(Number);
++        if (!limits.length) continue;
++        const current = Number(fs.readFileSync(path.join(group, "memory.current"), "utf8").trim());
++        const stats = fs.readFileSync(path.join(group, "memory.stat"), "utf8");
++        const inactive = Number(stats.match(/^inactive_file (\d+)/m)?.[1] ?? 0);
++        const dirty = Number(stats.match(/^file_dirty (\d+)/m)?.[1] ?? 0) + Number(stats.match(/^file_writeback (\d+)/m)?.[1] ?? 0);
++        budgets.push(Math.max(0, Math.min(...limits) - current + Math.min(current, Math.max(0, inactive - dirty))));
++      }
++      return budgets.length ? Math.min(...budgets) : null;
+     } catch { return 0; } // Fail closed instead of risking a shared runtime OOM.
+   }
+ 
+@@ -207,6 +218,8 @@
+     });
+ 
+     proc.on("exit", (code, signal) => {
++      if (this.resourceMonitor) clearInterval(this.resourceMonitor);
++      this.resourceMonitor = null;
+       this.emit("status", { state: "exited", code, signal });
+       for (const pending of this.pending.values()) {
+         clearTimeout(pending.timer);
+@@ -232,6 +245,17 @@
+     });
+     this.notify("initialized", {});
+     this.emit("status", { state: "ready" });
++    if (this.launch.scope) {
++      this.pressureReported = false;
++      this.resourceMonitor = setInterval(() => {
++        const headroom = this.getMemoryHeadroom();
++        if (headroom !== null && headroom < 256 * 1024 * 1024 && !this.pressureReported) {
++          this.pressureReported = true;
++          this.emit("status", { state: "resource_pressure", message: "memory_pressure: 运行时可用内存低于 256 MiB，正在请求安全暂停当前轮次。" });
++        } else if (headroom === null || headroom > 512 * 1024 * 1024) this.pressureReported = false;
++      }, 5000);
++      this.resourceMonitor.unref?.();
++    }
+   }
+ 
+   private scheduleRestart(): void {
+@@ -309,6 +333,10 @@
+       return;
+     }
+ 
++    if (message.method === "serverRequest/resolved") {
++      const requestId = (message.params as { requestId?: number | string } | null)?.requestId;
++      if (requestId !== undefined) this.serverRequests.delete(requestId);
++    }
+     this.emit("notification", message);
+   }
+ 
+diff --git a/backend/server/db.ts b/backend/server/db.ts
+index c88a9f87f6b73aa673f7e3cafca3598b92d5d193..8e2dc9050a730708d3e19cbf52c944657db609ea 100644
+--- a/backend/server/db.ts
++++ b/backend/server/db.ts
+@@ -5,6 +5,7 @@
+ import { isLegacyGeneratedBranchPin } from "./branchContext.js";
+ import { defaults, serverConfig } from "./config.js";
+ import type { CreateProjectInput, LocalSendSettings, Project, ReasoningEffort, UpdateLocalSendSettingsInput, UpdateProjectInput, UserProfile } from "./types.js";
++import type { TurnRecoveryState } from "./turnRetry.js";
+ 
+ export const ADMIN_USER_ID = "admin";
+ export const DEFAULT_USER_ID = ADMIN_USER_ID;
+@@ -250,6 +251,9 @@
+       PRAGMA synchronous = NORMAL;
+     `);
+     this.migrate();
++    this.db.exec(`CREATE TABLE IF NOT EXISTS thread_recovery_state (
++      thread_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, state_json TEXT NOT NULL
++    )`);
+     this.db.exec(`CREATE TABLE IF NOT EXISTS conversation_timeline (
+       thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL,
+       item_json TEXT NOT NULL, PRIMARY KEY(thread_id, turn_id, item_id)
+@@ -635,6 +639,31 @@
+       createdAt: now,
+       updatedAt: now
+     };
++  }
++
++  getTurnRecoveryState(threadId: string): TurnRecoveryState | null {
++    const row = this.db.prepare(`SELECT s.state_json FROM thread_recovery_state s
++      JOIN thread_owners o ON o.thread_id=s.thread_id AND o.user_id=s.user_id WHERE s.thread_id=?`).get(threadId) as { state_json: string } | undefined;
++    return row ? JSON.parse(row.state_json) as TurnRecoveryState : null;
++  }
++
++  isThreadArchivedLocal(threadId: string, userId: string): boolean {
++    const row = this.db.prepare("SELECT is_archived_local FROM thread_owners WHERE thread_id=? AND user_id=?").get(threadId, userId) as { is_archived_local: number } | undefined;
++    return !row || row.is_archived_local === 1;
++  }
++
++  listTurnRecoveryStates(userId?: string): TurnRecoveryState[] {
++    const rows = this.db.prepare(`SELECT s.state_json FROM thread_recovery_state s
++      JOIN thread_owners o ON o.thread_id=s.thread_id AND o.user_id=s.user_id
++      WHERE (? IS NULL OR s.user_id=?)`).all(userId ?? null, userId ?? null) as Array<{ state_json: string }>;
++    return rows.map(row => JSON.parse(row.state_json) as TurnRecoveryState);
++  }
++
++  setTurnRecoveryState(state: TurnRecoveryState): void {
++    if (this.getThreadOwner(state.threadId)?.userId !== state.userId) throw new Error("会话不属于当前用户。");
++    this.db.prepare(`INSERT INTO thread_recovery_state(thread_id,user_id,state_json) VALUES(?,?,?)
++      ON CONFLICT(thread_id) DO UPDATE SET user_id=excluded.user_id,state_json=excluded.state_json`)
++      .run(state.threadId, state.userId, JSON.stringify(state));
+   }
+ 
+   touchThreadOwner(threadId: string): void {
+diff --git a/backend/server/internalUserMessage.ts b/backend/server/internalUserMessage.ts
+index d5f70d3091f471aebbfd06eb240508ada2b5da9a..8c88f07984159eff3f44ce361e91479d6b96a39f 100644
+--- a/backend/server/internalUserMessage.ts
++++ b/backend/server/internalUserMessage.ts
+@@ -5,6 +5,7 @@
+   return text.startsWith("<environment_context>")
+     || text.startsWith("<codex_internal_context_recovery>")
+     || text.startsWith("<codex_internal_continuation_recovery>")
++    || text.startsWith("<codex_internal_retry>")
+     || text.startsWith("<recommended_plugins>")
+     || text.startsWith("<permissions instructions>")
+     || text.startsWith("<app-context>")
+diff --git a/backend/server/socket.ts b/backend/server/socket.ts
+index 4b5743886eca878607cddf46761e796f427d7219..ff403541dc8cba87ab144c5860a14b30cad0324f 100644
+--- a/backend/server/socket.ts
++++ b/backend/server/socket.ts
+@@ -11,6 +11,9 @@
+ import { authenticatedUserFromHeaders } from "./auth.js";
+ import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
+ import { LiveStateStore } from "./liveState.js";
++import { isUserInputRequest, validateUserInputResponse } from "./userInput.js";
++import { AppError } from "./appErrors.js";
++import { TurnRetryQueue, publicRecovery } from "./turnRetry.js";
+ import { notificationIsContextCompaction, RawCompactFilter } from "./rawNotificationFilter.js";
+ import { journalItem } from "./timelineJournal.js";
+ import { RequestDeduper } from "./requestDeduper.js";
+@@ -87,6 +90,7 @@
+   /** Turns created for a real user task, as opposed to maintenance compaction. */
+   recoverableTurnIds: Set<string>;
+   disconnectedThreads: Set<string>;
++  retries?: TurnRetryQueue;
+ };
+ 
+ function send(ws: WebSocket, message: SocketServerMessage): void {
+@@ -223,9 +227,11 @@
+ }
+ 
+ function requestedCollaborationMode(value: unknown, model: string, reasoningEffort: string) {
+-  if (value === undefined || value === "default") return undefined;
+-  if (value !== "plan") throw new Error("Invalid collaboration mode.");
+-  return { mode: "plan", settings: { model, reasoning_effort: reasoningEffort } };
++  if (value === undefined) return undefined;
++  if (value !== "plan" && value !== "default") throw new Error("Invalid collaboration mode.");
++  // Omitting a mode inherits the thread's previous setting. Turning Plan off
++  // must explicitly select Default, including its built-in instructions.
++  return { mode: value, settings: { model, reasoning_effort: reasoningEffort, developer_instructions: null } };
+ }
+ 
+ function sessionUserIdFromHeaders(headers: Record<string, unknown> | IncomingHttpHeaders): string | null {
+@@ -404,7 +410,7 @@
+ }
+ 
+ function watchdogState(turn: WatchdogTurn): string {
+-  return turn.phase === "waiting_approval" || turn.phase === "waiting_subagents" ? turn.phase : "no_progress";
++  return turn.phase === "waiting_approval" || turn.phase === "waiting_user_input" || turn.phase === "waiting_subagents" ? turn.phase : "no_progress";
+ }
+ 
+ function changesFromTurnDiff(diff: string): Array<{ path: string; kind: string; diff: string }> {
+@@ -512,8 +518,35 @@
+     disconnectedThreads: new Set()
+   };
+   const turnWatchdog = new TurnWatchdog();
++  const resourceStops = new Map<string, AppError>();
++  let socketServerClosed = false;
++  const retries = new TurnRetryQueue(store, {
++    busy: threadId => guards.activeTurnsByThread.has(threadId) || guards.startingThreads.has(threadId),
++    changed: state => sendToUser(wss, state.userId, { type: "turn.recovery", data: publicRecovery(state) }),
++    start: async state => {
++      if (!state.template || guards.activeTurnsByThread.has(state.threadId)) return null;
++      guards.startingThreads.add(state.threadId);
++      try {
++        const native = await bridge.request("thread/read", { threadId: state.threadId, includeTurns: false }) as { thread?: { status?: { type?: string } } };
++        if (!["idle", "systemError", "notLoaded"].includes(String(native.thread?.status?.type))) throw new AppError("retry_state_unknown", "会话仍在运行或等待输入，自动重试已暂停。");
++        await assertTrackedUserQuotaAvailable(bridge, store, state.userId, state.threadId);
++        const execution = store.getThreadExecutionSettings(state.threadId, state.userId);
++        await bridge.request("thread/resume", { threadId: state.threadId, cwd: state.template.cwd, model: state.template.model,
++          config: state.template.config, sandbox: execution?.sandbox, approvalPolicy: execution?.approvalPolicy }, 30_000);
++        if (!retries.isCurrent(state) || guards.activeTurnsByThread.has(state.threadId)) return null;
++        const result = await bridge.request("turn/start", { ...state.template, threadId: state.threadId,
++          input: state.job?.resumeOriginal ? state.template.input : textInput("<codex_internal_retry>上一轮因模型服务过载而结束。请在当前会话继续尚未完成的原任务，沿用原始指令、授权范围和已完成步骤。先核对已有结果，避免重复执行成功的操作；不要重新开始整个任务，也不要更换模型。</codex_internal_retry>") });
++        rememberAcceptedTurn(guards, state.threadId, `retry:${state.job!.id}`, result);
++        store.touchThreadOwner(state.threadId);
++        return turnIdFromStartResult(result);
++      } finally { guards.startingThreads.delete(state.threadId); }
++    }
++  });
++  guards.retries = retries;
++  wss.on("close", () => { socketServerClosed = true; retries.close(); });
+   const startingQueuedThreads = new Set<string>();
+   const startNextQueuedTurn = async (owner: string, threadId: string): Promise<void> => {
++    if (socketServerClosed || retries.pending(threadId)) return;
+     if (startingQueuedThreads.has(threadId) || guards.activeTurnsByThread.has(threadId) || guards.startingThreads.has(threadId)) return;
+     startingQueuedThreads.add(threadId);
+     try {
+@@ -522,6 +555,8 @@
+       };
+       const queuedSubmissionId = queued.data?.[0]?.id;
+       if (!queuedSubmissionId || guards.activeTurnsByThread.has(threadId)) return;
++      const savedTemplate = store.getTurnRecoveryState(threadId)?.template;
++      if (savedTemplate) retries.watch(owner, threadId, savedTemplate);
+       await assertTrackedUserQuotaAvailable(bridge, store, owner, threadId);
+       const execution = executionSettingsOverrides(store.getThreadExecutionSettings(threadId, owner));
+       if (execution) {
+@@ -672,6 +707,18 @@
+     }
+     const threadIdForWatchdog = notificationThreadId(message);
+     const accountId = notificationAccountId(message);
++    if (message.method === "serverRequest/resolved") {
++      const requestId = asRecord(message.params).requestId as number | string | undefined;
++      if (requestId !== undefined && pendingApprovalOwners.get(requestId) === owner) {
++        pendingApprovalOwners.delete(requestId);
++        const pending = pendingApprovalTurns.get(requestId);
++        pendingApprovalTurns.delete(requestId);
++        if (pending) {
++          const progress = turnWatchdog.progress(pending.userId, pending.accountId, pending.threadId, pending.turnId ?? "", "serverRequest/resolved");
++          if (progress) sendTurnProgress(progress.turn, "active");
++        }
++      }
++    }
+     if (threadIdForWatchdog && message.method === "turn/completed") {
+       const completedTurn = asRecord(asRecord(message.params).turn);
+       const status = completedTurn.status;
+@@ -685,6 +732,7 @@
+       }
+     }
+     if (turnId && threadIdForWatchdog && message.method === "turn/started") {
++      retries.started(threadIdForWatchdog, turnId);
+       turnWatchdog.start(owner, accountId, threadIdForWatchdog, turnId);
+     }
+     const progressMethod = meaningfulTurnProgressMethod(message);
+@@ -829,6 +877,12 @@
+         && isPlanOnlyContinuationReply(latestAgentText)
+         && !hasToolAfterLatestAgent;
+       const runtimeExited = asRecord(message.params).runtimeExited === true;
++      const nativeError = resourceStops.get(turnId) ?? asRecord(asRecord(message.params).turn).error;
++      resourceStops.delete(turnId);
++      if (completedThreadId && nativeError) retries.failed(owner, completedThreadId, turnId, nativeError,
++        guards.recoverableTurnIds.has(turnId) || retries.pending(completedThreadId));
++      else if (completedThreadId && turnStatus === "completed") retries.completed(completedThreadId, turnId);
++      else if (completedThreadId && turnStatus === "interrupted") retries.cancel(owner, completedThreadId);
+       const needsRecovery = !runtimeExited && (needsFallbackRecovery || needsPlanContinuation);
+       if (completedThreadId) {
+         for (const item of completedItems) {
+@@ -890,7 +944,7 @@
+   const runWatchdogProbe = async (claim: WatchdogProbeClaim): Promise<void> => {
+     const turn = claim.turn;
+     if (claim.shouldDiagnose) {
+-      const phase = turn.phase === "waiting_approval" || turn.phase === "waiting_subagents" ? turn.phase : "no_progress";
++      const phase = watchdogState(turn);
+       console.warn("[turn.watchdog.no_progress]", JSON.stringify({
+         userId: turn.userId,
+         accountId: turn.accountId,
+@@ -917,6 +971,10 @@
+       const flags = flagsRaw.map((flag) => typeof flag === "string" ? flag : pickString(asRecord(flag).type ?? asRecord(flag).name ?? asRecord(flag).flag)).filter(Boolean);
+       const resolved = turnWatchdog.resolveProbe(turn.userId, turn.accountId, turn.threadId, turn.turnId, claim.token, statusName, flags);
+       if (!resolved) return; // A newer turn replaced this probe while it was in flight.
++      if (bridge.getPendingServerRequests().some(request => isUserInputRequest(request.method)
++        && notificationThreadId(request as RpcEnvelope) === turn.threadId && notificationTurnId(request as RpcEnvelope) === turn.turnId)) {
++        turnWatchdog.setPhase(turn.userId, turn.accountId, turn.threadId, turn.turnId, "waiting_user_input");
++      }
+       const liveTurn = liveStateFor(turn.userId).snapshot().toolItems
+         .find((item) => item.threadId === turn.threadId && item.turnId === turn.turnId && !item.completed);
+       if (liveTurn && resolved.turn.phase === "running") {
+@@ -947,15 +1005,17 @@
+   bridge.on("serverRequest", (request) => {
+     const owner = ownerForEnvelope(request as RpcEnvelope);
+     if (owner) {
+-      if (request.id !== undefined && (request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")) {
++      if (request.id !== undefined && (isUserInputRequest(request.method) || request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")) {
+         pendingApprovalOwners.set(request.id, owner);
+         const threadId = notificationThreadId(request as RpcEnvelope);
+         if (threadId) {
+           const turnId = notificationTurnId(request as RpcEnvelope);
+           const accountId = notificationAccountId(request as RpcEnvelope);
+           pendingApprovalTurns.set(request.id, { userId: owner, accountId, threadId, turnId });
+-          turnWatchdog.setPhase(owner, accountId, threadId, turnId, "waiting_approval");
+-          void sendUserPush(store, owner, {
++          const phase = isUserInputRequest(request.method) ? "waiting_user_input" : "waiting_approval";
++          const waiting = turnWatchdog.setPhase(owner, accountId, threadId, turnId, phase);
++          if (waiting) sendTurnProgress(waiting, phase);
++          if (!isUserInputRequest(request.method)) void sendUserPush(store, owner, {
+             type: "approval",
+             threadId,
+             projectId: store.getThreadOwner(threadId)?.projectId,
+@@ -970,6 +1030,14 @@
+ 
+   bridge.on("status", (status) => {
+     const statusRecord = asRecord(status);
++    if (statusRecord.state === "resource_pressure") {
++      for (const turn of turnWatchdog.activeForAccount(stringOrNull(statusRecord.accountId))) {
++        const error = new AppError("memory_pressure", "运行资源不足，任务已暂停。请稍后继续。", pickString(statusRecord.message));
++        resourceStops.set(turn.turnId, error);
++        void bridge.request("turn/interrupt", { threadId: turn.threadId, turnId: turn.turnId }, 10_000)
++          .catch(error => retries.failed(turn.userId, turn.threadId, turn.turnId, error, false));
++      }
++    }
+     if (statusRecord.state === "exited") {
+       const accountId = stringOrNull(statusRecord.accountId);
+       for (const turn of turnWatchdog.activeForAccount(accountId)) {
+@@ -995,7 +1063,7 @@
+           params: {
+             threadId: turn.threadId,
+             turnId: turn.turnId,
+-            turn: { id: turn.turnId, status: "interrupted" },
++            turn: { id: turn.turnId, status: "interrupted", error: { code: "runtime_terminated", message: `Codex 运行进程退出（信号 ${String(statusRecord.signal ?? "unknown")}，退出码 ${String(statusRecord.code ?? "unknown")}）。` } },
+             runtimeExited: true
+           }
+         } as RpcEnvelope);
+@@ -1025,13 +1093,17 @@
+       data: {
+         pendingServerRequests: bridge.getPendingServerRequests().filter((pending) => pendingApprovalOwners.get(pending.id) === sessionUserId),
+         liveState: liveStateFor(sessionUserId).snapshot(),
++        turnRecoveries: retries.snapshot(sessionUserId),
+         turnProgress: turnWatchdog.diagnosedForUser(sessionUserId)
+           .map((turn) => watchdogProgressData(turn, watchdogState(turn)))
+       }
+     });
+ 
+     ws.on("message", (raw) => {
+-      void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission, browserService);
++      void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission, (requestId) => {
++        const pending = pendingApprovalTurns.get(requestId);
++        if (pending) processBridgeNotification({ method: "serverRequest/resolved", accountId: pending.accountId, params: { threadId: pending.threadId, requestId } } as RpcEnvelope);
++      }, browserService);
+     });
+     ws.on("close", () => {
+       for (const [processId, socket] of processSockets) {
+@@ -1062,6 +1134,7 @@
+   raw: string,
+   startNextQueuedTurn: (owner: string, threadId: string) => Promise<void>,
+   steerQueuedSubmission: (owner: string, threadId: string, expectedTurnId: string, queuedSubmissionId: string) => Promise<unknown>,
++  onServerRequestResolved: (requestId: number | string) => void,
+   browserService?: BrowserService
+ ): Promise<void> {
+   let message: SocketClientMessage;
+@@ -1075,6 +1148,17 @@
+   const requestId = message.requestId ?? randomUUID();
+   try {
+     switch (message.type) {
++      case "turn.retry.cancel":
++      case "turn.retry.now":
++      case "turn.error.dismiss": {
++        const threadId = pickString(message.threadId);
++        assertThreadOwnedBy(store, threadId, sessionUserId);
++        if (message.type === "turn.retry.now") guards.retries?.retryNow(sessionUserId, threadId);
++        else guards.retries?.cancel(sessionUserId, threadId, message.type === "turn.error.dismiss");
++        send(ws, { type: "ack", requestId, ok: true });
++        if (message.type === "turn.retry.cancel") setTimeout(() => void startNextQueuedTurn(sessionUserId, threadId), 0);
++        break;
++      }
+       case "transport.ping": {
+         send(ws, { type: "transport.pong", ok: true });
+         break;
+@@ -1163,7 +1247,7 @@
+             void bridge.request("thread/name/set", { threadId, name: autoTitle }).catch((error) => {
+               console.warn("Native Codex automatic thread title failed", error);
+             });
+-            const turn = await bridge.request("turn/start", {
++            const turnParams = {
+               threadId,
+               input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames, message.documentReference),
+               collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
+@@ -1176,7 +1260,15 @@
+                 ...threadTurnContextConfigOverrides(requestedContextConfig),
+                 ...await scopedHookTrustConfig(bridge, store, sessionUserId, project, threadId)
+               }
+-            });
++            };
++            guards.retries?.watch(sessionUserId, threadId, turnParams);
++            let turn: unknown;
++            try { turn = await bridge.request("turn/start", turnParams); }
++            catch (error) {
++              guards.retries?.failed(sessionUserId, threadId, `pending:${requestId}`, error, true, false);
++              if (AppError.from(error).retryable && guards.retries?.pending(threadId)) return { thread, queuedForRetry: true };
++              throw error;
++            }
+             rememberAcceptedTurn(guards, threadId, requestId, turn);
+             store.touchThreadOwner(threadId);
+             return { thread, turn };
+@@ -1213,6 +1305,7 @@
+           reasoningEffort,
+           async () => {
+             assertNoActiveTurn(guards, threadId);
++            guards.retries?.cancel(sessionUserId, threadId);
+             guards.startingThreads.add(threadId);
+             try {
+               const contextConfig = store.getThreadContextConfig(threadId, sessionUserId)
+@@ -1235,7 +1328,7 @@
+                   : undefined
+               }, 30_000);
+               store.setThreadExecutionSettings(threadId, sessionUserId, executionSandbox, executionApproval);
+-              const turn = await bridge.request("turn/start", {
++              const turnParams = {
+                 threadId,
+                 input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames, message.documentReference),
+                 collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
+@@ -1248,7 +1341,9 @@
+                   ...threadTurnContextConfigOverrides(contextConfig, contextWindowMeasuredForConfig(contextConfig, contextUsage)),
+                   ...await scopedHookTrustConfig(bridge, store, sessionUserId, project, threadId)
+                 }
+-              }, 30_000);
++              };
++              guards.retries?.watch(sessionUserId, threadId, turnParams);
++              const turn = await bridge.request("turn/start", turnParams, 30_000);
+               rememberAcceptedTurn(guards, threadId, requestId, turn);
+               if (!owner?.modelOverride || !owner.reasoningEffortOverride) {
+                 store.setThreadModelConfig(threadId, sessionUserId, model, reasoningEffort);
+@@ -1301,6 +1396,7 @@
+         const prompt = pickString(message.prompt).trim();
+         if (!threadId || !prompt) throw new Error("threadId and prompt are required.");
+         assertThreadOwnedBy(store, threadId, sessionUserId);
++        guards.retries?.cancel(sessionUserId, threadId);
+         if (message.sandbox !== undefined || message.approvalPolicy !== undefined) {
+           const owner = store.getThreadOwner(threadId)!;
+           const project = store.getProject(owner.projectId, sessionUserId);
+@@ -1390,6 +1486,7 @@
+           throw new Error("threadId and turnId are required.");
+         }
+         assertThreadOwnedBy(store, threadId, sessionUserId);
++        guards.retries?.cancel(sessionUserId, threadId);
+         const result = await guards.requestDeduper.run(
+           { userId: sessionUserId, requestId },
+           async () => {
+@@ -1625,21 +1722,25 @@
+         break;
+       }
+ 
++      case "userInput.respond":
+       case "approval.respond": {
+         const responseId = message.codexRequestId as number | string | undefined;
+         if (responseId === undefined) {
+           throw new Error("codexRequestId is required.");
+         }
+         if (pendingApprovalOwners.get(responseId) !== sessionUserId) {
+-          throw new Error("This approval does not belong to the logged-in user.");
+-        }
+-        bridge.respondToServerRequest(responseId, message.result);
+-        pendingApprovalOwners.delete(responseId);
+-        const approvalTurn = pendingApprovalTurns.get(responseId);
+-        pendingApprovalTurns.delete(responseId);
+-        if (approvalTurn) {
+-          turnWatchdog.setPhase(approvalTurn.userId, approvalTurn.accountId, approvalTurn.threadId, approvalTurn.turnId, "running");
+-        }
++          throw new Error("该请求已结束或不属于当前登录用户，请刷新会话。");
++        }
++        const pending = bridge.getPendingServerRequests().find(request => request.id === responseId);
++        if (!pending || isUserInputRequest(pending.method) !== (message.type === "userInput.respond")) {
++          throw new Error("该请求已结束或回答方式不匹配，请刷新会话。");
++        }
++        if (message.type === "userInput.respond" && message.threadId !== notificationThreadId(pending as RpcEnvelope)) {
++          throw new Error("答案与当前会话不匹配，请刷新会话。");
++        }
++        const result = message.type === "userInput.respond" ? validateUserInputResponse(pending.params, message.result) : message.result;
++        bridge.respondToServerRequest(responseId, result);
++        onServerRequestResolved(responseId);
+         send(ws, { type: "ack", requestId, ok: true });
+         break;
+       }
+@@ -1648,6 +1749,14 @@
+         throw new Error(`Unsupported socket message type: ${message.type}`);
+     }
+   } catch (error) {
++    const applicationError = AppError.from(error);
++    const threadId = pickString(message.threadId);
++    if (message.type === "turn.start" && threadId && store.getThreadOwner(threadId)?.userId === sessionUserId && !guards.activeTurnsByThread.has(threadId)) {
++      guards.retries?.failed(sessionUserId, threadId, `pending:${requestId}`, applicationError, true, false);
++      if (applicationError.retryable && guards.retries?.pending(threadId)) {
++        send(ws, { type: "ack", requestId, ok: true, data: { queuedForRetry: true } }); return;
++      }
++    }
+     console.error("[socket.ack.error]", JSON.stringify({
+       userId: sessionUserId,
+       type: message.type,
+@@ -1659,7 +1768,8 @@
+       type: "ack",
+       requestId,
+       ok: false,
+-      error: error instanceof Error ? error.message : String(error)
++      error: applicationError.toPublic().originalMessage,
++      data: { appError: applicationError.toPublic() }
+     });
+   }
+ }
+diff --git a/backend/server/socketCollaborationMode.test.ts b/backend/server/socketCollaborationMode.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..90137e92e42d402ee06f28081db9dec7f7d89b8d
+--- /dev/null
++++ b/backend/server/socketCollaborationMode.test.ts
+@@ -0,0 +1,79 @@
++import { EventEmitter } from "node:events";
++import http from "node:http";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { describe, expect, it } from "vitest";
++import WebSocket from "ws";
++import { createSessionCookie } from "./auth.js";
++import type { CodexBridge } from "./codexBridge.js";
++import { ProjectStore } from "./db.js";
++import { attachSocketServer } from "./socket.js";
++
++class StickyModeBridge extends EventEmitter {
++  mode: string = "default";
++  turns: Array<{ mode: string; settings: unknown }> = [];
++  getPendingServerRequests() { return []; }
++  async request(method: string, params: any) {
++    if (method === "turn/start") {
++      if (params.collaborationMode) this.mode = params.collaborationMode.mode;
++      this.turns.push({ mode: this.mode, settings: params.collaborationMode?.settings });
++      return { turn: { id: `turn-${this.turns.length}` } };
++    }
++    return {};
++  }
++  complete() {
++    this.emit("notification", { method: "turn/completed", params: { threadId: "mode-thread", turn: { id: `turn-${this.turns.length}`, status: "completed", items: [] } } });
++  }
++}
++
++async function connect(port: number) {
++  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { cookie: createSessionCookie("admin") } });
++  const messages: any[] = [];
++  socket.on("message", raw => messages.push(JSON.parse(String(raw))));
++  const wait = (predicate: (message: any) => boolean) => new Promise<any>((resolve, reject) => {
++    const existing = messages.find(predicate); if (existing) return resolve(existing);
++    const timeout = setTimeout(() => { socket.off("message", listener); reject(new Error("mode socket timeout")); }, 5_000);
++    const listener = (raw: WebSocket.RawData) => {
++      const message = JSON.parse(String(raw));
++      if (predicate(message)) { clearTimeout(timeout); socket.off("message", listener); resolve(message); }
++    };
++    socket.on("message", listener);
++  });
++  await wait(message => message.type === "hello");
++  return { socket, wait };
++}
++
++describe("leaving native Plan mode", () => {
++  it("switches a sticky native thread to Default after reconnect, preserves its model, and allows re-entering Plan", async () => {
++    const root = fs.mkdtempSync(path.join(os.tmpdir(), "socket-mode-"));
++    const store = new ProjectStore(path.join(root, "store.sqlite"));
++    const project = store.createProject({ name: "mode", rootPath: root, defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "max" });
++    store.registerThreadOwner({ threadId: "mode-thread", userId: "admin", projectId: project.id, rootPath: root });
++    const bridge = new StickyModeBridge(), server = http.createServer();
++    const wss = attachSocketServer(server, bridge as unknown as CodexBridge, store);
++    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
++    const sockets: WebSocket[] = [];
++    try {
++      let client = await connect((server.address() as { port: number }).port); sockets.push(client.socket);
++      for (const [index, mode] of ["plan", "default", "plan"].entries()) {
++        if (index === 1) {
++          client.socket.terminate();
++          client = await connect((server.address() as { port: number }).port); sockets.push(client.socket);
++        }
++        const requestId = `mode-${index}`;
++        client.socket.send(JSON.stringify({ type: "turn.start", requestId, threadId: "mode-thread", projectId: project.id, collaborationMode: mode, prompt: `mode change ${index}` }));
++        const ack = await client.wait(message => message.requestId === requestId);
++        expect(ack.ok, ack.error).toBe(true);
++        expect(bridge.mode).toBe(mode);
++        expect(bridge.turns[index].settings).toEqual({ model: "gpt-6.1-sol", reasoning_effort: "max", developer_instructions: null });
++        bridge.complete();
++      }
++      expect(bridge.turns.map(turn => turn.mode)).toEqual(["plan", "default", "plan"]);
++    } finally {
++      sockets.forEach(socket => socket.terminate());
++      await new Promise<void>(resolve => wss.close(() => server.close(() => resolve())));
++      store.close(); fs.rmSync(root, { recursive: true, force: true });
++    }
++  });
++});
+diff --git a/backend/server/socketRetry.test.ts b/backend/server/socketRetry.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba4d80136d8a4d92c3d60103293a35b5ae6220a4
+--- /dev/null
++++ b/backend/server/socketRetry.test.ts
+@@ -0,0 +1,100 @@
++import { EventEmitter } from "node:events";
++import http from "node:http";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { describe, expect, it, vi } from "vitest";
++import WebSocket from "ws";
++import { createSessionCookie } from "./auth.js";
++import type { CodexBridge } from "./codexBridge.js";
++import { ProjectStore } from "./db.js";
++import { attachSocketServer } from "./socket.js";
++
++type Message = { type: string; requestId?: string; ok?: boolean; data?: any };
++class FakeBridge extends EventEmitter {
++  pending: Array<{ id: number; method: string; params: unknown; receivedAt: string }> = [];
++  responses: Array<{ id: number | string; result: unknown }> = [];
++  calls: string[] = [];
++  getPendingServerRequests() { return this.pending; }
++  respondToServerRequest(id: number | string, result: unknown) {
++    this.responses.push({ id, result });
++    this.pending = this.pending.filter(request => request.id !== id);
++  }
++  parameters: Array<{ method: string; params: any }> = [];
++  rejectNextStart = false;
++  async request(method: string, params: any = {}) {
++    this.calls.push(method); this.parameters.push({ method, params });
++    if (method === "thread/read") return { thread: { status: { type: "idle" } } };
++    if (method === "thread/queue/list") return { data: [] };
++    if (method === "turn/start" && this.rejectNextStart) { this.rejectNextStart = false; throw { message: "Selected model is at capacity.", codexErrorInfo: "server_overloaded" }; }
++    if (method === "turn/start") return { turn: { id: "turn-" + this.parameters.filter(row => row.method === method).length } };
++    return {};
++  }
++}
++
++async function client(port: number, user: string) {
++  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { cookie: createSessionCookie(user) } });
++  const messages: Message[] = [];
++  socket.on("message", raw => messages.push(JSON.parse(raw.toString())));
++  const wait = (predicate: (message: Message) => boolean): Promise<Message> => {
++    const existing = messages.find(predicate);
++    if (existing) return Promise.resolve(existing);
++    return new Promise((resolve, reject) => {
++      const timer = setTimeout(() => { socket.off("message", receive); reject(new Error("Socket message timed out")); }, 2_000);
++      const receive = (raw: WebSocket.RawData) => {
++        const message = JSON.parse(raw.toString());
++        if (!predicate(message)) return;
++        clearTimeout(timer); socket.off("message", receive); resolve(message);
++      };
++      socket.on("message", receive);
++    });
++  };
++  await wait(message => message.type === "hello");
++  return { socket, messages, wait, send: (message: unknown) => socket.send(JSON.stringify(message)) };
++}
++
++describe("socket overload recovery", () => {
++  it("reconnects with error details, scopes controls to the owner, and resumes the same task once", async () => {
++    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "socket-retry-"));
++    const store = new ProjectStore(path.join(temporary, "store.sqlite"));
++    const project = store.createProject({ name: "test", rootPath: temporary, defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "max" });
++    store.registerThreadOwner({ threadId: "thread-a", userId: "admin", projectId: project.id, rootPath: temporary });
++    store.ensureUser("other", "other");
++    const bridge = new FakeBridge(), server = http.createServer(), wss = attachSocketServer(server, bridge as unknown as CodexBridge, store);
++    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
++    const port = (server.address() as { port: number }).port, sockets: WebSocket[] = [];
++    try {
++      const first = await client(port, "admin"); sockets.push(first.socket);
++      first.send({ type: "turn.start", requestId: "original", projectId: project.id, threadId: "thread-a", prompt: "private original task", collaborationMode: "default" });
++      expect((await first.wait(message => message.requestId === "original")).ok).toBe(true);
++      bridge.emit("notification", { method: "turn/completed", params: { threadId: "thread-a", turn: { id: "turn-1", status: "failed", error: { message: "Selected model is at capacity. Please try a different model.", codexErrorInfo: "server_overloaded" } } } });
++      const pending = await first.wait(message => message.type === "turn.recovery" && message.data?.job?.status === "waiting");
++      expect(pending.data.error.code).toBe("model_overloaded"); expect(pending.data.job.nextRetryAt - Date.now()).toBeGreaterThan(58_000);
++      const restored = await client(port, "admin"); sockets.push(restored.socket);
++      const hello = await restored.wait(message => message.type === "hello"); expect(hello.data.turnRecoveries[0].error.originalMessage).toContain("at capacity");
++      expect(JSON.stringify(hello.data.turnRecoveries)).not.toContain("private original task");
++      const foreign = await client(port, "other"); sockets.push(foreign.socket);
++      expect((await foreign.wait(message => message.type === "hello")).data.turnRecoveries).toEqual([]);
++      foreign.send({ type: "turn.retry.cancel", requestId: "foreign", threadId: "thread-a" }); expect((await foreign.wait(message => message.requestId === "foreign")).ok).toBe(false);
++      restored.send({ type: "turn.retry.now", requestId: "now", threadId: "thread-a" }); expect((await restored.wait(message => message.requestId === "now")).ok).toBe(true);
++      await vi.waitFor(() => expect(bridge.calls.filter(method => method === "turn/start")).toHaveLength(2));
++      const retry = bridge.parameters.filter(row => row.method === "turn/start")[1].params;
++      expect(retry.model).toBe("gpt-6.1-sol"); expect(retry.effort).toBe("max"); expect(retry.collaborationMode.mode).toBe("default");
++      expect(JSON.stringify(retry.input)).toContain("<codex_internal_retry>"); expect(JSON.stringify(retry.input)).not.toContain("private original task");
++      bridge.emit("notification", { method: "turn/completed", params: { threadId: "thread-a", turn: { id: "turn-2", status: "completed" } } });
++      await vi.waitFor(() => expect(store.getTurnRecoveryState("thread-a")?.job).toBeNull());
++      expect(bridge.calls.filter(method => method === "turn/start")).toHaveLength(2);
++      bridge.rejectNextStart = true;
++      first.send({ type: "turn.start", requestId: "rejected-start", projectId: project.id, threadId: "thread-a", prompt: "new task never accepted", collaborationMode: "default" });
++      const queued = await first.wait(message => message.requestId === "rejected-start"); expect(queued.ok).toBe(true); expect(queued.data.queuedForRetry).toBe(true);
++      first.send({ type: "turn.retry.now", requestId: "now-original", threadId: "thread-a" });
++      await vi.waitFor(() => expect(bridge.calls.filter(method => method === "turn/start")).toHaveLength(4));
++      const resumed = bridge.parameters.filter(row => row.method === "turn/start")[3].params;
++      expect(JSON.stringify(resumed.input)).toContain("new task never accepted"); expect(JSON.stringify(resumed.input)).not.toContain("<codex_internal_retry>");
++      await vi.waitFor(() => expect(store.getTurnRecoveryState("thread-a")?.job?.activeTurnId).toBe("turn-4"));
++    } finally {
++      vi.restoreAllMocks(); sockets.forEach(socket => socket.terminate());
++      await new Promise<void>(resolve => wss.close(() => server.close(() => resolve()))); store.close(); fs.rmSync(temporary, { recursive: true, force: true });
++    }
++  });
++});
+diff --git a/backend/server/socketUserInput.test.ts b/backend/server/socketUserInput.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..370e534cf31e986b7b5ea9a8d0efe492ec74ae47
+--- /dev/null
++++ b/backend/server/socketUserInput.test.ts
+@@ -0,0 +1,108 @@
++import { EventEmitter } from "node:events";
++import http from "node:http";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { describe, expect, it, vi } from "vitest";
++import WebSocket from "ws";
++import { createSessionCookie } from "./auth.js";
++import type { CodexBridge } from "./codexBridge.js";
++import { ProjectStore } from "./db.js";
++import { attachSocketServer } from "./socket.js";
++
++type Message = { type: string; requestId?: string; ok?: boolean; data?: any };
++class FakeBridge extends EventEmitter {
++  pending: Array<{ id: number; method: string; params: unknown; receivedAt: string }> = [];
++  responses: Array<{ id: number | string; result: unknown }> = [];
++  calls: string[] = [];
++  getPendingServerRequests() { return this.pending; }
++  respondToServerRequest(id: number | string, result: unknown) {
++    this.responses.push({ id, result });
++    this.pending = this.pending.filter(request => request.id !== id);
++  }
++  async request(method: string) { this.calls.push(method); return {}; }
++}
++
++async function client(port: number, user: string) {
++  const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`, { headers: { cookie: createSessionCookie(user) } });
++  const messages: Message[] = [];
++  socket.on("message", raw => messages.push(JSON.parse(raw.toString())));
++  const wait = (predicate: (message: Message) => boolean): Promise<Message> => {
++    const existing = messages.find(predicate);
++    if (existing) return Promise.resolve(existing);
++    return new Promise((resolve, reject) => {
++      const timer = setTimeout(() => { socket.off("message", receive); reject(new Error("Socket message timed out")); }, 2_000);
++      const receive = (raw: WebSocket.RawData) => {
++        const message = JSON.parse(raw.toString());
++        if (!predicate(message)) return;
++        clearTimeout(timer); socket.off("message", receive); resolve(message);
++      };
++      socket.on("message", receive);
++    });
++  };
++  await wait(message => message.type === "hello");
++  return { socket, messages, wait, send: (message: unknown) => socket.send(JSON.stringify(message)) };
++}
++
++describe("native question answers over the socket", () => {
++  it("keeps late questions on reconnect, routes all answers to the original tool, and rejects foreign or stale replies", async () => {
++    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "socket-user-input-"));
++    const store = new ProjectStore(path.join(temporary, "store.sqlite"));
++    const project = store.createProject({ name: "test", rootPath: temporary });
++    store.registerThreadOwner({ threadId: "thread-a", userId: "admin", projectId: project.id, rootPath: temporary });
++    store.ensureUser("other", "other");
++    const bridge = new FakeBridge();
++    const server = http.createServer();
++    const wss = attachSocketServer(server, bridge as unknown as CodexBridge, store);
++    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
++    const port = (server.address() as { port: number }).port;
++    const sockets: WebSocket[] = [];
++    try {
++      const first = await client(port, "admin"); sockets.push(first.socket);
++      bridge.emit("notification", { method: "turn/started", accountId: "account-a", params: { threadId: "thread-a", turnId: "turn-a", turn: { id: "turn-a" } } });
++      const params = { threadId: "thread-a", turnId: "turn-a", itemId: "call-q", isBlocking: true, questions: [
++        { id: "robot", header: "机器人", question: "选择范围", options: [{ label: "A", description: "A" }] },
++        { id: "camera", header: "相机", question: "选择范围", options: null }
++      ] };
++      const pending = { id: 17, method: "item/tool/requestUserInput", params, receivedAt: new Date().toISOString() };
++      bridge.pending.push(pending);
++      bridge.emit("serverRequest", { ...pending, accountId: "account-a" });
++      expect((await first.wait(message => message.type === "turn.progress" && message.data?.state === "waiting_user_input")).data.threadId).toBe("thread-a");
++      const now = Date.now();
++      const clock = vi.spyOn(Date, "now").mockReturnValue(now + 30 * 60_000);
++      const restored = await client(port, "admin"); sockets.push(restored.socket);
++      expect((await restored.wait(message => message.type === "hello")).data.pendingServerRequests).toEqual([pending]);
++      const foreign = await client(port, "other"); sockets.push(foreign.socket);
++      expect((await foreign.wait(message => message.type === "hello")).data.pendingServerRequests).toEqual([]);
++      const result = { answers: { robot: { answers: ["A"] }, camera: { answers: ["自定义\n第二行：内容"] } } };
++      foreign.send({ type: "userInput.respond", requestId: "foreign", codexRequestId: 17, threadId: "thread-a", result });
++      expect((await foreign.wait(message => message.requestId === "foreign")).ok).toBe(false);
++      restored.send({ type: "userInput.respond", requestId: "partial", codexRequestId: 17, threadId: "thread-a", result: { answers: { robot: result.answers.robot } } });
++      expect((await restored.wait(message => message.requestId === "partial")).ok).toBe(false);
++      expect(bridge.responses).toEqual([]);
++      restored.send({ type: "userInput.respond", requestId: "answer", codexRequestId: 17, threadId: "thread-a", result });
++      expect((await restored.wait(message => message.requestId === "answer")).ok).toBe(true);
++      expect(bridge.responses).toEqual([{ id: 17, result }]);
++      expect(bridge.calls).toEqual([]);
++      await first.wait(message => message.type === "codex.notification" && message.data?.method === "serverRequest/resolved");
++      await first.wait(message => message.type === "turn.progress" && message.data?.state === "active");
++      restored.send({ type: "userInput.respond", requestId: "duplicate", codexRequestId: 17, threadId: "thread-a", result });
++      expect((await restored.wait(message => message.requestId === "duplicate")).ok).toBe(false);
++      expect(bridge.responses).toHaveLength(1);
++      clock.mockRestore();
++      bridge.pending.push({ ...pending, id: 18 });
++      bridge.emit("serverRequest", { ...pending, id: 18, accountId: "account-a" });
++      bridge.pending = [];
++      bridge.emit("notification", { method: "serverRequest/resolved", accountId: "account-a", params: { threadId: "thread-a", requestId: 18 } });
++      restored.send({ type: "userInput.respond", requestId: "cancelled", codexRequestId: 18, threadId: "thread-a", result });
++      expect((await restored.wait(message => message.requestId === "cancelled")).ok).toBe(false);
++      const after = await client(port, "admin"); sockets.push(after.socket);
++      expect((await after.wait(message => message.type === "hello")).data.pendingServerRequests).toEqual([]);
++    } finally {
++      vi.restoreAllMocks();
++      for (const socket of sockets) socket.terminate();
++      await new Promise<void>(resolve => wss.close(() => server.close(() => resolve())));
++      store.close(); fs.rmSync(temporary, { recursive: true, force: true });
++    }
++  });
++});
+diff --git a/backend/server/threadEventIndex.test.ts b/backend/server/threadEventIndex.test.ts
+index f8b22e047aee8628b808771d42fa126399ce7652..61a9e1b0833d20f9451fafa06b3c6eb828f953fc 100644
+--- a/backend/server/threadEventIndex.test.ts
++++ b/backend/server/threadEventIndex.test.ts
+@@ -2,6 +2,33 @@
+ import os from "node:os";
+ import path from "node:path";
+ import { expect, it, vi } from "vitest";
++
++it("restores the latest native collaboration mode when a page omits turn_context or displays older history", async () => {
++  const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-index-mode-"));
++  vi.stubEnv("CODEX_THREAD_INDEX_DB", path.join(root, "index.sqlite"));
++  vi.stubEnv("CODEX_WEB_CODEX_SESSION_ROOTS", root); vi.resetModules();
++  try {
++    const file = path.join(root, "rollout-thread.jsonl");
++    const lines = (records: unknown[]) => records.map(record => JSON.stringify(record)).join("\n") + "\n";
++    const turn = (id: string, mode: string, text: string) => [
++      { type: "event_msg", payload: { type: "task_started", turn_id: id } },
++      { type: "turn_context", payload: { turn_id: id, collaboration_mode: { mode, settings: { developer_instructions: "private native instructions" } } } },
++      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text }] } },
++      { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "response" }] } },
++      { type: "event_msg", payload: { type: "task_complete", turn_id: id } }
++    ];
++    await fs.writeFile(file, lines([{ type: "session_meta", payload: { id: "thread" } }, ...turn("plan", "plan", "plan please")]));
++    const { readIndexedThreadPage } = await import("./threadEventIndex.js");
++    const planned = await readIndexedThreadPage(file, "thread", { limit: 1 });
++    expect(planned.thread.collaborationMode).toBe("plan");
++    expect(JSON.stringify(planned)).not.toContain("private native instructions");
++    await fs.appendFile(file, lines(turn("default", "default", "implement please")));
++    expect((await readIndexedThreadPage(file, "thread", { limit: 1 })).thread.collaborationMode).toBe("default");
++    const older = await readIndexedThreadPage(file, "thread", { limit: 1, before: 2 });
++    expect(older.thread.collaborationMode).toBe("default");
++    expect(JSON.stringify(older)).toContain("plan");
++  } finally { vi.unstubAllEnvs(); await fs.rm(root, { recursive: true, force: true }); }
++});
+ 
+ it("removes a rolled-back legacy turn from incremental and fresh history reads", async () => {
+   const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-index-rollback-"));
+diff --git a/backend/server/threadEventIndex.ts b/backend/server/threadEventIndex.ts
+index 25d8f50add9b02bb07c61e89419a3cbdc5a16bdf..ef1ed63c838f5327bfee9640764b5584a85a8bac 100644
+--- a/backend/server/threadEventIndex.ts
++++ b/backend/server/threadEventIndex.ts
+@@ -476,6 +476,30 @@
+   }
+ }
+ 
++async function indexedCollaborationMode(filePath: string, threadId: string): Promise<"plan" | "default" | undefined> {
++  // Read the indexed start of recent turns, even when the requested history
++  // page begins after turn_context or points to an older turn. Tool output can
++  // be very large, so a tail scan is insufficient and a full read is wasteful.
++  const turns = db.prepare("SELECT turn_id, start_offset FROM thread_turns WHERE thread_id = ? ORDER BY start_offset DESC LIMIT 4")
++    .all(threadId) as Array<{ turn_id: string; start_offset: number }>;
++  const handle = await fs.open(filePath, "r");
++  try {
++    const { size } = await handle.stat();
++    for (const turn of turns) {
++      const bytes = Buffer.alloc(Math.max(0, Math.min(256 * 1024, size - turn.start_offset)));
++      const { bytesRead } = await handle.read(bytes, 0, bytes.length, turn.start_offset);
++      for (const line of bytes.subarray(0, bytesRead).toString("utf8").split("\n")) {
++        let record: JsonRecord; try { record = asRecord(JSON.parse(line)); } catch { continue; }
++        const payload = asRecord(record.payload);
++        if (record.type !== "turn_context" || payload.turn_id !== turn.turn_id) continue;
++        const mode = asRecord(payload.collaboration_mode).mode;
++        if (mode === "plan" || mode === "default") return mode;
++      }
++    }
++  } finally { await handle.close(); }
++  return undefined;
++}
++
+ export async function readIndexedThreadPage(
+   filePath: string,
+   threadId: string,
+@@ -490,6 +514,8 @@
+   } else {
+     await warmThreadIndex(filePath, threadId);
+   }
++  const collaborationMode = await indexedCollaborationMode(filePath, threadId);
++  const withMode = (thread: JsonRecord) => collaborationMode ? { ...thread, collaborationMode } : thread;
+   const totalRow = db.prepare("SELECT COUNT(*) AS value, COALESCE(MAX(ordinal), 0) AS max_ordinal FROM thread_records WHERE thread_id = ?")
+     .get(threadId) as { value?: number; max_ordinal?: number };
+   const totalItems = Number(totalRow.value ?? 0);
+@@ -497,7 +523,7 @@
+   if (!totalItems) {
+     const parsed = await readThreadFromJsonl(filePath, threadId);
+     return {
+-      thread: parsed.thread,
++      thread: withMode(parsed.thread),
+       history: { totalItems: 0, returnedItems: 0, before: 0, nextBefore: 0, hasOlder: false, nextCursor: null, indexState: "fresh" as const }
+     };
+   }
+@@ -515,7 +541,7 @@
+   if (!rows.length) {
+     const parsed = await readThreadFromJsonl(filePath, threadId);
+     return {
+-      thread: { ...parsed.thread, turns: [] },
++      thread: { ...withMode(parsed.thread), turns: [] },
+       history: { totalItems, returnedItems: 0, before: totalItems, nextBefore: totalItems, hasOlder: false, nextCursor: null, indexState: "fresh" as const }
+     };
+   }
+@@ -536,7 +562,7 @@
+   });
+   const hasOlder = first.ordinal > 1;
+   return {
+-    thread: parsed.thread,
++    thread: withMode(parsed.thread),
+     history: {
+       totalItems,
+       returnedItems: rows.length,
+diff --git a/backend/server/threadFallback.ts b/backend/server/threadFallback.ts
+index 4b455519faeecb0f18e2ab1c356f703327c31764..82b9f6554519afcaae8d76e1e5725fa298ef4246 100644
+--- a/backend/server/threadFallback.ts
++++ b/backend/server/threadFallback.ts
+@@ -5,6 +5,7 @@
+ import { createInterface } from "node:readline";
+ import { accountHistoryRoots } from "./sessionReadRoots.js";
+ import { isInternalUserMessageText } from "./internalUserMessage.js";
++import { AppError } from "./appErrors.js";
+ 
+ type JsonObject = Record<string, unknown>;
+ 
+@@ -27,7 +28,7 @@
+   items: JsonObject[];
+   itemsView: string;
+   status: string;
+-  error: string | null;
++  error: unknown;
+   startedAt: number | null;
+   completedAt: number | null;
+   durationMs: number | null;
+@@ -690,6 +691,7 @@
+   const turns = new Map<string, FallbackTurn>();
+   let metadata: JsonObject | null = null;
+   let currentTurnId: string | null = null;
++  let collaborationMode: "plan" | "default" | undefined;
+   let itemCount = 0;
+   let preview = "";
+   let updatedAt = 0;
+@@ -730,6 +732,8 @@
+ 
+     if (record.type === "turn_context" && typeof payload.turn_id === "string") {
+       currentTurnId = payload.turn_id;
++      const mode = recordFromUnknown(payload.collaboration_mode).mode;
++      if (mode === "plan" || mode === "default") collaborationMode = mode;
+       const turn = ensureTurn(currentTurnId);
+       turn.startedAt ??= secondsFromIso(record.timestamp);
+       continue;
+@@ -749,7 +753,8 @@
+       }
+       if (payload.type === "task_complete" && typeof payload.turn_id === "string") {
+         const turn = ensureTurn(payload.turn_id);
+-        turn.status = "completed";
++        turn.status = payload.error ? "failed" : "completed";
++        turn.error = payload.error ? { ...AppError.from(payload.error).toPublic(), at: record.timestamp } : null;
+         turn.completedAt = typeof payload.completed_at === "number" ? payload.completed_at : secondsFromIso(record.timestamp);
+         turn.durationMs = typeof payload.duration_ms === "number" ? payload.duration_ms : null;
+         updatedAt = Math.max(updatedAt, turn.completedAt ?? 0);
+@@ -816,6 +821,7 @@
+       path: filePath,
+       cwd: metadata.cwd,
+       cliVersion: metadata.cli_version,
++      ...(collaborationMode ? { collaborationMode } : {}),
+       source: metadata.source,
+       threadSource: metadata.thread_source ?? null,
+       agentNickname: null,
+diff --git a/backend/server/turnRetry.test.ts b/backend/server/turnRetry.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..651bff799819c18b5057bed80e72aa99eb4bf851
+--- /dev/null
++++ b/backend/server/turnRetry.test.ts
+@@ -0,0 +1,73 @@
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { ProjectStore } from "./db.js";
++import { TurnRetryQueue, type TurnRecoveryState } from "./turnRetry.js";
++import { AppError } from "./appErrors.js";
++
++const fixtures: Array<{ store: ProjectStore; queue: TurnRetryQueue; root: string }> = [];
++afterEach(() => { vi.restoreAllMocks(); fixtures.splice(0).forEach(({ store, queue, root }) => { queue.close(); store.close(); fs.rmSync(root, { recursive: true, force: true }); }); });
++const overloaded = { message: "Selected model is at capacity. Please try a different model.", codexErrorInfo: "server_overloaded" };
++function fixture(maxAttempts = 10) {
++  const root = fs.mkdtempSync(path.join(os.tmpdir(), "turn-retry-")), store = new ProjectStore(path.join(root, "db.sqlite"));
++  const project = store.createProject({ name: "test", rootPath: root });
++  store.registerThreadOwner({ threadId: "thread", userId: "admin", projectId: project.id, rootPath: root });
++  const start = vi.fn(async (_state: TurnRecoveryState) => "retry-turn"), changed = vi.fn(), busy = vi.fn(() => false);
++  const queue = new TurnRetryQueue(store, { start, changed, busy, maxAttempts, tickMs: 1_000_000 });
++  fixtures.push({ root, store, queue });
++  queue.watch("admin", "thread", { model: "gpt-6.1-sol", effort: "max", collaborationMode: { mode: "plan" }, input: [{ type: "text", text: "private prompt" }] });
++  return { root, store, queue, start, changed, busy };
++}
++
++describe("persistent overload retries", () => {
++  it("waits exactly 60 seconds, preserves the original model/mode, and isolates private state", async () => {
++    const { queue, start } = fixture(); const clock = vi.spyOn(Date, "now").mockReturnValue(100_000);
++    queue.failed("admin", "thread", "failed-turn", overloaded, true);
++    expect(queue.snapshot("admin")[0].job?.nextRetryAt).toBe(160_000);
++    expect(queue.snapshot("other")).toEqual([]);
++    expect(JSON.stringify(queue.snapshot("admin"))).not.toContain("private prompt");
++    clock.mockReturnValue(159_999); await queue.drain(); expect(start).not.toHaveBeenCalled();
++    clock.mockReturnValue(160_000); await queue.drain();
++    expect(start).toHaveBeenCalledOnce();
++    expect(start.mock.calls[0][0].template).toMatchObject({ model: "gpt-6.1-sol", effort: "max", collaborationMode: { mode: "plan" } });
++    queue.completed("thread", "retry-turn"); expect(queue.snapshot("admin")).toEqual([]);
++  });
++  it("persists a waiting retry across restart, but never blindly replays an in-flight retry", async () => {
++    const { store, queue, start } = fixture(); queue.failed("admin", "thread", "failed", overloaded, true); queue.close();
++    const restarted = new TurnRetryQueue(store, { start, busy: () => false, changed: () => {}, tickMs: 1_000_000 });
++    try {
++      expect(restarted.snapshot("admin")[0].job?.status).toBe("waiting");
++      restarted.retryNow("admin", "thread"); await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
++      await vi.waitFor(() => expect(store.getTurnRecoveryState("thread")?.job?.activeTurnId).toBe("retry-turn"));
++    } finally { restarted.close(); }
++    const again = new TurnRetryQueue(store, { start, busy: () => false, changed: () => {}, tickMs: 1_000_000 });
++    try { await again.drain(); expect(start).toHaveBeenCalledOnce(); expect(again.snapshot("admin")[0].job).toBeNull(); } finally { again.close(); }
++  });
++  it("does not race a newer turn, retry approvals/auth/quota errors, or exceed the attempt limit", async () => {
++    const { queue, start, busy } = fixture(2); const clock = vi.spyOn(Date, "now").mockReturnValue(0);
++    for (const error of [{ message: "401 unauthorized" }, { message: "quota exceeded" }, new AppError("memory_pressure", "memory_pressure")]) {
++      queue.failed("admin", "thread", "failed", error, true); expect(queue.snapshot("admin")[0].job).toBeNull();
++    }
++    queue.failed("admin", "thread", "failed", overloaded, true); clock.mockReturnValue(60_000); busy.mockReturnValue(true);
++    await queue.drain(); expect(start).not.toHaveBeenCalled(); busy.mockReturnValue(false); await queue.drain();
++    queue.failed("admin", "thread", "retry-turn", overloaded, true); clock.mockReturnValue(120_000); await queue.drain();
++    queue.failed("admin", "thread", "retry-turn", overloaded, true); clock.mockReturnValue(240_000); await queue.drain();
++    expect(start).toHaveBeenCalledTimes(2); expect(queue.snapshot("admin")[0].job?.status).toBe("exhausted");
++  });
++  it("honors cancellation even while starting or after another overload, and supersedes retries on a new prompt", async () => {
++    const { queue, start, store } = fixture(); const clock = vi.spyOn(Date, "now").mockReturnValue(0);
++    let release!: (value: string) => void; start.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
++    queue.failed("admin", "thread", "failed", overloaded, true); clock.mockReturnValue(60_000);
++    const pending = queue.drain(); await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
++    queue.cancel("admin", "thread"); release("old-retry"); await pending;
++    queue.failed("admin", "thread", "old-retry", overloaded, true); expect(store.getTurnRecoveryState("thread")?.job).toBeNull();
++    queue.watch("admin", "thread", { model: "gpt-6.1-sol" }); queue.failed("admin", "thread", "new", overloaded, true);
++    queue.started("thread", "new-user-turn"); clock.mockReturnValue(240_000); await queue.drain(); expect(start).toHaveBeenCalledOnce();
++  });
++});
++
++it("keeps error codes and readable causes while redacting credentials", () => {
++  const error = AppError.from({ code: "server_overloaded", message: "capacity Bearer abc-secret-token api_key=secret-value" }).toPublic();
++  expect(error.retryable).toBe(true); expect(error.originalMessage).not.toContain("secret-token"); expect(error.originalMessage).not.toContain("secret-value");
++});
+diff --git a/backend/server/turnRetry.ts b/backend/server/turnRetry.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4834d354221b4ae9b4d07e754d0bf789db567131
+--- /dev/null
++++ b/backend/server/turnRetry.ts
+@@ -0,0 +1,86 @@
++import { randomUUID } from "node:crypto";
++import { AppError, type PublicAppError } from "./appErrors.js";
++import type { ProjectStore } from "./db.js";
++
++export interface TurnRecoveryState {
++  threadId: string; userId: string; error: PublicAppError | null; cancelled?: boolean;
++  template: Record<string, unknown> | null;
++  job: null | { id: string; status: "waiting" | "running" | "exhausted"; attempts: number; maxAttempts: number; nextRetryAt: number | null; failedTurnId: string; activeTurnId?: string; ownerRevision: string; resumeOriginal?: boolean };
++}
++export const publicRecovery = (state: TurnRecoveryState) => ({ threadId: state.threadId, error: state.error, job: state.job ? { status: state.job.status, attempts: state.job.attempts, maxAttempts: state.job.maxAttempts, nextRetryAt: state.job.nextRetryAt } : null });
++
++export class TurnRetryQueue {
++  private timer: ReturnType<typeof setInterval>;
++  private draining = false;
++  constructor(private store: ProjectStore, private options: {
++    start: (state: TurnRecoveryState) => Promise<string | null>;
++    busy: (threadId: string) => boolean;
++    changed: (state: TurnRecoveryState) => void;
++    intervalMs?: number; maxAttempts?: number; tickMs?: number;
++  }) {
++    // Never replay a request that may already have been accepted before restart.
++    for (const state of this.store.listTurnRecoveryStates()) if (state.job?.status === "running") { state.job = null; this.save(state); }
++    this.timer = setInterval(() => void this.drain(), options.tickMs ?? 2500); this.timer.unref?.();
++  }
++  close() { clearInterval(this.timer); }
++  private save(state: TurnRecoveryState) { this.store.setTurnRecoveryState(state); this.options.changed(state); }
++  snapshot(userId: string) { return this.store.listTurnRecoveryStates(userId).filter(state => state.error || state.job).map(publicRecovery); }
++  pending(threadId: string) { const state = this.store.getTurnRecoveryState(threadId); return state?.job?.status === "waiting" || state?.job?.status === "running"; }
++  watch(userId: string, threadId: string, params: Record<string, unknown>) {
++    this.save({ userId, threadId, template: params, error: null, job: null, cancelled: false });
++  }
++  failed(userId: string, threadId: string, turnId: string, error: unknown, eligible: boolean, accepted = true) {
++    const state = this.store.getTurnRecoveryState(threadId) ?? { threadId, userId, template: null, job: null, error: null };
++    if (state.userId !== userId) return;
++    state.error = AppError.from(error).toPublic();
++    const owner = this.store.getThreadOwner(threadId);
++    if (eligible && !state.cancelled && state.error.retryable && state.template && owner && !this.store.isThreadArchivedLocal(threadId, userId)) {
++      const attempts = state.job?.attempts ?? 0, maxAttempts = this.options.maxAttempts ?? 10;
++      state.job = { id: randomUUID(), status: attempts >= maxAttempts ? "exhausted" : "waiting", attempts, maxAttempts,
++        nextRetryAt: attempts >= maxAttempts ? null : Date.now() + (this.options.intervalMs ?? 60_000), failedTurnId: turnId, ownerRevision: owner.updatedAt,
++        resumeOriginal: accepted ? false : state.job?.resumeOriginal ?? true };
++    } else state.job = null;
++    this.save(state);
++  }
++  completed(threadId: string, turnId: string) {
++    const state = this.store.getTurnRecoveryState(threadId);
++    if (!state || !state.job || state.job.activeTurnId !== turnId) return;
++    state.job = null; state.error = null; this.save(state);
++  }
++  started(threadId: string, turnId: string) {
++    const state = this.store.getTurnRecoveryState(threadId);
++    if (!state?.job) return;
++    if (state.job.status === "running" && !state.job.activeTurnId) { state.job.activeTurnId = turnId; this.save(state); }
++    else if (state.job.activeTurnId !== turnId) this.cancel(state.userId, threadId);
++  }
++  cancel(userId: string, threadId: string, dismiss = false) {
++    const state = this.store.getTurnRecoveryState(threadId);
++    if (!state || state.userId !== userId) return;
++    state.job = null; state.cancelled = true; if (dismiss) state.error = null; this.save(state);
++  }
++  retryNow(userId: string, threadId: string) {
++    const state = this.store.getTurnRecoveryState(threadId);
++    if (!state || state.userId !== userId || state.job?.status !== "waiting") throw new AppError("retry_unavailable", "当前没有待重试的任务。");
++    state.job.nextRetryAt = Date.now(); this.save(state); void this.drain();
++  }
++  isCurrent(state: TurnRecoveryState) { return this.store.getTurnRecoveryState(state.threadId)?.job?.id === state.job?.id; }
++  async drain() {
++    if (this.draining) return; this.draining = true;
++    try {
++      for (const state of this.store.listTurnRecoveryStates()) {
++        if (state.job?.status !== "waiting" || (state.job.nextRetryAt ?? Infinity) > Date.now() || this.options.busy(state.threadId)) continue;
++        const owner = this.store.getThreadOwner(state.threadId);
++        if (!owner || owner.userId !== state.userId || this.store.isThreadArchivedLocal(state.threadId, state.userId) || owner.updatedAt !== state.job.ownerRevision) { this.cancel(state.userId, state.threadId); continue; }
++        state.job.status = "running"; state.job.attempts += 1; state.job.nextRetryAt = null; this.save(state);
++        try {
++          const turnId = await this.options.start(state);
++          if (this.isCurrent(state)) {
++            const current = this.store.getTurnRecoveryState(state.threadId)!;
++            if (turnId) { current.job!.activeTurnId = turnId; this.save(current); }
++            else this.cancel(state.userId, state.threadId);
++          }
++        } catch (error) { if (this.isCurrent(state)) this.failed(state.userId, state.threadId, state.job.failedTurnId, error, true, false); }
++      }
++    } finally { this.draining = false; }
++  }
++}
+diff --git a/backend/server/turnWatchdog.test.ts b/backend/server/turnWatchdog.test.ts
+index 70698ac5a87fba7c3732cf3064edbfdb4c1baf86..b799effd2da506465eb3f163a5d8d58c94726a36 100644
+--- a/backend/server/turnWatchdog.test.ts
++++ b/backend/server/turnWatchdog.test.ts
+@@ -1,7 +1,22 @@
+ import { describe, expect, it } from "vitest";
+-import { meaningfulTurnProgressMethod, TurnWatchdog } from "./turnWatchdog.js";
++import { meaningfulTurnProgressMethod, phaseFromProbe, TurnWatchdog } from "./turnWatchdog.js";
+ 
+ describe("TurnWatchdog", () => {
++  it("keeps a long user-input wait distinct from a stalled turn, then invalidates old probes after the answer", () => {
++    const watchdog = new TurnWatchdog();
++    const turn = watchdog.start("user-a", "account-a", "thread-a", "turn-a", 0);
++    expect(phaseFromProbe(["waitingOnUserInput"])).toBe("waiting_user_input");
++    watchdog.setPhase("user-a", "account-a", "thread-a", "turn-a", "waiting_user_input");
++    const probe = watchdog.claimDueProbes(30 * 60_000)[0]!;
++    watchdog.resolveProbe("user-a", "account-a", "thread-a", "turn-a", probe.token, "active", []);
++    expect(turn.phase).toBe("waiting_user_input");
++    expect(turn.lastProgressAt).toBe(0);
++    const oldProbe = watchdog.claimDueProbes(31 * 60_000)[0]!;
++    watchdog.progress("user-a", "account-a", "thread-a", "turn-a", "serverRequest/resolved", 31 * 60_000 + 1);
++    expect(watchdog.resolveProbe("user-a", "account-a", "thread-a", "turn-a", oldProbe.token, "active", ["waitingOnUserInput"])).toBeNull();
++    expect(turn.phase).toBe("running");
++    expect(watchdog.diagnosedForUser("user-a")).toEqual([]);
++  });
+   it("diagnoses after two quiet minutes and resets only on real turn progress", () => {
+     const watchdog = new TurnWatchdog();
+     const start = 1_000_000;
+diff --git a/backend/server/turnWatchdog.ts b/backend/server/turnWatchdog.ts
+index 12a2646bc169fe261ab8be807af8fd235ee972fe..e3d1ad9b0e730e640023fcfcd324059a00c6c5c7 100644
+--- a/backend/server/turnWatchdog.ts
++++ b/backend/server/turnWatchdog.ts
+@@ -1,4 +1,4 @@
+-export type TurnWatchdogPhase = "running" | "tool_running" | "waiting_approval" | "waiting_subagents" | "unknown";
++export type TurnWatchdogPhase = "running" | "tool_running" | "waiting_approval" | "waiting_user_input" | "waiting_subagents" | "unknown";
+ 
+ export interface WatchdogTurn {
+   userId: string;
+@@ -38,6 +38,7 @@
+ export function phaseFromProbe(activeFlags: unknown): TurnWatchdogPhase {
+   const flags = Array.isArray(activeFlags) ? activeFlags.map(normalizedFlag) : [];
+   if (flags.some((flag) => flag.includes("approval"))) return "waiting_approval";
++  if (flags.some((flag) => flag.includes("userinput"))) return "waiting_user_input";
+   if (flags.some((flag) => flag.includes("subagent") || flag.includes("collabagent"))) return "waiting_subagents";
+   return "running";
+ }
+@@ -119,7 +120,7 @@
+     if (!turn || turn.turnId !== turnId || turn.probeToken !== token) return null;
+     const flags = Array.isArray(activeFlags) ? activeFlags.map((flag) => String(flag)).slice(0, 16) : [];
+     const nextPhase = Array.isArray(activeFlags) && activeFlags.length === 0
+-      && (turn.phase === "waiting_approval" || turn.phase === "waiting_subagents")
++      && (turn.phase === "waiting_approval" || turn.phase === "waiting_user_input" || turn.phase === "waiting_subagents")
+       ? turn.phase
+       : phaseFromProbe(activeFlags);
+     const nextState = `${status}:${flags.join(",")}`;
+diff --git a/backend/server/uiUpdates.test.ts b/backend/server/uiUpdates.test.ts
+index ad0edeb8992034eedb6eb78fe5246770b97c67af..4624c4e402229ccbf86535aef16cfa803f15511c 100644
+--- a/backend/server/uiUpdates.test.ts
++++ b/backend/server/uiUpdates.test.ts
+@@ -7,6 +7,34 @@
+ import { publishUiUpdate, registerUiUpdateRoutes } from "./uiUpdates.js";
+ 
+ describe("generic account update dot", () => {
++  it("publishes the same release at questions and Plan without resetting either entry's acknowledgements", async () => {
++    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ui-plan-update-")); process.env.CODEX_WEB_UI_UPDATE_DIR = tmp;
++    const app = Fastify(); registerUiUpdateRoutes(app);
++    const headers = { cookie: createSessionCookie("mode-alice").split(";")[0] };
++    try {
++      publishUiUpdate("mode-fix-one", ["questions", "plan", "threads"]);
++      for (const target of ["questions", "plan", "threads"]) {
++        expect((await app.inject({ url: `/api/ui-updates?target=${target}`, headers })).json().hasUnseen).toBe(true);
++        expect((await app.inject({ method: "POST", url: "/api/ui-updates/seen", headers, payload: { version: "mode-fix-one", target } })).statusCode).toBe(200);
++      }
++      publishUiUpdate("mode-fix-one", ["questions", "plan", "threads"]);
++      for (const target of ["questions", "plan", "threads", "account"]) expect((await app.inject({ url: `/api/ui-updates?target=${target}`, headers })).json().hasUnseen).toBe(false);
++    } finally { await app.close(); delete process.env.CODEX_WEB_UI_UPDATE_DIR; fs.rmSync(tmp, { recursive: true, force: true }); }
++  });
++  it("publishes question fixes at the question entry and acknowledges them per user", async () => {
++    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ui-question-update-")); process.env.CODEX_WEB_UI_UPDATE_DIR = tmp;
++    const app = Fastify(); registerUiUpdateRoutes(app);
++    const alice = { cookie: createSessionCookie("question-alice").split(";")[0] }, bob = { cookie: createSessionCookie("question-bob").split(";")[0] };
++    try {
++      publishUiUpdate("question-fix-one", ["questions"]);
++      expect((await app.inject({ url: "/api/ui-updates?target=account", headers: alice })).json().hasUnseen).toBe(false);
++      expect((await app.inject({ url: "/api/ui-updates?target=plugins", headers: alice })).json().hasUnseen).toBe(false);
++      expect((await app.inject({ url: "/api/ui-updates?target=questions", headers: alice })).json().hasUnseen).toBe(true);
++      await app.inject({ method: "POST", url: "/api/ui-updates/seen", headers: alice, payload: { version: "question-fix-one", target: "questions" } });
++      expect((await app.inject({ url: "/api/ui-updates?target=questions", headers: alice })).json().hasUnseen).toBe(false);
++      expect((await app.inject({ url: "/api/ui-updates?target=questions", headers: bob })).json().hasUnseen).toBe(true);
++    } finally { await app.close(); delete process.env.CODEX_WEB_UI_UPDATE_DIR; fs.rmSync(tmp, { recursive: true, force: true }); }
++  });
+   it("places new plugin releases only at their real entry and preserves user separation", async () => {
+     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ui-update-")); process.env.CODEX_WEB_UI_UPDATE_DIR = tmp;
+     const app = Fastify(); registerUiUpdateRoutes(app);
+diff --git a/backend/server/uiUpdates.ts b/backend/server/uiUpdates.ts
+index 08ceb900bb05665fad3952cbe5ae4e8bc61278f9..b7f519b647ea9655d2bdf4c4f1b3105bfb51e9a7 100644
+--- a/backend/server/uiUpdates.ts
++++ b/backend/server/uiUpdates.ts
+@@ -43,7 +43,7 @@
+ /** Local administrator publication only; no client can publish a global update. */
+ export function publishUiUpdate(version: string, targets?: string[], notice?: string): void {
+   if (!validVersion(version)) throw new UpdateError(400, "更新版本标识不合法。");
+-  if (targets?.some(t => !["account", "plugins", "feishu"].includes(t))) throw new UpdateError(400, "更新入口不合法。");
++  if (targets?.some(t => !["account", "plugins", "feishu", "questions", "plan", "threads", "runtime"].includes(t))) throw new UpdateError(400, "更新入口不合法。");
+   atomicJson(path.join(root(), "release.json"), { version, ...(targets ? { targets } : {}), ...(notice ? { notice: notice.slice(0, 500) } : {}), publishedAt: new Date().toISOString() });
+ }
+ 
+@@ -58,7 +58,7 @@
+       const user = userFor(request), version = request.body?.version;
+       if (!validVersion(version)) throw new UpdateError(400, "更新版本标识不合法。");
+       const target = request.body.target ?? "account";
+-      if (!["account", "plugins", "feishu"].includes(target)) throw new UpdateError(400, "更新入口不合法。");
++      if (!["account", "plugins", "feishu", "questions", "plan", "threads", "runtime"].includes(target)) throw new UpdateError(400, "更新入口不合法。");
+       const current = state(user, target);
+       if (current.version !== version) return reply.header("Cache-Control", "no-store").send(current);
+       if (current.hasUnseen) {
+diff --git a/backend/server/userInput.ts b/backend/server/userInput.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a4a06643ec55e85dcc5882457260003e676ce77
+--- /dev/null
++++ b/backend/server/userInput.ts
+@@ -0,0 +1,25 @@
++export function isUserInputRequest(method: unknown): boolean {
++  return method === "item/tool/requestUserInput" || method === "tool/requestUserInput";
++}
++
++/** Return only answers to the questions in this pending native request. */
++export function validateUserInputResponse(params: unknown, result: unknown): { answers: Record<string, { answers: string[] }> } {
++  const questions = (params as { questions?: Array<{ id?: unknown }> } | null)?.questions;
++  const answers = (result as { answers?: unknown } | null)?.answers;
++  if (!Array.isArray(questions) || !questions.length || !answers || typeof answers !== "object" || Array.isArray(answers)) {
++    throw new Error("请回答所有问题后再发送。");
++  }
++  const entries = questions.map((question) => {
++    if (typeof question.id !== "string" || !question.id) throw new Error("提问缺少问题编号，请刷新会话。");
++    const answer = (answers as Record<string, unknown>)[question.id] as { answers?: unknown } | undefined;
++    if (!Array.isArray(answer?.answers) || !answer.answers.length || answer.answers.some(value => typeof value !== "string" || !value.trim())) {
++      throw new Error("请回答所有问题后再发送。");
++    }
++    return [question.id, { answers: answer.answers.map(value => (value as string).trim()) }] as const;
++  });
++  const ids = new Set(entries.map(([id]) => id));
++  if (ids.size !== questions.length || Object.keys(answers).some(id => !ids.has(id))) {
++    throw new Error("答案与当前问题不匹配，请刷新会话。");
++  }
++  return { answers: Object.fromEntries(entries) };
++}
+diff --git a/backend/server/userInputLifecycle.test.ts b/backend/server/userInputLifecycle.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9a7746b50003db32df435c6a2195d40de0b8526
+--- /dev/null
++++ b/backend/server/userInputLifecycle.test.ts
+@@ -0,0 +1,60 @@
++import { EventEmitter } from "node:events";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { describe, expect, it } from "vitest";
++import { CodexBridge } from "./codexBridge.js";
++import { AccountPoolBridge } from "./accountPoolBridge.js";
++import { validateUserInputResponse } from "./userInput.js";
++
++describe("native question request lifecycle", () => {
++  it("removes requests cleared by native completion or interruption before reconnect", () => {
++    const bridge = new CodexBridge();
++    const receive = (message: unknown) => (bridge as unknown as { handleLine(line: string): void }).handleLine(JSON.stringify(message));
++    receive({ id: 17, method: "item/tool/requestUserInput", params: { threadId: "thread-a", itemId: "call-q" } });
++    expect(bridge.getPendingServerRequests()).toHaveLength(1);
++    receive({ method: "serverRequest/resolved", params: { threadId: "thread-a", requestId: 17 } });
++    expect(bridge.getPendingServerRequests()).toEqual([]);
++  });
++
++  it("maps cancellation IDs to their account-scoped public IDs", () => {
++    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "question-pool-"));
++    class FakeBridge extends EventEmitter {
++      pending: any[] = [];
++      responses: unknown[] = [];
++      getPendingServerRequests() { return this.pending; }
++      async start() {}
++      stop() {}
++      respondToServerRequest(id: unknown, result: unknown) {
++        this.responses.push({ id, result });
++        this.pending = this.pending.filter(request => request.id !== id);
++      }
++    }
++    const first = new FakeBridge(), second = new FakeBridge();
++    const fakes = [first, second]; let index = 0;
++    for (const id of ["a", "b"]) fs.mkdirSync(path.join(directory, id));
++    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "A", codexHome: path.join(directory, "a") }, { id: "b", label: "B", codexHome: path.join(directory, "b") }], stateFile: "state.json" }, directory, () => fakes[index++] as unknown as CodexBridge);
++    try {
++      const requests: any[] = [], notifications: any[] = [];
++      pool.on("serverRequest", request => requests.push(request));
++      pool.on("notification", message => notifications.push(message));
++      for (const [account, bridge] of [["a", first], ["b", second]] as const) {
++        const request = { id: 17, method: "item/tool/requestUserInput", params: { threadId: `thread-${account}`, turnId: `turn-${account}`, itemId: `call-${account}`, questions: [] }, receivedAt: "2026-10-14T00:00:00Z" };
++        bridge.pending.push(request); bridge.emit("serverRequest", request);
++      }
++      expect(requests[0].id).not.toBe(requests[1].id);
++      first.pending = [];
++      first.emit("notification", { method: "serverRequest/resolved", params: { threadId: "thread-a", requestId: 17 } });
++      expect(notifications[0]).toMatchObject({ accountId: "a", params: { requestId: requests[0].id, threadId: "thread-a" } });
++      expect(pool.getPendingServerRequests().map(request => request.id)).toEqual([requests[1].id]);
++      expect(() => pool.respondToServerRequest(requests[0].id, { answers: {} })).toThrow();
++      pool.respondToServerRequest(requests[1].id, { answers: {} });
++      expect(second.responses).toEqual([{ id: 17, result: { answers: {} } }]);
++    } finally { pool.stop(); fs.rmSync(directory, { recursive: true, force: true }); }
++  });
++
++  it("rejects unrelated question IDs without resolving a pending request", () => {
++    expect(() => validateUserInputResponse({ questions: [{ id: "robot" }] }, { answers: { robot: { answers: ["A"] }, foreign: { answers: ["B"] } } })).toThrow();
++    expect(() => validateUserInputResponse({ questions: [{ id: "robot" }, { id: "robot" }] }, { answers: { robot: { answers: ["A"] } } })).toThrow();
++  });
++});
+diff --git a/frontend/src/AccountUpdateIndicator.tsx b/frontend/src/AccountUpdateIndicator.tsx
+index cbe23f44798e1684087af8f7548413930b52dfcf..942547164c4dbb66bf440705577c813823399daf 100644
+--- a/frontend/src/AccountUpdateIndicator.tsx
++++ b/frontend/src/AccountUpdateIndicator.tsx
+@@ -5,7 +5,7 @@
+ interface AccountUpdateIndicatorProps {
+   userId: string;
+   menuOpen: boolean;
+-  target?: "account" | "plugins" | "feishu";
++  target?: "account" | "plugins" | "feishu" | "questions" | "plan" | "threads" | "runtime";
+   dismissOnRefresh?: boolean;
+ }
+ 
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index 51bc1f8fcecd18611bf2ae8abb9221d19d62f6ca..f6ef06bfab5fb3004014077fdb4721378406e82c 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -76,13 +76,15 @@
+ import { SelectionAskAction, type SelectionAskActionHandle } from "./SelectionAskAction";
+ import { PetBuddy } from "./PetBuddy";
+ import { AccountUpdateIndicator } from "./AccountUpdateIndicator";
++import { useConversationPlanMode } from "./useConversationPlanMode";
++import { TurnRecoveryNotice, historicalRecovery, type TurnRecoveryView } from "./TurnRecoveryNotice";
+ import { FeishuOffice } from "./FeishuOffice";
+ import { useFeishuAttention, needsFeishuAuthorization } from "./useFeishuAttention";
+ import { FeatureUpdateNotice } from "./FeatureUpdateNotice";
+ import { collectAgents, parseAgentOperation, reconcileSubagents } from "./subagentPresentation";
+ import { useSubagentDirectory } from "./subagentDirectory";
+ import { useSidebarThreadLists } from "./sidebarThreadLists";
+-import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage } from "./questionTool";
++import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, type UserInputRequest } from "./questionTool";
+ import { ToolQuestionCard, ToolQuestionMessage } from "./ToolQuestionCard";
+ import rehypeKatex from "rehype-katex";
+ import remarkBreaks from "remark-breaks";
+@@ -635,6 +637,7 @@
+   threadId: string | null;
+   model: string;
+   reasoningEffort: ReasoningEffort;
++  collaborationMode: "plan" | "default";
+   sentPromptText: string;
+   visibleText: string;
+   remoteDraftId?: string;
+@@ -1149,6 +1152,7 @@
+   return text.startsWith("<environment_context>")
+     || text.startsWith("<codex_internal_context_recovery>")
+     || text.startsWith("<codex_internal_continuation_recovery>")
++    || text.startsWith("<codex_internal_retry>")
+     || text.startsWith("<recommended_plugins>")
+     || text.startsWith("<permissions instructions>")
+     || text.startsWith("<app-context>")
+@@ -4525,8 +4529,18 @@
+   const liveDeltaGapRecoveryAtRef = useRef(0);
+   const [liveTools, setLiveTools] = useState<Record<string, LiveToolEntry>>({});
+   const [turnProgress, setTurnProgress] = useState<Record<string, TurnProgress>>({});
++  const [turnRecoveries, setTurnRecoveries] = useState<Record<string, TurnRecoveryView>>({});
+   const [answeredQuestionItems, setAnsweredQuestionItems] = useState<Record<string, true>>({});
+   const submittingQuestionItemsRef = useRef(new Set<string>());
++  const pendingUserInputsRef = useRef(new Map<string, UserInputRequest>());
++  const questionAnswerAcksRef = useRef(new Map<string, { resolve: (accepted: boolean) => void; timer: number }>());
++  useEffect(() => () => {
++    for (const pending of questionAnswerAcksRef.current.values()) {
++      window.clearTimeout(pending.timer);
++      pending.resolve(false);
++    }
++    questionAnswerAcksRef.current.clear();
++  }, []);
+   const [expandedToolBundles, setExpandedToolBundles] = useState<Record<string, true>>({});
+   const [expandedToolEntries, setExpandedToolEntries] = useState<Record<string, true>>({});
+   const [pendingUserMessages, setPendingUserMessages] = useState<PendingUserMessage[]>([]);
+@@ -4602,7 +4616,7 @@
+   const [skills, setSkills] = useState<CodexSkill[]>([]);
+   const [skillsLoading, setSkillsLoading] = useState(false);
+   const [skillsPickerOpen, setSkillsPickerOpen] = useState(false);
+-  const [planMode, setPlanMode] = useState(false);
++  const [planMode, setPlanMode] = useConversationPlanMode(selectedUserId, selectedThread?.id ?? `draft:${remoteDraftId}`, selectedThread?.collaborationMode);
+   const [skillSearch, setSkillSearch] = useState("");
+   const [selectedSkillNames, setSelectedSkillNames] = useState<string[]>([]);
+   useEffect(() => {
+@@ -5721,7 +5735,7 @@
+     setThreadContextMenu({
+       thread,
+       x: Math.max(8, Math.min(event.clientX, window.innerWidth - 224)),
+-      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 56))
++      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 160))
+     });
+   }
+ 
+@@ -8751,6 +8765,10 @@
+       setError("计划模式请等当前轮次结束后发送；如需排队或立即纠偏，请先关闭计划模式。");
+       return false;
+     }
++    if (!planMode && selectedActiveTurnId && selectedThread?.collaborationMode === "plan" && !isQuestionAnswer) {
++      setError("当前轮次仍在计划模式中。请停止或等本轮结束，再发送新消息以切换到普通模式。");
++      return false;
++    }
+     if (editingPromptDraft) {
+       if (selectedThread?.id !== editingPromptDraft.threadId || selectedActiveTurnId) {
+         setError("原会话仍在运行或已切换，请停止回答并重新打开会话后再发送。");
+@@ -8790,6 +8808,7 @@
+     if (selectedThread && selectedActiveTurnId && mode === "queue") {
+       const requestId = `queue-add-${requestToken()}`;
+       try {
++        const accepted = isQuestionAnswer ? waitForQuestionAnswerAck(requestId) : null;
+         codexSocket.send({
+           type: "turn.queue.add",
+           requestId,
+@@ -8809,8 +8828,9 @@
+           setSelectedSkillNames([]);
+           setDocumentReference(null);
+         }
+-        return true;
++        return accepted ? await accepted : true;
+       } catch (caught) {
++        finishQuestionAnswerAck(requestId, false);
+         setError(caught instanceof Error ? caught.message : String(caught));
+         return false;
+       }
+@@ -8827,7 +8847,8 @@
+       model: selectedModelProfile.model,
+       reasoningEffort: selectedModelProfile.effort,
+       sentPromptText,
+-      visibleText
++      visibleText,
++      collaborationMode: planMode ? "plan" : "default"
+     });
+     const payload = selectedThread && selectedActiveTurnId && mode === "steer"
+       ? {
+@@ -8878,6 +8899,7 @@
+           ...(threadContextFeatureEnabled && newThreadContextPin.trim() ? { contextPin: newThreadContextPin.trim() } : {})
+         };
+     try {
++      const accepted = isQuestionAnswer ? waitForQuestionAnswerAck(requestId) : null;
+       codexSocket.send(payload);
+       if (payload.type !== "turn.steer") {
+         setTopAnchoredPrompt({ requestId, threadId: selectedThread?.id ?? null, turnId: null, viewToken: requestViewToken });
+@@ -8906,8 +8928,9 @@
+         setSelectedSkillNames([]);
+         setDocumentReference(null);
+       }
+-      return true;
++      return accepted ? await accepted : true;
+     } catch (caught) {
++      finishQuestionAnswerAck(requestId, false);
+       promptRequestContextsRef.current.delete(requestId);
+       setError(caught instanceof Error ? caught.message : String(caught));
+       return false;
+@@ -8917,25 +8940,97 @@
+   function questionIsAnswered(itemId: string, turnId?: string, visibleItems?: ThreadItem[]): boolean {
+     const threadId = selectedThread?.id;
+     if (!threadId) return false;
++    if ([...pendingUserInputsRef.current.values()].some(request => request.params.threadId === threadId && request.params.itemId === itemId)) return false;
+     if (answeredQuestionItems[`${threadId}:${itemId}`]) return true;
++    const liveItem = liveTools[itemId];
++    if (liveItem?.threadId === threadId && synchronousQuestionHasResult(liveItem)) return true;
+     if (visibleItems && questionHasLaterUserMessage(visibleItems, itemId)) return true;
+     const turns = selectedThread.turns;
+     const turnIndex = turns.findIndex((turn) => turn.id === turnId || (turn.items ?? []).some((item) => item.id === itemId));
+     if (turnIndex < 0) return false;
++    if (synchronousQuestionHasResult((turns[turnIndex].items ?? []).find(item => item.id === itemId) ?? {})) return true;
+     if (questionHasLaterUserMessage(turns[turnIndex].items ?? [], itemId)) return true;
+     return turns.slice(turnIndex + 1).some((turn) => turnHasUserItem(turn) || Boolean(turnUserText(turn)));
+   }
+ 
+-  async function chooseToolQuestion(itemId: string, answer: string): Promise<boolean> {
++  function waitForQuestionAnswerAck(requestId: string): Promise<boolean> {
++    return new Promise(resolve => {
++      const timer = window.setTimeout(() => {
++        questionAnswerAcksRef.current.delete(requestId);
++        setError("尚未确认答案已被接收，请刷新会话后重试。");
++        resolve(false);
++      }, 30_000);
++      questionAnswerAcksRef.current.set(requestId, { resolve, timer });
++    });
++  }
++
++  function finishQuestionAnswerAck(requestId: string, accepted: boolean): void {
++    const pending = questionAnswerAcksRef.current.get(requestId);
++    if (!pending) return;
++    window.clearTimeout(pending.timer);
++    questionAnswerAcksRef.current.delete(requestId);
++    pending.resolve(accepted);
++  }
++
++  function receiveUserInputRequest(value: unknown): void {
++    const request = readUserInputRequest(value);
++    if (!request) return;
++    pendingUserInputsRef.current.set(String(request.id), request);
++    const { threadId, turnId, itemId } = request.params;
++    setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "waiting_user_input", silentForMs: 0 }, activeTurnsByThreadRef.current[threadId]));
++    setAnsweredQuestionItems(current => {
++      const next = { ...current };
++      delete next[`${threadId}:${itemId}`];
++      return next;
++    });
++    const now = new Date().toISOString();
++    setLiveTools(current => ({ ...current, [itemId]: {
++      ...current[itemId], itemId, threadId, turnId, tool: "request_user_input", input: JSON.stringify({ questions: request.params.questions }),
++      output: "", completed: false, startedAt: current[itemId]?.startedAt ?? now, updatedAt: now
++    } }));
++  }
++
++  function resolveUserInputRequest(requestId: unknown): void {
++    const request = pendingUserInputsRef.current.get(String(requestId));
++    if (!request) return;
++    pendingUserInputsRef.current.delete(String(requestId));
++    const { threadId, turnId, itemId } = request.params;
++    setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "active", silentForMs: 0 }));
++    setAnsweredQuestionItems(current => ({ ...current, [`${threadId}:${itemId}`]: true }));
++    setLiveTools(current => current[itemId] ? { ...current, [itemId]: { ...current[itemId], completed: true } } : current);
++  }
++
++  async function chooseToolQuestion(itemId: string, answer: string, answers: string[]): Promise<boolean> {
+     const threadId = selectedThread?.id;
+     if (!threadId || !selectedProject || !answer.trim()) return false;
+     const key = `${threadId}:${itemId}`;
+     if (submittingQuestionItemsRef.current.has(key) || questionIsAnswered(itemId)) return false;
+     submittingQuestionItemsRef.current.add(key);
+     try {
++      const request = [...pendingUserInputsRef.current.values()].find(request => request.params.threadId === threadId && request.params.itemId === itemId);
++      if (request) {
++        const result = userInputAnswerResult(request, answers);
++        const requestId = `question-answer-${requestToken()}`;
++        const accepted = waitForQuestionAnswerAck(requestId);
++        try {
++          codexSocket.send({ type: "userInput.respond", requestId, codexRequestId: request.id, threadId, result });
++        } catch (caught) {
++          finishQuestionAnswerAck(requestId, false);
++          throw caught;
++        }
++        return await accepted;
++      }
++      const item = liveTools[itemId] ?? selectedThread?.turns.flatMap(turn => turn.items ?? []).find(item => item.id === itemId);
++      if (item && typeof item.tool === "string" && /(?:^|\.)request_user_input$/.test(item.tool)) {
++        setError("该提问的待回答请求尚未同步，请刷新会话后再回答。");
++        return false;
++      }
+       const accepted = await sendPrompt(selectedActiveTurnId ? "steer" : "queue", answer);
+       if (accepted) setAnsweredQuestionItems((current) => ({ ...current, [key]: true }));
+       return accepted;
++    } catch (caught) {
++      setError(caught instanceof Error ? caught.message : String(caught));
++      return false;
+     } finally {
+       submittingQuestionItemsRef.current.delete(key);
+     }
+@@ -8963,7 +9058,8 @@
+       model: selectedModelProfile.model,
+       reasoningEffort: selectedModelProfile.effort,
+       sentPromptText: continuation.sentPromptText,
+-      visibleText: continuation.visibleText
++      visibleText: continuation.visibleText,
++      collaborationMode: planMode ? "plan" : "default"
+     });
+     try {
+       codexSocket.send({
+@@ -9256,6 +9352,11 @@
+   }
+ 
+   function handleSocketMessage(message: SocketMessage) {
++    if (message.type === "turn.recovery") {
++      const state = message.data as TurnRecoveryView | undefined;
++      if (state?.threadId) setTurnRecoveries(current => ({ ...current, [`${selectedUserId}:${state.threadId}`]: state }));
++      return;
++    }
+     if (message.type === "turn.progress") {
+       const progress = readTurnProgress(message.data);
+       if (progress) setTurnProgress(current => updateTurnProgress(current, selectedUserId, progress, activeTurnsByThreadRef.current[progress.threadId]));
+@@ -9269,7 +9370,9 @@
+       return;
+     }
+     if (message.type === "hello") {
+-      const data = message.data as { liveState?: LiveStateSnapshot; turnProgress?: unknown[]; pendingServerRequests?: Array<{ id: string | number; method: string; params: Record<string, unknown> }> } | undefined;
++      const data = message.data as { liveState?: LiveStateSnapshot; turnProgress?: unknown[]; turnRecoveries?: TurnRecoveryView[]; pendingServerRequests?: Array<{ id: string | number; method: string; params: Record<string, unknown> }> } | undefined;
++      setTurnRecoveries(current => ({ ...Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${selectedUserId}:`))),
++        ...Object.fromEntries((data?.turnRecoveries ?? []).map(state => [`${selectedUserId}:${state.threadId}`, state])) }));
+       hydrateLiveState(data?.liveState);
+       refreshSelectedThreadFromLiveState(data?.liveState);
+       setTurnProgress(current => {
+@@ -9283,6 +9386,8 @@
+       setPendingApprovals(Object.fromEntries((data?.pendingServerRequests ?? [])
+         .filter((request) => request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")
+         .map((request) => [String(request.id), request])));
++      pendingUserInputsRef.current.clear();
++      for (const request of data?.pendingServerRequests ?? []) receiveUserInputRequest(request);
+       return;
+     }
+ 
+@@ -9310,6 +9415,7 @@
+           id: request.id!, method: request.method!, params: request.params ?? {}
+         } }));
+       }
++      receiveUserInputRequest(request);
+       return;
+     }
+ 
+@@ -9366,6 +9472,11 @@
+     }
+ 
+     if (message.type === "ack") {
++      if (message.requestId) finishQuestionAnswerAck(message.requestId, message.ok === true);
++      if (message.requestId?.startsWith("question-answer-")) {
++        if (!message.ok) setError(`回答发送失败：${message.error ?? "请重试"}`);
++        return;
++      }
+       // The embedded terminal owns its errors; they must not become a chat banner.
+       if (message.requestId?.startsWith("term-")) return;
+       // The thread-scoped Goal controller owns its confirmation and errors.
+@@ -9626,6 +9737,7 @@
+         }
+         const normalizedThread = {
+           ...newThread,
++          collaborationMode: requestContext?.collaborationMode ?? newThread.collaborationMode,
+           pinned: false,
+           configuredModel: requestContext?.model ?? newThread.configuredModel ?? null,
+           configuredReasoningEffort: requestContext?.reasoningEffort ?? newThread.configuredReasoningEffort ?? null,
+@@ -9705,6 +9817,16 @@
+ 
+     if (message.type === "codex.notification") {
+       const notification = message.data as CodexNotification;
++      if (notification.method === "serverRequest/resolved") {
++        const requestId = isRecord(notification.params) ? notification.params.requestId : undefined;
++        resolveUserInputRequest(requestId);
++        setPendingApprovals(current => {
++          const next = { ...current };
++          delete next[String(requestId)];
++          return next;
++        });
++        return;
++      }
+       const params = notification.params ?? {};
+       if (notification.method === "turn/diff/updated") {
+         const turnId = notificationTurnId(params);
+@@ -9782,6 +9904,9 @@
+         }
+       }
+       if (notification.method === "turn/completed") {
++        for (const request of pendingUserInputsRef.current.values()) {
++          if (request.params.threadId === notificationThreadId(params) && request.params.turnId === notificationTurnId(params)) resolveUserInputRequest(request.id);
++        }
+         const turnId = notificationTurnId(params);
+         const threadId = notificationThreadId(params) ?? (turnId ? turnThreadIdsRef.current.get(turnId) ?? null : null);
+         if (threadId && turnId) setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "completed", silentForMs: 0 }));
+@@ -9967,11 +10092,11 @@
+     const collaborationItem = { ...liveToolItem, aggregatedOutput: entry.output, completed: entry.completed };
+     if (parseAgentOperation(collaborationItem)) return <article className="messageItem kind-tool subagentMessage" key={entry.id}><SubagentToolCard item={collaborationItem} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} /></article>;
+     const liveQuestions = parseQuestionTool(safeText(entry.tool), entry.input);
+-    if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} onChoose={(answer) => chooseToolQuestion(entry.id, answer)} />;
++    if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} />;
+     return (
+       <article className="messageItem kind-tool type-toolCall live" key={entry.id}>
+         <div className="messageMeta">{entry.completed ? "工具输出" : "调用工具"} · {entry.tool}</div>
+-        {liveQuestions ? <ToolQuestionCard questions={liveQuestions} onChoose={(answer) => chooseToolQuestion(entry.id, answer)} /> : entry.input ? <pre>{safeText(entry.input)}</pre> : null}
++        {liveQuestions ? <ToolQuestionCard questions={liveQuestions} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} /> : entry.input ? <pre>{safeText(entry.input)}</pre> : null}
+         <MessageImagePreviews item={liveToolItem} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
+         {!liveQuestions && entry.output ? <pre className="outputBlock">{displayOutputText(entry.output)}</pre> : entry.completed || liveQuestions ? null : <div className="messageBody">正在执行...</div>}
+       </article>
+@@ -10152,7 +10277,7 @@
+       >
+         <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
+         <ToolReveal open={expanded}>
+-        {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer) => chooseToolQuestion(call.id, answer)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
++        {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer, answers) => chooseToolQuestion(call.id, answer, answers)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
+         <MessageImagePreviews item={call} projectId={contextProjectId} onOpenFileLink={openFilePreview} />
+         {hasChanges ? <button className="openDiffReviewButton" type="button" onClick={(event) => { event.stopPropagation(); openDiffReview(call.changes ?? [], "本轮文件变更", contextTurnId, call.id, contextThreadId); }}><FileText size={14} /> 查看变更 · {call.changes?.length ?? 0} 个文件</button> : null}
+         {!agentOperation && (!questions || historyContext?.readOnly) && (outputText || deferredOutputItem) ? <DeferredToolOutput text={displayOutputText(outputText)} deferred={Boolean(deferredOutputItem)} threadId={contextThreadId} itemId={String(deferredOutputItem?.outputItemId ?? deferredOutputItem?.id ?? call.id)} projectId={contextProjectId} loadOutput={historyContext?.loadOutput} /> : null}
+@@ -11089,7 +11214,7 @@
+         )}
+       />
+ 
+-      {threadContextMenu ? (
++      {threadContextMenu ? createPortal(
+         <div
+           className="threadContextMenu"
+           role="menu"
+@@ -11101,6 +11226,7 @@
+           <button type="button" role="menuitem" onClick={() => void copyThreadSessionId(threadContextMenu.thread)}>
+             <Copy size={15} />
+             复制会话 ID
++            <AccountUpdateIndicator key={`threads:${selectedUserId}`} userId={selectedUserId} menuOpen={false} target="threads" dismissOnRefresh />
+           </button>
+           <button type="button" role="menuitem" onClick={() => beginThreadRename(threadContextMenu.thread)}>
+             <PencilLine size={15} />
+@@ -11113,7 +11239,7 @@
+           <button type="button" role="menuitem" onClick={() => void changeThreadArchive(threadContextMenu.thread, true)}>
+             <Archive size={15} />归档会话
+           </button>
+-        </div>
++        </div>, document.body
+       ) : null}
+ 
+       {newThreadProjectPickerPresence.present ? <div className={`workspaceFeatureScrim${newThreadProjectPickerPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={newThreadProjectPickerPresence.closing} inert={newThreadProjectPickerPresence.closing} onMouseDown={(event) => { if (event.target === event.currentTarget) setNewThreadProjectPickerOpen(false); }}>
+@@ -12653,7 +12779,7 @@
+                     const inlineQuestions = kind === "tool" ? parseQuestionToolItem(item) : null;
+                     if (inlineQuestions) {
+                       toolGroupIndex = flushToolGroup(toolGroupIndex, true);
+-                      renderedHistoryItems.push(<ToolQuestionMessage key={`${turn.id}-${item.id}-question`} open={!questionIsAnswered(item.id, turn.id, items)} questions={inlineQuestions} onChoose={(answer) => chooseToolQuestion(item.id, answer)} />);
++                      renderedHistoryItems.push(<ToolQuestionMessage key={`${turn.id}-${item.id}-question`} open={!questionIsAnswered(item.id, turn.id, items)} questions={inlineQuestions} onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers)} />);
+                       continue;
+                     }
+                     if (kind === "tool" || kind === "reasoning") {
+@@ -12942,13 +13068,17 @@
+               </div> : null}
+               <div className="composerBody">
+                 <div className="composerThreadActivity">
++                  <TurnRecoveryNotice state={selectedThread ? turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1)) : undefined} userId={selectedUserId} onAction={action => {
++                    if (!selectedThread) return;
++                    codexSocket.send({ type: action === "dismiss" ? "turn.error.dismiss" : action === "now" ? "turn.retry.now" : "turn.retry.cancel", threadId: selectedThread.id, requestId: `recovery-${requestToken()}` });
++                  }} />
+                   <ToolReveal key={`progress:${selectedUserId}:${selectedThread?.id ?? "new"}`} open={Boolean(selectedThread?.id && turnProgress[`${selectedUserId}:${selectedThread.id}`]?.turnId === selectedActiveTurnId)}><div className="composerRunNotice" role="status">{turnProgressText(selectedThread?.id ? turnProgress[`${selectedUserId}:${selectedThread.id}`] : undefined)}</div></ToolReveal>
+                   <GoalProgress key={`goal:${selectedUserId}:${selectedThread?.id ?? "new"}`} controller={threadGoal} running={conversationRunState === "running"} />
+                   <SubagentActivity key={`agents:${selectedUserId}:${selectedThread?.id ?? "new"}`} agents={composerAgents} directoryPage={subagentDirectory.page} parentRunning={Boolean(selectedActiveTurnId)} taskKey={selectedActiveTurnId ?? "idle"} onOpen={openSubagentReview} onOpenHistory={() => openSubagentReview(undefined, "history")} />
+                   <ToolReveal open={Boolean(documentReference && documentReference.projectId === selectedProject?.id)}><div className="composerDocumentReference"><FileText size={14} /><span title={documentReference?.text}><strong>{documentReference?.path}</strong> · {documentReference?.text.slice(0, 120)}</span><button type="button" aria-label="移除文档引用" onClick={() => setDocumentReference(null)}><X size={14} /></button></div></ToolReveal>
+                 </div>
+                 <div className="composerTools">
+-                  {planMode ? <button className="v2PlanActiveChip" type="button" onClick={() => setPlanMode(false)} title="关闭计划模式，恢复可执行改动"><Lightbulb size={14} />计划</button> : null}
++                  {planMode ? <button className="v2PlanActiveChip" type="button" onClick={() => setPlanMode(false)} title="关闭计划模式，下次发送可执行改动"><Lightbulb size={14} />计划<AccountUpdateIndicator key={`plan:${selectedUserId}`} userId={selectedUserId} menuOpen={false} target="plan" dismissOnRefresh /></button> : null}
+                   {selectedSkills.map((skill) => (
+                     <button className="selectedSkillChip" type="button" key={skill.name} onClick={() => toggleSelectedSkill(skill.name)} title={`移除 $${skill.name}`}>
+                       <span>{localizedSkill(skill).name}</span>
+@@ -12986,7 +13116,7 @@
+                   <ModelGroupedSelect
+                     value={activeModelProfileId}
+                     onChange={(profileId) => void changeConversationModelProfile(profileId)}
+-                    disabled={savingThreadModel || conversationRunState === "running"}
++                    disabled={savingThreadModel || conversationRunState === "running" || Boolean(selectedThread && ["waiting", "running"].includes(turnRecoveries[`${selectedUserId}:${selectedThread.id}`]?.job?.status ?? ""))}
+                     title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
+                     profiles={selectableModelProfiles}
+                   />
+diff --git a/frontend/src/ToolQuestionCard.tsx b/frontend/src/ToolQuestionCard.tsx
+index 6861310dc52b47628b3a1748a92dc4ad4d98229c..7dd10b20975d405a61b65c3bd6454bfa1a7885e3 100644
+--- a/frontend/src/ToolQuestionCard.tsx
++++ b/frontend/src/ToolQuestionCard.tsx
+@@ -2,8 +2,10 @@
+ import { Send } from "lucide-react";
+ import { ToolReveal } from "./ToolReveal";
+ import type { ToolQuestion } from "./questionTool";
++import { AccountUpdateIndicator } from "./AccountUpdateIndicator";
++import { getApiUserId } from "./api";
+ 
+-export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuestion[]; onChoose: (answer: string) => Promise<boolean> }) {
++export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuestion[]; onChoose: (answer: string, answers: string[]) => Promise<boolean> }) {
+   const [answers, setAnswers] = useState<(string | null)[]>(() => questions.map(() => null));
+   const [customAnswers, setCustomAnswers] = useState<string[]>(() => questions.map(() => ""));
+   const [submitting, setSubmitting] = useState(false);
+@@ -16,7 +18,7 @@
+     setSubmitting(true);
+     const reply = questions.length === 1 ? option : questions.map((question, index) => `${question.title}：${next[index]}`).join("\n");
+     try {
+-      if (!await onChoose(reply)) setSubmitting(false);
++      if (!await onChoose(reply, next.map(answer => answer!))) setSubmitting(false);
+     } catch {
+       setSubmitting(false);
+     }
+@@ -24,7 +26,7 @@
+   const hasChoices = questions.some((question) => question.options.length > 0);
+   return <div className={`toolQuestionCard${submitting ? " submitting" : ""}`} aria-label="向用户提出的问题">
+     {questions.map((question, index) => <section className="toolQuestionBlock" key={`${index}:${question.title}`}>
+-      <div className="toolQuestionHeading"><span className="toolQuestionTag">{question.options.length ? "选择题" : "问题"} {questions.length > 1 ? index + 1 : ""}</span><span>{question.title}</span></div>
++      <div className="toolQuestionHeading"><span className="toolQuestionTag">{question.options.length ? "选择题" : "问题"} {questions.length > 1 ? index + 1 : ""}{index === 0 ? <AccountUpdateIndicator userId={getApiUserId()} menuOpen={answers.some(answer => answer !== null)} target="questions" /> : null}</span><span>{question.title}</span></div>
+       <div className="toolQuestionOptions">
+         {question.options.map((option, optionIndex) => <button type="button" className={`toolQuestionOption${answers[index] === option ? " selected" : ""}`} key={`${optionIndex}:${option}`} disabled={submitting} aria-pressed={answers[index] === option} onClick={(event) => { event.stopPropagation(); void selectOption(index, option); }} title="选择并发送答案">
+           <span className="toolQuestionOptionNumber">{optionIndex + 1}</span><span>{option}</span>
+@@ -51,7 +53,7 @@
+ }
+ 
+ /** Receipt/completion does not close a question. Only an actual user reply does. */
+-export function ToolQuestionMessage({ open, questions, onChoose }: { open: boolean; questions: ToolQuestion[]; onChoose: (answer: string) => Promise<boolean> }) {
++export function ToolQuestionMessage({ open, questions, onChoose }: { open: boolean; questions: ToolQuestion[]; onChoose: (answer: string, answers: string[]) => Promise<boolean> }) {
+   return <ToolReveal open={open} className="toolQuestionPresence">
+     <article className="messageItem kind-question">
+       <ToolQuestionCard questions={questions} onChoose={onChoose} />
+diff --git a/frontend/src/TurnRecoveryNotice.css b/frontend/src/TurnRecoveryNotice.css
+new file mode 100644
+index 0000000000000000000000000000000000000000..21c3f2f0cea7808c9beb93c8cd9c29fa8f3be3c1
+--- /dev/null
++++ b/frontend/src/TurnRecoveryNotice.css
+@@ -0,0 +1,8 @@
++.turnRecoveryNotice { margin: 6px 0; padding: 10px 12px; border-radius: 9px; background: var(--ui-control-hover, #292b29); color: var(--text); font-size: 12px; }
++.turnRecoveryNotice strong { font-weight: 500; }
++.turnRecoveryNotice p { margin: 5px 0; }
++.turnRecoveryNotice details { margin-top: 6px; }
++.turnRecoveryNotice summary { cursor: pointer; }
++.turnRecoveryNotice pre { max-height: 140px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
++.turnRecoveryActions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
++.turnRecoveryActions button { background: var(--ui-control-hover, #393c39); color: inherit; padding: 5px 8px; border-radius: 6px; }
+diff --git a/frontend/src/TurnRecoveryNotice.tsx b/frontend/src/TurnRecoveryNotice.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e16662d4ed8579679b81206cdcfdfcb400baec2
+--- /dev/null
++++ b/frontend/src/TurnRecoveryNotice.tsx
+@@ -0,0 +1,39 @@
++import { useEffect, useState } from "react";
++import { AccountUpdateIndicator } from "./AccountUpdateIndicator";
++import "./TurnRecoveryNotice.css";
++
++export interface TurnRecoveryView {
++  threadId: string;
++  error: null | { code: string; message: string; originalMessage: string; retryable: boolean; at: string };
++  job: null | { status: "waiting" | "running" | "exhausted"; attempts: number; maxAttempts: number; nextRetryAt: number | null };
++}
++
++export function historicalRecovery(threadId: string, turn?: { status: unknown; [key: string]: unknown }): TurnRecoveryView | undefined {
++  if (turn?.status !== "failed" || !turn.error || typeof turn.error !== "object") return;
++  const error = turn.error as Record<string, unknown>;
++  if (typeof error.message !== "string") return;
++  return { threadId, job: null, error: { code: typeof error.code === "string" ? error.code : String(error.codexErrorInfo ?? "request_failed"),
++    message: error.message, originalMessage: typeof error.originalMessage === "string" ? error.originalMessage : error.message,
++    retryable: false, at: typeof error.at === "string" ? error.at : "" } };
++}
++
++export function TurnRecoveryNotice({ state, userId, onAction }: { state?: TurnRecoveryView; userId: string; onAction: (action: "now" | "cancel" | "dismiss") => void }) {
++  const [now, setNow] = useState(Date.now());
++  useEffect(() => {
++    if (state?.job?.status !== "waiting") return;
++    setNow(Date.now()); const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer);
++  }, [state?.job?.status, state?.job?.nextRetryAt]);
++  if (!state?.error && !state?.job) return null;
++  const job = state.job;
++  return <div className="turnRecoveryNotice" role="status">
++    <div><strong>{state.error?.message ?? "正在继续原任务。"}</strong><AccountUpdateIndicator userId={userId} menuOpen={false} target="runtime" dismissOnRefresh /></div>
++    {job?.status === "waiting" ? <p>已排队，约 {Math.max(0, Math.ceil(((job.nextRetryAt ?? now) - now) / 1000))} 秒后进行第 {job.attempts + 1} 次重试（最多 {job.maxAttempts} 次）。</p> : null}
++    {job?.status === "running" ? <p>正在进行第 {job.attempts} 次自动续接，沿用当前会话和模型。</p> : null}
++    {job?.status === "exhausted" ? <p>已达到 {job.maxAttempts} 次重试上限，请稍后继续或调整模型。</p> : null}
++    {state.error ? <details><summary>错误详情 · {state.error.code}</summary><pre>{state.error.originalMessage}</pre></details> : null}
++    <div className="turnRecoveryActions">
++      {job?.status === "waiting" ? <><button type="button" onClick={() => onAction("now")}>立即重试</button><button type="button" onClick={() => onAction("cancel")}>取消自动重试</button></> : null}
++      {!job || job.status === "exhausted" ? <button type="button" onClick={() => onAction("dismiss")}>关闭提示</button> : null}
++    </div>
++  </div>;
++}
+diff --git a/frontend/src/questionTool.test.ts b/frontend/src/questionTool.test.ts
+index abea6ab7ebfe146ab773dcd75e9600b3d279c879..5e1a0a6614a16e1dc967098f7c9e7a299e1f7b73 100644
+--- a/frontend/src/questionTool.test.ts
++++ b/frontend/src/questionTool.test.ts
+@@ -1,7 +1,28 @@
+ import { describe, expect, it } from "vitest";
+-import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage } from "./questionTool";
++import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult } from "./questionTool";
+ 
+ describe("question tool presentation", () => {
++  it("returns multiple choices by their native IDs, including a free-text answer with newlines", () => {
++    const request = readUserInputRequest({ id: "pool-8", method: "item/tool/requestUserInput", params: {
++      threadId: "thread-a", turnId: "turn-a", itemId: "call-q", questions: [
++        { id: "robot", question: "请选择范围", options: [{ label: "A" }] },
++        { id: "camera", question: "请选择范围", options: null }
++      ]
++    } })!;
++    expect(request.questions.map(question => question.id)).toEqual(["robot", "camera"]);
++    expect(userInputAnswerResult(request, ["A", "自定义\n另一行：内容"])).toEqual({ answers: {
++      robot: { answers: ["A"] }, camera: { answers: ["自定义\n另一行：内容"] }
++    } });
++    expect(() => userInputAnswerResult(request, ["A"])).toThrow();
++    expect(() => userInputAnswerResult(request, ["A", " "])).toThrow();
++    expect(readUserInputRequest({ ...request, params: { ...request.params, questions: [{ question: "缺少编号" }] } })).toBeNull();
++  });
++
++  it("closes resolved synchronous questions while keeping async accepted receipts open", () => {
++    expect(synchronousQuestionHasResult({ tool: "request_user_input", status: "completed" })).toBe(true);
++    expect(synchronousQuestionHasResult({ tool: "request_user_input", completed: false })).toBe(false);
++    expect(synchronousQuestionHasResult({ tool: "request_user_input_async", completed: true, output: '{"accepted":true}' })).toBe(false);
++  });
+   it("extracts choices from the async question tool without exposing its JSON", () => {
+     const input = JSON.stringify({ questions: [{ title: "是否执行？", options: ["先测试", "立即启用"] }] });
+     expect(parseQuestionTool("functions.request_user_input_async", input)).toEqual([{ title: "是否执行？", options: ["先测试", "立即启用"] }]);
+diff --git a/frontend/src/questionTool.ts b/frontend/src/questionTool.ts
+index 64082432d6d26e2b88732cf98b37a44dcd7a02e8..eb65847c83f982362d53927903e8b6d7cca719f4 100644
+--- a/frontend/src/questionTool.ts
++++ b/frontend/src/questionTool.ts
+@@ -1,4 +1,5 @@
+ export interface ToolQuestion {
++  id?: string;
+   title: string;
+   options: string[];
+ }
+@@ -28,9 +29,38 @@
+       : [];
+     // Async questions may intentionally omit options: they are free-text prompts.
+     // The tool's {accepted:true} receipt is not an answer and is not parsed here.
+-    return typeof title === "string" && title.trim() ? { title: title.trim(), options } : null;
++    return typeof title === "string" && title.trim() ? { ...(typeof question.id === "string" ? { id: question.id } : {}), title: title.trim(), options } : null;
+   }).filter((question): question is ToolQuestion => question !== null);
+   return questions.length ? questions : null;
++}
++
++export interface UserInputRequest {
++  id: string | number;
++  method: string;
++  params: { threadId: string; turnId: string; itemId: string; questions: unknown[] };
++  questions: ToolQuestion[];
++}
++
++export function readUserInputRequest(value: unknown): UserInputRequest | null {
++  const request = record(value);
++  if ((typeof request.id !== "string" && typeof request.id !== "number")
++    || (request.method !== "item/tool/requestUserInput" && request.method !== "tool/requestUserInput")) return null;
++  const params = record(request.params);
++  if (typeof params.threadId !== "string" || typeof params.turnId !== "string" || typeof params.itemId !== "string") return null;
++  const questions = parseQuestionTool("request_user_input", params);
++  if (!questions || !Array.isArray(params.questions) || questions.length !== params.questions.length
++    || questions.some(question => !question.id) || new Set(questions.map(question => question.id)).size !== questions.length) return null;
++  return { id: request.id, method: request.method, params: params as UserInputRequest["params"], questions };
++}
++
++export function userInputAnswerResult(request: UserInputRequest, answers: string[]): { answers: Record<string, { answers: string[] }> } {
++  if (answers.length !== request.questions.length || answers.some(answer => !answer.trim())) throw new Error("请回答所有问题后再发送。");
++  return { answers: Object.fromEntries(request.questions.map((question, index) => [question.id!, { answers: [answers[index].trim()] }])) };
++}
++
++export function synchronousQuestionHasResult(item: { tool?: unknown; status?: unknown; completed?: unknown; output?: unknown }): boolean {
++  return typeof item.tool === "string" && /(?:^|\.)request_user_input$/.test(item.tool.trim())
++    && (item.completed === true || ["completed", "failed", "declined"].includes(String(item.status)) || Boolean(item.output));
+ }
+ 
+ /** App-server history can place function arguments in `command`, not `input`. */
+diff --git a/frontend/src/styles.css b/frontend/src/styles.css
+index 54effcf1c99b713fd135958dd3da1a3cf5252474..2cbda4670bee4c8127d4ecbfcb746605c82586c1 100644
+--- a/frontend/src/styles.css
++++ b/frontend/src/styles.css
+@@ -590,7 +590,7 @@
+ 
+ .threadContextMenu {
+   position: fixed;
+-  z-index: 60;
++  z-index: 1000;
+   min-width: 200px;
+   padding: 5px;
+   border: 1px solid var(--line);
+diff --git a/frontend/src/turnProgress.test.ts b/frontend/src/turnProgress.test.ts
+index d639ff963792fb13fc2a3453f09a230613fb50cf..1cd79b339c85e5de567e60596fac3be48b1e02a6 100644
+--- a/frontend/src/turnProgress.test.ts
++++ b/frontend/src/turnProgress.test.ts
+@@ -15,6 +15,7 @@
+     expect(readTurnProgress({ threadId: "a" })).toBeNull();
+     const progress = readTurnProgress({ threadId: "a", turnId: "t", state: "waiting_approval", silentForMs: 200_000 })!;
+     expect(turnProgressText(progress)).toContain("等待操作批准");
++    expect(turnProgressText({ ...progress, state: "waiting_user_input", silentForMs: 60 * 60_000 })).toBe("正在等待你回答问题，回答后会继续。");
+     expect(turnProgressText({ ...progress, state: "waiting_subagents" })).toContain("子代理状态更新");
+     expect(turnProgressText({ ...progress, state: "no_progress" })).toContain("核对运行状态");
+   });
+diff --git a/frontend/src/turnProgress.ts b/frontend/src/turnProgress.ts
+index 21df2b278eb14f1f4d533e7abc925cfa8fe23efe..ca3bde17b2cb476ebf7a69f2d643bc3d2fd3abba 100644
+--- a/frontend/src/turnProgress.ts
++++ b/frontend/src/turnProgress.ts
+@@ -15,6 +15,7 @@
+ export function turnProgressText(progress: TurnProgress | undefined): string {
+   if (!progress) return "";
+   if (progress.state === "waiting_approval") return "正在等待操作批准。";
++  if (progress.state === "waiting_user_input") return "正在等待你回答问题，回答后会继续。";
+   if (progress.state === "waiting_subagents") return "正在等待子代理状态更新，可在右栏查看各任务进展。";
+   const minutes = Math.max(2, Math.floor(progress.silentForMs / 60_000));
+   return `已约 ${minutes} 分钟没有新输出，正在核对运行状态。`;
+diff --git a/frontend/src/types.ts b/frontend/src/types.ts
+index effd7afe204e2922e983d8ccb0e0bc58f8b18451..b9688aab29241ade608762f960a6d85dfe25c721 100644
+--- a/frontend/src/types.ts
++++ b/frontend/src/types.ts
+@@ -261,6 +261,7 @@
+   pinned?: boolean;
+   configuredModel?: string | null;
+   configuredReasoningEffort?: ReasoningEffort | null;
++  collaborationMode?: "plan" | "default";
+   cwd: string;
+   updatedAt: number;
+   createdAt: number;
+diff --git a/frontend/src/useConversationPlanMode.ts b/frontend/src/useConversationPlanMode.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e455e55cbaaabee31f59db4bcb86167123bbea9
+--- /dev/null
++++ b/frontend/src/useConversationPlanMode.ts
+@@ -0,0 +1,25 @@
++import { useCallback, useState, type SetStateAction } from "react";
++
++function preferenceKey(userId: string, conversationId: string): string {
++  return `codex-web-plan-mode:${encodeURIComponent(userId)}:${encodeURIComponent(conversationId)}`;
++}
++
++function storedMode(key: string): boolean | undefined {
++  try {
++    const value = window.localStorage.getItem(key);
++    return value === "plan" ? true : value === "default" ? false : undefined;
++  } catch { return undefined; }
++}
++
++/** A choice applies to the next turn, and stays with its user and conversation. */
++export function useConversationPlanMode(userId: string, conversationId: string, nativeMode?: "plan" | "default") {
++  const key = preferenceKey(userId, conversationId);
++  const [choices, setChoices] = useState<Record<string, boolean>>({});
++  const planMode = choices[key] ?? storedMode(key) ?? nativeMode === "plan";
++  const setPlanMode = useCallback((next: SetStateAction<boolean>) => {
++    const value = typeof next === "function" ? next(planMode) : next;
++    try { window.localStorage.setItem(key, value ? "plan" : "default"); } catch { /* Keep the current tab usable without storage. */ }
++    setChoices(current => ({ ...current, [key]: value }));
++  }, [key, planMode]);
++  return [planMode, setPlanMode] as const;
++}
+diff --git a/frontend/tests/nativeQuestion.playwright.mjs b/frontend/tests/nativeQuestion.playwright.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5d059bc2bc6e38424fe1596ba8e71aaa9e46317
+--- /dev/null
++++ b/frontend/tests/nativeQuestion.playwright.mjs
+@@ -0,0 +1,97 @@
++import assert from "node:assert/strict";
++import { chromium } from "@playwright/test";
++
++const origin = process.env.QUESTION_TEST_ORIGIN ?? "http://127.0.0.1:5193";
++const questions = [{ id: "robot", question: "选择机器人范围", options: [{ label: "通用 ROS 2", description: "配置驱动" }] }, { id: "camera", question: "选择相机范围", options: null }];
++const item = { id: "call-q", type: "toolCall", tool: "request_user_input", input: JSON.stringify({ questions }), completed: false };
++const thread = { id: "fixture-thread", sessionId: "fixture-thread", name: "延迟回答验收", cwd: "/test", updatedAt: 1, createdAt: 1, status: "running", turns: [{ id: "fixture-turn", status: "running", items: [{ id: "user-1", type: "userMessage", text: "整理服务，先确认范围" }, item] }] };
++const project = { id: "fixture-project", name: "验收项目", rootPath: "/test", userId: "lzc", defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "high", defaultSandbox: "danger-full-access", defaultApprovalPolicy: "never" };
++const browser = await chromium.launch({ headless: true });
++const results = [];
++let page;
++const errors = [], paths = [];
++try {
++  page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
++  page.on("pageerror", error => errors.push(error.message));
++  page.on("console", message => { if (message.type() === "error") errors.push(message.text()); });
++  await page.addInitScript(({ questions }) => {
++    localStorage.setItem("codex-web-user-id", "lzc");
++    class FixtureSocket extends EventTarget {
++      static OPEN = 1; static CONNECTING = 0; static CLOSED = 3;
++      readyState = 0;
++      constructor() {
++        super(); window.questionSocket = this; window.questionWrites = []; window.failQuestionAnswer = true;
++        setTimeout(() => {
++          this.readyState = 1; this.dispatchEvent(new Event("open"));
++          this.emit({ type: "hello", data: { liveState: this.snapshot(), turnProgress: [], pendingServerRequests: [{ id: "pool-17", method: "item/tool/requestUserInput", params: { threadId: "fixture-thread", turnId: "fixture-turn", itemId: "call-q", isBlocking: true, questions } }] } });
++        }, 40);
++      }
++      snapshot() { return { activeTurns: [{ threadId: "fixture-thread", turnId: "fixture-turn", status: "running" }], agentMessages: [], toolItems: [] }; }
++      emit(message) { this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(message) })); }
++      send(raw) {
++        const message = JSON.parse(raw);
++        if (message.type === "transport.ping") return this.emit({ type: "transport.pong" });
++        if (message.type === "live.state") return this.emit({ type: "live.state", data: this.snapshot() });
++        if (message.type === "turn.queue.list") return this.emit({ type: "ack", requestId: message.requestId, ok: true, data: { data: [] } });
++        window.questionWrites.push(message);
++        if (message.type === "userInput.respond") setTimeout(() => {
++          if (window.failQuestionAnswer) { window.failQuestionAnswer = false; this.emit({ type: "ack", requestId: message.requestId, ok: false, error: "模拟发送失败" }); }
++          else {
++            this.emit({ type: "codex.notification", data: { method: "serverRequest/resolved", params: { threadId: "fixture-thread", requestId: "pool-17" } } });
++            this.emit({ type: "turn.progress", data: { threadId: "fixture-thread", turnId: "fixture-turn", state: "active", silentForMs: 0 } });
++            this.emit({ type: "ack", requestId: message.requestId, ok: true });
++          }
++        }, 120);
++      }
++      close() { this.readyState = 3; this.dispatchEvent(new Event("close")); }
++    }
++    window.WebSocket = FixtureSocket;
++  }, { questions });
++  await page.route("**/api/**", async route => {
++    const path = new URL(route.request().url()).pathname;
++    paths.push(path);
++    let json = { data: [] };
++    if (path === "/api/projects") json = { data: [project], projectRoot: "/test" };
++    else if (path === "/api/pets") json = { pets: [], activePetId: null, visible: false, position: null };
++    else if (path === "/api/users") json = { data: [{ id: "lzc", name: "lzc" }], defaultUserId: "lzc" };
++    else if (path === "/api/threads/fixture-thread") json = { thread, history: { totalItems: 2, returnedItems: 2, before: 0, hasOlder: false } };
++    else if (path === "/api/projects/fixture-project/threads") json = { data: [thread] };
++    else if (path.endsWith("/execution-settings")) json = { data: { sandbox: "danger-full-access", approvalPolicy: "never" } };
++    else if (path.endsWith("/context")) json = { data: null };
++    else if (path.endsWith("/subagents")) json = { data: [], page: { total: 0, activeCount: 0, historyCount: 0, hasMore: false } };
++    else if (path === "/api/codex/account-pool") json = { data: { strategy: "highest-remaining-sticky-thread", accounts: [] } };
++    else if (path === "/api/models") json = { data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }] };
++    await route.fulfill({ json });
++  });
++  const url = `${origin}/?project=fixture-project&thread=fixture-thread`;
++  await page.goto(url);
++  await page.waitForFunction(() => document.querySelector(".toolQuestionCard, .appRenderFallback"));
++  assert.equal(await page.locator(".appRenderFallback").count(), 0, "fixture must initialize the application");
++  await page.locator(".toolQuestionCard").waitFor();
++  await page.getByText("正在等待你回答问题，回答后会继续。", { exact: true }).waitFor();
++  await page.reload();
++  await page.getByText("延迟回答验收", { exact: true }).click();
++  await page.locator(".toolQuestionCard").waitFor();
++  assert.equal(await page.locator(".toolQuestionCard").count(), 1, "reconnect displays one question");
++  await page.getByRole("button", { name: /通用 ROS 2/ }).click();
++  const custom = page.getByRole("textbox", { name: "自行输入答案：选择相机范围" });
++  await custom.fill("指定 RealSense D405");
++  await page.getByRole("button", { name: "发送自定义答案" }).nth(1).click();
++  await page.getByText(/回答发送失败：模拟发送失败/).waitFor();
++  assert.equal(await page.locator(".toolQuestionCard").count(), 1);
++  assert.equal(await custom.inputValue(), "指定 RealSense D405");
++  await page.getByRole("button", { name: "发送自定义答案" }).nth(1).click();
++  await page.locator(".toolQuestionCard").waitFor({ state: "detached" });
++  const writes = await page.evaluate(() => window.questionWrites);
++  const answers = writes.filter(message => message.type === "userInput.respond");
++  assert.equal(answers.length, 2);
++  assert.deepEqual(answers[1].result, { answers: { robot: { answers: ["通用 ROS 2"] }, camera: { answers: ["指定 RealSense D405"] } } });
++  assert.equal(answers[1].codexRequestId, "pool-17");
++  assert.equal(writes.some(message => ["turn.steer", "turn.start", "turn.queue.add"].includes(message.type)), false);
++  assert.deepEqual(errors, []);
++  results.push({ fullApplication: true, lateQuestionRestored: true, failedReplyPreserved: true, nativeReplyConfirmed: true, appendedTurns: 0 });
++  console.log(JSON.stringify(results));
++} catch (error) {
++  console.error(JSON.stringify({ errors, paths, body: (await page?.locator("body").innerText())?.slice(0, 6000) }));
++  throw error;
++} finally { await browser.close(); }
+diff --git a/frontend/tests/planMode.playwright.mjs b/frontend/tests/planMode.playwright.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ccd44ede4900a5f2ec647a966e32fb32b55607bd
+--- /dev/null
++++ b/frontend/tests/planMode.playwright.mjs
+@@ -0,0 +1,122 @@
++import assert from "node:assert/strict";
++import { chromium } from "@playwright/test";
++
++const origin = process.env.QUESTION_TEST_ORIGIN ?? "http://127.0.0.1:5193";
++const project = { id: "mode-project", name: "模式验收", rootPath: "/test", userId: "lzc", defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "max", defaultSandbox: "danger-full-access", defaultApprovalPolicy: "never" };
++const thread = (id, name, mode) => ({ id, sessionId: id, name, cwd: "/test", collaborationMode: mode, updatedAt: 1, createdAt: 1, status: "completed", turns: [{ id: `${id}-turn`, status: "completed", items: [{ id: `${id}-user`, type: "userMessage", text: "先给出方案" }, { id: `${id}-agent`, type: "agentMessage", text: "方案已经完成" }] }] });
++const threads = [thread("mode-thread", "刷新后的计划会话", "plan"), thread("other-thread", "另一个会话", "default")];
++const browser = await chromium.launch({ headless: true });
++const errors = [];
++let page;
++try {
++  page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
++  page.on("pageerror", error => errors.push(error.message));
++  await page.addInitScript(() => {
++    localStorage.setItem("codex-web-user-id", "lzc");
++    localStorage.setItem("codex-v2-project-lzc", "mode-project");
++    localStorage.setItem("codex-v2-expanded-projects-lzc", JSON.stringify(["mode-project"]));
++    class FixtureSocket extends EventTarget {
++      static OPEN = 1; static CONNECTING = 0; static CLOSED = 3; readyState = 0;
++      constructor() {
++        super(); window.modeWrites = [];
++        setTimeout(() => { this.readyState = 1; this.dispatchEvent(new Event("open")); this.emit({ type: "hello", data: { liveState: this.snapshot(), turnProgress: [], pendingServerRequests: [], turnRecoveries: [this.recovery()] } }); }, 40);
++      }
++      recovery() { return { threadId: "mode-thread", error: { code: "model_overloaded", message: "模型服务暂时过载，已完成的步骤会沿用。", originalMessage: "Selected model is at capacity. Please try a different model.", retryable: true, at: new Date().toISOString() }, job: { status: "waiting", attempts: 0, maxAttempts: 10, nextRetryAt: Date.now() + 60_000 } }; }
++      snapshot() { return { activeTurns: [], agentMessages: [], toolItems: [] }; }
++      emit(message) { this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(message) })); }
++      send(raw) {
++        const message = JSON.parse(raw);
++        if (message.type === "transport.ping") return this.emit({ type: "transport.pong" });
++        if (message.type === "live.state") return this.emit({ type: "live.state", data: this.snapshot() });
++        if (message.type === "turn.queue.list") return this.emit({ type: "ack", requestId: message.requestId, ok: true, data: { data: [] } });
++        window.modeWrites.push(message);
++        if (message.type === "turn.retry.cancel" || message.type === "turn.error.dismiss") {
++          const state = this.recovery(); state.job = null; if (message.type === "turn.error.dismiss") state.error = null;
++          this.emit({ type: "turn.recovery", data: state });
++        }
++        setTimeout(() => this.emit({ type: "ack", requestId: message.requestId, ok: true, data: {} }), 40);
++      }
++      close() { this.readyState = 3; this.dispatchEvent(new Event("close")); }
++    }
++    window.WebSocket = FixtureSocket;
++  });
++  await page.route("**/api/**", async route => {
++    const path = new URL(route.request().url()).pathname;
++    let json = { data: [] };
++    if (path === "/api/projects") json = { data: [project], projectRoot: "/test" };
++    else if (path === "/api/users") json = { data: [{ id: "lzc", name: "lzc" }], defaultUserId: "lzc" };
++    else if (path === "/api/pets") json = { pets: [], activePetId: null, visible: false, position: null };
++    else if (path === "/api/projects/mode-project/threads") json = { data: threads };
++    else if (threads.some(thread => path === `/api/threads/${thread.id}`)) json = { thread: threads.find(thread => path.endsWith(thread.id)), history: { totalItems: 2, returnedItems: 2, before: 0, hasOlder: false } };
++    else if (path.endsWith("/execution-settings")) json = { data: { sandbox: "danger-full-access", approvalPolicy: "never" } };
++    else if (path.endsWith("/context")) json = { data: null };
++    else if (path.endsWith("/subagents")) json = { data: [], page: { total: 0, activeCount: 0, historyCount: 0, hasMore: false } };
++    else if (path === "/api/codex/account-pool") json = { data: { strategy: "highest-remaining-sticky-thread", accounts: [] } };
++    else if (path === "/api/models") json = { data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "max" }] };
++    await route.fulfill({ json });
++  });
++  await page.goto(`${origin}/?project=mode-project&thread=mode-thread`);
++  await page.locator(".v2PlanActiveChip").waitFor();
++  assert.equal(await page.locator(".appRenderFallback").count(), 0);
++  await page.getByText(/秒后进行第 1 次重试/).waitFor();
++  await page.reload();
++  await page.locator('[data-thread-id="mode-thread"] .threadSelectButton').click();
++  await page.getByText(/秒后进行第 1 次重试/).waitFor();
++  await page.getByText("错误详情 · model_overloaded", { exact: true }).click();
++  await page.getByText("Selected model is at capacity. Please try a different model.", { exact: true }).waitFor();
++  await page.getByRole("button", { name: "取消自动重试", exact: true }).click();
++  await page.getByRole("button", { name: "关闭提示", exact: true }).click();
++  await page.locator(".turnRecoveryNotice").waitFor({ state: "detached" });
++  for (const theme of ["dark", "light"]) {
++    await page.evaluate(theme => document.documentElement.dataset.theme = theme, theme);
++    await page.locator('[data-thread-id="other-thread"]').click({ button: "right" });
++    const menu = page.getByRole("menu"); await menu.waitFor();
++    const visible = await menu.evaluate(element => ({
++      portal: element.parentElement === document.body,
++      items: [...element.querySelectorAll('[role="menuitem"]')].map(item => {
++        const rect = item.getBoundingClientRect();
++        const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
++        return { aboveList: Boolean(hit && item.contains(hit)), inViewport: rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight };
++      })
++    }));
++    assert.equal(visible.portal, true); assert.equal(visible.items.length, 4);
++    assert.equal(visible.items.every(item => item.aboveList && item.inViewport), true, `${theme} context menu items are above the list and inside the window`);
++    if (theme === "light") {
++      await page.getByRole("menuitem", { name: "重命名会话", exact: true }).click();
++      const dialog = page.getByRole("dialog", { name: "重命名会话", exact: true }); await dialog.waitFor();
++      await dialog.getByRole("button", { name: "取消", exact: true }).click();
++    } else await page.keyboard.press("Escape");
++    await menu.waitFor({ state: "detached" });
++  }
++  await page.locator(".v2PlanActiveChip").click();
++  await page.locator('.composer [contenteditable="true"][aria-label="随心输入"]').waitFor();
++  await page.reload();
++  await page.locator('[data-thread-id="mode-thread"] .threadSelectButton').click();
++  await page.locator('.composer [contenteditable="true"][aria-label="随心输入"]').waitFor();
++  assert.equal(await page.locator(".v2PlanActiveChip").count(), 0, "the explicit Default choice survives reload despite a previous native Plan turn");
++  await page.locator('[data-thread-id="other-thread"] .threadSelectButton').click();
++  await page.locator(".v2ComposerPlus").click();
++  await page.locator('[data-action="plan"]').click();
++  await page.locator(".v2PlanActiveChip").waitFor();
++  await page.locator('[data-thread-id="mode-thread"] .threadSelectButton').click();
++  await page.locator('.composer [contenteditable="true"][aria-label="随心输入"]').waitFor();
++  assert.equal(await page.locator(".v2PlanActiveChip").count(), 0, "Plan selection does not leak between conversations");
++  await page.locator('[data-thread-id="other-thread"] .threadSelectButton').click();
++  await page.locator(".v2PlanActiveChip").waitFor();
++  await page.reload();
++  await page.locator('[data-thread-id="other-thread"] .threadSelectButton').click();
++  await page.locator(".v2PlanActiveChip").waitFor();
++  await page.locator('[data-thread-id="mode-thread"] .threadSelectButton').click();
++  const execute = page.locator('.composer [contenteditable="true"][aria-label="随心输入"]');
++  await execute.fill("开始执行已批准的方案"); await execute.press("Enter");
++  await page.waitForFunction(() => window.modeWrites.some(message => message.type === "turn.start"));
++  const writes = await page.evaluate(() => window.modeWrites);
++  const start = writes.find(message => message.type === "turn.start");
++  assert.equal(start.threadId, "mode-thread"); assert.equal(start.collaborationMode, "default");
++  assert.equal(writes.some(message => message.type === "thread.start"), false, "switching modes continues the original conversation");
++  assert.deepEqual(errors, []);
++  console.log(JSON.stringify({ nativePlanRestored: true, disableSurvivesReload: true, enableSurvivesReload: true, conversationChoicesIsolated: true, sendsExplicitDefault: true, newConversationCreated: false, contextMenuAboveList: true, menuItemsVisibleInBothThemes: true, overloadDetailsVisible: true, retryRestoredOnReload: true, retryCancelledAndDismissed: true }));
++} catch (error) {
++  console.error(JSON.stringify({ errors, composer: await page?.locator(".composer").evaluate(element => ({ mode: element.dataset.planMode, fields: [...element.querySelectorAll("textarea, [contenteditable]")].map(field => ({ tag: field.tagName, placeholder: field.getAttribute("placeholder"), aria: field.getAttribute("aria-label"), class: field.className })), preferences: Object.entries(localStorage).filter(([key]) => key.startsWith("codex-web-plan-mode:")) })), body: (await page?.locator("body").innerText())?.slice(0, 2000) }));
++  throw error;
++} finally { await browser.close(); }
+diff --git a/maintenance/deploy-user-input-when-idle.mjs b/maintenance/deploy-user-input-when-idle.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a95130346b6f68b6456a51e043dbf89e36f636dd
+--- /dev/null
++++ b/maintenance/deploy-user-input-when-idle.mjs
+@@ -0,0 +1,194 @@
++import fs from "node:fs";
++import path from "node:path";
++import { createHash, createHmac, randomUUID } from "node:crypto";
++import { DatabaseSync } from "node:sqlite";
++import { createRequire } from "node:module";
++import { fileURLToPath } from "node:url";
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
++import { publishDist } from "../frontend/scripts/publish-dist.mjs";
++
++const script = fileURLToPath(import.meta.url);
++const root = path.resolve(path.dirname(script), "..");
++const execute = promisify(execFile);
++const WebSocket = createRequire(path.join(root, "backend/package.json"))("ws");
++const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
++
++export function treeHash(directory, accept = () => true) {
++  const hash = createHash("sha256");
++  const walk = current => {
++    for (const entry of fs.readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
++      const file = path.join(current, entry.name);
++      if (entry.isDirectory()) walk(file);
++      else if (entry.isFile() && accept(file)) hash.update(path.relative(directory, file)).update("\0").update(fs.readFileSync(file)).update("\0");
++    }
++  };
++  walk(directory);
++  return hash.digest("hex");
++}
++
++export function deploymentSourceHash() {
++  const hash = createHash("sha256");
++  hash.update(treeHash(path.join(root, "backend/server"), file => file.endsWith(".ts") && !file.includes(".test.")));
++  hash.update(treeHash(path.join(root, "frontend/src"), file => /\.(tsx?|css)$/.test(file) && !file.includes(".test.")));
++  for (const file of [script, path.join(root, "frontend/scripts/publish-dist.mjs"), path.join(root, "scripts/publish-ui-update.cjs")]) hash.update(fs.readFileSync(file));
++  return hash.digest("hex");
++}
++
++export function idleDecision(snapshots, health, pool, staleAllowance = 0) {
++  const unknown = snapshots.filter(snapshot => !snapshot || snapshot.unknown).length;
++  const active = snapshots.reduce((n, snapshot) => n + (snapshot?.active?.filter(turn => turn.status === "running").length ?? 0), 0);
++  const visiblePending = snapshots.reduce((n, snapshot) => n + (snapshot?.pending?.length ?? 0), 0);
++  const pendingRetries = snapshots.reduce((n, snapshot) => n + (snapshot?.recoveries?.filter(state => ["waiting", "running"].includes(state.job?.status)).length ?? 0), 0);
++  const totalPending = health?.codexPendingApprovals;
++  const inFlight = Array.isArray(pool?.accounts) ? pool.accounts.reduce((n, account) => n + (Number.isInteger(account.activeRequests) ? account.activeRequests : 1), 0) : 1;
++  return { unknown, active, visiblePending, pendingRetries, totalPending, inFlight,
++    idle: snapshots.length > 0 && unknown === 0 && active === 0 && visiblePending === 0 && pendingRetries === 0 && inFlight === 0
++      && Number.isInteger(totalPending) && totalPending >= 0 && totalPending <= staleAllowance };
++}
++
++export async function waitForQuiet(observe, onState, { pause = sleep, now = Date.now, pollMs = 30_000, quietMs = 60_000 } = {}) {
++  let quietSince = null;
++  for (;;) {
++    const state = await observe();
++    if (!state.idle) quietSince = null;
++    else quietSince ??= now();
++    onState(state, quietSince === null ? "waiting_for_idle" : "verifying_quiet_window");
++    if (quietSince !== null && now() - quietSince >= quietMs) {
++      const confirmed = await observe();
++      if (confirmed.idle) return confirmed;
++      quietSince = null;
++      onState(confirmed, "waiting_for_idle");
++    }
++    await pause(pollMs);
++  }
++}
++
++function report(manifest, stage, details = {}) {
++  let previous; try { previous = JSON.parse(fs.readFileSync(manifest.report, "utf8")); } catch { /* First report. */ }
++  const value = { version: manifest.version, stage, at: new Date().toISOString(),
++    ...(previous?.version === manifest.version && previous.deployed ? { deployed: true } : {}), ...details };
++  const temporary = manifest.report + ".tmp";
++  fs.writeFileSync(temporary, JSON.stringify(value, null, 2), { mode: 0o600 });
++  fs.renameSync(temporary, manifest.report);
++  console.log(JSON.stringify(value));
++}
++
++function cookieFor(user) {
++  const value = Buffer.from(JSON.stringify({ u: user, exp: Date.now() + 600_000 })).toString("base64url");
++  const secret = fs.readFileSync(path.join(root, "data/auth/session-secret"), "utf8").trim();
++  return `codex_remote_session_4575=${value}.${createHmac("sha256", secret).update(value).digest("base64url")}`;
++}
++
++function socketRequest(user, request, timeoutMs = 10_000) {
++  return new Promise((resolve, reject) => {
++    const socket = new WebSocket("ws://127.0.0.1:4576/ws", { headers: { cookie: cookieFor(user) } });
++    let settled = false;
++    const finish = (error, value) => {
++      if (settled) return;
++      settled = true; clearTimeout(timer); socket.terminate();
++      error ? reject(error) : resolve(value);
++    };
++    const timer = setTimeout(() => finish(new Error("运行状态查询超时")), timeoutMs);
++    socket.on("error", error => finish(error));
++    socket.on("message", raw => {
++      let message; try { message = JSON.parse(String(raw)); } catch { return; }
++      if (message.type === "hello") {
++        if (!request) finish(null, { active: message.data?.liveState?.activeTurns ?? [], pending: message.data?.pendingServerRequests ?? [], recoveries: message.data?.turnRecoveries ?? [] });
++        else socket.send(JSON.stringify(request));
++      } else if (request && message.type === "ack" && message.requestId === request.requestId) {
++        finish(message.ok ? null : new Error(message.error ?? "会话恢复请求未被接受"), message.data);
++      }
++    });
++  });
++}
++
++async function readApi(user, route) {
++  const response = await fetch(`http://127.0.0.1:4576${route}`, { headers: { cookie: cookieFor(user) }, signal: AbortSignal.timeout(30_000) });
++  if (!response.ok) throw new Error(`运行状态接口 HTTP ${response.status}`);
++  return response.json();
++}
++
++function targetRevision(manifest) {
++  const db = new DatabaseSync(manifest.target.stateDb, { readOnly: true });
++  try { return db.prepare("SELECT updated_at_ms,archived FROM threads WHERE id=?").get(manifest.target.threadId); }
++  finally { db.close(); }
++}
++
++async function observe(manifest) {
++  if (deploymentSourceHash() !== manifest.sourceHash) throw new Error("待上线源码已改变，本次更新暂缓；没有重启服务。");
++  const db = new DatabaseSync(path.join(root, "data/backend/codex-web.sqlite"), { readOnly: true });
++  let users; try { users = db.prepare("SELECT id FROM users").all().map(user => user.id); } finally { db.close(); }
++  const snapshots = await Promise.all(users.map(user => socketRequest(user).catch(() => ({ unknown: true }))));
++  const [health, pool] = await Promise.all([readApi(manifest.target.userId, "/api/health").catch(() => null), readApi(manifest.target.userId, "/api/codex/account-pool").catch(() => null)]);
++  return idleDecision(snapshots, health, pool?.data, manifest.staleAllowance);
++}
++
++async function apply(manifest) {
++  const final = await observe(manifest);
++  if (!final.idle) { report(manifest, "waiting_for_idle", final); return 75; }
++  if (treeHash(manifest.build) !== manifest.artifactHash) throw new Error("待上线网页构建已改变，未重启服务。");
++  report(manifest, "restarting_idle_backend", final);
++  await execute("systemctl", ["--user", "restart", "codex-account-pool-4576.service"], { timeout: 60_000 });
++  let ready = false;
++  for (let attempt = 0; attempt < 30; attempt++) {
++    try { await socketRequest(manifest.target.userId); ready = true; break; } catch { await sleep(1_000); }
++  }
++  if (!ready) throw new Error("后端重启后未恢复连接；原会话记录仍保留。");
++  await publishDist(manifest.build, path.join(root, "frontend/dist"));
++  await execute(process.execPath, [path.join(root, "scripts/publish-ui-update.cjs"), manifest.version, "questions,plan,threads,runtime"], { timeout: 10_000 });
++  report(manifest, "deployed_restoring_question", { deployed: true });
++  const owners = new DatabaseSync(path.join(root, "data/backend/codex-web.sqlite"), { readOnly: true });
++  let owner;
++  try { owner = owners.prepare("SELECT user_id,project_id,is_archived_local FROM thread_owners WHERE thread_id=?").get(manifest.target.threadId); }
++  finally { owners.close(); }
++  const revision = targetRevision(manifest);
++  const state = await socketRequest(manifest.target.userId);
++  if (!owner || owner.user_id !== manifest.target.userId || owner.is_archived_local || !revision || revision.archived
++    || revision.updated_at_ms !== manifest.target.updatedAtMs || state.active.some(turn => turn.threadId === manifest.target.threadId)) {
++    report(manifest, "complete", { recovery: "conversation_changed_or_already_running", restartedOnIdleSnapshot: true });
++    return 0;
++  }
++  const prompt = "网页问答故障已经修复，现在恢复上一轮被中断的等待状态。请继续原自动标定服务整理和容器打包方案任务，沿用已有检查结果和此前的范围约定，不再重新检查文件。请直接用 request_user_input 重新展示以下原来的三个问题，保持问题、编号与选项不变并等待用户回答。不替用户选择默认答案，不开始实施，仍先提出方案、经用户批准后再实施。\n\n" + JSON.stringify(manifest.questions);
++  await socketRequest(manifest.target.userId, { type: "turn.start", requestId: `question-recovery-${randomUUID()}`, projectId: manifest.target.projectId,
++    threadId: manifest.target.threadId, collaborationMode: "plan", prompt }, 120_000);
++  for (let attempt = 0; attempt < 30; attempt++) {
++    await sleep(10_000);
++    const restored = await socketRequest(manifest.target.userId);
++    const pending = restored.pending.find(request => request.method === "item/tool/requestUserInput" && request.params?.threadId === manifest.target.threadId);
++    if (pending) {
++      report(manifest, "complete", { recovery: "waiting_for_user_answers", threadId: manifest.target.threadId, questionCount: pending.params?.questions?.length, restartedOnIdleSnapshot: true });
++      return 0;
++    }
++    if (!restored.active.some(turn => turn.threadId === manifest.target.threadId)) break;
++  }
++  report(manifest, "deployed", { recovery: "resume_accepted_question_not_yet_confirmed", threadId: manifest.target.threadId });
++  return 0;
++}
++
++async function main() {
++  const manifestPath = process.argv[2];
++  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
++  try {
++    if (process.argv.includes("--check")) { report(manifest, "checked_waiting_for_idle", await observe(manifest)); return; }
++    if (process.argv.includes("--apply")) { process.exitCode = await apply(manifest); return; }
++    for (;;) {
++      await waitForQuiet(() => observe(manifest), (state, stage) => report(manifest, stage, state));
++      try {
++        const result = await execute("/usr/bin/flock", ["--exclusive", "--nonblock", "--conflict-exit-code", "75", "--no-fork",
++          path.join(root, "data/backend/deployment.lock"), process.execPath, script, manifestPath, "--apply"], { timeout: 15 * 60_000, maxBuffer: 1_048_576 });
++        if (result.stdout) process.stdout.write(result.stdout);
++        return;
++      } catch (error) {
++        if (error.code !== 75) throw error;
++        report(manifest, "waiting_for_idle_or_deployment_lock");
++        await sleep(30_000);
++      }
++    }
++  } catch (error) {
++    let state; try { state = JSON.parse(fs.readFileSync(manifest.report, "utf8")); } catch { /* No report yet. */ }
++    report(manifest, state?.deployed ? "deployed_recovery_failed" : "deferred", { error: error.message }); process.exitCode = 1;
++  }
++}
++
++if (process.argv[1] && path.resolve(process.argv[1]) === script) await main();
+diff --git a/maintenance/deploy-user-input-when-idle.test.mjs b/maintenance/deploy-user-input-when-idle.test.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..720d9fd010f8b8316a0dac857456499944dbd7e0
+--- /dev/null
++++ b/maintenance/deploy-user-input-when-idle.test.mjs
+@@ -0,0 +1,28 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { idleDecision, waitForQuiet } from "./deploy-user-input-when-idle.mjs";
++
++test("requires every user's active turn and visible request to finish, while tolerating only the known cancelled legacy request", () => {
++  const health = { codexPendingApprovals: 1 }, pool = { accounts: [{ activeRequests: 0 }] };
++  const idle = { active: [], pending: [] };
++  assert.equal(idleDecision([idle], health, pool, 1).idle, true);
++  assert.equal(idleDecision([idle], health, pool).idle, false);
++  assert.equal(idleDecision([idle, { active: [{ status: "running" }], pending: [] }], health, pool, 1).idle, false);
++  assert.equal(idleDecision([{ active: [], pending: [{ id: "question" }] }], health, pool, 1).idle, false);
++  assert.equal(idleDecision([idle], { codexPendingApprovals: 2 }, pool, 1).idle, false);
++  assert.equal(idleDecision([idle], health, { accounts: [{ activeRequests: 1 }] }, 1).idle, false);
++  assert.equal(idleDecision([{ unknown: true }], health, pool, 1).idle, false);
++  assert.equal(idleDecision([idle], null, null, 1).idle, false);
++});
++
++test("a new turn during the quiet window resets the wait, including the final confirmation", async () => {
++  let time = 0, read = 0;
++  const stages = [];
++  const states = [false, true, true, true, false, true, true, true, true];
++  const state = await waitForQuiet(async () => ({ idle: states[read++] ?? true }), (_state, stage) => stages.push(stage),
++    { now: () => time, pollMs: 30, quietMs: 60, pause: async ms => { time += ms; } });
++  assert.equal(state.idle, true);
++  assert.equal(read, 9);
++  assert.equal(time, 180);
++  assert.equal(stages.filter(stage => stage === "waiting_for_idle").length, 2);
++});
+diff --git a/scripts/publish-ui-update.cjs b/scripts/publish-ui-update.cjs
+index b2f53a88d37aaf786c7075d4751df96f7a992eee..7a984ed7a49de87de800e4485683bf52c4e45069 100644
+--- a/scripts/publish-ui-update.cjs
++++ b/scripts/publish-ui-update.cjs
+@@ -5,12 +5,13 @@
+ const crypto = require('node:crypto');
+ const version = process.argv[2];
+ const target = process.argv[3];
++const targets = target?.split(',');
+ const notice = process.argv[4];
+-if (target && !['account', 'plugins'].includes(target)) throw new Error('Invalid update target');
++if (targets?.some(entry => !['account', 'plugins', 'questions', 'plan', 'threads', 'runtime'].includes(entry))) throw new Error('Invalid update target');
+ if (!/^[a-zA-Z0-9._:-]{1,128}$/.test(version ?? '')) throw new Error('Usage: node scripts/publish-ui-update.cjs <unique-release-version>');
+ const directory = path.resolve(__dirname, '../data/backend/ui-updates');
+ fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+ const temp = path.join(directory, `.release-${crypto.randomUUID()}.tmp`);
+-fs.writeFileSync(temp, JSON.stringify({ version, ...(target ? { targets: [target] } : {}), ...(notice ? { notice: notice.slice(0, 500) } : {}), publishedAt: new Date().toISOString() }), { mode: 0o600 });
++fs.writeFileSync(temp, JSON.stringify({ version, ...(targets ? { targets } : {}), ...(notice ? { notice: notice.slice(0, 500) } : {}), publishedAt: new Date().toISOString() }), { mode: 0o600 });
+ fs.renameSync(temp, path.join(directory, 'release.json'));
+ console.log(JSON.stringify({ publishedUpdate: version }));
