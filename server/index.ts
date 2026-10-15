@@ -6,12 +6,21 @@ import multipart from "@fastify/multipart";
 import compress from "@fastify/compress";
 import Fastify from "fastify";
 import { CodexBridge } from "./codexBridge.js";
-import { AccountPoolBridge } from "./accountPoolBridge.js";
+import { AccountPoolBridge, isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders, changeUserPassword, clearSessionCookie, createSessionCookie, verifyCredentials } from "./auth.js";
 import { serverConfig } from "./config.js";
 import { ProjectStore } from "./db.js";
-import { registerRoutes } from "./routes.js";
+import { invalidateModelCatalogCache, registerRoutes } from "./routes.js";
+import { ModelCatalogAutoUpdater } from "./modelCatalogAutoUpdate.js";
+import { DocumentCompiler } from "./documentCompiler.js";
+import { registerDocumentWorkbenchRoutes } from "./documentWorkbench.js";
 import { attachSocketServer } from "./socket.js";
+import { BrowserService } from "./browserService.js";
+import { registerBrowserRoutes, browserMcpAuthorized } from "./browserRoutes.js";
+import { registerPetRoutes } from "./pets.js";
+import { registerUiUpdateRoutes } from "./uiUpdates.js";
+import { registerSpeechRoutes } from "./speech.js";
+import { registerFeishuRoutes } from "./feishu.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -48,7 +57,7 @@ function gzipVariant(filePath: string): string {
   return gzipPath;
 }
 
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: { serializers: { req(req) { return { method: req.method, url: req.url?.startsWith("/api/feishu/callback") ? "/api/feishu/callback" : req.url, hostname: req.hostname, remoteAddress: req.ip }; } } } });
 await app.register(compress, { global: true, threshold: 1024 });
 
 function requestPath(url: string | undefined): string {
@@ -72,6 +81,7 @@ app.addHook("onRequest", async (request, reply) => {
   if (isPublicPath(pathname)) {
     return;
   }
+  if ((pathname === "/api/browser/mcp" || pathname === "/api/schedules/mcp" || pathname === "/api/feishu/mcp") && browserMcpAuthorized(request.headers)) return;
 
   // A peer can request only its local leaderboard snapshot with the shared
   // internal token; browser login cookies never leave this machine.
@@ -104,6 +114,21 @@ const store = new ProjectStore();
 const bridge = serverConfig.accountPoolFile
   ? AccountPoolBridge.fromFile(serverConfig.accountPoolFile)
   : new CodexBridge();
+const modelCatalogUpdater = isAccountPoolBridge(bridge)
+  ? new ModelCatalogAutoUpdater(
+      bridge,
+      serverConfig.modelCatalogRefreshIntervalMs,
+      { info: (details, message) => app.log.info(details, message), warn: (details, message) => app.log.warn(details, message) },
+      invalidateModelCatalogCache
+    )
+  : null;
+bridge.on("accountAuth", (diagnostic: { accountId: string; code: string; requiresLogin: boolean }) => {
+  if (diagnostic.requiresLogin) app.log.warn(diagnostic, "Account authentication requires device login");
+  else app.log.info(diagnostic, "Account authentication lifecycle");
+});
+bridge.on("accountRuntime", (diagnostic: Record<string, unknown>) => {
+  app.log.info(diagnostic, "Account runtime lifecycle");
+});
 
 await app.register(multipart, {
   limits: {
@@ -112,7 +137,16 @@ await app.register(multipart, {
   }
 });
 
-registerRoutes(app, bridge as CodexBridge, store);
+registerRoutes(app, bridge as CodexBridge, store, { browserTools: true });
+const documentCompiler = new DocumentCompiler();
+registerDocumentWorkbenchRoutes(app, store, { compiler: documentCompiler });
+const browserService = new BrowserService();
+registerBrowserRoutes(app, store, browserService);
+registerPetRoutes(app);
+registerUiUpdateRoutes(app);
+registerSpeechRoutes(app);
+registerFeishuRoutes(app);
+app.addHook("onClose", async () => { await browserService.dispose(); });
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[char] ?? char));
@@ -123,21 +157,22 @@ function authLayout(title: string, body: string): string {
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>${escapeHtml(title)}</title>
   <style>
     :root { color-scheme: light; }
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: linear-gradient(135deg,#eef2ff,#f8fafc 45%,#ecfeff); color: #111827; }
-    main { width: min(92vw, 460px); background: rgba(255,255,255,.96); border: 1px solid #e5e7eb; border-radius: 18px; padding: 30px; box-shadow: 0 18px 50px rgba(15,23,42,.12); }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; min-width: 0; min-height: 100vh; min-height: 100dvh; display: grid; place-items: safe center; padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); overflow: auto; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: linear-gradient(135deg,#eef2ff,#f8fafc 45%,#ecfeff); color: #111827; }
+    main { width: min(100%, 460px); min-width: 0; background: rgba(255,255,255,.96); border: 1px solid #e5e7eb; border-radius: 18px; padding: clamp(20px, 6vw, 30px); box-shadow: 0 18px 50px rgba(15,23,42,.12); }
     h1 { margin: 0 0 8px; font-size: 26px; letter-spacing: -0.03em; }
     p { color: #4b5563; line-height: 1.6; margin: 8px 0 0; }
     label { display: block; margin-top: 18px; font-weight: 700; color: #1f2937; }
-    input { width: 100%; box-sizing: border-box; margin-top: 7px; padding: 11px 12px; border: 1px solid #d1d5db; border-radius: 10px; font-size: 15px; outline: none; }
+    input { width: 100%; min-width: 0; margin-top: 7px; padding: 11px 12px; border: 1px solid #d1d5db; border-radius: 10px; font-size: 16px; outline: none; }
     input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.14); }
     button { margin-top: 24px; width: 100%; padding: 12px 14px; border: 0; border-radius: 10px; background: #2563eb; color: white; font-size: 15px; font-weight: 800; cursor: pointer; }
     button.secondary { background: #f3f4f6; color: #111827; }
     a { color: #2563eb; font-weight: 700; text-decoration: none; }
-    .links { display: flex; gap: 14px; justify-content: center; margin-top: 18px; }
+    .links { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; margin-top: 18px; }
     .msg { margin-top: 16px; padding: 10px 12px; border-radius: 10px; display: none; font-size: 14px; }
     .ok { background: #ecfdf5; color: #065f46; display: block; }
     .err { background: #fef2f2; color: #991b1b; display: block; }
@@ -150,7 +185,7 @@ function authLayout(title: string, body: string): string {
 
 app.get("/login", async (_request, reply) => {
   const page = authLayout("登录 Codex Remote", `<h1>登录 Codex Remote</h1>
-    <p>加入 ZeroTier 网络后，用自己的姓名登录。初始密码是 <code>ls</code>，登录后可以修改密码。</p>
+    <p>加入 ZeroTier 网络后，用自己的姓名登录。初始密码由管理员提供，登录后可以修改密码。</p>
     <form id="form">
       <label>用户名 / 姓名</label>
       <input name="username" autocomplete="username" required autofocus />
@@ -184,7 +219,7 @@ app.post("/api/auth/login", async (request, reply) => {
   const username = typeof body?.username === "string" ? body.username.trim() : "";
   const password = typeof body?.password === "string" ? body.password : "";
   if (!username || !verifyCredentials(username, password)) {
-    return reply.code(401).send({ error: "用户名或密码不正确。首次登录请使用自己的姓名和初始密码 ls。" });
+    return reply.code(401).send({ error: "用户名或密码不正确。首次登录请使用管理员提供的凭据。" });
   }
   return reply.header("Set-Cookie", createSessionCookie(username)).send({ ok: true, username });
 });
@@ -228,7 +263,7 @@ app.get("/change-password", async (request, reply) => {
   const safeUsername = escapeHtml(username);
   const page = authLayout("修改 Codex Remote 密码", `<h1>修改密码</h1>
     <p>当前登录用户：<code>${safeUsername}</code></p>
-    <p>初始密码是 <code>ls</code>。修改后请用新密码重新登录。</p>
+    <p>初始密码由管理员提供。修改后请用新密码重新登录。</p>
     <form id="form">
       <label>当前密码</label>
       <input name="currentPassword" type="password" autocomplete="current-password" required />
@@ -281,7 +316,7 @@ app.setNotFoundHandler((request, reply) => {
     ? candidate
     : path.join(distDir, "index.html");
   const extension = path.extname(filePath);
-  if (extension === ".html") {
+  if (extension === ".html" || path.basename(filePath) === "sw.js") {
     reply.header("Cache-Control", "no-store");
   } else {
     reply.header("Cache-Control", "public, max-age=31536000, immutable");
@@ -304,7 +339,7 @@ app.setNotFoundHandler((request, reply) => {
   return reply.type(mimeTypes[extension] ?? "application/octet-stream").send(fs.createReadStream(responsePath));
 });
 
-attachSocketServer(app.server, bridge as CodexBridge, store);
+attachSocketServer(app.server, bridge as CodexBridge, store, browserService);
 
 let shuttingDown = false;
 async function shutdownServer(signal: string) {
@@ -314,6 +349,8 @@ async function shutdownServer(signal: string) {
   shuttingDown = true;
   try {
     app.log.info({ signal }, "Shutting down Codex Web Console");
+    await browserService.dispose();
+    modelCatalogUpdater?.stop();
     bridge.stop();
     store.close();
     process.exit(0);
@@ -333,3 +370,4 @@ process.on("SIGTERM", () => {
 
 await bridge.start();
 await app.listen({ host: serverConfig.host, port: serverConfig.port });
+modelCatalogUpdater?.start();

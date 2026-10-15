@@ -2,6 +2,14 @@ import type { RpcEnvelope } from "./types.js";
 
 type LiveTurnStatus = "running" | "completed";
 
+// Live state is only a reconnect aid while a turn is running. The complete
+// transcript is persisted by Codex and loaded through the thread history API,
+// so replaying an unbounded number of tool calls here only makes every browser
+// reconnect progressively more expensive.
+const MAX_LIVE_AGENT_MESSAGES = 32;
+const MAX_LIVE_TOOL_ITEMS = 48;
+const MAX_LIVE_TOOL_TEXT_CHARS = 6_000;
+
 export interface LiveAgentMessage {
   itemId: string;
   sourceItemId: string;
@@ -15,7 +23,10 @@ export interface LiveAgentMessage {
 }
 
 export interface LiveToolItem {
+  collaboration?: Record<string, unknown>;
+  internal?: boolean;
   itemId: string;
+  sourceItemId?: string;
   threadId: string | null;
   turnId: string | null;
   tool: string;
@@ -44,7 +55,7 @@ export interface LiveStateSnapshot {
 
 export type LiveStateUpdate =
   | { kind: "agent"; item: LiveAgentMessage }
-  | { kind: "tool"; item: LiveToolItem };
+  | { kind: "tool"; item: LiveToolItem; historyItem?: LiveToolItem };
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
@@ -64,8 +75,21 @@ function textFromValue(value: unknown): string {
   }
 }
 
+function livePreview(text: string, maxChars = MAX_LIVE_TOOL_TEXT_CHARS): string {
+  if (text.length <= maxChars) return text;
+  const notice = "\n…[实时预览已截断，完整内容保留在会话历史中]…\n";
+  const available = Math.max(0, maxChars - notice.length);
+  const headLength = Math.ceil(available * 0.65);
+  return `${text.slice(0, headLength)}${notice}${text.slice(text.length - (available - headLength))}`;
+}
+
 function normalizedToken(value: unknown): string {
   return textFromValue(value).toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function isContextCompactionItem(item: Record<string, unknown>): boolean {
+  const token = normalizedToken(item.type ?? item.kind ?? item.tool ?? item.name);
+  return token.includes("contextcompaction");
 }
 
 function isToolItem(item: Record<string, unknown>): boolean {
@@ -102,7 +126,7 @@ function toolLabel(item: Record<string, unknown>): string {
 }
 
 function toolInput(item: Record<string, unknown>): string {
-  for (const value of [item.command, item.input, item.arguments, item.action, item.changes, item.query, item.queries]) {
+  for (const value of [item.command, item.input, item.arguments, item.action, item.changes, item.query, item.queries, item.path, item.imagePath, item.image_path]) {
     const text = textFromValue(value);
     if (text.trim()) return text;
   }
@@ -149,16 +173,47 @@ export class LiveStateStore {
   private nextSequence = 0;
   private updatedAt: string | null = null;
 
+  private hasActiveTurn(params: Record<string, unknown>): boolean {
+    const { threadId, turnId } = turnFields(params);
+    if (threadId && this.activeTurns.has(threadId)) return true;
+    if (turnId && Array.from(this.activeTurns.values()).some((turn) => turn.turnId === turnId)) return true;
+    return !threadId && !turnId && this.activeTurns.size === 1;
+  }
+
+  private pruneAgentMessages(): void {
+    while (this.agentMessages.size > MAX_LIVE_AGENT_MESSAGES) {
+      const oldest = this.agentMessages.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.agentMessages.delete(oldest);
+    }
+    for (const [sourceItemId, segmentId] of this.activeAgentSegments.entries()) {
+      if (!this.agentMessages.has(segmentId)) {
+        this.activeAgentSegments.delete(sourceItemId);
+      }
+    }
+  }
+
+  private pruneToolItems(): void {
+    while (this.toolItems.size > MAX_LIVE_TOOL_ITEMS) {
+      const completed = Array.from(this.toolItems.entries()).find(([, item]) => item.completed)?.[0];
+      const oldest = completed ?? (this.toolItems.keys().next().value as string | undefined);
+      if (!oldest) break;
+      this.toolItems.delete(oldest);
+    }
+  }
+
   recordNotification(envelope: RpcEnvelope): LiveStateUpdate | null {
     const params = asRecord(envelope.params);
     const method = envelope.method ?? "";
     if (method === "item/agentMessage/delta") {
+      if (!this.hasActiveTurn(params)) return null;
       const agent = this.recordAgentMessageDelta(params);
       return agent ? { kind: "agent", item: agent } : null;
     }
     const typedItemEvent = method.match(/^item\/(.+)\/(started|completed|outputDelta)$/);
     const genericItemEvent = method.match(/^item\/(started|completed|outputDelta)$/);
     if (typedItemEvent || genericItemEvent) {
+      if (!this.hasActiveTurn(params)) return null;
       const item = asRecord(params.item);
       const eventType = typedItemEvent?.[1] ?? item.type;
       const eventPhase = typedItemEvent?.[2] ?? genericItemEvent?.[1];
@@ -171,7 +226,7 @@ export class LiveStateStore {
         { ...params, item: eventItem },
         eventPhase === "completed"
       );
-      return tool ? { kind: "tool", item: tool } : null;
+      return tool ? { kind: "tool", item: { ...tool, input: livePreview(tool.input), output: livePreview(tool.output) }, historyItem: tool } : null;
     }
     if (envelope.method === "turn/started") {
       this.recordTurnStarted(params);
@@ -222,10 +277,11 @@ export class LiveStateStore {
     const resolvedTurnId = turnId ?? inferredTurn?.turnId ?? null;
     const activeSegmentId = this.activeAgentSegments.get(sourceItemId);
     const activeSegment = activeSegmentId ? this.agentMessages.get(activeSegmentId) : undefined;
-    const resumeAfterAnotherItem = Boolean(activeSegment && activeSegment.sequence !== this.nextSequence);
-    const sequence = !activeSegment || resumeAfterAnotherItem ? ++this.nextSequence : activeSegment.sequence;
-    const itemId = !activeSegment || resumeAfterAnotherItem ? `${sourceItemId}::${sequence}` : activeSegment.itemId;
-    const existing = !activeSegment || resumeAfterAnotherItem ? undefined : activeSegment;
+    // A streamed message keeps its identity and first-seen position even when
+    // an asynchronous tool completion arrives between two text deltas.
+    const sequence = activeSegment?.sequence ?? ++this.nextSequence;
+    const itemId = sourceItemId;
+    const existing = activeSegment;
     const next: LiveAgentMessage = {
       itemId,
       sourceItemId,
@@ -239,6 +295,7 @@ export class LiveStateStore {
     };
     this.agentMessages.set(itemId, next);
     this.activeAgentSegments.set(sourceItemId, itemId);
+    this.pruneAgentMessages();
     this.updatedAt = now;
     return next;
   }
@@ -268,9 +325,15 @@ export class LiveStateStore {
     const activeTurn = threadId ? this.activeTurns.get(threadId) : undefined;
     const next: LiveToolItem = {
       itemId,
+      sourceItemId: rawItemId ?? existing?.sourceItemId,
       threadId: existing?.threadId ?? threadId,
       turnId: existing?.turnId ?? turnId ?? activeTurn?.turnId ?? null,
       tool: toolLabel(item) || existing?.tool || "tool",
+      internal: isContextCompactionItem(item) || existing?.internal,
+      ...(normalizedToken(item.type) === "collabagenttoolcall" ? { collaboration: {
+        type: "collabAgentToolCall", tool: item.tool, status: item.status, senderThreadId: item.senderThreadId,
+        receiverThreadIds: item.receiverThreadIds, agentsStates: item.agentsStates, model: item.model
+      } } : existing?.collaboration ? { collaboration: existing.collaboration } : {}),
       input: toolInput(item) || existing?.input || "",
       output: toolOutput(item) || existing?.output || "",
       completed: completed || existing?.completed || false,
@@ -278,7 +341,8 @@ export class LiveStateStore {
       startedAt: existing?.startedAt ?? now,
       updatedAt: now
     };
-    this.toolItems.set(itemId, next);
+    this.toolItems.set(itemId, { ...next, input: livePreview(next.input), output: livePreview(next.output) });
+    this.pruneToolItems();
     this.updatedAt = now;
     return next;
   }

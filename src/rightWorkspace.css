@@ -1,0 +1,90 @@
+.rightWorkspace { --workspace-ease: cubic-bezier(.22,1,.36,1); }
+.rightWorkspace.diffReviewPanel { background: var(--bg); border-left: 0; }
+.rightWorkspaceBar { display: flex; flex: 0 0 45px; align-items: center; gap: 3px; min-width: 0; padding: 5px 8px 5px 10px; border-bottom: 1px solid var(--ui-divider); }
+.rightWorkspaceIcon,.rightWorkspaceIcon svg { display: block; flex: none; width: 16px; height: 16px; }
+.rightWorkspace button { font-family: var(--pool-ui-font); }
+.rightWorkspaceTabs { position: relative; display: flex; flex: 1; min-width: 0; gap: 3px; overflow-x: auto; scrollbar-width: none; }
+.rightWorkspaceTabs::-webkit-scrollbar { display: none; }
+.rightWorkspaceTabGroup { display: flex; flex: none; min-width: 0; max-width: 180px; align-items: center; border-radius: 9px; background: transparent; transition: background .22s ease, opacity .26s ease, transform .38s var(--workspace-ease); animation: rightWindowEnter .38s var(--workspace-ease) both; }
+.rightWorkspaceTabGroup.selected,.rightWorkspaceHome[aria-selected="true"] { background: var(--ui-hover); }
+.rightWorkspaceTab,.rightWorkspaceControl,.rightWorkspaceTabClose { display: flex; align-items: center; justify-content: center; flex: none; gap: 7px; height: 32px; padding: 0 8px; border: 0; border-radius: 8px; background: transparent; color: var(--ui-content-muted); font-size: 12px; cursor: pointer; transition: background .22s ease, color .22s ease; }
+.rightWorkspaceTab { min-width: 0; flex: 1; }
+.rightWorkspaceTab span:not(.rightWorkspaceIcon) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rightWorkspaceTab[aria-selected="true"] { color: var(--ui-content); }
+.rightWorkspaceHome { flex: none; width: 32px; }
+.rightWorkspaceAttention { flex: none; width: 5px; height: 5px; border-radius: 50%; background: var(--teal,#5593b7); }
+.rightWorkspaceControl { width: 30px; padding: 0; }
+.rightWorkspaceTabClose { width: 23px; padding: 0 5px 0 2px; }
+.rightWorkspaceTabClose .rightWorkspaceIcon,.rightWorkspaceTabClose svg { width: 12px; height: 12px; }
+.rightWorkspaceControl:hover,.rightWorkspaceTabClose:hover,.rightWorkspaceTab:hover { background: var(--ui-hover); color: var(--ui-content); }
+.rightWorkspace button:focus-visible { outline: 2px solid var(--ui-content-muted); outline-offset: -2px; }
+.rightWorkspaceStage { flex: 1; position: relative; min-height: 0; min-width: 0; overflow: hidden; }
+.rightWorkspacePane { position: absolute; inset: 0; display: flex; flex-direction: column; overflow: hidden; min-width: 0; min-height: 0; visibility: hidden; opacity: 0; transform: translateY(8px) scale(.995); pointer-events: none; transition: opacity .2s ease, transform .32s var(--workspace-ease), visibility 0s linear .32s; }
+.rightWorkspacePane.active { visibility: visible; opacity: 1; transform: none; pointer-events: auto; transition-delay: 0s; }
+.rightWorkspacePane.closing,.rightWorkspaceTabGroup.closing { opacity: 0; transform: translateY(8px) scale(.985); pointer-events: none; }
+.rightWorkspacePane > .rightPaneSubagents,.rightWorkspacePane > .rightPaneDiff,.rightWorkspacePane > .webTerminalPanel,.rightWorkspacePane > .browserPanel { width: 100%; height: 100%; flex: 1 1 auto; min-height: 0; }
+.rightWorkspacePane > .browserPanel { position: relative; inset: auto; }
+.rightWorkspace .diffReviewResizeHandle::after { background: transparent; }
+.rightWorkspace .diffReviewResizeHandle:hover::after { background: var(--ui-divider); }
+.rightWorkspace.overviewMode .rightWorkspaceBar { border-bottom-color: transparent; }
+.rightWorkspaceOverview { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 10px 16px 20px 10px; }
+.rightWorkspaceOverviewCard { border-radius: 20px; padding: 6px 15px; background: var(--ui-surface-raised); color: var(--ui-content); }
+.rightWorkspaceOverviewCard > section { padding: 13px 0; }
+.rightWorkspaceOverviewCard > section + section { border-top: 1px solid var(--ui-divider); }
+.rightWorkspaceOverview h3 { margin: 0 6px 7px; color: var(--ui-content-muted); font-size: 12px; font-weight: 500; }
+.rightWorkspaceEntry { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; padding: 8px 6px; border: 0; border-radius: 9px; background: transparent; color: inherit; text-align: left; cursor: pointer; transition: background .24s ease, opacity .24s ease; }
+.rightWorkspaceEntry:hover { background: var(--ui-hover); }
+.rightWorkspaceEntry:disabled { cursor: default; opacity: .4; }
+.rightWorkspaceEntry > .rightWorkspaceEntryText,.rightWorkspaceList .rightWorkspaceEntry > span:not(.rightWorkspaceIcon) { display: grid; gap: 3px; flex: 1; min-width: 0; }
+.rightWorkspaceEntry strong { font-size: 13px; font-weight: 450; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rightWorkspaceEntry small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--ui-content-muted); }
+.rightWorkspaceEntry em { flex: none; color: var(--ui-content-muted); font-size: 11px; font-style: normal; }
+.rightWorkspaceMore { margin-top: 5px; padding: 6px; background: transparent; border: 0; border-radius: 8px; color: var(--ui-content-muted); font-size: 12px; cursor: pointer; }
+.rightWorkspaceMore:hover { background: var(--ui-hover); color: var(--ui-content); }
+.rightWorkspaceList,.rightWorkspaceGoal { padding: 16px; overflow-y: auto; min-height: 0; }
+.rightWorkspaceList > h2,.rightWorkspaceGoal > h2 { margin: 0 0 14px; font-size: 14px; font-weight: 550; }
+.rightWorkspaceList > p,.rightWorkspaceGoal > p { font-size: 12px; color: var(--ui-content-muted); line-height: 1.7; }
+.rightWorkspaceList button { border: 0; }
+.rightWorkspaceGoal .goalObjective { display: none; }
+.rightWorkspaceGoal .goalProgressDetails p { white-space: pre-wrap; }
+.rightWorkspaceToggle { display: grid; place-items: center; flex: none; width: 29px; height: 29px; border: 0; border-radius: 8px; padding: 0; background: transparent; color: var(--ui-content-muted); cursor: pointer; transition: color .2s ease, background .2s ease; }
+.rightWorkspaceToggle:hover,.rightWorkspaceToggle[aria-expanded="true"] { background: var(--ui-hover); color: var(--ui-content); }
+.rightWorkspacePreviewMount { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+.rightWorkspace .dockedDocumentViewer { position: relative; inset: auto; flex: 1; display: flex; min-height: 0; padding: 0; background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; }
+.rightWorkspace .dockedDocumentViewer .documentViewerPanel { flex: 1; width: 100%; height: 100%; max-height: none; max-width: none; border-radius: 0; box-shadow: none; background: var(--bg); }
+.rightWorkspace .dockedDocumentViewer .imageViewerHeader { min-height: 44px; padding: 7px 12px; gap: 5px; }
+.rightWorkspace .dockedDocumentViewer .imageViewerTitle strong { font-size: 12px; }
+.rightWorkspace .dockedDocumentViewer .filePreviewBody { min-height: 0; }
+:root[data-theme] .rightWorkspace .dockedDocumentViewer .filePreviewBody { background: transparent !important; color: var(--ui-content) !important; }
+.rightWorkspace .dockedDocumentViewer .documentViewerPanel { grid-template-rows: 48px minmax(0,1fr); }
+.rightWorkspace .dockedDocumentViewer :is(.imageViewerTitle,.imageViewerTitle strong,.imageViewerRoundButton,.imageViewerZoomControls button,.imageViewerActionMenu button,.documentAutoSendToggle,.documentArchive button,.documentArchiveNavigation button) { color: var(--ui-content); }
+.rightWorkspace .dockedDocumentViewer :is(.imageViewerZoomControls,.imageViewerActionMenu,.documentArchive) { background: var(--ui-surface-raised); border-color: var(--ui-divider); }
+.rightWorkspace .dockedDocumentViewer :is(.imageViewerRoundButton,.imageViewerZoomControls button) { background: var(--ui-hover); }
+.rightWorkspace .dockedDocumentViewer :is(.documentPreviewStatus,.fileBinaryPreview,.documentPdfPage > span) { color: var(--ui-content-muted); }
+.rightWorkspace .dockedDocumentViewer .filePreviewError { color: var(--red); }
+.rightWorkspace .dockedDocumentViewer .fileTextPreview { background: var(--ui-surface-raised) !important; color: var(--ui-content) !important; padding: 16px; }
+.rightWorkspace .dockedDocumentViewer :is(.documentArchive th,.documentArchive td) { border-color: var(--ui-divider); }
+@keyframes rightWindowEnter { from { opacity: 0; transform: translateY(7px) scale(.96); } to { opacity: 1; transform: none; } }
+@media (max-width: 900px) {
+  .workspace > .rightWorkspace.diffReviewPanel { position: fixed; inset: 0 0 0 auto; z-index: 240; width: 100dvw !important; height: var(--phone-viewport-height,100dvh); max-width: 100%; background: var(--bg); }
+  .rightWorkspaceBar { padding-top: max(5px,env(safe-area-inset-top)); flex-basis: auto; min-height: 45px; }
+  .rightWorkspace .diffReviewResizeHandle { display: none; }
+  .rightWorkspaceOverview { padding: 10px 14px max(16px,env(safe-area-inset-bottom)); }
+  /* Keep the restore control in the title row, outside the four policy cells. */
+  .topbar .projectTitle { padding-right: 34px; }
+  .topbar .controls > .rightWorkspaceToggle { position: absolute; top: max(6px,env(safe-area-inset-top)); right: max(10px,env(safe-area-inset-right)); width: 28px; min-width: 28px; max-width: 28px; height: 28px; min-height: 28px; margin: 0; padding: 0; }
+  .rightWorkspace .dockedDocumentViewer { width: 100%; height: 100%; max-width: 100%; }
+}
+@media (prefers-reduced-motion: reduce) { .rightWorkspacePane,.rightWorkspaceTabGroup { animation: none; transition-duration: .01ms; } }
+
+.directoryToolbar { justify-content: flex-start; gap: 8px; }
+.directoryToolbar > .iconButton { margin-left: auto; }
+.directoryCreateForm { padding: 8px 2px 14px; color: var(--ui-content); font-family: var(--pool-ui-font); }
+.directoryCreateForm label { display: block; margin-bottom: 7px; font-size: 12px; color: var(--ui-content-muted); }
+.directoryCreateForm > div { display: flex; align-items: center; gap: 7px; }
+.directoryCreateForm input { flex: 1; min-width: 0; width: 0; padding: 8px 10px; border: 0; border-radius: 8px; background: var(--ui-surface-input); color: var(--ui-content); font: inherit; font-size: 14px; }
+.directoryCreateForm input:focus-visible { outline: 1px solid var(--ui-content-muted); }
+:root[data-theme] .directoryCreateForm .primary { background: var(--ui-action-primary-bg, #e0e2dd); color: var(--ui-action-primary-text, #202120); border: 0; }
+:root[data-theme] .directoryCreateForm .primary:hover { background: var(--ui-action-primary-hover, #f0f1ed); }
+.directoryCreateForm p { margin: 7px 0 0; color: var(--red); font-size: 12px; }
+@media (max-width: 720px) { .directoryCreateForm input { font-size: 16px; } }

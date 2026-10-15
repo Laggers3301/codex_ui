@@ -1,0 +1,8 @@
+.turnRecoveryNotice { margin: 6px 0; padding: 10px 12px; border-radius: 9px; background: var(--ui-control-hover, #292b29); color: var(--text); font-size: 12px; }
+.turnRecoveryNotice strong { font-weight: 500; }
+.turnRecoveryNotice p { margin: 5px 0; }
+.turnRecoveryNotice details { margin-top: 6px; }
+.turnRecoveryNotice summary { cursor: pointer; }
+.turnRecoveryNotice pre { max-height: 140px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.turnRecoveryActions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.turnRecoveryActions button { background: var(--ui-control-hover, #393c39); color: inherit; padding: 5px 8px; border-radius: 6px; }

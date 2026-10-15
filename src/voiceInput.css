@@ -1,0 +1,21 @@
+.voiceInput { position:relative; align-self:end; flex:0 0 auto; }
+.conversation > .composer { --composer-control-size:30px; --composer-control-row-size:34px; grid-template-columns:minmax(0,1fr) auto!important; column-gap:6px!important; }
+.conversation > .composer .composerTools { gap:6px!important; padding-right:0!important; }
+.conversation > .composer .composerTools:not(:has(.selectedSkillChip)) { justify-content:flex-end; }
+.conversation > .composer .composerTools { min-height:var(--composer-control-row-size); }
+.conversation > .composer .composerTools :is(.v2FastModeButton,.polishedSelectTrigger) { height:var(--composer-control-size)!important; min-height:var(--composer-control-size)!important; box-sizing:border-box; }
+.composerSendActions { display:flex; gap:6px; height:var(--composer-control-row-size,34px); align-items:center; align-self:end; }
+.composerSendActions > .voiceInput { align-self:center; }
+.composerSendActions .voiceButton,
+.composerSendActions > .sendButton { display:grid; place-items:center; width:var(--composer-control-size,30px); height:var(--composer-control-size,30px); min-width:var(--composer-control-size,30px); min-height:var(--composer-control-size,30px); flex:0 0 var(--composer-control-size,30px); padding:0; margin:0; align-self:center; border-radius:50%!important; box-sizing:border-box; }
+.voiceButton { border:0!important; background:var(--ui-hover)!important; color:var(--ui-content-muted)!important; touch-action:none; transition:color .2s ease,background .25s cubic-bezier(.16,1,.3,1),opacity .25s ease; }
+.voiceButton:hover { color:var(--text)!important; }
+.voiceButton.recording { color:#e76363!important; animation:voicePulse 1.3s ease-in-out infinite; }
+.voiceNotice { position:absolute; right:0; bottom:calc(100% + 10px); display:flex; align-items:center; gap:8px; padding:9px 12px; width:max-content; max-width:min(320px,80vw); border-radius:13px; background:var(--ui-glass-background); color:var(--text); backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px); box-shadow:var(--ui-glass-shadow); font-size:12px; line-height:1.5; animation:uiGlassSurfaceEnter .25s cubic-bezier(.16,1,.3,1) both; z-index:30; }
+.voiceNotice button { border:0; background:transparent; color:inherit; padding:3px; }
+.voiceNotice.closing { animation:voiceNoticeExit .24s cubic-bezier(.16,1,.3,1) both; pointer-events:none; }
+@keyframes voiceNoticeExit { to { opacity:0; transform:translateY(8px) scale(.96); } }
+.voiceSpinner { animation:voiceSpin .9s linear infinite; }
+@keyframes voiceSpin { to { transform:rotate(360deg); } }
+@keyframes voicePulse { 50% { opacity:.55; } }
+@media(prefers-reduced-motion:reduce) { .voiceButton,.voiceNotice,.voiceSpinner { animation:none!important; transition:none!important; } }

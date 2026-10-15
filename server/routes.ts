@@ -1,34 +1,67 @@
 import fs from "node:fs";
+import { overlayJournal } from "./timelineJournal.js";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
+import { randomUUID } from "node:crypto";
 import type { MultipartFile } from "@fastify/multipart";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
+import { ComposerPredictions } from "./composerPredictions.js";
+import { LegacyRollbackConflictError } from "./legacyRollback.js";
+import { inheritedBillingTurnIds } from "./leaderboardForkUsage.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
+import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
+import { registerScheduledTaskMcp } from "./scheduledTaskMcp.js";
+import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
+import { createCrossAccountForkSnapshot } from "./crossAccountFork.js";
+import { assertLargeBranchMemory, BranchConflictError, BranchGate, copyLargeThreadBranch, isLegacyRollout, largeThreadForkBytes } from "./largeThreadFork.js";
+import {toolArchiveRoot,toolArchivePath,readToolArchiveSummary,type ToolArchiveSummary} from "./toolOutputArchive.js";
 import { DEFAULT_USER_ID, type ProjectStore, type ThreadPresentation } from "./db.js";
 import { listBrowsableDirectories } from "./directoryBrowser.js";
+import { isInternalUserMessageText } from "./internalUserMessage.js";
+import { isContextCompactionItem, isGenericContextLossReply } from "./contextRecovery.js";
 import { ensureProjectDirectory, PathPolicyError, resolveProjectFilePath, resolveProjectPath } from "./pathPolicy.js";
-import { findThreadJsonlPathById, paginateThreadPayload, readThreadFromJsonl, readThreadSummaryFromJsonl, threadJsonlMatchesSearch, threadJsonlPathFromError } from "./threadFallback.js";
-import { locateIndexedThreadItem, readIndexedThreadItem, readIndexedThreadPage, searchIndexedThreads, warmThreadIndex } from "./threadEventIndex.js";
+import { findThreadJsonlPathById, paginateThreadPayload, readThreadFromJsonl, readThreadSummaryFromJsonl, threadJsonlMatchesSearch, threadJsonlPathFromError, threadJsonlSessionsRoot, threadHistoryRuntimeHomes } from "./threadFallback.js";
+import {readArchivedThreadIndex} from "./archivedThreadIndex.js";
+import { isProjectLocalHook, listHooksForProject } from "./hookTrust.js";
+import { assertRepositoryWithinProject, createManagedWorktree, discoverGitRepositories, removeManagedWorktree } from "./worktree.js";
+import { locateIndexedThreadItem, readIndexedThreadItem, readIndexedThreadPage, warmThreadIndex } from "./threadEventIndex.js";
+import { searchChatThreadHits, searchChatThreads, startChatSearch } from "./chatSearch.js";
 import { listAllCodexThreads, THREAD_LIST_PAGE_SIZE } from "./threadList.js";
+import {
+  contextPinDeveloperInstructions,
+  contextWindowMeasuredForConfig,
+  defaultThreadContextConfig,
+  readThreadContextUsage,
+  resolveThreadContextConfig,
+  ThreadContextConfigError,
+  threadContextFeatureEnabled,
+  threadContextConfigOverrides,
+  threadTurnContextConfigOverrides
+} from "./threadContext.js";
 import { importStagedUserHandoff, type ImportedUserHandoff } from "./userHandoff.js";
+import { pushPublicKey } from "./webPush.js";
+import { advanceTrackedQuotaLedger, type TrackedQuotaLedgerAccount } from "./trackedQuotaLedger.js";
+import { configuredSubagentRuntimeHomes, findSubagentDescendant, readSubagentDirectoryPage } from "./subagentHistory.js";
+import { executionSettingsOverrides, queueScheduledPrompt, resumeThreadIfUnloaded, ScheduleConflictError, ScheduledTaskStore, type ScheduleRule } from "./scheduledTasks.js";
 
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
 // Default Codex cwd per logged-in user. This prevents generated artifacts from
-// accumulating in /home/ls while retaining historical shared-home projects.
-const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? "/home/ls/codex_zerotier_remote/users";
+// accumulating in /home/example while retaining historical shared-home projects.
+const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
 const maxThreadHistoryPageSize = 240;
 const handoffInFlightUsers = new Set<string>();
+const branchGate = new BranchGate();
 type HandoffJobPhase = "connecting" | "transferring" | "extracting" | "importing" | "completed" | "failed";
 type HandoffImportResult = Awaited<ReturnType<typeof importStagedUserHandoff>>;
 interface HandoffJob {
@@ -70,6 +103,7 @@ const textExtensions = new Set([
   ".go",
   ".h",
   ".hpp",
+  ".htm",
   ".html",
   ".ini",
   ".java",
@@ -78,6 +112,8 @@ const textExtensions = new Set([
   ".jsx",
   ".log",
   ".mjs",
+  ".mmd",
+  ".mermaid",
   ".py",
   ".rs",
   ".sh",
@@ -92,17 +128,24 @@ const textExtensions = new Set([
 ]);
 const markdownExtensions = new Set([".md", ".markdown", ".mdx"]);
 const imageExtensions = new Set([".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"]);
+const videoExtensions = new Set([".m4v", ".mov", ".mp4", ".webm"]);
 const mimeTypes: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
   ".csv": "text/csv; charset=utf-8",
   ".gif": "image/gif",
   ".html": "text/html; charset=utf-8",
+  ".htm": "text/html; charset=utf-8",
+  ".mmd": "text/plain; charset=utf-8",
+  ".mermaid": "text/plain; charset=utf-8",
   ".jpeg": "image/jpeg",
   ".jpg": "image/jpeg",
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".md": "text/markdown; charset=utf-8",
   ".mdx": "text/markdown; charset=utf-8",
+  ".m4v": "video/x-m4v",
+  ".mov": "video/quicktime",
+  ".mp4": "video/mp4",
   ".pdf": "application/pdf",
   ".png": "image/png",
   ".svg": "image/svg+xml",
@@ -111,6 +154,7 @@ const mimeTypes: Record<string, string> = {
   ".tsx": "text/plain; charset=utf-8",
   ".txt": "text/plain; charset=utf-8",
   ".webp": "image/webp",
+  ".webm": "video/webm",
   ".yaml": "text/yaml; charset=utf-8",
   ".yml": "text/yaml; charset=utf-8"
 };
@@ -130,6 +174,8 @@ const createProjectSchema = z.object({
   defaultSandbox: sandboxSchema.optional(),
   defaultApprovalPolicy: approvalSchema.optional()
 });
+const createWorkspaceDirectorySchema = z.object({ parentPath: z.string().min(1).max(4096), name: z.string().max(128) }).strict();
+const createWorktreeSchema = z.object({ name: z.string().trim().min(1).max(80).optional(), repositoryPath: z.string().min(1).max(4096).optional() });
 
 const updateProjectSchema = z.object({
   name: z.string().min(1).optional(),
@@ -166,7 +212,9 @@ const threadExportSchema = z.object({
 
 const threadBranchSchema = z.object({
   turnId: z.string().trim().min(1).max(256),
-  prompt: z.string().trim().min(1).max(24_000)
+  prompt: z.string().trim().max(24_000).optional().default(""),
+  targetProjectId: z.string().uuid().optional(),
+  archiveToolOutputs: z.boolean().optional().default(false)
 });
 
 const threadReadQuerySchema = z.object({
@@ -180,6 +228,17 @@ const threadReadQuerySchema = z.object({
 const threadPresentationSchema = z.object({
   pinned: z.boolean()
 });
+
+const threadContextPinSchema = z.object({
+  text: z.string().max(16_000)
+}).strict();
+
+const threadContextConfigSchema = z.object({
+  profile: z.enum(["default", "balanced", "long", "maximum", "custom"]),
+  contextWindow: z.number().int().nullable().optional(),
+  compactTokenLimit: z.number().int().nullable().optional(),
+  scope: z.enum(["total", "body_after_prefix"]).nullable().optional()
+}).strict();
 
 const threadModelProfileSchema = z.object({
   model: z.string().trim().min(1).max(128),
@@ -200,13 +259,13 @@ const fallbackCodexModels: Array<{
   priority: number;
   efforts: ReasoningEffort[];
 }> = [
-  { slug: "gpt-5.5", displayName: "GPT-5.5", priority: 0, efforts: ["xhigh", "high", "medium", "low"] },
-  { slug: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", priority: 1, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
-  { slug: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", priority: 2, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
-  { slug: "gpt-5.6-luna", displayName: "GPT-5.6-Luna", priority: 3, efforts: ["max", "xhigh", "high", "medium", "low"] },
-  { slug: "gpt-5.4", displayName: "GPT-5.4", priority: 16, efforts: ["xhigh", "high", "medium", "low"] },
-  { slug: "gpt-5.4-mini", displayName: "GPT-5.4-Mini", priority: 23, efforts: ["xhigh", "high", "medium", "low"] },
-  { slug: "gpt-5.3-codex-spark", displayName: "GPT-5.3-Codex-Spark", priority: 26, efforts: ["xhigh", "high", "medium", "low"] }
+  { slug: "gpt-6-astra", displayName: "GPT-6-Astra", priority: 1, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
+  { slug: "gpt-6.1-sol", displayName: "GPT-6.1-Sol", priority: 1.5, efforts: ["max", "xhigh", "high", "medium", "low"] },
+  { slug: "gpt-6-sol", displayName: "GPT-6-Sol", priority: 2, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
+  { slug: "gpt-6-luna", displayName: "GPT-6-Luna", priority: 3, efforts: ["max", "xhigh", "high", "medium", "low"] },
+  { slug: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", priority: 4, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
+  { slug: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", priority: 7, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
+  { slug: "gpt-5.6-luna", displayName: "GPT-5.6-Luna", priority: 8, efforts: ["max", "xhigh", "high", "medium", "low"] }
 ];
 
 const effortLabels: Record<ReasoningEffort, string> = {
@@ -227,6 +286,12 @@ const effortOrder: Record<ReasoningEffort, number> = {
   low: 5
 };
 
+const hiddenChatGptCodexModels = new Set([
+  "gpt-5.3-codex-spark",
+  "gpt-5.4",
+  "gpt-5.4-mini"
+]);
+
 export type PublicModelProfile = {
   id: string;
   label: string;
@@ -238,6 +303,10 @@ export type PublicModelProfile = {
 
 let modelCatalogCache: { expiresAt: number; data: PublicModelProfile[] } | null = null;
 
+export function invalidateModelCatalogCache(): void {
+  modelCatalogCache = null;
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
@@ -247,9 +316,11 @@ function isReasoningEffort(value: unknown): value is ReasoningEffort {
 }
 
 function profilesForModel(model: { slug: string; displayName: string; priority: number }, efforts: ReasoningEffort[]): PublicModelProfile[] {
-  return efforts.map((effort) => ({
+  // Keep accepting `ultra` on existing/persisted threads for backwards
+  // compatibility, but do not advertise it as a selectable UI profile.
+  return efforts.filter((effort) => effort !== "ultra").map((effort) => ({
     id: `${model.slug}:${effort}`,
-    label: `${model.displayName} ${effortLabels[effort]}`,
+    label: `${model.displayName} ${effort}`,
     model: model.slug,
     effort,
     displayName: model.displayName,
@@ -261,7 +332,7 @@ function fallbackModelProfiles(): PublicModelProfile[] {
   return fallbackCodexModels.flatMap((model) => profilesForModel(model, model.efforts));
 }
 
-function modelProfilesFromCatalog(catalog: unknown): PublicModelProfile[] {
+export function modelProfilesFromCatalog(catalog: unknown): PublicModelProfile[] {
   const models = Array.isArray(asRecord(catalog).models) ? (asRecord(catalog).models as unknown[]) : [];
   const profiles = models.flatMap((entry) => {
     const record = asRecord(entry);
@@ -269,8 +340,21 @@ function modelProfilesFromCatalog(catalog: unknown): PublicModelProfile[] {
     const displayName = typeof record.display_name === "string" ? record.display_name.trim() : slug;
     const visibility = typeof record.visibility === "string" ? record.visibility : "";
     const shellType = typeof record.shell_type === "string" ? record.shell_type : "";
-    const priority = typeof record.priority === "number" ? record.priority : 999;
-    if (!slug || visibility !== "list" || shellType !== "shell_command") {
+    // Codex requires integer priorities in its catalog. Keep the web picker
+    // ordering independent so GPT-6.1 Sol stays between Astra and Sol.
+    const priority = slug === "gpt-6.1-sol"
+      ? 1.5
+      : typeof record.priority === "number" ? record.priority : 999;
+    // Codex 0.153 switched current models (including GPT-6 Astra) from the
+    // legacy shell_command transport to unified_exec.  Both transports are
+    // valid model-picker entries; rejecting the newer value silently replaced
+    // the whole live catalog with our stale fallback list.
+    if (
+      !slug
+      || hiddenChatGptCodexModels.has(slug)
+      || visibility !== "list"
+      || (shellType !== "shell_command" && shellType !== "unified_exec")
+    ) {
       return [];
     }
 
@@ -292,13 +376,31 @@ function listModelProfiles(): PublicModelProfile[] {
   }
 
   try {
-    const stdout = execFileSync(serverConfig.codexBin, ["debug", "models"], {
+    const debugArgs = ["debug", "models"];
+    const configuredCodexHome = process.env.CODEX_HOME?.trim();
+    if (configuredCodexHome) {
+      const configuredCatalog = path.join(configuredCodexHome, "model-catalog-gpt-5.6-sol-long-context.json");
+      if (fs.existsSync(configuredCatalog)) {
+        // Codex 0.153 does not consistently apply model_catalog_json from the
+        // config file to `debug models`; pass the same catalog explicitly that
+        // the account-pool app-server processes use.
+        debugArgs.push("-c", `model_catalog_json=${JSON.stringify(configuredCatalog)}`);
+      }
+    }
+    const stdout = execFileSync(serverConfig.codexBin, debugArgs, {
       encoding: "utf8",
       timeout: 10_000,
       maxBuffer: 2 * 1024 * 1024,
       env: process.env
     });
     const profiles = modelProfilesFromCatalog(JSON.parse(stdout));
+    for (const catalogPath of (process.env.CODEX_WEB_EXTRA_MODEL_CATALOGS ?? "").split(path.delimiter).filter(Boolean)) {
+      try {
+        profiles.push(...modelProfilesFromCatalog(JSON.parse(fs.readFileSync(catalogPath, "utf8"))));
+      } catch (error) {
+        console.warn(`Unable to read extra model catalog ${catalogPath}:`, error);
+      }
+    }
     modelCatalogCache = { expiresAt: now + 5 * 60 * 1000, data: profiles.length ? profiles : fallbackModelProfiles() };
   } catch {
     modelCatalogCache = { expiresAt: now + 60 * 1000, data: fallbackModelProfiles() };
@@ -470,8 +572,11 @@ function sanitizeCodexQuota(accountResult: unknown, limitsResult: unknown, usage
 
 async function readCodexQuota(bridge: CodexBridge): Promise<PublicCodexQuota> {
   const errors: string[] = [];
-  const [accountSettled, limitsSettled, usageSettled] = await Promise.allSettled([
-    bridge.request("account/read", { refreshToken: false }, 30_000),
+  // Let Codex refresh an expired access token before quota requests use it.
+  const [accountSettled] = await Promise.allSettled([
+    bridge.request("account/read", { refreshToken: true }, 30_000)
+  ]);
+  const [limitsSettled, usageSettled] = await Promise.allSettled([
     bridge.request("account/rateLimits/read", undefined, 30_000),
     bridge.request("account/usage/read", undefined, 30_000)
   ]);
@@ -488,6 +593,16 @@ async function readCodexQuota(bridge: CodexBridge): Promise<PublicCodexQuota> {
 }
 
 async function readCachedCodexQuota(bridge: CodexBridge, forceRefresh = false): Promise<PublicCodexQuota> {
+  if (isAccountPoolBridge(bridge)) {
+    // Legacy clients still use /quota. Route them through the pool's same
+    // single-flight and native-owned auth instead of forcing a separate OAuth
+    // refresh or assembling account/limits/usage from different accounts.
+    const snapshots = await bridge.refreshAccountData(forceRefresh);
+    const selected = snapshots.find(entry => entry.selectedForNewThreads && entry.kind !== "api-provider")
+      ?? snapshots.find(entry => entry.kind !== "api-provider");
+    if (!selected) throw new Error("No OpenAI account is available for quota details.");
+    return sanitizeCodexQuota(selected.account, selected.limits, selected.usage, selected.errors);
+  }
   const now = Date.now();
   if (!forceRefresh && codexQuotaCache && codexQuotaCache.expiresAt > now) {
     return codexQuotaCache.data;
@@ -566,6 +681,25 @@ function sanitizeSkillsList(result: unknown): { data: PublicSkill[]; errors: Arr
   };
 }
 
+export function sanitizeMcpServerStatus(result: unknown) {
+  const root = asRecord(result);
+  const entries = Array.isArray(root.data) ? root.data : [];
+  return {
+    data: entries.slice(0, 100).map((entry) => {
+      const server = asRecord(entry);
+      return {
+        name: typeof server.name === "string" ? server.name.slice(0, 128) : "未命名 MCP",
+        pluginId: typeof server.pluginId === "string" ? server.pluginId.slice(0, 128) : null,
+        runtimeStatus: typeof server.runtimeStatus === "string" ? server.runtimeStatus : null,
+        authStatus: typeof server.authStatus === "string" ? server.authStatus : "unknown",
+        toolCount: Object.keys(asRecord(server.tools)).length
+      };
+    }),
+    nextCursor: typeof root.nextCursor === "string" ? root.nextCursor : null,
+    sharedRuntimeWarning: "Codex 额度账号运行时由多人共享；此处只显示状态，不开放外部账号授权。"
+  };
+}
+
 type PublicTokenBreakdown = {
   inputTokens: number;
   cachedInputTokens: number;
@@ -619,6 +753,8 @@ type LeaderboardFileUsage = TokenAccumulator & {
   model: string;
   effort: string | null;
   resetAt: number | null;
+  occurredAt?: number | null;
+  dayKey?: string | null;
 };
 
 type LeaderboardFileSummary = {
@@ -626,6 +762,8 @@ type LeaderboardFileSummary = {
   mtimeMs: number;
   startAt: number | null;
   usage: LeaderboardFileUsage[];
+  granularity?: "day" | "event";
+  billingVersion?: number;
 };
 
 type LeaderboardFileCachePayload = {
@@ -636,8 +774,62 @@ type LeaderboardFileCachePayload = {
 type LeaderboardAccountSource = {
   id: string;
   label: string;
+  kind: "codex-account" | "api-provider";
   sessionsRoot: string;
   quota: PublicCodexQuota;
+};
+
+type LeaderboardCycleWindow = {
+  startAt: number;
+  resetAt: number | null;
+  resetWindowMins: number | null;
+};
+
+// Quota snapshots from parallel Codex processes can differ by seconds (and
+// occasionally a few minutes) while still referring to the same weekly cycle.
+// Do not use the JSONL timestamp alone for GPT: imported rollouts may stamp
+// old usage with the import time, making historical tokens look current.
+const leaderboardResetDriftSeconds = 5 * 60;
+
+export type PublicTrackedQuotaDayAccount = {
+  accountId: string;
+  accountLabel: string;
+  userTokens: number;
+  quotaPercent: number;
+};
+
+export type PublicTrackedQuotaDay = {
+  date: string;
+  userTokens: number;
+  quotaPercent: number;
+  accounts: PublicTrackedQuotaDayAccount[];
+};
+
+export type PublicTrackedQuotaAccount = {
+  accountId: string;
+  accountLabel: string;
+  cycleStartAt: number | null;
+  resetAt: number | null;
+  accountUsedPercent: number | null;
+  accountRemainingPercent: number | null;
+  userCycleTokens: number;
+  userCycleQuotaPercent: number;
+  todayTokens: number;
+  todayQuotaPercent: number;
+};
+
+export type PublicTrackedQuotaUsage = {
+  userId: string;
+  timeZone: string;
+  today: string;
+  dailyLimitPercent: number;
+  unlimitedAccountId: string | null;
+  todayQuotaPercent: number;
+  blocked: boolean;
+  accounts: PublicTrackedQuotaAccount[];
+  days: PublicTrackedQuotaDay[];
+  updatedAt: string;
+  errors: string[];
 };
 
 const leaderboardCacheTtlMs = 60_000;
@@ -646,6 +838,36 @@ let leaderboardCache: { data: PublicCodexLeaderboard; expiresAt: number; resetKe
 let leaderboardRefreshInFlight: Promise<PublicCodexLeaderboard> | null = null;
 let leaderboardFileCacheLoaded = false;
 const leaderboardFileCache = new Map<string, LeaderboardFileSummary>();
+let trackedQuotaCache: { data: PublicTrackedQuotaUsage; expiresAt: number } | null = null;
+let trackedQuotaRefreshInFlight: Promise<PublicTrackedQuotaUsage> | null = null;
+let trackedQuotaDiskCacheLoaded = false;
+const trackedQuotaCacheTtlMs = 60_000;
+const trackedQuotaCachePath = path.join(serverConfig.dataDir, "tracked-quota-cache.json");
+const trackedQuotaLedgerPath = path.join(serverConfig.dataDir, "tracked-quota-ledger.json");
+
+function readTrackedQuotaLedger(): Record<string, TrackedQuotaLedgerAccount> {
+  try {
+    const payload = JSON.parse(fs.readFileSync(trackedQuotaLedgerPath, "utf8")) as {
+      version?: number;
+      userId?: string;
+      accounts?: Record<string, TrackedQuotaLedgerAccount>;
+    };
+    if (payload.version !== 1 || payload.userId !== serverConfig.trackedQuotaUser || !payload.accounts) return {};
+    return payload.accounts;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`Unable to read tracked quota ledger: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return {};
+  }
+}
+
+function persistTrackedQuotaLedger(accounts: Record<string, TrackedQuotaLedgerAccount>): void {
+  fs.mkdirSync(path.dirname(trackedQuotaLedgerPath), { recursive: true, mode: 0o700 });
+  const temporary = `${trackedQuotaLedgerPath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify({ version: 1, userId: serverConfig.trackedQuotaUser, accounts }), { mode: 0o600 });
+  fs.renameSync(temporary, trackedQuotaLedgerPath);
+}
 
 function emptyTokenAccumulator(): TokenAccumulator {
   return {
@@ -672,6 +894,55 @@ function round2(value: number | null): number | null {
     return null;
   }
   return Math.round(value * 100) / 100;
+}
+
+function naturalDayKey(timestampSeconds: number, timeZone = serverConfig.trackedQuotaTimeZone): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date(timestampSeconds * 1000));
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+export function estimatedQuotaPercent(userTokens: number, totalTokens: number, accountUsedPercent: number | null): number {
+  if (userTokens <= 0 || totalTokens <= 0 || accountUsedPercent === null || !Number.isFinite(accountUsedPercent)) return 0;
+  return round2((userTokens / totalTokens) * accountUsedPercent) ?? 0;
+}
+
+function loadTrackedQuotaDiskCache(): void {
+  if (trackedQuotaDiskCacheLoaded) return;
+  trackedQuotaDiskCacheLoaded = true;
+  try {
+    const data = JSON.parse(fs.readFileSync(trackedQuotaCachePath, "utf8")) as PublicTrackedQuotaUsage;
+    const today = naturalDayKey(Math.floor(Date.now() / 1000));
+    if (
+      data?.today === today
+      && data.userId === serverConfig.trackedQuotaUser
+      && data.timeZone === serverConfig.trackedQuotaTimeZone
+      && data.dailyLimitPercent === serverConfig.trackedQuotaDailyLimitPercent
+      && data.unlimitedAccountId === (serverConfig.trackedQuotaAllowedAccountId || null)
+      && Array.isArray(data.accounts)
+      && Array.isArray(data.days)
+    ) {
+      // Return the last complete snapshot immediately after a process restart,
+      // then refresh it in the background on the first request.
+      trackedQuotaCache = { data, expiresAt: 0 };
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      console.warn(`Unable to read tracked quota cache: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+function persistTrackedQuotaDiskCache(data: PublicTrackedQuotaUsage): void {
+  fs.mkdirSync(path.dirname(trackedQuotaCachePath), { recursive: true, mode: 0o700 });
+  const temporary = `${trackedQuotaCachePath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(data), { mode: 0o600 });
+  fs.renameSync(temporary, trackedQuotaCachePath);
 }
 
 function loadLeaderboardFileCache(): void {
@@ -728,18 +999,43 @@ function countField(record: Record<string, unknown>, camel: string, snake: strin
   return safeCount(record[camel]) ?? safeCount(record[snake]) ?? 0;
 }
 
-function userIdFromSessionCwd(cwd: string | null): string | null {
+export function userIdFromSessionCwd(cwd: string | null, isKnownUser?: (userId: string) => boolean): string | null {
   if (!cwd) {
     return null;
   }
   const normalizedRoot = path.resolve(userWorkspaceRoot);
   const normalizedCwd = path.resolve(cwd);
-  if (!normalizedCwd.startsWith(`${normalizedRoot}${path.sep}`)) {
-    return null;
+  if (normalizedCwd.startsWith(`${normalizedRoot}${path.sep}`)) {
+    const [firstSegment] = path.relative(normalizedRoot, normalizedCwd).split(path.sep);
+    return firstSegment?.trim() || null;
   }
-  const relative = path.relative(normalizedRoot, normalizedCwd);
-  const [firstSegment] = relative.split(path.sep);
-  return firstSegment?.trim() || null;
+  // Some existing users run Codex directly in /home/example/<login> rather than
+  // the managed users root. Only trust this layout for a registered login.
+  const homeRoot = path.dirname(path.dirname(normalizedRoot));
+  if (isKnownUser && normalizedCwd.startsWith(`${homeRoot}${path.sep}`)) {
+    const [firstSegment] = path.relative(homeRoot, normalizedCwd).split(path.sep);
+    if (firstSegment && isKnownUser(firstSegment)) return firstSegment;
+  }
+  return null;
+}
+
+function sessionMetadataFromFileStart(filePath: string): Record<string, unknown> | null {
+  const buffer = Buffer.alloc(64 * 1024);
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const bytes = fs.readSync(fd, buffer, 0, buffer.length, 0);
+    const firstLine = buffer.toString("utf8", 0, bytes).split("\n", 1)[0];
+    const record = JSON.parse(firstLine) as { type?: string; payload?: Record<string, unknown> };
+    return record.type === "session_meta" ? record.payload ?? null : null;
+  } catch {
+    return null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function sessionCwdFromFileStart(filePath: string): string | null {
+  return stringOrNull(sessionMetadataFromFileStart(filePath)?.cwd);
 }
 
 function aggregateBucketFor(map: Map<string, AggregateBucket>, userId: string): AggregateBucket {
@@ -891,14 +1187,59 @@ function mergeLeaderboardScopes(
   );
 }
 
-function mergeAccountLeaderboards(boards: PublicCodexLeaderboard[]): PublicCodexLeaderboard {
+/** API plans have no Codex quota reset; rank them over the same visible GPT window. */
+export function apiLeaderboardCycleWindow(
+  cycles: Array<{ resetAt: number | null; resetWindowMins: number | null }>,
+  nowSeconds: number
+): LeaderboardCycleWindow {
+  const valid = cycles.flatMap(({ resetAt, resetWindowMins }) =>
+    resetAt !== null && resetWindowMins !== null && resetWindowMins > 0
+      ? [{ startAt: resetAt - resetWindowMins * 60, resetAt }]
+      : []
+  );
+  return valid.length
+    ? {
+        startAt: Math.min(...valid.map((cycle) => cycle.startAt)),
+        resetAt: Math.max(...valid.map((cycle) => cycle.resetAt)),
+        resetWindowMins: null
+      }
+    : { startAt: nowSeconds - 7 * 24 * 60 * 60, resetAt: null, resetWindowMins: null };
+}
+
+export function usageInLeaderboardCycle(
+  usage: { resetAt: number | null; occurredAt?: number | null },
+  sourceKind: LeaderboardAccountSource["kind"],
+  window: LeaderboardCycleWindow
+): boolean {
+  if (sourceKind !== "api-provider") {
+    return window.resetAt !== null && usage.resetAt !== null
+      && Math.abs(usage.resetAt - window.resetAt) <= leaderboardResetDriftSeconds;
+  }
+  return usage.occurredAt !== null && usage.occurredAt !== undefined
+    && usage.occurredAt >= window.startAt
+    && (window.resetAt === null || usage.occurredAt < window.resetAt);
+}
+
+export function mergeAccountLeaderboards(boards: PublicCodexLeaderboard[], sources: LeaderboardAccountSource[]): PublicCodexLeaderboard {
+  const codexBoards = boards.filter((_, index) => sources[index]?.kind !== "api-provider");
+  const quotaByUser = new Map<string, number>();
+  for (const board of codexBoards) {
+    for (const user of board.currentCycle.users) {
+      if (user.quotaPercent !== null) quotaByUser.set(user.userId, (quotaByUser.get(user.userId) ?? 0) + user.quotaPercent);
+    }
+  }
+  const currentCycle = mergeLeaderboardScopes(
+    boards.map((board) => board.currentCycle),
+    boards.map((_, index) => `账号 ${index + 1}`),
+    false,
+    codexBoards.some((board) => board.currentCycle.quotaUsedPercent !== null)
+      ? codexBoards.reduce((sum, board) => sum + (board.currentCycle.quotaUsedPercent ?? 0), 0)
+      : null
+  );
+  // API tokens affect token rank/share, never a user's estimated GPT quota.
+  currentCycle.users = currentCycle.users.map((user) => ({ ...user, quotaPercent: quotaByUser.get(user.userId) ?? null }));
   return {
-    currentCycle: mergeLeaderboardScopes(
-      boards.map((board) => board.currentCycle),
-      boards.map((_, index) => `账号 ${index + 1}`),
-      false,
-      boards.reduce((sum, board) => sum + (board.currentCycle.quotaUsedPercent ?? 0), 0)
-    ),
+    currentCycle,
     lifetime: mergeLeaderboardScopes(
       boards.map((board) => board.lifetime),
       boards.map((_, index) => `账号 ${index + 1}`),
@@ -907,6 +1248,23 @@ function mergeAccountLeaderboards(boards: PublicCodexLeaderboard[]): PublicCodex
     updatedAt: new Date().toISOString(),
     errors: boards.flatMap((board) => board.errors)
   };
+}
+
+/** The leaderboard and quota panel must show the same accrued estimate;
+ * dividing again by other users' tokens would dilute previously assigned use. */
+export function applyAccruedTrackedQuota(
+  board: PublicCodexLeaderboard,
+  sources: LeaderboardAccountSource[],
+  ledger: Record<string, TrackedQuotaLedgerAccount>,
+  userId: string
+): PublicCodexLeaderboard {
+  const matched = sources.filter(source => source.kind !== "api-provider" && ledger[source.id]
+    && source.quota.rateLimits?.primary?.resetsAt != null
+    && Math.abs(ledger[source.id].resetAt - source.quota.rateLimits.primary.resetsAt) <= leaderboardResetDriftSeconds);
+  if (!matched.length) return board;
+  const accrued = round2(matched.reduce((sum, source) => sum + ledger[source.id].userCycleQuotaPercent, 0));
+  return { ...board, currentCycle: { ...board.currentCycle, users: board.currentCycle.users.map(user =>
+    sameTrackedUser(user.userId, userId) ? { ...user, quotaPercent: accrued } : user) } };
 }
 
 async function mergePeerLeaderboards(local: PublicCodexLeaderboard): Promise<PublicCodexLeaderboard> {
@@ -948,10 +1306,11 @@ async function mergePeerLeaderboards(local: PublicCodexLeaderboard): Promise<Pub
   };
 }
 
-async function summarizeLeaderboardFile(
+export async function summarizeLeaderboardFile(
   filePath: string,
   store: ProjectStore,
-  resolveSessionOwner: (sessionId: string) => string | null
+  resolveSessionOwner: (sessionId: string) => string | null,
+  preciseTimestamps = false
 ): Promise<LeaderboardFileSummary> {
   const stat = fs.statSync(filePath);
   const usageByKey = new Map<string, LeaderboardFileUsage>();
@@ -960,6 +1319,14 @@ async function summarizeLeaderboardFile(
   let model = "unknown";
   let effort: string | null = null;
   let startAt: number | null = null;
+  let tokenEventIndex = 0;
+  let currentTurnId: string | null = null;
+  let inheritedTurns = new Set<string>();
+  const knownUsers = new Map<string, boolean>();
+  const isKnownUser = (id: string): boolean => {
+    if (!knownUsers.has(id)) knownUsers.set(id, store.getUser(id) !== null);
+    return knownUsers.get(id)!;
+  };
   const input = fs.createReadStream(filePath, { encoding: "utf8", highWaterMark: 256 * 1024 });
   const lines = createInterface({ input, crlfDelay: Infinity });
 
@@ -975,27 +1342,40 @@ async function summarizeLeaderboardFile(
     const payload = asRecord(record.payload);
     if (type === "session_meta") {
       sessionId = stringOrNull(payload.session_id) ?? stringOrNull(payload.id) ?? sessionId;
-      userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd));
+      userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd), isKnownUser);
+      const parentId = stringOrNull(payload.forked_from_id);
+      if (parentId && parentId !== sessionId) {
+        const parentPath = await findThreadJsonlPathById(parentId);
+        if (!parentPath) throw new Error(`分支来源 ${parentId} 的日志不可用，不能可靠去除继承用量。`);
+        inheritedTurns = await inheritedBillingTurnIds(parentPath);
+      }
       continue;
     }
     if (type === "turn_context") {
-      userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd));
+      currentTurnId = stringOrNull(payload.turn_id) ?? currentTurnId;
+      userId = userId ?? resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd), isKnownUser);
       model = stringOrNull(payload.model) ?? model;
       effort = stringOrNull(payload.effort)
         ?? stringOrNull(asRecord(asRecord(payload.collaboration_mode).settings).reasoning_effort)
         ?? effort;
       continue;
     }
+    if (type === "event_msg" && payload.type === "task_started") {
+      currentTurnId = stringOrNull(payload.turn_id) ?? currentTurnId;
+    }
     if (type !== "event_msg" || stringOrNull(payload.type) !== "token_count") continue;
+    if (currentTurnId && inheritedTurns.has(currentTurnId)) continue;
 
     const recordTimestamp = stringOrNull(record.timestamp);
     const parsedTimestampMs = recordTimestamp ? Date.parse(recordTimestamp) : Number.NaN;
+    const occurredAt = Number.isFinite(parsedTimestampMs) ? Math.floor(parsedTimestampMs / 1000) : null;
+    const dayKey = occurredAt === null ? null : naturalDayKey(occurredAt);
     if (Number.isFinite(parsedTimestampMs)) {
-      const parsedTimestamp = Math.floor(parsedTimestampMs / 1000);
+      const parsedTimestamp = occurredAt!;
       startAt = startAt === null ? parsedTimestamp : Math.min(startAt, parsedTimestamp);
     }
     if (!userId) {
-      userId = resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd)) ?? "unknown";
+      userId = resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd), isKnownUser) ?? "unknown";
     }
     const info = asRecord(payload.info);
     const usageRecord = asRecord(info.last_token_usage);
@@ -1012,25 +1392,45 @@ async function summarizeLeaderboardFile(
     if (!usage.totalTokens) continue;
     const primary = asRecord(asRecord(payload.rate_limits).primary);
     const resetAt = safeCount(primary.resets_at) ?? safeCount(primary.resetsAt);
-    const key = JSON.stringify([userId, sessionId, model, effort, resetAt]);
+    const key = JSON.stringify([userId, sessionId, model, effort, resetAt, dayKey, preciseTimestamps ? tokenEventIndex++ : null]);
     const existing = usageByKey.get(key);
     if (existing) {
       addTokenAccumulator(existing, usage);
+      existing.occurredAt = existing.occurredAt === null || existing.occurredAt === undefined
+        ? occurredAt
+        : occurredAt === null
+          ? existing.occurredAt
+          : Math.min(existing.occurredAt, occurredAt);
     } else {
-      usageByKey.set(key, { userId, sessionId, model, effort, resetAt, ...usage });
+      usageByKey.set(key, { userId, sessionId, model, effort, resetAt, occurredAt, dayKey, ...usage });
     }
   }
 
-  return { size: stat.size, mtimeMs: stat.mtimeMs, startAt, usage: Array.from(usageByKey.values()) };
+  return { size: stat.size, mtimeMs: stat.mtimeMs, startAt, usage: Array.from(usageByKey.values()), granularity: preciseTimestamps ? "event" : "day", billingVersion: 2 };
 }
 
-async function readCodexLeaderboard(source: LeaderboardAccountSource, store: ProjectStore): Promise<PublicCodexLeaderboard> {
+async function readCodexLeaderboard(
+  source: LeaderboardAccountSource,
+  store: ProjectStore,
+  apiCycleWindow?: LeaderboardCycleWindow,
+  requireDailyBreakdown = false
+): Promise<PublicCodexLeaderboard> {
   loadLeaderboardFileCache();
   const files = walkJsonlFiles(source.sessionsRoot);
   const currentQuota = source.quota;
-  const currentResetAt = currentQuota.rateLimits?.primary?.resetsAt ?? null;
-  const currentResetWindowMins = currentQuota.rateLimits?.primary?.windowDurationMins ?? null;
-  const currentQuotaUsedPercent = currentQuota.rateLimits?.primary?.usedPercent ?? null;
+  const currentResetAt = source.kind === "api-provider" ? apiCycleWindow?.resetAt ?? null : currentQuota.rateLimits?.primary?.resetsAt ?? null;
+  const currentResetWindowMins = source.kind === "api-provider" ? null : currentQuota.rateLimits?.primary?.windowDurationMins ?? null;
+  const currentQuotaUsedPercent = source.kind === "api-provider" ? null : currentQuota.rateLimits?.primary?.usedPercent ?? null;
+  const currentCycleStartAt = source.kind === "api-provider"
+    ? apiCycleWindow?.startAt ?? Math.floor(Date.now() / 1000) - 7 * 24 * 60 * 60
+    : currentResetAt !== null && currentResetWindowMins !== null && currentResetWindowMins > 0
+      ? currentResetAt - currentResetWindowMins * 60
+      : null;
+  const cycleWindow = currentCycleStartAt === null ? null : {
+    startAt: currentCycleStartAt,
+    resetAt: currentResetAt,
+    resetWindowMins: currentResetWindowMins
+  };
   const lifetime = new Map<string, AggregateBucket>();
   const currentCycle = new Map<string, AggregateBucket>();
   const errors: string[] = [];
@@ -1053,18 +1453,41 @@ async function readCodexLeaderboard(source: LeaderboardAccountSource, store: Pro
     try {
       const stat = fs.statSync(filePath);
       let summary = leaderboardFileCache.get(filePath);
-      if (!summary || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs) {
-        summary = await summarizeLeaderboardFile(filePath, store, resolveSessionOwner);
+      if (summary && summary.billingVersion !== 2 && !sessionMetadataFromFileStart(filePath)?.forked_from_id) {
+        // Existing non-fork summaries remain valid: avoid reparsing the full
+        // historical corpus merely to correct copied fork records.
+        summary.billingVersion = 2;
+        cacheChanged = true;
+      }
+      const needsCurrentCycleDailyBreakdown = requireDailyBreakdown && Boolean(
+        summary
+        && currentCycleStartAt !== null
+        && stat.mtimeMs >= currentCycleStartAt * 1000
+        && summary.usage.some((entry) => entry.dayKey === undefined)
+      );
+      const needsEventTimestamps = source.kind === "api-provider" && summary?.granularity !== "event";
+      if (!summary || summary.billingVersion !== 2 || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs || needsCurrentCycleDailyBreakdown || needsEventTimestamps) {
+        summary = await summarizeLeaderboardFile(filePath, store, resolveSessionOwner, source.kind === "api-provider");
         leaderboardFileCache.set(filePath, summary);
         cacheChanged = true;
+      }
+      if (summary.usage.some((entry) => entry.userId === "unknown")) {
+        const cwdUser = userIdFromSessionCwd(sessionCwdFromFileStart(filePath), (id) => store.getUser(id) !== null);
+        if (cwdUser) {
+          for (const entry of summary.usage) {
+            if (entry.userId === "unknown") entry.userId = cwdUser;
+          }
+          cacheChanged = true;
+        }
       }
       if (summary.startAt !== null) {
         lifetimeStartAt = lifetimeStartAt === null ? summary.startAt : Math.min(lifetimeStartAt, summary.startAt);
       }
       for (const entry of summary.usage) {
-        recordUsage(lifetime, entry.userId, entry.sessionId, entry.model, entry.effort, entry);
-        if (currentResetAt !== null && entry.resetAt === currentResetAt) {
-          recordUsage(currentCycle, entry.userId, entry.sessionId, entry.model, entry.effort, entry);
+        const owner = resolveSessionOwner(entry.sessionId) ?? entry.userId;
+        recordUsage(lifetime, owner, entry.sessionId, entry.model, entry.effort, entry);
+        if (cycleWindow && usageInLeaderboardCycle(entry, source.kind, cycleWindow)) {
+          recordUsage(currentCycle, owner, entry.sessionId, entry.model, entry.effort, entry);
         }
       }
     } catch (error) {
@@ -1084,7 +1507,8 @@ async function readCodexLeaderboard(source: LeaderboardAccountSource, store: Pro
     currentCycle: finalizeLeaderboardScope(currentCycle, {
       totalQuotaUsedPercent: currentQuotaUsedPercent,
       resetAt: currentResetAt,
-      resetWindowMins: currentResetWindowMins
+      resetWindowMins: currentResetWindowMins,
+      startAt: currentCycleStartAt
     }),
     lifetime: finalizeLeaderboardScope(lifetime, {
       totalQuotaUsedPercent: null,
@@ -1112,9 +1536,17 @@ async function readCachedCodexLeaderboard(
     return leaderboardRefreshInFlight;
   }
   const refresh = (async () => {
+    const apiCycleWindow = apiLeaderboardCycleWindow(
+      sources.filter((source) => source.kind !== "api-provider").map((source) => ({
+        resetAt: source.quota.rateLimits?.primary?.resetsAt ?? null,
+        resetWindowMins: source.quota.rateLimits?.primary?.windowDurationMins ?? null
+      })),
+      Math.floor(Date.now() / 1000)
+    );
     const boards: PublicCodexLeaderboard[] = [];
-    for (const source of sources) boards.push(await readCodexLeaderboard(source, store));
-    return boards.length === 1 ? boards[0] : mergeAccountLeaderboards(boards);
+    for (const source of sources) boards.push(await readCodexLeaderboard(source, store, apiCycleWindow));
+    const local = boards.length === 1 ? boards[0] : mergeAccountLeaderboards(boards, sources);
+    return applyAccruedTrackedQuota(local, sources, readTrackedQuotaLedger(), serverConfig.trackedQuotaUser);
   })()
     .then((local) => includePeers ? mergePeerLeaderboards(local) : local)
     .then((data) => {
@@ -1134,6 +1566,7 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
     return snapshots.map((entry) => ({
       id: entry.id,
       label: entry.label,
+      kind: entry.kind,
       sessionsRoot: path.join(entry.codexHome, "sessions"),
       quota: sanitizeCodexQuota(entry.account, entry.limits, entry.usage, entry.errors)
     }));
@@ -1141,12 +1574,234 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
   return [{
     id: serverConfig.leaderboardAccountLabel,
     label: serverConfig.leaderboardAccountLabel,
-    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/ls", ".codex"), "sessions"),
+    kind: "codex-account",
+    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/example", ".codex"), "sessions"),
     quota: await readCachedCodexQuota(bridge, forceRefresh)
   }];
 }
 
-function fileKind(filePath: string): "markdown" | "text" | "image" | "pdf" | "binary" {
+function sameTrackedUser(left: string, right: string): boolean {
+  return left.trim().toLocaleLowerCase("en-US") === right.trim().toLocaleLowerCase("en-US");
+}
+
+export function allowedAccountForUser(userId: string): string | null {
+  return serverConfig.trackedQuotaEnforce && serverConfig.trackedQuotaAllowedAccountId && sameTrackedUser(userId, serverConfig.trackedQuotaUser)
+    ? serverConfig.trackedQuotaAllowedAccountId
+    : null;
+}
+
+async function buildTrackedQuotaUsage(
+  bridge: CodexBridge,
+  store: ProjectStore,
+  forceRefresh: boolean
+): Promise<PublicTrackedQuotaUsage> {
+  const sources = await leaderboardAccountSources(bridge, forceRefresh);
+  const today = naturalDayKey(Math.floor(Date.now() / 1000));
+  const trackedUser = serverConfig.trackedQuotaUser;
+  const accounts: PublicTrackedQuotaAccount[] = [];
+  const dayAccounts = new Map<string, PublicTrackedQuotaDayAccount[]>();
+  const errors: string[] = [];
+  const ledgerAccounts = readTrackedQuotaLedger();
+  const previousDisplay = trackedQuotaCache?.data ?? (() => {
+    try {
+      return JSON.parse(fs.readFileSync(trackedQuotaCachePath, "utf8")) as PublicTrackedQuotaUsage;
+    } catch {
+      return null;
+    }
+  })();
+
+  for (const source of sources) {
+    const board = await readCodexLeaderboard(source, store, undefined, true);
+    errors.push(...board.errors.map((error) => `${source.label}: ${error}`));
+    const cycle = board.currentCycle;
+    const accountUsedPercent = cycle.quotaUsedPercent;
+    const trackedCycle = cycle.users.find((entry) => sameTrackedUser(entry.userId, trackedUser));
+    const dailyUserTotals = new Map<string, number>();
+
+    for (const filePath of walkJsonlFiles(source.sessionsRoot)) {
+      const summary = leaderboardFileCache.get(filePath);
+      if (!summary) continue;
+      for (const entry of summary.usage) {
+        if (!entry.dayKey || cycle.resetAt === null || entry.resetAt === null || Math.abs(entry.resetAt - cycle.resetAt) > leaderboardResetDriftSeconds) continue;
+        if (sameTrackedUser(entry.userId, trackedUser)) {
+          dailyUserTotals.set(entry.dayKey, (dailyUserTotals.get(entry.dayKey) ?? 0) + entry.totalTokens);
+        }
+      }
+    }
+
+    const previousLedger = ledgerAccounts[source.id];
+    const previousAccount = previousDisplay?.userId === trackedUser
+      ? previousDisplay.accounts.find((entry) => entry.accountId === source.id && entry.resetAt === cycle.resetAt)
+      : null;
+    const initialDailyPercent = Object.fromEntries(
+      (previousAccount ? previousDisplay?.days ?? [] : [])
+        .map((day) => [day.date, day.accounts.find((entry) => entry.accountId === source.id)?.quotaPercent ?? 0])
+    );
+    if (cycle.resetAt !== null && accountUsedPercent !== null) {
+      ledgerAccounts[source.id] = advanceTrackedQuotaLedger(
+        previousLedger ?? null,
+        {
+          resetAt: cycle.resetAt,
+          quotaPercent: accountUsedPercent,
+          totalTokens: cycle.totalTokens,
+          userTokens: trackedCycle?.totalTokens ?? 0,
+          dailyUserTokens: Object.fromEntries(dailyUserTotals),
+          observedAt: Date.now()
+        },
+        {
+          cyclePercent: previousAccount?.userCycleQuotaPercent
+            ?? estimatedQuotaPercent(trackedCycle?.totalTokens ?? 0, cycle.totalTokens, accountUsedPercent),
+          dailyPercent: Object.keys(initialDailyPercent).length
+            ? initialDailyPercent
+            : Object.fromEntries(Array.from(dailyUserTotals, ([date, tokens]) => [
+              date,
+              estimatedQuotaPercent(tokens, cycle.totalTokens, accountUsedPercent)
+            ]))
+        }
+      );
+    }
+    const ledger = ledgerAccounts[source.id]?.resetAt === cycle.resetAt ? ledgerAccounts[source.id] : null;
+
+    for (const [date, userTokens] of dailyUserTotals) {
+      const quotaPercent = round2(ledger?.dailyQuotaPercent[date]
+        ?? estimatedQuotaPercent(userTokens, cycle.totalTokens, accountUsedPercent)) ?? 0;
+      const list = dayAccounts.get(date) ?? [];
+      list.push({ accountId: source.id, accountLabel: source.label, userTokens, quotaPercent });
+      dayAccounts.set(date, list);
+    }
+
+    const todayTokens = dailyUserTotals.get(today) ?? 0;
+    accounts.push({
+      accountId: source.id,
+      accountLabel: source.label,
+      cycleStartAt: cycle.startAt,
+      resetAt: cycle.resetAt,
+      accountUsedPercent,
+      accountRemainingPercent: accountUsedPercent === null ? null : round2(Math.max(0, 100 - accountUsedPercent)),
+      userCycleTokens: trackedCycle?.totalTokens ?? 0,
+      userCycleQuotaPercent: round2(ledger?.userCycleQuotaPercent
+        ?? estimatedQuotaPercent(trackedCycle?.totalTokens ?? 0, cycle.totalTokens, accountUsedPercent)) ?? 0,
+      todayTokens,
+      todayQuotaPercent: round2(ledger?.dailyQuotaPercent[today]
+        ?? estimatedQuotaPercent(todayTokens, cycle.totalTokens, accountUsedPercent)) ?? 0
+    });
+  }
+
+  persistTrackedQuotaLedger(ledgerAccounts);
+
+  const days = Array.from(dayAccounts.entries())
+    .map(([date, dayEntries]) => ({
+      date,
+      userTokens: dayEntries.reduce((sum, entry) => sum + entry.userTokens, 0),
+      quotaPercent: round2(dayEntries.reduce((sum, entry) => sum + entry.quotaPercent, 0)) ?? 0,
+      accounts: [...dayEntries].sort((left, right) => left.accountLabel.localeCompare(right.accountLabel))
+    }))
+    .sort((left, right) => right.date.localeCompare(left.date));
+  const todayQuotaPercent = round2(accounts.reduce((sum, account) => sum + account.todayQuotaPercent, 0)) ?? 0;
+  return {
+    userId: trackedUser,
+    timeZone: serverConfig.trackedQuotaTimeZone,
+    today,
+    dailyLimitPercent: serverConfig.trackedQuotaDailyLimitPercent,
+    unlimitedAccountId: serverConfig.trackedQuotaAllowedAccountId || null,
+    todayQuotaPercent,
+    blocked: serverConfig.trackedQuotaEnforce && !serverConfig.trackedQuotaAllowedAccountId && todayQuotaPercent >= serverConfig.trackedQuotaDailyLimitPercent,
+    accounts,
+    days,
+    updatedAt: new Date().toISOString(),
+    errors
+  };
+}
+
+export async function readTrackedQuotaUsage(
+  bridge: CodexBridge,
+  store: ProjectStore,
+  forceRefresh = false
+): Promise<PublicTrackedQuotaUsage> {
+  loadTrackedQuotaDiskCache();
+  const startRefresh = (refreshAccountQuota: boolean) => {
+    if (trackedQuotaRefreshInFlight) return trackedQuotaRefreshInFlight;
+    trackedQuotaRefreshInFlight = buildTrackedQuotaUsage(bridge, store, refreshAccountQuota)
+    .then((data) => {
+      trackedQuotaCache = { data, expiresAt: Date.now() + trackedQuotaCacheTtlMs };
+      persistTrackedQuotaDiskCache(data);
+      return data;
+    })
+    .finally(() => {
+      trackedQuotaRefreshInFlight = null;
+    });
+    return trackedQuotaRefreshInFlight;
+  };
+  if (!forceRefresh && trackedQuotaCache) {
+    if (trackedQuotaCache.expiresAt <= Date.now()) {
+      // Stale-while-revalidate: opening the panel never waits for a JSONL scan.
+      void startRefresh(false).catch((error) => {
+        console.warn(`Tracked quota background refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+    return trackedQuotaCache.data;
+  }
+  return startRefresh(forceRefresh);
+}
+
+export function invalidateTrackedQuotaCacheForUser(userId: string): void {
+  if (trackedQuotaCache && sameTrackedUser(userId, serverConfig.trackedQuotaUser)) {
+    trackedQuotaCache.expiresAt = 0;
+  }
+}
+
+async function readTrackedQuotaUsageForEnforcement(
+  bridge: CodexBridge,
+  store: ProjectStore
+): Promise<PublicTrackedQuotaUsage> {
+  loadTrackedQuotaDiskCache();
+  if (trackedQuotaCache && trackedQuotaCache.expiresAt > Date.now()) return trackedQuotaCache.data;
+  if (trackedQuotaRefreshInFlight) return trackedQuotaRefreshInFlight;
+  trackedQuotaRefreshInFlight = buildTrackedQuotaUsage(bridge, store, false)
+    .then((data) => {
+      trackedQuotaCache = { data, expiresAt: Date.now() + trackedQuotaCacheTtlMs };
+      persistTrackedQuotaDiskCache(data);
+      return data;
+    })
+    .finally(() => {
+      trackedQuotaRefreshInFlight = null;
+    });
+  return trackedQuotaRefreshInFlight;
+}
+
+export async function assertTrackedUserQuotaAvailable(
+  bridge: CodexBridge,
+  store: ProjectStore,
+  userId: string,
+  threadId?: string
+): Promise<void> {
+  if (!serverConfig.trackedQuotaEnforce || !serverConfig.trackedQuotaUser || !sameTrackedUser(userId, serverConfig.trackedQuotaUser)) return;
+  const allowedAccountId = allowedAccountForUser(userId);
+  if (allowedAccountId) {
+    if (!isAccountPoolBridge(bridge) || !bridge.hasAccount(allowedAccountId)) {
+      throw new Error(`${userId} 的专用账号 ${allowedAccountId} 当前不可用。`);
+    }
+    if (threadId) {
+      const account = await bridge.resolveThreadAccount(threadId);
+      if (account.id !== allowedAccountId) {
+        throw new Error(`${userId} 只能使用 ${allowedAccountId}；此会话属于 ${account.label}，可查看历史或迁移后继续。`);
+      }
+    }
+    return;
+  }
+  const usage = await readTrackedQuotaUsageForEnforcement(bridge, store);
+  assertTrackedDailyQuotaWithinLimit(usage);
+}
+
+export function assertTrackedDailyQuotaWithinLimit(usage: Pick<PublicTrackedQuotaUsage,"userId"|"todayQuotaPercent"|"dailyLimitPercent">): void {
+  if (usage.todayQuotaPercent >= usage.dailyLimitPercent) {
+    throw new Error(
+      `${usage.userId} 今日估算额度占用已达 ${usage.todayQuotaPercent.toFixed(2)}%，超过每日 ${usage.dailyLimitPercent.toFixed(2)}% 上限；今日可查看历史，但不能继续发起回答。`
+    );
+  }
+}
+
+function fileKind(filePath: string): "markdown" | "text" | "image" | "video" | "pdf" | "binary" {
   const extension = path.extname(filePath).toLowerCase();
   if (markdownExtensions.has(extension)) {
     return "markdown";
@@ -1156,6 +1811,9 @@ function fileKind(filePath: string): "markdown" | "text" | "image" | "pdf" | "bi
   }
   if (imageExtensions.has(extension)) {
     return "image";
+  }
+  if (videoExtensions.has(extension)) {
+    return "video";
   }
   if (extension === ".pdf") {
     return "pdf";
@@ -1241,6 +1899,10 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\''`)}'`;
 }
 
+function powershellQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
 function expandHomePath(value: string): string {
   if (value === "~") {
     return process.env.HOME ?? value;
@@ -1313,12 +1975,62 @@ function validateLocalSendSettings(settings: ReturnType<ProjectStore["getLocalSe
 
 function localSshOptions(clean: ReturnType<typeof validateLocalSendSettings>, portFlag: "-p" | "-P" = "-p"): string[] {
   const identityOptions = clean.identityFile ? ["-i", expandHomePath(clean.identityFile)] : [];
-  return ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10", ...identityOptions, portFlag, String(clean.sshPort)];
+  // The service SSH agent can contain many unrelated deployment keys. Without
+  // this guard Windows OpenSSH may hit MaxAuthTries before the selected/default
+  // identity is offered, producing a misleading "Too many authentication
+  // failures" even though the host and port are reachable.
+  return ["-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10", ...identityOptions, portFlag, String(clean.sshPort)];
+}
+
+type RemoteSshShell = "posix" | "windows";
+
+function encodedPowerShellCommand(script: string): string {
+  return `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
+}
+
+async function detectRemoteSshShell(clean: ReturnType<typeof validateLocalSendSettings>, sshTarget: string): Promise<RemoteSshShell> {
+  // Windows OpenSSH can use either PowerShell or cmd.exe as its default shell.
+  // Probe both expansion syntaxes before falling back to POSIX.
+  const powerShellProbe = await execFileAsync(
+    "ssh",
+    [...localSshOptions(clean), sshTarget, "echo CODEX_REMOTE_OS=$env:OS"],
+    { timeout: 30_000, maxBuffer: 512 * 1024 }
+  ).catch(() => ({ stdout: "" }));
+  if (powerShellProbe.stdout.includes("CODEX_REMOTE_OS=Windows_NT")) return "windows";
+  const cmdProbe = await execFileAsync(
+    "ssh",
+    [...localSshOptions(clean), sshTarget, "echo CODEX_REMOTE_OS=%OS%"],
+    { timeout: 30_000, maxBuffer: 512 * 1024 }
+  );
+  return cmdProbe.stdout.includes("CODEX_REMOTE_OS=Windows_NT") ? "windows" : "posix";
+}
+
+function remoteEnsureDirectoryCommand(remoteShell: RemoteSshShell, directory: string): string {
+  if (remoteShell === "windows") {
+    const quoted = powershellQuote(directory);
+    return encodedPowerShellCommand(`$ProgressPreference='SilentlyContinue'; $codexPath=${quoted}; if (-not (Test-Path -LiteralPath $codexPath)) { New-Item -ItemType Directory -Path $codexPath -Force | Out-Null }`);
+  }
+  return `mkdir -p -- ${shellQuote(directory)}`;
+}
+
+function remoteRemoveFileCommand(remoteShell: RemoteSshShell, filePath: string): string {
+  if (remoteShell === "windows") {
+    return encodedPowerShellCommand(`$ProgressPreference='SilentlyContinue'; Remove-Item -LiteralPath ${powershellQuote(filePath)} -Force -ErrorAction SilentlyContinue`);
+  }
+  return `rm -f -- ${shellQuote(filePath)}`;
+}
+
+function remoteScpTarget(remoteShell: RemoteSshShell, sshTarget: string, filePath: string): string {
+  // Modern scp uses SFTP by default. The destination is already one argv item,
+  // so PowerShell quotes become literal filename characters on Windows.
+  const quotedPath = remoteShell === "windows" ? filePath.replace(/\\/g, "/") : shellQuote(filePath);
+  return `${sshTarget}:${quotedPath}`;
 }
 
 async function testLocalSendSettingsViaSsh(settings: ReturnType<ProjectStore["getLocalSendSettings"]>) {
   const clean = validateLocalSendSettings(settings);
   const sshTarget = `${clean.sshUser}@${clean.sshHost}`;
+  const remoteShell = await detectRemoteSshShell(clean, sshTarget);
   const probeName = `.codex-web-ssh-test-${process.pid}-${Date.now()}`;
   const localProbe = path.join(uploadRoot, probeName);
   const remoteProbe = remoteJoin(clean.destinationPath, probeName);
@@ -1328,12 +2040,12 @@ async function testLocalSendSettingsViaSsh(settings: ReturnType<ProjectStore["ge
   try {
     await execFileAsync(
       "ssh",
-      [...localSshOptions(clean), sshTarget, `mkdir -p -- ${shellQuote(clean.destinationPath)}`],
+      [...localSshOptions(clean), sshTarget, remoteEnsureDirectoryCommand(remoteShell, clean.destinationPath)],
       { timeout: 30_000, maxBuffer: 512 * 1024 }
     );
     await execFileAsync(
       "scp",
-      [...localSshOptions(clean, "-P"), localProbe, `${sshTarget}:${shellQuote(remoteProbe)}`],
+      [...localSshOptions(clean, "-P"), localProbe, remoteScpTarget(remoteShell, sshTarget, remoteProbe)],
       { timeout: 30_000, maxBuffer: 512 * 1024 }
     );
     transferred = true;
@@ -1342,7 +2054,7 @@ async function testLocalSendSettingsViaSsh(settings: ReturnType<ProjectStore["ge
     if (transferred) {
       await execFileAsync(
         "ssh",
-        [...localSshOptions(clean), sshTarget, `rm -f -- ${shellQuote(remoteProbe)}`],
+        [...localSshOptions(clean), sshTarget, remoteRemoveFileCommand(remoteShell, remoteProbe)],
         { timeout: 30_000, maxBuffer: 512 * 1024 }
       ).catch(() => undefined);
     }
@@ -1366,15 +2078,16 @@ async function sendFileToLocalViaSsh(settings: ReturnType<ProjectStore["getLocal
   const remoteFile = remoteJoin(clean.destinationPath, filename);
   const sshTarget = `${clean.sshUser}@${clean.sshHost}`;
   const sshOptions = localSshOptions(clean);
+  const remoteShell = await detectRemoteSshShell(clean, sshTarget);
 
   await execFileAsync(
     "ssh",
-    [...sshOptions, sshTarget, `mkdir -p -- ${shellQuote(clean.destinationPath)}`],
+    [...sshOptions, sshTarget, remoteEnsureDirectoryCommand(remoteShell, clean.destinationPath)],
     { timeout: 30_000, maxBuffer: 512 * 1024 }
   );
   const { stdout, stderr } = await execFileAsync(
     "scp",
-    [...localSshOptions(clean, "-P"), sourcePath, `${sshTarget}:${shellQuote(remoteFile)}`],
+    [...localSshOptions(clean, "-P"), sourcePath, remoteScpTarget(remoteShell, sshTarget, remoteFile)],
     { timeout: 120_000, maxBuffer: 1024 * 1024 }
   );
   return {
@@ -1496,6 +2209,21 @@ function handoffResultMessage(result: ImportedUserHandoff): string {
   return `已从 ${result.sourceLabel} 迁移 ${result.importedThreadIds.length} 个会话，已存在 ${result.alreadyPresentThreadIds.length} 个；源端可迁移会话 ${result.sourceSessionCount} 个。`;
 }
 
+function importHandoffArchive(store: ProjectStore, bridge: CodexBridge, userId: string, extractedDirectory: string) {
+  return importStagedUserHandoff(store, userId, extractedDirectory, serverConfig.projectRoot, {
+    overwriteExisting: true,
+    targetCodexHome: serverConfig.handoffTargetCodexHome || undefined
+  }).then((result) => {
+    if (serverConfig.handoffTargetAccountId && isAccountPoolBridge(bridge)) {
+      bridge.assignThreadsToAccount(
+        [...result.importedThreadIds, ...result.alreadyPresentThreadIds],
+        serverConfig.handoffTargetAccountId
+      );
+    }
+    return result;
+  });
+}
+
 
 function validateServerOutputPath(value: string | undefined, settings: ReturnType<ProjectStore["getLocalSendSettings"]>): string {
   const outputPath = cleanSshScalar(value?.trim() || settings.outputPath || "/tmp/codex_remote_exports", "4090-left 临时中转目录");
@@ -1599,7 +2327,8 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 }
 
 function errorStatus(error: unknown): number {
-  if (error instanceof PathPolicyError || error instanceof z.ZodError) {
+  if (error instanceof LegacyRollbackConflictError || error instanceof ScheduleConflictError || error instanceof BranchConflictError) return 409;
+  if (error instanceof PathPolicyError || error instanceof z.ZodError || error instanceof ThreadContextConfigError) {
     if (error instanceof PathPolicyError && error.message === "File does not exist.") {
       return 404;
     }
@@ -1692,59 +2421,23 @@ function searchableTextFromValue(value: unknown, depth = 0): string {
   return "";
 }
 
-/**
- * Cross-account threads cannot share the native Codex session file.  This
- * creates a bounded, visible-history handoff instead: user and agent messages
- * through the chosen completed turn, without hidden reasoning or huge tool
- * output.  The target account receives it as the first prompt of a new thread.
- */
-function crossAccountBranchContext(threadValue: unknown, boundaryTurnId: string): string {
-  const thread = asRecord(threadValue);
-  const turns = Array.isArray(thread.turns) ? thread.turns : [];
-  const sections: string[] = [];
-  let foundBoundary = false;
-  for (const turnValue of turns) {
-    const turn = asRecord(turnValue);
-    const turnId = stringOrNull(turn.id);
-    const items = Array.isArray(turn.items) ? turn.items : [];
-    const lines: string[] = [];
-    for (const itemValue of items) {
-      const item = asRecord(itemValue);
-      const type = String(item.type ?? "").toLowerCase();
-      const role = String(item.role ?? "").toLowerCase();
-      const isUser = role === "user" || type.includes("user");
-      const isAgent = role === "assistant" || role === "agent" || type.includes("agentmessage") || type === "assistantmessage";
-      if (!isUser && !isAgent) continue;
-      const text = [item.text, item.message, item.content, item.value]
-        .map((value) => searchableTextFromValue(value))
-        .find((value) => value.trim())
-        ?.replace(/\s+/g, " ").trim() ?? "";
-      if (text) lines.push(`${isUser ? "用户" : "Codex"}：${text.slice(0, 8_000)}`);
-    }
-    if (lines.length) sections.push(lines.join("\n"));
-    if (turnId === boundaryTurnId) {
-      foundBoundary = true;
+export function branchTitle(sourceName: string, targetAccountLabel: string | null, sourceAccountLabel: string | null): string {
+  const shortLabel = (label: string) => /^\d{6}$/.test(label) ? label.slice(-4) : label;
+  let base = sourceName.trim() || "会话";
+  const previousLabel = sourceAccountLabel?.trim();
+  const previousSuffixes = previousLabel
+    ? [` - ${shortLabel(previousLabel)}`, ` - ${previousLabel}`, " · 分支"]
+    : [" · 分支"];
+  for (const suffix of previousSuffixes) {
+    if (base.endsWith(suffix)) {
+      base = base.slice(0, -suffix.length).trimEnd() || "会话";
       break;
     }
   }
-  if (!foundBoundary) {
-    throw new Error("选择的回答不在当前会话历史中，请刷新后重试。");
-  }
-  const joined = sections.join("\n\n").trim();
-  if (!joined) {
-    throw new Error("该节点之前没有可用于续接的可见对话内容。");
-  }
-  const maximumCharacters = 36_000;
-  if (joined.length <= maximumCharacters) return joined;
-  // Preserve the opening goal and the newest decisions when a thread is large.
-  return `${joined.slice(0, 7_000)}\n\n[中间较早的对话已省略]\n\n${joined.slice(-(maximumCharacters - 7_000))}`;
-}
-
-function branchTitle(sourceName: string, prompt: string): string {
-  const cleanPrompt = prompt.replace(/\s+/g, " ").trim();
-  const segment = (cleanPrompt.split(/[\r\n。！？!?；;]/, 1)[0] ?? cleanPrompt).trim();
-  const suffix = Array.from(segment).slice(0, /[\u4e00-\u9fff]/.test(segment) ? 20 : 36).join("").trim() || "分支";
-  return `${sourceName || "会话"} · ${suffix}`.slice(0, 160);
+  const label = targetAccountLabel?.trim();
+  if (!label) return Array.from(base).slice(0, 160).join("");
+  const suffix = ` - ${shortLabel(label)}`;
+  return `${Array.from(base).slice(0, Math.max(0, 160 - Array.from(suffix).length)).join("")}${suffix}`;
 }
 
 function itemMatchesSearch(item: unknown, query: string): boolean {
@@ -1771,6 +2464,19 @@ function resolvedThreadModelPresentation(
   return {
     model: presentation?.model ?? ownerProject?.defaultModel ?? defaults.model,
     reasoningEffort: presentation?.reasoningEffort ?? ownerProject?.defaultReasoningEffort ?? defaults.reasoningEffort
+  };
+}
+
+export function applyThreadPresentation(
+  thread: unknown,
+  presentation: ThreadPresentation | undefined,
+  modelPresentation: { model: string; reasoningEffort: ReasoningEffort }
+): Record<string, unknown> {
+  return {
+    ...asRecord(thread),
+    pinned: presentation?.pinned === true,
+    configuredModel: modelPresentation.model,
+    configuredReasoningEffort: modelPresentation.reasoningEffort
   };
 }
 
@@ -1828,14 +2534,48 @@ function listItemSummaryFromThread(thread: unknown): unknown {
   };
 }
 
-function sanitizeThreadPayloadForClient<T>(value: T): T {
+function threadUserItemText(item: Record<string, unknown>): string {
+  for (const value of [item.text, item.message, item.input, item.prompt]) {
+    if (typeof value === "string") return value;
+  }
+  if (Array.isArray(item.content)) {
+    return item.content.map((part) => {
+      if (typeof part === "string") return part;
+      const record = asRecord(part);
+      return typeof record.text === "string" ? record.text : typeof record.content === "string" ? record.content : "";
+    }).filter(Boolean).join("\n");
+  }
+  return "";
+}
+
+export function sanitizeThreadPayloadForClient<T>(value: T): T {
   const root = asRecord(value);
   const thread = asRecord(root.thread ?? value);
   const turns = Array.isArray(thread.turns) ? thread.turns : [];
   for (const turnValue of turns) {
     const turn = asRecord(turnValue);
     const items = Array.isArray(turn.items) ? turn.items : [];
-    for (const itemValue of items) {
+    const containsContextCompaction = items.some(isContextCompactionItem);
+    const clientItems = items.filter((itemValue) => {
+      const item = asRecord(itemValue);
+      const itemType = typeof item.type === "string" ? item.type.toLowerCase() : "";
+      const role = typeof item.role === "string" ? item.role.toLowerCase() : "";
+      if (isContextCompactionItem(item)) {
+        return false;
+      }
+      if (
+        containsContextCompaction
+        && (role === "assistant" || itemType.includes("agent"))
+        && isGenericContextLossReply(threadUserItemText(item))
+      ) {
+        return false;
+      }
+      if (role !== "user" && !itemType.includes("user")) return true;
+      const text = threadUserItemText(item).trim();
+      return !isInternalUserMessageText(text);
+    });
+    turn.items = clientItems;
+    for (const itemValue of clientItems) {
       const item = asRecord(itemValue);
       const itemType = typeof item.type === "string" ? item.type : "";
       const savedPath = stringOrNull(item.savedPath) ?? stringOrNull(item.saved_path) ?? stringOrNull(item.imagePath) ?? stringOrNull(item.image_path);
@@ -1923,39 +2663,6 @@ async function threadMatchesSearch(bridge: CodexBridge, item: unknown, query: st
   return itemMatchesSearch(fullThread, query);
 }
 
-async function searchOwnedThreadList(bridge: CodexBridge, ownedThreadIds: Set<string>, searchTerm: string): Promise<unknown[]> {
-  const targets: Array<{ threadId: string; filePath: string }> = [];
-  const missing: string[] = [];
-  for (const threadId of ownedThreadIds) {
-    const filePath = await findThreadJsonlPathById(threadId);
-    if (filePath) targets.push({ threadId, filePath });
-    else missing.push(threadId);
-  }
-  const indexedMatches = await searchIndexedThreads(targets, searchTerm, 80);
-  const bestMatchByThread = new Map<string, typeof indexedMatches[number]>();
-  for (const match of indexedMatches) {
-    if (!bestMatchByThread.has(match.threadId)) bestMatchByThread.set(match.threadId, match);
-  }
-  const pathByThread = new Map(targets.map((target) => [target.threadId, target.filePath]));
-  const matches: unknown[] = [];
-  for (const [threadId, match] of bestMatchByThread) {
-    const filePath = pathByThread.get(threadId);
-    if (!filePath) continue;
-    try {
-      matches.push({
-        ...await readThreadSummaryFromJsonl(filePath, threadId),
-        searchMatch: match
-      });
-    } catch {
-      // A damaged historical file must not prevent other search results.
-    }
-  }
-  for (const threadId of missing) {
-    const fullThread = await readOwnedThreadForList(bridge, threadId);
-    if (fullThread && itemMatchesSearch(fullThread, searchTerm)) matches.push(listItemSummaryFromThread(fullThread));
-  }
-  return matches.sort((left, right) => listItemUpdatedAt(right) - listItemUpdatedAt(left));
-}
 
 async function readOwnedThreadSummariesFromJsonl(ownedThreadIds: Set<string>): Promise<unknown[] | null> {
   const threadIds = [...ownedThreadIds];
@@ -1989,25 +2696,28 @@ async function readOwnedThreadSummariesFromJsonl(ownedThreadIds: Set<string>): P
   return summaries.length === targets.length ? summaries : null;
 }
 
+const pendingIndexWarm = new Set<string>();
+const lastIndexWarm = new Map<string, number>();
 let backgroundIndexWarmPromise: Promise<void> | null = null;
 function warmOwnedThreadIndexes(ownedThreadIds: Set<string>): void {
+  for (const id of ownedThreadIds) {
+    if (Date.now() - (lastIndexWarm.get(id) ?? 0) > 10_000) pendingIndexWarm.add(id);
+  }
   if (backgroundIndexWarmPromise) return;
   backgroundIndexWarmPromise = (async () => {
-    const targets: Array<{ threadId: string; filePath: string }> = [];
-    for (const threadId of ownedThreadIds) {
-      const filePath = await findThreadJsonlPathById(threadId);
-      if (filePath) targets.push({ threadId, filePath });
-    }
-    let next = 0;
-    const worker = async () => {
-      for (;;) {
-        const target = targets[next++];
-        if (!target) return;
-        await warmThreadIndex(target.filePath, target.threadId);
+    while (pendingIndexWarm.size) {
+      const threadId = pendingIndexWarm.values().next().value!;
+      pendingIndexWarm.delete(threadId);
+      try {
+        const filePath = await findThreadJsonlPathById(threadId);
+        if (filePath) await warmThreadIndex(filePath, threadId);
+      } catch {
+        // One missing historical file must not starve other users' indexes.
       }
-    };
-    await Promise.all(Array.from({ length: Math.min(2, targets.length) }, () => worker()));
-  })().catch(() => undefined).finally(() => { backgroundIndexWarmPromise = null; });
+      lastIndexWarm.set(threadId, Date.now());
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+  })().finally(() => { backgroundIndexWarmPromise = null; });
 }
 
 async function filterOwnedThreadList(
@@ -2025,12 +2735,12 @@ async function filterOwnedThreadList(
     }
   }
 
-  for (const threadId of ownedThreadIds) {
+  for (const threadId of hydrateMissing ? ownedThreadIds : []) {
     if (byId.has(threadId)) {
       continue;
     }
     const fullThread = await readOwnedThreadForList(bridge, threadId);
-    // Ownership is the access boundary. A legacy session may retain /home/ls as
+    // Ownership is the access boundary. A legacy session may retain /home/example as
     // its historical cwd after the user's default workspace is moved.
     if (fullThread) {
       byId.set(threadId, listItemSummaryFromThread(fullThread));
@@ -2050,12 +2760,63 @@ function userWorkspacePath(userId: string): string {
   return path.join(userWorkspaceRoot, safeFolderSegment(userId, "user"));
 }
 
+function isWithinDirectory(rootPath: string, targetPath: string): boolean {
+  const relative = path.relative(rootPath, targetPath);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/** Ensure the personal workspace itself is a real, non-symlink directory. */
+function ensureUserWorkspaceDirectory(userId: string): string {
+  fs.mkdirSync(userWorkspaceRoot, { recursive: true, mode: 0o700 });
+  const base = fs.realpathSync(userWorkspaceRoot);
+  const expected = path.join(base, safeFolderSegment(userId, "user"));
+  try {
+    const current = fs.lstatSync(expected);
+    if (current.isSymbolicLink() || !current.isDirectory()) throw new PathPolicyError("Personal workspace must be a real directory.");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    fs.mkdirSync(expected, { mode: 0o700 });
+  }
+  const canonical = fs.realpathSync(expected);
+  if (canonical !== expected) throw new PathPolicyError("Personal workspace must stay inside its user directory.");
+  return canonical;
+}
+
+function assertNoSymlinkPath(rootPath: string, targetPath: string): void {
+  const root = path.resolve(rootPath), target = path.resolve(targetPath);
+  if (!isWithinDirectory(root, target)) throw new PathPolicyError(`Project path must stay under ${root}.`);
+  let current = root;
+  const parts = path.relative(root, target).split(path.sep).filter(Boolean);
+  for (let index = 0; index < parts.length; index += 1) {
+    current = path.join(current, parts[index]);
+    try {
+      const stat = fs.lstatSync(current);
+      if (stat.isSymbolicLink()) throw new PathPolicyError("Project path cannot pass through a symbolic link.");
+      if (index < parts.length - 1 && !stat.isDirectory()) throw new PathPolicyError("Project path parent is not a directory.");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+      throw error;
+    }
+  }
+}
+
+function ensureUserWorkspaceProjectDirectory(userId: string, inputPath: string, create: boolean): string {
+  const root = ensureUserWorkspaceDirectory(userId);
+  const candidate = path.resolve(inputPath);
+  assertNoSymlinkPath(root, candidate);
+  const projectPath = ensureProjectDirectory(candidate, { create, allowedRoot: root, allowOutsideRoot: false });
+  assertNoSymlinkPath(root, projectPath);
+  if (fs.realpathSync(projectPath) !== projectPath || !isWithinDirectory(root, projectPath)) {
+    throw new PathPolicyError("Project path must resolve inside the personal workspace.");
+  }
+  return projectPath;
+}
+
 function ensureProjectsForUser(store: ProjectStore, userId: string) {
-  const rootPath = userWorkspacePath(userId);
-  fs.mkdirSync(rootPath, { recursive: true, mode: 0o700 });
+  const rootPath = ensureUserWorkspaceDirectory(userId);
 
   // List the personal workspace first: a newly opened page selects it by
-  // default. Existing projects (including historical /home/ls conversations)
+  // default. Existing projects (including historical /home/example conversations)
   // are deliberately retained below it.
   const workspace = store.getProjectByRootPath(rootPath, userId) ?? store.createProject({
     name: "我的工作区",
@@ -2067,6 +2828,15 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
 }
 
 const deferredToolOutputPreviewBytes = 4 * 1024;
+
+export function inlineContentDisposition(filename: string): string {
+  const fallback = filename
+    .replace(/[^\x20-\x7e]/g, "_")
+    .replace(/["\\]/g, "_");
+  const encoded = encodeURIComponent(filename)
+    .replace(/['()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `inline; filename="${fallback || "file"}"; filename*=UTF-8''${encoded}`;
+}
 
 function deferLargeToolOutputs(threadValue: unknown): void {
   const thread = asRecord(threadValue);
@@ -2094,7 +2864,196 @@ function deferLargeToolOutputs(threadValue: unknown): void {
   }
 }
 
-export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore): void {
+export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore, options: { backgroundIndexing?: boolean; browserTools?: boolean } = {}): void {
+  const predictions=isAccountPoolBridge(bridge)?new ComposerPredictions(bridge):null;
+  app.post<{Params:{id:string;threadId:string}}>("/api/projects/:id/threads/:threadId/prediction",async(request,reply)=>{
+    const userId=userIdFromRequest(request,store),owner=store.getThreadOwner(request.params.threadId);
+    if(!owner||owner.userId!==userId||owner.projectId!==request.params.id)return reply.code(403).send({error:"Thread does not belong to this user."});
+    const parsed=z.object({sourceTurnId:z.string().min(1).max(200),modelKey:z.string().max(120).optional()}).strict().safeParse(request.body);
+    if(!parsed.success)return reply.code(400).send({error:"Invalid prediction request."});
+    reply.header("Cache-Control","no-store");
+    if(!predictions)return {data:{text:null,sourceTurnId:parsed.data.sourceTurnId,eligible:false}};
+    const abort=new AbortController(),closed=()=>{if(!reply.raw.writableEnded)abort.abort();};reply.raw.once("close",closed);
+    try{return {data:await predictions.request(userId,owner.threadId,parsed.data.sourceTurnId,abort.signal,parsed.data.modelKey)};}
+    catch{return {data:{text:null,sourceTurnId:parsed.data.sourceTurnId,eligible:false}};}
+    finally{reply.raw.removeListener("close",closed);}
+  });
+  const scheduledTasks = new ScheduledTaskStore(path.join(serverConfig.dataDir, "scheduled-tasks.json"));
+  app.get<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/execution-settings", async (request, reply) => {
+    const userId = userIdFromRequest(request, store), owner = store.getThreadOwner(request.params.threadId);
+    if (!owner || owner.userId !== userId || owner.projectId !== request.params.id) return reply.code(403).send({ error: "Thread execution settings do not belong to this user." });
+    return { data: store.getThreadExecutionSettings(owner.threadId, userId) };
+  });
+  app.patch<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/execution-settings", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store), owner = store.getThreadOwner(request.params.threadId);
+      if (!owner || owner.userId !== userId || owner.projectId !== request.params.id) return reply.code(403).send({ error: "Thread execution settings do not belong to this user." });
+      const input = z.object({ sandbox: sandboxSchema, approvalPolicy: z.enum(["never", "on-request", "untrusted"]) }).strict().parse(request.body);
+      await resumeThreadIfUnloaded(bridge, owner.threadId, owner.rootPath, browserMcpForThread(owner.threadId), executionSettingsOverrides(input));
+      store.setThreadExecutionSettings(owner.threadId, userId, input.sandbox, input.approvalPolicy);
+      return { data: input, appliesTo: "subsequent-turns" };
+    } catch (error) { return reply.code(errorStatus(error) === 500 ? 400 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  registerScheduledTaskMcp(app, store, scheduledTasks);
+  let scheduleTimer: ReturnType<typeof setInterval> | undefined;
+  const scheduleRuleSchema = z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("once"), at: z.string().datetime(), timezone: z.string().min(1).max(128) }).strict(),
+    z.object({ kind: z.literal("interval"), intervalMinutes: z.number().int(), timezone: z.string().min(1).max(128) }).strict(),
+    z.object({ kind: z.enum(["daily", "weekdays"]), time: z.string(), timezone: z.string().min(1).max(128) }).strict(),
+    z.object({ kind: z.literal("weekly"), time: z.string(), weekdays: z.array(z.number().int()), timezone: z.string().min(1).max(128) }).strict()
+  ]);
+  const scheduleCreateSchema = z.object({ title: z.string().trim().max(160).optional(), prompt: z.string().trim().min(1).max(20_000), schedule: scheduleRuleSchema, enabled: z.boolean().optional() }).strict();
+  app.get<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/schedules", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store); const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      return { data: scheduledTasks.list(userId, project.id, request.params.threadId) };
+    } catch (error) { return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/schedules", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store); const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      const input = scheduleCreateSchema.parse(request.body);
+      const task = scheduledTasks.create({ userId, projectId: project.id, threadId: request.params.threadId, title: input.title || input.prompt.slice(0, 80), prompt: input.prompt, schedule: input.schedule as ScheduleRule, enabled: input.enabled ?? true });
+      return reply.code(201).send({ data: task });
+    } catch (error) { return reply.code(errorStatus(error) === 500 ? 400 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.patch<{ Params: { id: string; threadId: string; scheduleId: string } }>("/api/projects/:id/threads/:threadId/schedules/:scheduleId", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store); const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      const owned = scheduledTasks.list(userId, project.id, request.params.threadId).some(task => task.id === request.params.scheduleId);
+      if (!owned) return reply.code(404).send({ error: "Scheduled task not found." });
+      const schema = z.object({ title: z.string().trim().max(160).optional(), prompt: z.string().trim().min(1).max(20_000).optional(), schedule: scheduleRuleSchema.optional(), enabled: z.boolean().optional() }).strict();
+      const previous = scheduledTasks.list(userId, project.id, request.params.threadId).find(task => task.id === request.params.scheduleId)!;
+      const task = scheduledTasks.update(request.params.scheduleId, userId, schema.parse(request.body));
+      return { data: task, ...(previous.history.at(-1)?.status === "queued" ? { warning: "An already queued run cannot be recalled by editing or pausing this schedule." } : {}) };
+    } catch (error) { return reply.code(errorStatus(error) === 500 ? 400 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  app.delete<{ Params: { id: string; threadId: string; scheduleId: string } }>("/api/projects/:id/threads/:threadId/schedules/:scheduleId", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store); const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      const owned = scheduledTasks.list(userId, project.id, request.params.threadId).some(task => task.id === request.params.scheduleId);
+      if (!owned) return reply.code(404).send({ error: "Scheduled task not found." });
+      const alreadyQueued = scheduledTasks.list(userId, project.id, request.params.threadId).find(task => task.id === request.params.scheduleId)?.history.at(-1)?.status === "queued";
+      scheduledTasks.delete(request.params.scheduleId, userId); return { ok: true, ...(alreadyQueued ? { warning: "An already queued run cannot be recalled by deleting its schedule." } : {}) };
+    } catch (error) { return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+  const pushSubscriptionSchema = z.object({
+    endpoint: z.string().url().max(2048),
+    keys: z.object({ p256dh: z.string().min(32).max(256), auth: z.string().min(8).max(128) }).strict()
+  }).strict();
+  const trustedPushHosts = new Set(["fcm.googleapis.com", "updates.push.services.mozilla.com", "web.push.apple.com"]);
+  const validatePushEndpoint = (endpoint: string) => {
+    const url = new URL(endpoint);
+    if (url.protocol !== "https:" || !trustedPushHosts.has(url.hostname) || url.username || url.password || url.port) {
+      throw new Error("Unsupported browser push endpoint.");
+    }
+  };
+  app.get("/api/push/key", async (request) => {
+    userIdFromRequest(request, store);
+    return { data: { publicKey: pushPublicKey() } };
+  });
+  app.post("/api/push/subscription", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const subscription = pushSubscriptionSchema.parse(request.body);
+      validatePushEndpoint(subscription.endpoint);
+      store.savePushSubscription(userId, subscription);
+      return { ok: true };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+  app.delete("/api/push/subscription", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const { endpoint } = z.object({ endpoint: z.string().url() }).parse(request.body);
+      store.removePushSubscription(userId, endpoint);
+      return { ok: true };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+  let searchRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  const safelyDispatchScheduledTasks = () => {
+    void dispatchScheduledTasks().catch(error => {
+      console.error("[scheduled-tasks.tick.error]", error instanceof Error ? error.message : String(error));
+    });
+  };
+  const dispatchScheduledTasks = async () => {
+    for (const task of scheduledTasks.due()) {
+      const dueAt = Date.parse(task.nextRunAt ?? "");
+      const runId = scheduledTasks.claim(task.id, dueAt);
+      if (!runId) continue;
+      try {
+        const owner = store.getThreadOwner(task.threadId);
+        const project = store.getProject(task.projectId, task.userId);
+        if (!owner || !project || owner.userId !== task.userId || owner.projectId !== task.projectId || !store.userCanAccessThread(task.threadId, task.userId, task.projectId)) throw new Error("Scheduled thread is no longer available to its owner.");
+        await assertTrackedUserQuotaAvailable(bridge, store, task.userId, task.threadId);
+        // Restore this owner's explicit saved execution choice on cold load
+        // and native queue start; unspecified legacy tasks are not promoted.
+        await resumeThreadIfUnloaded(bridge, task.threadId, owner.rootPath, browserMcpForThread(task.threadId),
+          executionSettingsOverrides(store.getThreadExecutionSettings(task.threadId, task.userId)));
+        const result = await queueScheduledPrompt(bridge, task, runId);
+        store.touchThreadOwner(task.threadId);
+        scheduledTasks.finish(task.id, runId, undefined, Date.now(), !result.queued, result.warning);
+      } catch (error) {
+        scheduledTasks.finish(task.id, runId, error instanceof Error ? error.message : String(error));
+      }
+    }
+  };
+  app.addHook("onReady", async () => {
+    scheduleTimer = setInterval(safelyDispatchScheduledTasks, 5_000);
+    scheduleTimer.unref();
+    safelyDispatchScheduledTasks();
+    if (options.backgroundIndexing === false) return;
+    startChatSearch();
+    const refresh = () => {
+      const ids = new Set(store.listUsers().flatMap(user => store.listVisibleThreadOwnersForUser(user.id).map(owner => owner.threadId)));
+      warmOwnedThreadIndexes(ids);
+    };
+    refresh();
+    searchRefreshTimer = setInterval(refresh, 15_000);
+    searchRefreshTimer.unref();
+  });
+  app.addHook("onClose", async () => { if (searchRefreshTimer) clearInterval(searchRefreshTimer); if (scheduleTimer) clearInterval(scheduleTimer); });
+
+  app.get<{ Querystring: { q?: string; offset?: string; limit?: string; projectId?: string } }>("/api/search/threads", async (request, reply) => {
+    const userId = userIdFromRequest(request, store);
+    const query = normalizeSearchTerm(request.query.q);
+    if (!query || query.length > 512) return reply.code(400).send({ error: "Search requires 1–512 characters." });
+    const projectId = request.query.projectId;
+    if (projectId && !store.getProject(projectId, userId)) return reply.code(404).send({ error: "Project not found." });
+    const owners = store.listVisibleThreadOwnersForUser(userId).filter(owner => !projectId || owner.projectId === projectId);
+    const controller = new AbortController();
+    const disconnected = () => { if (!reply.raw.writableEnded) controller.abort(); };
+    reply.raw.once("close", disconnected);
+    try {
+      return await searchChatThreads(owners, query, {
+        offset: Math.max(0, Number.parseInt(request.query.offset ?? "0", 10) || 0),
+        limit: Math.min(80, Math.max(1, Number.parseInt(request.query.limit ?? "30", 10) || 30))
+      }, controller.signal);
+    } catch (error) {
+      if (!controller.signal.aborted) return reply.code(503).send({ error: error instanceof Error ? error.message : String(error) });
+    } finally { reply.raw.off("close", disconnected); }
+  });
+  app.get<{ Params: { threadId: string }; Querystring: { q?: string; projectId?: string } }>("/api/search/threads/:threadId/hits", async (request, reply) => {
+    const userId = userIdFromRequest(request, store);
+    const query = normalizeSearchTerm(request.query.q);
+    if (!query || query.length > 512) return reply.code(400).send({ error: "Search requires 1–512 characters." });
+    const owner = store.listVisibleThreadOwnersForUser(userId).find(entry => entry.threadId === request.params.threadId
+      && (!request.query.projectId || entry.projectId === request.query.projectId));
+    if (!owner) return reply.code(404).send({ error: "Thread not found." });
+    try { return await searchChatThreadHits(owner.threadId, query); }
+    catch (error) { return reply.code(503).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
   const publicHandoffJob = (job: HandoffJob) => ({
     id: job.id,
     status: job.status,
@@ -2125,7 +3084,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       await extractHandoffArchive(received.archivePath, extractedDirectory);
       job.phase = "importing";
       job.updatedAt = new Date().toISOString();
-      const result = await importStagedUserHandoff(store, job.userId, extractedDirectory, serverConfig.projectRoot);
+      const result = await importHandoffArchive(store, bridge, job.userId, extractedDirectory);
       if (result.sourceSessionCount === 0) {
         throw new Error(`${source.label} 上没有用户「${job.userId}」的可迁移会话。`);
       }
@@ -2147,10 +3106,12 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
   app.get("/api/health", async (request) => ({
     ok: true,
+    branchImplementation: "load-balanced-native-v3",
     codexPendingApprovals: bridge.getPendingServerRequests().length,
     projectRoot: serverConfig.projectRoot,
     allowOutsideProjectRoot: serverConfig.allowOutsideProjectRoot,
     systemDirectoryPickerAvailable: systemDirectoryPickerAvailableForRequest(request),
+    threadContextFeatureEnabled,
     defaults
   }));
 
@@ -2202,6 +3163,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           accounts: snapshots.map((entry) => ({
             id: entry.id,
             label: entry.label,
+            kind: entry.kind,
             health: entry.health,
             selectedForNewThreads: entry.selectedForNewThreads,
             assignedThreadCount: entry.assignedThreadCount,
@@ -2222,11 +3184,25 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     try {
       reply.header("Cache-Control", "no-store");
       const forceRefresh = request.query.refresh === "true";
-      const sources = await leaderboardAccountSources(bridge, forceRefresh);
+      if (!forceRefresh && leaderboardCache && leaderboardCache.expiresAt > Date.now()) {
+        return { data: leaderboardCache.data };
+      }
+      // A token refresh must not wait for every provider's auth/quota probes.
+      // The quota bridge refreshes its own cached snapshot independently.
+      const sources = await leaderboardAccountSources(bridge, false);
       // Never merge peer boards into the normal endpoint. A peer can expose
       // historical JSONL records for the same login, which is useful for an
       // audit but misleading as a current-service quota view.
       return { data: await readCachedCodexLeaderboard(sources, store, forceRefresh, false) };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Querystring: { refresh?: string } }>("/api/codex/tracked-quota", async (request, reply) => {
+    try {
+      reply.header("Cache-Control", "no-store");
+      return { data: await readTrackedQuotaUsage(bridge, store, request.query.refresh === "true") };
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -2246,6 +3222,122 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       return sanitizeSkillsList(result);
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/mcp-status", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project || !store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(404).send({ error: "Thread not found." });
+      }
+      const result = await bridge.request("mcpServerStatus/list", {
+        threadId: request.params.threadId,
+        detail: "toolsAndAuthOnly",
+        limit: 100
+      }, 30_000);
+      return sanitizeMcpServerStatus(result);
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { id: string }; Querystring: { threadId?: string } }>("/api/projects/:id/hooks", async (request, reply) => {
+    const userId = userIdFromRequest(request, store);
+    const project = store.getProject(request.params.id, userId);
+    if (!project) return reply.code(404).send({ error: "Project not found." });
+    if (request.query.threadId && !store.userCanAccessThread(request.query.threadId, userId, project.id)) {
+      return reply.code(404).send({ error: "Thread not found." });
+    }
+    try {
+      const entry = await listHooksForProject(bridge, project, request.query.threadId);
+      const grants = store.getProjectHookTrust(userId, project.id);
+      return { data: {
+        hooks: entry.hooks.map(hook => ({
+          key: String(hook.key ?? ""), eventName: String(hook.eventName ?? ""),
+          handlerType: String(hook.handlerType ?? ""), source: String(hook.source ?? ""),
+          pluginId: typeof hook.pluginId === "string" ? hook.pluginId : null,
+          enabled: hook.enabled === true, isManaged: hook.isManaged === true,
+          trustStatus: String(hook.trustStatus ?? "unknown"),
+          matcher: typeof hook.matcher === "string" ? hook.matcher : null,
+          trustable: !hook.isManaged && isProjectLocalHook(project.rootPath, hook.sourcePath),
+          currentHash: isProjectLocalHook(project.rootPath, hook.sourcePath) && typeof hook.currentHash === "string" ? hook.currentHash : null,
+          command: isProjectLocalHook(project.rootPath, hook.sourcePath) && typeof hook.command === "string" ? hook.command : null,
+          userTrusted: Boolean(hook.key && hook.currentHash && isProjectLocalHook(project.rootPath, hook.sourcePath) && grants.get(hook.key) === hook.currentHash)
+        })),
+        warnings: entry.warnings.map(String),
+        errors: entry.errors.map(error => String(error.message ?? ""))
+      } };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post<{ Params: { id: string } }>("/api/projects/:id/hooks", async (request, reply) => {
+    const userId = userIdFromRequest(request, store);
+    const project = store.getProject(request.params.id, userId);
+    if (!project) return reply.code(404).send({ error: "Project not found." });
+    try {
+      const userRoot = fs.realpathSync(path.join(userWorkspaceRoot, userId));
+      const managedRoot = path.join(userWorkspaceRoot, ".codex-web-worktrees");
+      const root = fs.realpathSync(project.rootPath);
+      if (root !== userRoot && !root.startsWith(`${userRoot}${path.sep}`) && !root.startsWith(`${managedRoot}${path.sep}`)) {
+        return reply.code(403).send({ error: "只能在自己的工作区中新增项目 Hook。" });
+      }
+      const input = z.object({
+        eventName: z.enum(["SessionStart", "Stop", "PreToolUse", "PostToolUse"]),
+        matcher: z.string().trim().max(120).optional(),
+        command: z.string().trim().min(1).max(1000)
+      }).parse(request.body);
+      const hookDir = path.join(root, ".codex");
+      const hookFile = path.join(hookDir, "hooks.json");
+      if (fs.existsSync(hookDir) && (fs.lstatSync(hookDir).isSymbolicLink() || !fs.lstatSync(hookDir).isDirectory())) {
+        return reply.code(400).send({ error: ".codex 不是普通目录。" });
+      }
+      if (fs.existsSync(hookFile) && (fs.lstatSync(hookFile).isSymbolicLink() || !fs.lstatSync(hookFile).isFile())) {
+        return reply.code(400).send({ error: "hooks.json 不是普通文件。" });
+      }
+      const config = fs.existsSync(hookFile) ? JSON.parse(fs.readFileSync(hookFile, "utf8")) as Record<string, unknown> : {};
+      if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("现有 hooks.json 格式不是对象，未修改文件。");
+      const hooks = config.hooks === undefined ? {} : config.hooks;
+      if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) throw new Error("现有 hooks.json 的 hooks 字段无效，未修改文件。");
+      const groups = (hooks as Record<string, unknown>)[input.eventName] ?? [];
+      if (!Array.isArray(groups)) throw new Error("现有 Hook 事件格式无效，未修改文件。");
+      const command = input.command;
+      const matcher = input.matcher || (input.eventName === "PreToolUse" || input.eventName === "PostToolUse" ? "Bash" : undefined);
+      const group = { ...(matcher ? { matcher } : {}), hooks: [{ type: "command", command, timeout: 30 }] };
+      fs.mkdirSync(hookDir, { recursive: true, mode: 0o700 });
+      const next = { ...config, hooks: { ...hooks, [input.eventName]: [...groups, group] } };
+      const temporary = path.join(hookDir, `hooks.json.${randomUUID()}.tmp`);
+      try {
+        fs.writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+        fs.renameSync(temporary, hookFile);
+      } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
+      return reply.code(201).send({ ok: true, path: hookFile });
+    } catch (error) {
+      return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post<{ Params: { id: string }; Querystring: { threadId?: string } }>("/api/projects/:id/hooks/trust", async (request, reply) => {
+    const userId = userIdFromRequest(request, store);
+    const project = store.getProject(request.params.id, userId);
+    if (!project) return reply.code(404).send({ error: "Project not found." });
+    if (request.query.threadId && !store.userCanAccessThread(request.query.threadId, userId, project.id)) {
+      return reply.code(404).send({ error: "Thread not found." });
+    }
+    try {
+      const input = z.object({ key: z.string().min(1).max(1000), currentHash: z.string().min(1).max(256), trusted: z.boolean() }).parse(request.body);
+      const listed = await listHooksForProject(bridge, project, request.query.threadId);
+      const hook = listed.hooks.find(item => item.key === input.key && item.currentHash === input.currentHash);
+      if (!hook || hook.isManaged || !isProjectLocalHook(project.rootPath, hook.sourcePath)) {
+        return reply.code(400).send({ error: "该 Hook 已变化或不属于当前工作区，不能授予信任。" });
+      }
+      store.setProjectHookTrust(userId, project.id, input.key, input.trusted ? input.currentHash : null);
+      return { ok: true };
+    } catch (error) {
+      return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
     }
   });
 
@@ -2340,7 +3432,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       workDir = received.workDir;
       const extractedDirectory = path.join(workDir, "extracted");
       await extractHandoffArchive(received.archivePath, extractedDirectory);
-      const data = await importStagedUserHandoff(store, userId, extractedDirectory, serverConfig.projectRoot);
+      const data = await importHandoffArchive(store, bridge, userId, extractedDirectory);
       if (data.sourceSessionCount === 0) {
         return reply.code(404).send({
           error: `${source.label} 上没有用户「${userId}」的可迁移会话，无法迁移。`,
@@ -2363,54 +3455,61 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
   app.get("/api/projects", async (request) => {
     const userId = userIdFromRequest(request, store);
+    const projects = ensureProjectsForUser(store, userId);
     return {
-      data: ensureProjectsForUser(store, userId),
-      projectRoot: serverConfig.projectRoot,
-      allowOutsideProjectRoot: serverConfig.allowOutsideProjectRoot,
-      systemDirectoryPickerAvailable: systemDirectoryPickerAvailableForRequest(request)
+      data: projects,
+      projectRoot: ensureUserWorkspaceDirectory(userId),
+      allowOutsideProjectRoot: false,
+      systemDirectoryPickerAvailable: false,
+      threadContextFeatureEnabled
     };
   });
 
   app.get<{ Querystring: { path?: string } }>("/api/system/directories", async (request, reply) => {
     try {
-      return {
-        data: listBrowsableDirectories(request.query.path, serverConfig.projectRoot, {
-          allowOutsideRoot: serverConfig.allowOutsideProjectRoot
-        })
-      };
+      const userId = userIdFromRequest(request, store);
+      const rootPath = ensureUserWorkspaceDirectory(userId);
+      const data = listBrowsableDirectories(request.query.path, rootPath, { allowOutsideRoot: false });
+      if (data.rootPath !== rootPath) throw new PathPolicyError("Directory path must stay in the personal workspace.");
+      return { data };
     } catch (error) {
       return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
     }
   });
 
-  app.post("/api/system/select-directory", async (request, reply) => {
-    if (!systemDirectoryPickerAvailableForRequest(request)) {
-      return reply.code(501).send({
-        error: "system-directory-picker-unavailable",
-        message: "System directory picker is only available when this service is opened locally on the host machine."
-      });
-    }
-
+  app.post("/api/system/directories", async (request, reply) => {
     try {
-      const script = [
-        `set defaultFolder to POSIX file ${JSON.stringify(serverConfig.projectRoot)}`,
-        'set selectedFolder to choose folder with prompt "选择本地项目目录" default location defaultFolder',
-        "POSIX path of selectedFolder"
-      ].join("\n");
-      const { stdout } = await execFileAsync("osascript", ["-e", script], { timeout: 120_000 });
-      const selectedPath = stdout.trim().replace(/\/+$/, "");
-      const rootPath = resolveProjectPath(selectedPath || serverConfig.projectRoot, serverConfig.projectRoot, {
-        allowOutsideRoot: serverConfig.allowOutsideProjectRoot
-      });
-      return { data: { rootPath } };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.includes("User canceled")) {
-        return reply.code(499).send({ error: "Directory selection was canceled." });
+      const userId = userIdFromRequest(request, store);
+      const input = createWorkspaceDirectorySchema.parse(request.body);
+      const name = input.name.trim();
+      if (!name || name === "." || name === ".." || /[\\/\u0000-\u001f\u007f]/.test(name)) {
+        throw new PathPolicyError("请输入文件夹名称，不能包含路径分隔符、控制字符或使用 . 和 ..。");
       }
-      return reply.code(errorStatus(error)).send({ error: message });
+      const rootPath = ensureUserWorkspaceDirectory(userId);
+      const parent = listBrowsableDirectories(input.parentPath, rootPath, { allowOutsideRoot: false });
+      if (parent.rootPath !== rootPath || !isWithinDirectory(rootPath, parent.currentPath)) {
+        throw new PathPolicyError("Parent directory must stay inside the personal workspace.");
+      }
+      assertNoSymlinkPath(rootPath, parent.currentPath);
+      const target = path.join(parent.currentPath, name);
+      assertNoSymlinkPath(rootPath, target);
+      fs.mkdirSync(target, { recursive: false, mode: 0o700 });
+      assertNoSymlinkPath(rootPath, target);
+      const canonicalTarget = fs.realpathSync(target);
+      if (!isWithinDirectory(rootPath, canonicalTarget) || canonicalTarget !== target) {
+        throw new PathPolicyError("Created directory must stay inside the personal workspace.");
+      }
+      return reply.code(201).send({ data: { path: canonicalTarget } });
+    } catch (error) {
+      const exists = (error as NodeJS.ErrnoException)?.code === "EEXIST";
+      return reply.code(exists ? 409 : errorStatus(error)).send({ error: exists ? "已存在同名文件夹。" : error instanceof Error ? error.message : String(error) });
     }
   });
+
+  app.post("/api/system/select-directory", async (_request, reply) => reply.code(501).send({
+    error: "system-directory-picker-unavailable",
+    message: "Native directory selection is disabled; use the personal workspace directory picker."
+  }));
 
   app.post("/api/projects", async (request, reply) => {
     try {
@@ -2419,10 +3518,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       if (!store.getUser(userId)) {
         return reply.code(404).send({ error: "User not found." });
       }
-      const rootPath = ensureProjectDirectory(input.rootPath, {
-        create: input.createDirectory,
-        allowOutsideRoot: serverConfig.allowOutsideProjectRoot
-      });
+      const rootPath = ensureUserWorkspaceProjectDirectory(userId, input.rootPath, Boolean(input.createDirectory));
       const existingProject = store.getProjectByRootPath(rootPath, userId);
       if (existingProject) {
         return { data: existingProject };
@@ -2434,6 +3530,46 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
       const project = store.createProject({ ...input, rootPath, userId });
       return reply.code(201).send({ data: project });
+    } catch (error) {
+      return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { id: string } }>("/api/projects/:id/git-repositories", async (request, reply) => {
+    const userId = userIdFromRequest(request, store);
+    const source = store.getProject(request.params.id, userId);
+    if (!source) return reply.code(404).send({ error: "Project not found." });
+    try {
+      const roots = await discoverGitRepositories(source.rootPath);
+      return { data: roots.map(rootPath => ({ rootPath, name: path.basename(rootPath) })) };
+    } catch (error) {
+      return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post<{ Params: { id: string } }>("/api/projects/:id/worktrees", async (request, reply) => {
+    const userId = userIdFromRequest(request, store);
+    const source = store.getProject(request.params.id, userId);
+    if (!source) return reply.code(404).send({ error: "Project not found." });
+    try {
+      const input = createWorktreeSchema.parse(request.body ?? {});
+      const repositoryRoot = assertRepositoryWithinProject(source.rootPath, input.repositoryPath ?? source.rootPath);
+      const token = randomUUID();
+      // Keep the child outside the source repository so Git never sees it as
+      // an untracked nested checkout. Project ids are server-generated UUIDs.
+      const parent = path.join(userWorkspaceRoot, ".codex-web-worktrees", source.id);
+      const { rootPath: worktreePath, branch } = await createManagedWorktree(repositoryRoot, parent, token);
+      try {
+        const project = store.createProject({
+          name: input.name || `${path.basename(repositoryRoot)} · 独立工作树`, rootPath: worktreePath, userId,
+          defaultModel: source.defaultModel, defaultReasoningEffort: source.defaultReasoningEffort,
+          defaultSandbox: source.defaultSandbox, defaultApprovalPolicy: source.defaultApprovalPolicy
+        });
+        return reply.code(201).send({ data: project, branch, sourceProjectId: source.id, repositoryRoot });
+      } catch (error) {
+        await removeManagedWorktree(repositoryRoot, worktreePath);
+        throw error;
+      }
     } catch (error) {
       return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -2520,11 +3656,11 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       if (!stat.isFile()) {
         return reply.code(400).send({ error: "Path is not a file." });
       }
-      const filename = path.basename(target.filePath).replace(/"/g, "'");
+      const filename = path.basename(target.filePath);
       return reply
         .type(mimeTypeForPath(target.filePath))
         .header("Content-Length", String(stat.size))
-        .header("Content-Disposition", `inline; filename="${filename}"`)
+        .header("Content-Disposition", inlineContentDisposition(filename))
         .send(fs.createReadStream(target.filePath));
     } catch (error) {
       return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
@@ -2603,19 +3739,54 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         // sessions imported into `codex1 迁移会话` must never leak into the
         // personal `我的工作区` list for the same user.
         const ownedThreadIds = store.ownedThreadIds(userId, project.id);
+        const locallyArchivedIds = store.locallyArchivedThreadIds(userId, project.id);
         const searchTerm = normalizeSearchTerm(request.query.search);
         if (searchTerm) {
-          const data = await searchOwnedThreadList(bridge, ownedThreadIds, searchTerm);
+          const owners = store.listVisibleThreadOwnersForUser(userId).filter(owner => owner.projectId === project.id && !locallyArchivedIds.has(owner.threadId));
+          const result = await searchChatThreads(owners, searchTerm, { limit: 80 });
           return {
-            data: sortThreadsForUser(store, userId, data),
+            ...result,
+            data: sortThreadsForUser(store, userId, result.data),
             nextCursor: null,
             backwardsCursor: null
           };
         }
-        const fast = request.query.fast !== "false";
+        const archived = request.query.archived === "true";
+        if (archived) {
+          const index=await readArchivedThreadIndex(threadHistoryRuntimeHomes(),ownedThreadIds);
+          let native=index.data as unknown[];
+          // Old runtimes without a usable state index get a bounded, DB-only
+          // fallback. Never request JSONL scanning/repair for this dialog.
+          if (!index.available && !locallyArchivedIds.size) {
+            let timer:ReturnType<typeof setTimeout>|undefined;
+            try {
+              const result=await Promise.race([
+                bridge.request("thread/list",{limit:500,archived:true,searchTerm:null,useStateDbOnly:true},5_000),
+                new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error("归档列表读取超时，请稍后重试。")),5_000);})
+              ]);
+              native=Array.isArray(asRecord(result).data)?asRecord(result).data as unknown[]:[];
+            } finally {if(timer)clearTimeout(timer);}
+          }
+          const data=new Map<string,unknown>();
+          for(const item of native){const id=threadIdFromListItem(item);if(id&&ownedThreadIds.has(id)){
+            data.set(id,item);store.setThreadLocallyArchived(id,userId,project.id,true);
+          }}
+          // Web archive flags remain authoritative if native metadata lags.
+          // Owner metadata is enough for a restore entry: no full-history load.
+          for(const id of locallyArchivedIds){
+            if(data.has(id))continue;
+            const owner=store.getThreadOwner(id);
+            if(owner&&owner.userId===userId&&owner.projectId===project.id)data.set(id,{
+              id,name:owner.displayName||"未命名会话",cwd:owner.rootPath,createdAt:owner.createdAt,updatedAt:owner.updatedAt
+            });
+          }
+          return {data:sortThreadsForUser(store,userId,[...data.values()]),nextCursor:null,backwardsCursor:null,
+            archiveIndexIncomplete:index.incomplete||(!index.available&&locallyArchivedIds.size>0)};
+        }
+        const fast = request.query.fast !== "false" && !archived;
         warmOwnedThreadIndexes(ownedThreadIds);
         if (fast) {
-          const summaries = await readOwnedThreadSummariesFromJsonl(ownedThreadIds);
+          const summaries = await readOwnedThreadSummariesFromJsonl(new Set([...ownedThreadIds].filter(id => !locallyArchivedIds.has(id))));
           if (summaries) {
             return {
               data: sortThreadsForUser(store, userId, summaries),
@@ -2624,19 +3795,44 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
             };
           }
         }
-        const result = await listAllCodexThreads(bridge, {
+        const listParams = {
           // Query global summaries, then strictly filter by per-user ownership.
           // This includes historical sessions whose cwd predates the workspace move.
           limit: THREAD_LIST_PAGE_SIZE,
           sortKey: "updated_at",
           sortDirection: "desc",
-          archived: request.query.archived === "true",
+          archived,
           // Empty string forces app-server to scan and repair JSONL metadata; null can miss recent cwd-matched threads.
           // We do fuzzy matching after ownership filtering so app-server search cannot hide owned threads unexpectedly.
           searchTerm: fast ? null : "",
           useStateDbOnly: fast
-        });
-        const data = await filterOwnedThreadList(bridge, result.data, ownedThreadIds, "");
+        };
+        let result;
+        try {
+          result = await listAllCodexThreads(bridge, listParams);
+        } catch (error) {
+          // A just-archived thread is already recorded locally. Keep its
+          // restore entry available while app-server's account list recovers.
+          if (!archived || !locallyArchivedIds.size) throw error;
+          result = { data: [], nextCursor: null, backwardsCursor: null };
+        }
+        const nativeData = await filterOwnedThreadList(bridge, result.data, ownedThreadIds, "", !archived);
+        if (archived) {
+          for (const item of nativeData) {
+            const threadId = threadIdFromListItem(item);
+            if (threadId) {
+              store.setThreadLocallyArchived(threadId, userId, project.id, true);
+              locallyArchivedIds.add(threadId);
+            }
+          }
+        }
+        let data = nativeData.filter(item => archived || !locallyArchivedIds.has(threadIdFromListItem(item) ?? ""));
+        if (archived && locallyArchivedIds.size) {
+          const localData = await readOwnedThreadSummariesFromJsonl(locallyArchivedIds)
+            ?? await filterOwnedThreadList(bridge, [], locallyArchivedIds, "", true);
+          const seen = new Set(data.map(item => threadIdFromListItem(item)));
+          data = [...data, ...localData.filter(item => !seen.has(threadIdFromListItem(item)))];
+        }
         return {
           ...result,
           data: sortThreadsForUser(store, userId, data),
@@ -2648,6 +3844,28 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       }
     }
   );
+
+  app.post<{ Params: { id: string; threadId: string; action: string } }>("/api/projects/:id/threads/:threadId/:action", async (request, reply) => {
+    const { id, threadId, action } = request.params;
+    if (action !== "archive" && action !== "unarchive") return reply.code(404).send({ error: "Unknown action." });
+    const userId = userIdFromRequest(request, store);
+    const project = store.getProject(id, userId);
+    if (!project || !store.userCanAccessThread(threadId, userId, id)) return reply.code(404).send({ error: "Thread not found." });
+    const locallyTracked = store.locallyArchivedThreadIds(userId, id).has(threadId);
+    try {
+      await bridge.request(action === "archive" ? "thread/archive" : "thread/unarchive", { threadId }, 30_000);
+      store.setThreadLocallyArchived(threadId, userId, id, action === "archive");
+      return { ok: true };
+    } catch (error) {
+      if (error instanceof Error
+          && error.message.includes("Codex thread was not found in any configured account.")
+          && (locallyTracked || await findThreadJsonlPathById(threadId))) {
+        store.setThreadLocallyArchived(threadId, userId, id, action === "archive");
+        return { ok: true, locallyArchived: true };
+      }
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
 
   app.patch<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/presentation", async (request, reply) => {
     try {
@@ -2671,6 +3889,155 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     }
   });
 
+  app.get<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/context", async (request, reply) => {
+    try {
+      reply.header("Cache-Control", "no-store");
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project || !store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(404).send({ error: "Thread not found." });
+      }
+      const config = store.getThreadContextConfig(request.params.threadId, userId)
+        ?? defaultThreadContextConfig(request.params.threadId);
+      const [usage, pin] = await Promise.all([
+        readThreadContextUsage(request.params.threadId, config),
+        Promise.resolve(store.getThreadContextPin(request.params.threadId, userId))
+      ]);
+      return {
+        data: {
+          ...usage,
+          config,
+          pin: pin ?? { threadId: request.params.threadId, text: "", updatedAt: null }
+        }
+      };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { id: string; threadId: string }; Querystring: { view?: string; q?: string; cursor?: string; limit?: string } }>("/api/projects/:id/threads/:threadId/subagents", async (request, reply) => {
+    try {
+      reply.header("Cache-Control", "no-store");
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const query = request.query ?? {};
+      const view = query.view ?? "all";
+      if (!(["all", "active", "history"].includes(view)) || (query.q !== undefined && query.q.length > 256)
+        || (query.limit !== undefined && !/^\d+$/.test(query.limit)) || (query.cursor !== undefined && query.cursor.length > 1024)) {
+        return reply.code(400).send({ error: "Invalid subagent directory query." });
+      }
+      const limit = query.limit === undefined ? 40 : Number(query.limit);
+      if (limit < 1 || limit > 100) return reply.code(400).send({ error: "limit must be between 1 and 100." });
+      try {
+        return await readSubagentDirectoryPage(request.params.threadId, configuredSubagentRuntimeHomes(request.params.threadId), {
+          view: view as "all" | "active" | "history", q: query.q, cursor: query.cursor, limit,
+          resolveSessionFile: (id, sessionsRoot) => findThreadJsonlPathById(id, sessionsRoot)
+        });
+      } catch (error) {
+        return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+      }
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { id: string; threadId: string; agentThreadId: string }; Querystring: { before?: string; cursor?: string; fresh?: string; limit?: string } }>("/api/projects/:id/threads/:threadId/subagents/:agentThreadId", async (request, reply) => {
+    try {
+      reply.header("Cache-Control", "no-store");
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const input = threadReadQuerySchema.parse(request.query ?? {});
+      const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId));
+      if (!record) return reply.code(404).send({ error: "Subagent thread not found." });
+      const sessionsRoot = path.join(record.runtimeHome, "sessions");
+      const filePath = await findThreadJsonlPathById(record.id, sessionsRoot);
+      if (!filePath) return reply.code(404).send({ error: "Subagent history file not found." });
+      const indexedPage = await readIndexedThreadPage(filePath, record.id, {
+        before: input.before,
+        cursor: input.cursor,
+        limit: input.limit,
+        backgroundRefresh: !input.fresh && input.before === 0 && !input.cursor
+      });
+      const result = sanitizeThreadPayloadForClient({ thread: indexedPage.thread });
+      deferLargeToolOutputs(asRecord(result).thread);
+      return { thread: asRecord(result).thread, history: indexedPage.history };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.get<{ Params: { id: string; threadId: string; agentThreadId: string; itemId: string } }>("/api/projects/:id/threads/:threadId/subagents/:agentThreadId/items/:itemId/output", async (request, reply) => {
+    try {
+      reply.header("Cache-Control", "private, max-age=300");
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId));
+      if (!record) return reply.code(404).send({ error: "Subagent thread not found." });
+      const sessionsRoot = path.join(record.runtimeHome, "sessions");
+      const filePath = await findThreadJsonlPathById(record.id, sessionsRoot);
+      const indexedItem = filePath ? await readIndexedThreadItem(filePath, record.id, request.params.itemId) : null;
+      if (!indexedItem) return reply.code(404).send({ error: "Tool output was not found in the thread index." });
+      const output = typeof indexedItem.aggregatedOutput === "string"
+        ? indexedItem.aggregatedOutput
+        : typeof indexedItem.output === "string" ? indexedItem.output : "";
+      return { data: { output, bytes: Buffer.byteLength(output) } };
+    } catch (error) {
+      return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.put<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/context-config", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project || !store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(404).send({ error: "Thread not found." });
+      }
+      const input = threadContextConfigSchema.parse(request.body ?? {});
+      const resolved = threadContextFeatureEnabled
+        ? resolveThreadContextConfig(request.params.threadId, input)
+        : defaultThreadContextConfig(request.params.threadId);
+      const data = store.setThreadContextConfig(request.params.threadId, userId, {
+        profile: resolved.profile,
+        contextWindow: resolved.contextWindow,
+        compactTokenLimit: resolved.compactTokenLimit,
+        scope: resolved.scope
+      });
+      if (!data) return reply.code(404).send({ error: "Thread not found." });
+      return { data };
+    } catch (error) {
+      return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.put<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/context-pin", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project || !store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(404).send({ error: "Thread not found." });
+      }
+      const input = threadContextPinSchema.parse(request.body ?? {});
+      const data = store.setThreadContextPin(request.params.threadId, userId, input.text);
+      if (!data) return reply.code(404).send({ error: "Thread not found." });
+      return { data };
+    } catch (error) {
+      return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   app.patch<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/model-profile", async (request, reply) => {
     try {
       const userId = userIdFromRequest(request, store);
@@ -2686,6 +4053,10 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const supported = listModelProfiles().some((profile) => profile.model === input.model && profile.effort === input.reasoningEffort);
       if (!supported) {
         return reply.code(400).send({ error: "Selected model profile is not available." });
+      }
+      const poolBridge = isAccountPoolBridge(bridge) ? bridge : null;
+      if (poolBridge && !poolBridge.canThreadUseModel(request.params.threadId, input.model)) {
+        return reply.code(409).send({ error: "这个会话绑定了原供应商运行时，不能直接切换到其他供应商。请从上一轮回答创建分支后再选择新模型。" });
       }
       const data = store.setThreadModelConfig(request.params.threadId, userId, input.model, input.reasoningEffort);
       if (!data) {
@@ -2736,7 +4107,23 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     return { ok: true, data: unusedThread };
   });
 
+  app.get<{Params:{id:string;threadId:string};Querystring:{download?:string}}>("/api/projects/:id/threads/:threadId/tool-output-archive",async(request,reply)=>{
+    try{
+      const userId=userIdFromRequest(request,store);
+      if(!store.userCanAccessThread(request.params.threadId,userId,request.params.id))return reply.code(403).send({error:"Thread is not visible for this logged-in user."});
+      const root=toolArchiveRoot(serverConfig.dataDir,userId);
+      const summary=await readToolArchiveSummary(root,z.string().uuid().parse(request.params.threadId));
+      reply.header("Cache-Control","private, no-store");
+      if(request.query.download==="1"){
+        if(!summary)return reply.code(404).send({error:"工具结果附件不存在。"});
+        return reply.type("application/gzip").header("X-Content-Type-Options","nosniff").header("Content-Disposition",`attachment; filename="tool-results-${request.params.threadId}.jsonl.gz"`).header("Content-Length",String(summary.archiveBytes)).send(fs.createReadStream(toolArchivePath(root,request.params.threadId)));
+      }
+      return {data:summary};
+    }catch(error){return reply.code(errorStatus(error)).send({error:error instanceof Error?error.message:String(error)});}
+  });
+
   app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/branch", async (request, reply) => {
+    let releaseBranch: (() => void) | undefined;
     try {
       const userId = userIdFromRequest(request, store);
       const project = store.getProject(request.params.id, userId);
@@ -2745,23 +4132,136 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
       }
       const input = threadBranchSchema.parse(request.body ?? {});
-      const source = await bridge.request("thread/read", { threadId: request.params.threadId, includeTurns: true }, 60_000);
-      const sourceThread = asRecord(asRecord(source).thread);
-      const context = crossAccountBranchContext(sourceThread, input.turnId);
+      const targetProject = input.targetProjectId ? store.getProject(input.targetProjectId, userId) : project;
+      if (!targetProject) return reply.code(404).send({ error: "Target project not found." });
+      releaseBranch = branchGate.enter();
+      // Resolve the source account and metadata cheaply first. Native forks do
+      // not need to hydrate a potentially hundreds-of-megabytes history in
+      // Node; Codex performs the exact fork inside the owning app-server.
+      const poolBridge = isAccountPoolBridge(bridge) ? bridge : null;
+      const persistedSourcePath = await findThreadJsonlPathById(request.params.threadId);
+      let sourceThread: Record<string, unknown>;
+      try {
+        const source = await bridge.request("thread/read", { threadId: request.params.threadId, includeTurns: false }, 60_000);
+        sourceThread = asRecord(asRecord(source).thread);
+      } catch (error) {
+        // A retired/disabled account cannot answer thread/read, but its exact
+        // immutable JSONL remains a valid native-fork source for an active account.
+        if (!poolBridge || !persistedSourcePath) throw error;
+        sourceThread = asRecord(await readThreadSummaryFromJsonl(persistedSourcePath, request.params.threadId));
+        sourceThread.path = persistedSourcePath;
+      }
+      const storedPin = store.getThreadContextPin(request.params.threadId, userId)?.text ?? "";
+      const manualPin = isLegacyGeneratedBranchPin(storedPin) ? "" : storedPin;
       const owner = store.getThreadOwner(request.params.threadId);
+      const sourceContextConfig = store.getThreadContextConfig(request.params.threadId, userId)
+        ?? defaultThreadContextConfig(request.params.threadId);
+      const sourceContextUsage = await readThreadContextUsage(request.params.threadId, sourceContextConfig);
       const presentation = store.getThreadPresentation(userId, [request.params.threadId]).get(request.params.threadId);
       const model = presentation?.model ?? owner?.modelOverride ?? project.defaultModel;
       const reasoningEffort = presentation?.reasoningEffort ?? owner?.reasoningEffortOverride ?? project.defaultReasoningEffort;
-
-      // No thread id is supplied here: AccountPoolBridge deliberately chooses
-      // the healthiest account with the most remaining quota for the branch.
-      const started = await bridge.request("thread/start", {
-        cwd: project.rootPath,
+      const contextConfig = threadContextConfigOverrides(
+        sourceContextConfig,
+        contextWindowMeasuredForConfig(sourceContextConfig, sourceContextUsage)
+      );
+      const allowedAccountId = allowedAccountForUser(userId);
+      if (allowedAccountId && (!poolBridge || !poolBridge.hasAccount(allowedAccountId))) {
+        throw new Error(`${userId} 的专用账号 ${allowedAccountId} 当前不可用。`);
+      }
+      const routing = poolBridge?.getBranchRoutingDecision(request.params.threadId, model, allowedAccountId ?? undefined) ?? null;
+      const nativeFork = !routing || routing.mode === "native";
+      const browserMcp = options.browserTools ? mintBrowserMcpConfig(userId, targetProject.id) : null;
+      const forkParams = {
+        threadId: request.params.threadId,
+        lastTurnId: input.turnId,
+        cwd: targetProject.rootPath,
         model,
-        approvalPolicy: project.defaultApprovalPolicy,
-        sandbox: project.defaultSandbox,
-        threadSource: "user"
-      }, 60_000);
+        approvalPolicy: targetProject.defaultApprovalPolicy,
+        sandbox: targetProject.defaultSandbox,
+        threadSource: "user",
+        config: { ...contextConfig, ...browserMcp?.config },
+        excludeTurns: true,
+        deferGoalContinuation: true
+      };
+
+      // Cross-account branches are still native Codex forks. The source JSONL
+      // is exposed to the selected target through a private immutable snapshot;
+      // no summary or reconstructed prompt is substituted for model history.
+      let snapshot: Awaited<ReturnType<typeof createCrossAccountForkSnapshot>> | null = null;
+      let started: unknown;
+      let streamedBranch = false;
+      let toolArchive:ToolArchiveSummary|undefined;
+      try {
+        const sourcePath = persistedSourcePath ?? stringOrNull(sourceThread.path) ?? stringOrNull(sourceThread.rolloutPath);
+        const sourceSessionsRoot = sourcePath ? threadJsonlSessionsRoot(sourcePath) : null;
+        const sourceSize = sourcePath ? (await fs.promises.stat(sourcePath)).size : 0;
+        const legacySource=(sourceSize>=largeThreadForkBytes||input.archiveToolOutputs)&&sourcePath?await isLegacyRollout(sourcePath):false;
+        if(input.archiveToolOutputs&&(!poolBridge||!routing||!sourcePath||!sourceSessionsRoot||!legacySource))throw new BranchConflictError("此历史格式暂不支持安全归档工具结果；原会话未修改。");
+        // User-authorized pool-wide policy: large compatible histories are
+        // archived before loading, not only after an out-of-memory rejection.
+        // Never mutate the source or rewrite an unsupported history format.
+        const archiveToolOutputs = input.archiveToolOutputs || (sourceSize >= largeThreadForkBytes && legacySource);
+        if (poolBridge && routing && sourcePath && sourceSessionsRoot && (sourceSize >= largeThreadForkBytes||input.archiveToolOutputs) && legacySource) {
+          // Archiving is bounded to one <=64MiB record at a time, but still
+          // requires host headroom before parsing/compressing any result.
+          if(archiveToolOutputs)assertLargeBranchMemory(64*1024*1024);
+          else assertLargeBranchMemory(sourceSize);
+          const accountHeadroom = poolBridge.getAccountMemoryHeadroom(routing.targetAccount.id);
+          if (!archiveToolOutputs&&accountHeadroom !== null) assertLargeBranchMemory(sourceSize, accountHeadroom);
+          const copied = await copyLargeThreadBranch({
+            sourcePath, sourceSessionsRoot, sourceThreadId: request.params.threadId,
+            lastTurnId: input.turnId, targetSessionsRoot: path.join(routing.targetAccount.codexHome, "sessions"),
+            cwd: targetProject.rootPath,
+            ...(archiveToolOutputs?{toolArchiveRoot:toolArchiveRoot(serverConfig.dataDir,userId)}:{})
+          });
+          if(archiveToolOutputs){
+            try{assertLargeBranchMemory(copied.copiedBytes);const headroom=poolBridge.getAccountMemoryHeadroom(routing.targetAccount.id);if(headroom!==null)assertLargeBranchMemory(copied.copiedBytes,headroom);}
+            catch(error){await fs.promises.unlink(copied.path);const archivePath=toolArchivePath(toolArchiveRoot(serverConfig.dataDir,userId),copied.threadId);await Promise.all([archivePath,`${archivePath}.json`].map(f=>fs.promises.unlink(f).catch(()=>{})));throw error;}
+            toolArchive=copied.toolArchive;
+          }
+          // Register the durable copy before native loading. Even a transport
+          // failure must not leave an inaccessible anonymous history file.
+          poolBridge.assignThreadsToAccount([copied.threadId], routing.targetAccount.id);
+          store.registerThreadOwner({ threadId: copied.threadId, userId, projectId: targetProject.id,
+            rootPath: targetProject.rootPath, model, reasoningEffort });
+          store.updateThreadDisplayName(copied.threadId, userId, branchTitle(
+            presentation?.displayName ?? stringOrNull(sourceThread.name) ?? "会话",
+            routing.targetAccount.label, routing.sourceAccount?.label ?? null
+          ));
+          started = await bridge.request("thread/resume", {
+            threadId: copied.threadId, path: copied.path, cwd: targetProject.rootPath, model,
+            approvalPolicy: targetProject.defaultApprovalPolicy, sandbox: targetProject.defaultSandbox,
+            config: { ...contextConfig, ...browserMcp?.config }, excludeTurns: true
+          }, 60_000);
+          streamedBranch = true;
+          console.info("branch.legacy_stream_import", { sourceThreadId: request.params.threadId,
+            threadId: copied.threadId, copiedBytes: copied.copiedBytes, targetAccountId: routing.targetAccount.id });
+        } else if (!poolBridge || !routing) {
+          started = await bridge.request("thread/fork", forkParams, 60_000);
+        } else if (nativeFork) {
+          started = await poolBridge.forkThreadOnAccount(routing.targetAccount.id, forkParams, 60_000);
+        } else {
+          const sourcePath = stringOrNull(sourceThread.path) ?? stringOrNull(sourceThread.rolloutPath);
+          const sourceSessionsRoot = sourcePath
+            ? routing.sourceAccount
+              ? path.join(routing.sourceAccount.codexHome, "sessions")
+              : threadJsonlSessionsRoot(sourcePath)
+            : null;
+          if (!sourcePath || !sourceSessionsRoot) {
+            throw new Error("Codex did not expose the source session path for an exact cross-account branch.");
+          }
+          snapshot = await createCrossAccountForkSnapshot(
+            sourcePath,
+            sourceSessionsRoot
+          );
+          started = await poolBridge.forkThreadOnAccount(routing.targetAccount.id, {
+            ...forkParams,
+            path: snapshot.path
+          }, 60_000);
+        }
+      } finally {
+        await snapshot?.remove();
+      }
       const createdThread = asRecord(asRecord(started).thread);
       const createdThreadId = stringOrNull(createdThread.id);
       if (!createdThreadId) throw new Error("Codex did not return a branch thread id.");
@@ -2769,51 +4269,178 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       store.registerThreadOwner({
         threadId: createdThreadId,
         userId,
-        projectId: project.id,
-        rootPath: project.rootPath,
+        projectId: targetProject.id,
+        rootPath: targetProject.rootPath,
         model,
         reasoningEffort
       });
-      const name = branchTitle(stringOrNull(sourceThread.name) ?? stringOrNull(sourceThread.preview) ?? "会话", input.prompt);
+      if (browserMcp?.bindingId) bindBrowserMcpThread(browserMcp.bindingId, createdThreadId, store);
+      const targetAccount = poolBridge?.getKnownThreadAccount(createdThreadId)
+        ?? (routing ? { id: routing.targetAccount.id, label: routing.targetAccount.label } : null);
+      const name = branchTitle(
+        `${presentation?.displayName ?? stringOrNull(sourceThread.name) ?? stringOrNull(sourceThread.preview) ?? "会话"}${toolArchive?"（精简工具）":""}`,
+        targetAccount?.label ?? null,
+        routing?.sourceAccount?.label ?? null
+      );
       store.updateThreadDisplayName(createdThreadId, userId, name);
+      // Only user-authored pins remain durable; legacy generated handoff pins
+      // are intentionally not inherited by new native branches.
+      if (manualPin) store.setThreadContextPin(createdThreadId, userId, manualPin);
+      store.setThreadContextConfig(createdThreadId, userId, {
+        profile: sourceContextConfig.profile,
+        contextWindow: sourceContextConfig.contextWindow,
+        compactTokenLimit: sourceContextConfig.compactTokenLimit,
+        scope: sourceContextConfig.scope
+      });
       createdThread.name = name;
       createdThread.title = name;
       void bridge.request("thread/name/set", { threadId: createdThreadId, name }).catch((error) => {
         console.warn("Native Codex branch title failed", error);
       });
 
-      const continuationPrompt = [
-        "你正在接续另一个 Codex 会话的分支。以下是截至分支节点的可见历史摘要；把它作为背景，不要复述整段历史。隐藏思考、工具执行状态和未展示内容不会被继承。",
-        "【分支上下文】",
-        context,
-        "【当前分支任务】",
-        input.prompt
-      ].join("\n\n");
-      const turn = await bridge.request("turn/start", {
+      const turn = input.prompt ? await bridge.request("turn/start", {
         threadId: createdThreadId,
-        input: [{ type: "text", text: continuationPrompt, text_elements: [] }],
-        cwd: project.rootPath,
-        approvalPolicy: project.defaultApprovalPolicy,
-        sandboxPolicy: project.defaultSandbox === "danger-full-access"
+        // Only a prompt explicitly supplied by the caller starts a new turn.
+        input: [{ type: "text", text: input.prompt, text_elements: [] }],
+        cwd: targetProject.rootPath,
+        approvalPolicy: targetProject.defaultApprovalPolicy,
+        sandboxPolicy: targetProject.defaultSandbox === "danger-full-access"
           ? { type: "dangerFullAccess" }
-          : project.defaultSandbox === "read-only"
+          : targetProject.defaultSandbox === "read-only"
             ? { type: "readOnly", networkAccess: false }
-            : { type: "workspaceWrite", writableRoots: [project.rootPath], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
+            : { type: "workspaceWrite", writableRoots: [targetProject.rootPath], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
         model,
-        effort: reasoningEffort
-      }, 60_000);
+        effort: reasoningEffort,
+        config: threadTurnContextConfigOverrides(
+          sourceContextConfig,
+          contextWindowMeasuredForConfig(sourceContextConfig, sourceContextUsage)
+        )
+      }, 60_000) : null;
       store.touchThreadOwner(createdThreadId);
-      const targetAccount = isAccountPoolBridge(bridge) ? bridge.getKnownThreadAccount(createdThreadId) : null;
       return {
         data: {
           thread: createdThread,
           turn,
           sourceThreadId: request.params.threadId,
           sourceTurnId: input.turnId,
-          targetAccount
+          targetAccount,
+          ...(toolArchive?{toolArchive}:{}),
+          branchMode: toolArchive ? "legacy-tool-archive" : streamedBranch ? "legacy-stream-import" : nativeFork ? "native" : "cross-account-native"
         }
       };
     } catch (error) {
+      console.warn("Native Codex branch request failed", {
+        threadId: request.params.threadId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      return reply.code(errorStatus(error) === 500 ? 502 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      releaseBranch?.();
+    }
+  });
+
+  app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/review", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const input = z.object({ branch: z.string().trim().min(1).max(120).optional() }).strict().parse(request.body ?? {});
+      const target = input.branch
+        ? { type: "baseBranch", branch: input.branch }
+        : { type: "uncommittedChanges" };
+      await assertTrackedUserQuotaAvailable(bridge, store, userId, request.params.threadId);
+      await bridge.request("thread/resume", {
+        threadId: request.params.threadId,
+        config: browserMcpForThread(request.params.threadId),
+        cwd: project.rootPath,
+        approvalPolicy: project.defaultApprovalPolicy,
+        sandbox: project.defaultSandbox
+      }, 30_000);
+      const result = await bridge.request("review/start", {
+        threadId: request.params.threadId,
+        target,
+        delivery: "inline"
+      }, 60_000);
+      store.touchThreadOwner(request.params.threadId);
+      return { data: result };
+    } catch (error) {
+      return reply.code(errorStatus(error) === 500 ? 502 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/edit-latest", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
+        return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+      const { turnId } = z.object({ turnId: z.string().min(1) }).strict().parse(request.body ?? {});
+      const summary = await bridge.request("thread/read", { threadId: request.params.threadId, includeTurns: false }, 30_000);
+      const historyMode = asRecord(asRecord(summary).thread).historyMode;
+      const goalState = await bridge.request("thread/goal/get", { threadId: request.params.threadId }, 30_000) as { goal?: { status?: string } | null };
+      if (goalState?.goal?.status === "active") {
+        return reply.code(409).send({ error: "当前 Goal 仍在自动续跑；请先暂停或结束 Goal，再编辑最后一条提问。" });
+      }
+      const queued = await bridge.request("thread/queue/list", { threadId: request.params.threadId, limit: 1 }, 30_000) as { data?: unknown[] };
+      if (queued?.data?.length) {
+        return reply.code(409).send({ error: "当前会话还有排队消息；请先处理排队消息，再编辑最后一条提问。" });
+      }
+      if (historyMode === "legacy" && isAccountPoolBridge(bridge)) {
+        // The guarded compatibility path stops only an idle owning runtime,
+        // appends the Codex replay marker, and verifies/reverses it on failure.
+        // Do not call paginated turns/list or revert for a legacy rollout.
+        const result = await bridge.rollbackLegacyLatest(request.params.threadId, turnId);
+        store.touchThreadOwner(request.params.threadId);
+        const rolloutPath = asRecord(asRecord(result).thread).path;
+        if (typeof rolloutPath === "string") {
+          // Complete the local history projection before acknowledging edit.
+          // A projection error must not imply that the successful rollback
+          // failed and invite the client to roll back a second turn.
+          await warmThreadIndex(rolloutPath, request.params.threadId).catch((error) => {
+            console.warn("Could not refresh history after legacy rollback", { threadId: request.params.threadId, error });
+          });
+        }
+        return { data: result };
+      }
+      if (historyMode !== "paginated") {
+        return reply.code(409).send({ error: "当前运行时不支持安全撤回此会话；草稿和附件仍保留。" });
+      }
+      const latest = await bridge.request("thread/turns/list", {
+        threadId: request.params.threadId,
+        limit: 1,
+        sortDirection: "desc"
+      }, 30_000) as { data?: Array<{ id?: string; status?: string }> };
+      const lastTurn = latest.data?.[0];
+      if (!lastTurn || lastTurn.id !== turnId) {
+        return reply.code(409).send({ error: "只能撤回当前会话最后一轮；请刷新后重试。" });
+      }
+      if (lastTurn.status !== "completed" && lastTurn.status !== "failed" && lastTurn.status !== "interrupted") {
+        return reply.code(409).send({ error: "这轮仍在运行，请等待完成后再撤回。" });
+      }
+      // Paginated revert operates on a loaded thread. This does not undo
+      // filesystem changes made during that turn.
+      await bridge.request("thread/resume", {
+        threadId: request.params.threadId,
+        config: browserMcpForThread(request.params.threadId),
+        cwd: project.rootPath,
+        approvalPolicy: project.defaultApprovalPolicy,
+        sandbox: project.defaultSandbox
+      }, 30_000);
+      const result = await bridge.request("thread/revert", { threadId: request.params.threadId, beforeTurnId: turnId }, 60_000);
+      store.touchThreadOwner(request.params.threadId);
+      return { data: result };
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("thread/revert only supports paginated threads")) {
+        return reply.code(409).send({
+          code: "LEGACY_ROLLBACK_UNAVAILABLE",
+          error: "这条会话使用 Codex 默认的 legacy 历史格式；当前运行的 Codex 版本没有可安全撤回此格式最后一轮的接口。原记录未改动。"
+        });
+      }
       return reply.code(errorStatus(error) === 500 ? 502 : errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
     }
   });
@@ -2911,6 +4538,9 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
       }
 
+      const presentation = store.getThreadPresentation(userId, [request.params.threadId]).get(request.params.threadId);
+      const modelPresentation = resolvedThreadModelPresentation(store, userId, request.params.threadId, presentation);
+
       let result: unknown;
       // Persisted JSONL is local, paginated and independent of the shared Codex
       // app-server queue. Prefer it for every existing session, not only huge ones.
@@ -2922,11 +4552,14 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           limit: input.limit,
           backgroundRefresh: !input.fresh && input.before === 0 && !input.cursor
         });
-        result = { thread: indexedPage.thread };
+        result = { thread: overlayJournal(indexedPage.thread as Record<string, unknown>, (turnId) => store.readTimelineItems(request.params.threadId, turnId), input.before === 0 && !input.cursor) };
         result = sanitizeThreadPayloadForClient(result);
         const clientThread = asRecord(result).thread;
         deferLargeToolOutputs(clientThread);
-        return { thread: clientThread, history: indexedPage.history };
+        return {
+          thread: applyThreadPresentation(clientThread, presentation, modelPresentation),
+          history: indexedPage.history
+        };
       } else {
         result = await bridge.request("thread/read", {
           threadId: request.params.threadId,
@@ -2936,16 +4569,9 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       }
       result = sanitizeThreadPayloadForClient(result);
       const page = paginateThreadPayload(result, input.before, input.limit);
-      const presentation = store.getThreadPresentation(userId, [request.params.threadId]).get(request.params.threadId);
-      const modelPresentation = resolvedThreadModelPresentation(store, userId, request.params.threadId, presentation);
       return {
         ...page,
-        thread: {
-          ...page.thread,
-          pinned: presentation?.pinned === true,
-          configuredModel: modelPresentation.model,
-          configuredReasoningEffort: modelPresentation.reasoningEffort
-        }
+        thread: applyThreadPresentation(page.thread, presentation, modelPresentation)
       };
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
@@ -2982,8 +4608,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
       }
       const filePath = await findThreadJsonlPathById(request.params.threadId);
-      if (!filePath) return reply.code(404).send({ error: "Thread history file not found." });
-      const item = await readIndexedThreadItem(filePath, request.params.threadId, request.params.itemId);
+      const indexedItem = filePath ? await readIndexedThreadItem(filePath, request.params.threadId, request.params.itemId) : null;
+      const item = indexedItem ?? store.readTimelineItem(request.params.threadId, request.params.itemId);
       if (!item) return reply.code(404).send({ error: "Tool output was not found in the thread index." });
       const output = typeof item.aggregatedOutput === "string"
         ? item.aggregatedOutput

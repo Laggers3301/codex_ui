@@ -1,0 +1,60 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import Fastify from "fastify";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ProjectStore } from "./db.js";
+
+describe("scheduled task routes", () => {
+  afterEach(() => { vi.unstubAllEnvs(); vi.resetModules(); });
+  it("enforces user+project+thread scope for schedule reads and writes", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "schedule-routes-"));
+    vi.stubEnv("CODEX_WEB_DATA_DIR", path.join(temporary, "server-data")); vi.stubEnv("CODEX_WEB_AUTH_MODE", "member"); vi.resetModules();
+    const root = path.join(temporary, "workspace"); fs.mkdirSync(root, { recursive: true });
+    const store = new ProjectStore(path.join(temporary, "store.sqlite"));
+    store.ensureUser("alice", "alice");
+    const project = store.createProject({ name: "test", rootPath: root, userId: "alice" });
+    store.registerThreadOwner({ threadId: "alice-thread", userId: "alice", projectId: project.id, rootPath: root });
+    const app = Fastify();
+    try {
+      const [{ registerRoutes }, { createSessionCookie }] = await Promise.all([import("./routes.js"), import("./auth.js")]);
+      const nativeCalls: Array<{ method: string; params: any }> = [];
+      registerRoutes(app, { request: async (method: string, params: any) => { nativeCalls.push({ method, params }); return method === "thread/loaded/list" ? { data: ["alice-thread"] } : {}; } } as any, store, { backgroundIndexing: false });
+      const alice = { cookie: createSessionCookie("alice").split(";")[0] };
+      const bob = { cookie: createSessionCookie("bob").split(";")[0] };
+      const url = `/api/projects/${project.id}/threads/alice-thread/schedules`;
+      const created = await app.inject({ method: "POST", url, headers: alice, payload: { prompt: "Run later", schedule: { kind: "interval", intervalMinutes: 5, timezone: "UTC" } } });
+      expect(created.statusCode).toBe(201); expect(created.json().data.status).toBe("scheduled");
+      expect((await app.inject({ method: "GET", url, headers: alice })).json().data).toHaveLength(1);
+      expect((await app.inject({ method: "GET", url, headers: bob })).statusCode).toBe(404);
+      expect((await app.inject({ method: "POST", url: url.replace("alice-thread", "other-thread"), headers: alice, payload: { prompt: "wrong thread", schedule: { kind: "interval", intervalMinutes: 5, timezone: "UTC" } } })).statusCode).toBe(403);
+      const taskUrl = `${url}/${created.json().data.id}`;
+      expect((await app.inject({ method: "PATCH", url: taskUrl, headers: bob, payload: { enabled: false } })).statusCode).toBe(404);
+      const paused = await app.inject({ method: "PATCH", url: taskUrl, headers: alice, payload: { enabled: false, title: "Paused task" } });
+      expect(paused.statusCode).toBe(200);
+      expect(paused.json().data).toMatchObject({ enabled: false, nextRunAt: null, title: "Paused task" });
+      expect((await app.inject({ method: "DELETE", url: taskUrl, headers: bob })).statusCode).toBe(404);
+      expect((await app.inject({ method: "DELETE", url: taskUrl, headers: alice })).statusCode).toBe(200);
+      expect((await app.inject({ method: "GET", url, headers: alice })).json().data).toEqual([]);
+      expect((await app.inject({ method: "POST", url, headers: alice, payload: { prompt: "too often", schedule: { kind: "interval", intervalMinutes: 4, timezone: "UTC" } } })).statusCode).toBe(400);
+      const executionUrl = url.replace(/schedules$/, "execution-settings");
+      expect((await app.inject({ method: "GET", url: executionUrl, headers: alice })).json().data).toBeNull();
+      const before = nativeCalls.length;
+      expect((await app.inject({ method: "PATCH", url: executionUrl, headers: bob, payload: { sandbox: "danger-full-access", approvalPolicy: "never" } })).statusCode).toBe(403);
+      expect(nativeCalls.length).toBe(before);
+      const changed = await app.inject({ method: "PATCH", url: executionUrl, headers: alice, payload: { sandbox: "read-only", approvalPolicy: "on-request" } });
+      expect(changed.statusCode).toBe(200);
+      expect(changed.json()).toMatchObject({ data: { sandbox: "read-only", approvalPolicy: "on-request" }, appliesTo: "subsequent-turns" });
+      expect(nativeCalls.at(-1)).toEqual({ method: "thread/settings/update", params: { threadId: "alice-thread", permissions: ":read-only", approvalPolicy: "on-request" } });
+      expect((await app.inject({ method: "GET", url: executionUrl, headers: alice })).json().data.sandbox).toBe("read-only");
+      expect((await app.inject({ method: "GET", url: executionUrl, headers: bob })).statusCode).toBe(403);
+      const predictionUrl=url.replace(/schedules$/,"prediction");
+      const callsBeforePrediction=nativeCalls.length;
+      expect((await app.inject({method:"POST",url:predictionUrl,headers:bob,payload:{sourceTurnId:"turn"}})).statusCode).toBe(403);
+      expect((await app.inject({method:"POST",url:predictionUrl.replace("alice-thread","other-thread"),headers:alice,payload:{sourceTurnId:"turn"}})).statusCode).toBe(403);
+      expect((await app.inject({method:"POST",url:predictionUrl,headers:alice,payload:{sourceTurnId:"turn",access_token:"forbidden"}})).statusCode).toBe(400);
+      expect((await app.inject({method:"POST",url:predictionUrl,headers:alice,payload:{sourceTurnId:"turn"}})).json().data.eligible).toBe(false);
+      expect(nativeCalls.length).toBe(callsBeforePrediction);
+    } finally { await app.close(); store.close(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+});

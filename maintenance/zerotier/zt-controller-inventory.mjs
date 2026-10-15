@@ -1,0 +1,17 @@
+import fs from 'node:fs';
+const home = '/var/lib/zerotier-one';
+const network = process.env.ZT_NETWORK_ID;
+if (!/^[0-9a-f]{16}$/.test(network ?? '')) throw Error('Set ZT_NETWORK_ID explicitly');
+const controllerId = network.slice(0, 10);
+const state = '/var/lib/codex-zt-migration-example';
+const headers = { 'X-ZT1-AUTH': fs.readFileSync(home + '/authtoken.secret', 'utf8').trim() };
+const get = async url => { const r = await fetch('http://127.0.0.1:9993' + url, { headers, signal: AbortSignal.timeout(10000) }); if (!r.ok) throw Error(`Controller HTTP ${r.status}`); return r.json(); };
+const config = await get('/controller/network/' + network);
+const listed = await get('/controller/network/' + network + '/member');
+const members = {};
+for (const id of Object.keys(listed).sort()) members[id] = await get('/controller/network/' + network + '/member/' + id);
+const newClientPublic = fs.readFileSync(state + '/new-client/identity.public', 'utf8').trim();
+const old = members[controllerId];
+if (!old?.ipAssignments?.length) throw Error('Old controller client address unavailable; do not cut over');
+fs.writeFileSync(state + '/inventory.json', JSON.stringify({ network, config, members, oldClientId: controllerId, newClientId: newClientPublic.split(':')[0], newClientPublic }), { mode: 0o600 });
+console.log(JSON.stringify({ snapshot: true, network, memberCount: Object.keys(members).length }));

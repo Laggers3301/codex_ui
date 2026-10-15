@@ -3,6 +3,7 @@ import net from "node:net";
 import path from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { createRemoteFoldersHandler } from "./remote-folders.mjs";
 
 const host = "0.0.0.0";
 const port = Number(process.env.CODEX_V2_PORT ?? 4575);
@@ -10,10 +11,15 @@ const upstreamHost = "127.0.0.1";
 const upstreamPort = Number(process.env.CODEX_V2_UPSTREAM_PORT ?? 4576);
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "dist");
 const sessionCookieName = process.env.CODEX_V2_SESSION_COOKIE_NAME?.trim() || "codex_remote_session_4575";
+const upstreamRetryDelaysMs = [100, 250, 500, 1_000, 2_000, 3_000];
+const upstreamAgent = new http.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 32 });
+const remoteFolders = createRemoteFoldersHandler({ upstreamHost, upstreamPort,
+  workspaceRoot: process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..") });
 
 const mime = new Map([
   [".html", "text/html; charset=utf-8"],
   [".js", "text/javascript; charset=utf-8"],
+  [".mjs", "text/javascript; charset=utf-8"],
   [".css", "text/css; charset=utf-8"],
   [".json", "application/json; charset=utf-8"],
   [".svg", "image/svg+xml"],
@@ -53,21 +59,39 @@ function requireAuthorization(request, response) {
 }
 
 function proxyHttp(request, response) {
-  const upstream = http.request({
-    host: upstreamHost,
-    port: upstreamPort,
-    method: request.method,
-    path: request.url,
-    headers: { ...request.headers, host: `${upstreamHost}:${upstreamPort}` }
-  }, (upstreamResponse) => {
-    response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
-    upstreamResponse.pipe(response);
-  });
-  upstream.on("error", (error) => {
-    if (!response.headersSent) response.writeHead(502, { "Content-Type": "text/plain; charset=utf-8" });
-    response.end(`Codex backend unavailable: ${error.message}`);
-  });
-  request.pipe(upstream);
+  const retryable = request.method === "GET" || request.method === "HEAD";
+
+  const attempt = (attemptIndex = 0) => {
+    if (request.destroyed || response.destroyed || response.writableEnded) return;
+    const upstream = http.request({
+      host: upstreamHost,
+      port: upstreamPort,
+      method: request.method,
+      path: request.url,
+      headers: { ...request.headers, host: `${upstreamHost}:${upstreamPort}` },
+      agent: upstreamAgent
+    }, (upstreamResponse) => {
+      response.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+      upstreamResponse.pipe(response);
+    });
+    upstream.on("error", (error) => {
+      const retryDelay = upstreamRetryDelaysMs[attemptIndex];
+      if (retryable && retryDelay !== undefined && !response.headersSent && !response.writableEnded) {
+        setTimeout(() => attempt(attemptIndex + 1), retryDelay);
+        return;
+      }
+      if (!response.headersSent) {
+        response.writeHead(502, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+        response.end(`Codex backend unavailable: ${error.message}`);
+      } else {
+        response.destroy(error);
+      }
+    });
+    if (retryable) upstream.end();
+    else request.pipe(upstream);
+  };
+
+  attempt();
 }
 
 async function staticFileFor(url) {
@@ -90,13 +114,18 @@ const server = http.createServer(async (request, response) => {
     return;
   }
   if (!requireAuthorization(request, response)) return;
+  const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+  if (pathname === "/api/remote-folders" || pathname.startsWith("/api/remote-folders/")) {
+    await remoteFolders(request, response);
+    return;
+  }
   const filePath = await staticFileFor(request.url ?? "/");
   if (filePath) {
     const body = await readFile(filePath);
     const extension = path.extname(filePath).toLowerCase();
     response.writeHead(200, {
       "Content-Type": mime.get(extension) ?? "application/octet-stream",
-      "Cache-Control": extension === ".html" ? "no-store" : "public, max-age=31536000, immutable"
+      "Cache-Control": extension === ".html" || ["sw.js", "loader.mjs"].includes(path.basename(filePath)) ? "no-store" : "public, max-age=31536000, immutable"
     });
     response.end(body);
     return;

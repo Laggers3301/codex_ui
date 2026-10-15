@@ -1,0 +1,6 @@
+interface:
+  display_name: "LaTeX / Word 写作"
+  short_description: "原生编辑 LaTeX 与 Word，按选区修改并检查转换和导出结果"
+  default_prompt: "使用 $latex-word-authoring 处理当前文档与选区，保留原稿并核对修改和导出结果。"
+policy:
+  allow_implicit_invocation: true

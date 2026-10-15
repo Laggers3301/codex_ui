@@ -1,0 +1,59 @@
+.threadSchedulesPanel { --schedule-font-size:13px; position:relative; display:flex; flex-direction:column; gap:12px; min-width:0; height:100%; overflow:auto; padding:16px; color:var(--ui-content); font:inherit; font-size:var(--schedule-font-size); line-height:1.55; animation:threadScheduleEnter .38s cubic-bezier(.16,1,.3,1) both; }
+.threadSchedulesPanel > *,.threadScheduleEditor > * { flex-shrink:0; }
+.rightWorkspace .threadScheduleEditor input:not([type=checkbox]),.rightWorkspace .threadScheduleEditor select { box-sizing:border-box; min-height:38px; height:auto; flex:0 0 auto; padding:8px 10px; line-height:1.5; }
+.rightWorkspace .threadScheduleEditor textarea { box-sizing:border-box; min-height:116px; padding:9px 10px; flex:0 0 auto; }
+.threadSchedulesHeader,.threadSchedulesHeader>div,.threadScheduleActions,.threadScheduleEditorHeading,.threadScheduleSaveRow { display:flex; align-items:center; }
+.threadSchedulesHeader { position:sticky; top:-14px; z-index:1; justify-content:space-between; min-height:29px; padding:5px 0; background:var(--bg); }
+.threadSchedulesHeader>div { gap:8px; }
+.threadSchedulesTitleIcon { display:inline-flex; color:var(--ui-content-muted); }
+.threadSchedulesHeader strong,.threadScheduleEditorHeading strong { font-size:inherit; font-weight:550; }
+.threadSchedulesNotice { margin:0; color:var(--ui-content-muted); font-size:inherit; line-height:1.6; }
+.threadScheduleList { display:flex; flex-direction:column; gap:5px; }
+.threadScheduleCard { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:1px 4px; padding:5px 4px 5px 7px; border:1px solid transparent; border-radius:9px; transition:background-color .28s cubic-bezier(.16,1,.3,1),border-color .28s cubic-bezier(.16,1,.3,1),transform .36s cubic-bezier(.16,1,.3,1); }
+.threadScheduleCard.selected { background:var(--ui-hover); border-color:color-mix(in srgb,var(--ui-content) 12%,transparent); }
+.threadScheduleMain { display:flex; min-width:0; align-items:center; gap:8px; padding:3px 2px; border:0; background:none; color:inherit; font:inherit; text-align:left; cursor:pointer; }
+.threadScheduleCardText { display:flex; min-width:0; flex-direction:column; gap:1px; }
+.threadScheduleCardText strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ui-content); font-size:inherit; font-weight:500; }
+.threadScheduleCardText small,.threadScheduleErrorHint { overflow:hidden; color:var(--ui-content-muted); font-size:inherit; text-overflow:ellipsis; white-space:nowrap; }
+.threadScheduleDot { width:7px; height:7px; flex:0 0 7px; border-radius:50%; background:var(--teal); opacity:.85; }
+.threadScheduleDot.failed { background:var(--red); }
+.threadScheduleDot.paused:not(.failed) { background:var(--ui-content-muted); opacity:.45; }
+.threadScheduleActions { gap:1px; }
+.threadScheduleIconButton { display:inline-flex; width:29px; height:29px; align-items:center; justify-content:center; padding:0; border:0; border-radius:7px; background:transparent; color:var(--ui-content-muted); cursor:pointer; transition:background-color .25s cubic-bezier(.16,1,.3,1),color .25s cubic-bezier(.16,1,.3,1); }
+.threadScheduleIconButton:hover { background:var(--ui-hover); color:var(--ui-content); }
+.threadScheduleIconButton:focus-visible,.threadScheduleMain:focus-visible,.threadScheduleNew:focus-visible { outline:2px solid var(--ui-content-muted); outline-offset:2px; }
+.threadScheduleErrorHint { grid-column:1/-1; padding-left:17px; color:var(--red); }
+.threadScheduleEmpty { padding:12px 5px; color:var(--ui-content-muted); text-align:center; }
+.threadScheduleNew { display:flex; min-height:32px; align-items:center; justify-content:center; gap:7px; border:1px dashed color-mix(in srgb,var(--ui-content) 20%,transparent); border-radius:9px; background:transparent; color:var(--ui-content-muted); font:inherit; cursor:pointer; transition:background-color .25s cubic-bezier(.16,1,.3,1),color .25s cubic-bezier(.16,1,.3,1); }
+.threadScheduleNew:hover { background:var(--ui-hover); color:var(--ui-content); }
+.threadScheduleEditor { display:flex; flex-direction:column; gap:13px; padding:13px 0 8px; border-top:1px solid color-mix(in srgb,var(--ui-content) 12%,transparent); animation:threadScheduleEnter .3s cubic-bezier(.16,1,.3,1) both; }
+.threadScheduleEditorHeading { justify-content:space-between; margin-bottom:1px; }
+.threadScheduleEditor>label { position:relative; display:flex; flex-wrap:wrap; align-items:center; gap:7px; color:var(--ui-content-muted); font-size:inherit; }
+.threadScheduleEditor input:not([type=checkbox]),.threadScheduleEditor textarea,.threadScheduleEditor select { width:100%; min-width:0; padding:8px 10px; border:1px solid color-mix(in srgb,var(--ui-content) 17%,transparent); border-radius:8px; outline:none; background:var(--ui-surface-input); color:var(--ui-content); font:inherit; }
+.threadScheduleEditor input:focus,.threadScheduleEditor textarea:focus,.threadScheduleEditor select:focus { border-color:color-mix(in srgb,var(--ui-content) 40%,transparent); }
+.threadScheduleEditor textarea { resize:vertical; line-height:1.5; }
+.threadScheduleEditor .threadScheduleNumber { width:112px; }
+.threadScheduleSuffix { margin-left:-2px; }
+.threadScheduleTimezone { color:var(--ui-content-muted); font-size:inherit; overflow-wrap:anywhere; }
+.threadScheduleWeekdays { display:flex; flex-wrap:wrap; gap:4px 8px; min-width:0; margin:0; padding:5px 7px; border:1px solid color-mix(in srgb,var(--ui-content) 15%,transparent); border-radius:7px; }
+.threadScheduleWeekdays legend { padding:0 3px; color:var(--ui-content-muted); font-size:inherit; }
+.threadScheduleWeekdays label { display:inline-flex; align-items:center; gap:4px; color:var(--ui-content); font-size:inherit; }
+.threadScheduleWeekdays input { accent-color:var(--teal); }
+.threadScheduleRunNotice { padding:5px 7px; border-radius:6px; background:color-mix(in srgb,var(--ui-content) 4%,transparent); }
+.threadScheduleSaveRow { gap:7px; }
+.threadScheduleSave,.threadScheduleCancel,.threadScheduleConfirm button { min-height:34px; padding:6px 13px; border:1px solid color-mix(in srgb,var(--ui-content) 18%,transparent); border-radius:8px; background:var(--ui-hover); color:var(--ui-content); font:inherit; cursor:pointer; }
+.threadScheduleSave { background:var(--ui-content); color:var(--bg); font-weight:550; }
+.threadScheduleSave:disabled { opacity:.45; cursor:default; }
+.threadScheduleError { margin:0; color:var(--red); font-size:inherit; overflow-wrap:anywhere; }
+.threadScheduleRunDetails p { margin:0; font-size:inherit; overflow-wrap:anywhere; }
+.threadScheduleRunDetails { color:var(--ui-content-muted); font-size:inherit; }
+.threadScheduleRunDetails p { margin-top:5px; }
+.threadScheduleConfirm { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; padding:8px 9px; border:1px solid color-mix(in srgb,var(--red) 38%,transparent); border-radius:8px; color:var(--ui-content); animation:threadScheduleEnter .24s cubic-bezier(.16,1,.3,1) both; }
+.threadScheduleConfirm.closing { animation:threadScheduleExit .2s cubic-bezier(.4,0,.7,1) both; pointer-events:none; }
+.threadScheduleConfirm>div { display:flex; gap:8px; }
+.threadScheduleConfirm button.danger { color:var(--red); }
+@keyframes threadScheduleEnter { from { opacity:0; transform:translateY(5px) scale(.99); } to { opacity:1; transform:translateY(0) scale(1); } }
+@keyframes threadScheduleExit { to { opacity:0; transform:translateY(-3px) scale(.99); } }
+@media(max-width:720px) { .threadSchedulesPanel { padding:12px; } .threadScheduleCard { padding-left:4px; } .threadScheduleCardText small { white-space:normal; } }
+@media(max-width:720px) and (pointer:coarse) { .threadScheduleEditor input:not([type=checkbox]),.threadScheduleEditor textarea,.threadScheduleEditor select { font-size:16px; } }
+@media(prefers-reduced-motion:reduce) { .threadSchedulesPanel,.threadScheduleEditor,.threadScheduleConfirm { animation:none; } .threadScheduleCard,.threadScheduleIconButton,.threadScheduleNew { transition:none; } }

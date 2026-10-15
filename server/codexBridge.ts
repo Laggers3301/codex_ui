@@ -1,8 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import readline from "node:readline";
+import fs from "node:fs";
+import path from "node:path";
 import { serverConfig } from "./config.js";
 import type { RpcEnvelope } from "./types.js";
+import { AppError } from "./appErrors.js";
 
 /**
  * The process used as the JSON-RPC transport for a Codex app-server.
@@ -15,6 +19,34 @@ export interface CodexBridgeLaunchOptions {
   command: string;
   args: readonly string[];
   env?: NodeJS.ProcessEnv;
+  scope?: {
+    unitPrefix: string;
+    slice: string;
+    memoryHigh: string;
+    memoryMax: string;
+    memorySwapMax: string;
+  };
+}
+
+/** Keep agent tools outside the web backend's cgroup, with a per-account cap. */
+export function codexProcessCommand(launch: CodexBridgeLaunchOptions, nonce = randomUUID().slice(0, 8)):
+  { command: string; args: string[] } {
+  if (!launch.scope) return { command: launch.command, args: [...launch.args] };
+  const { unitPrefix, slice, memoryHigh, memoryMax, memorySwapMax } = launch.scope;
+  if (!/^[A-Za-z0-9-]+$/.test(unitPrefix) || !/^[A-Za-z0-9-]+\.slice$/.test(slice)) {
+    throw new Error("Invalid Codex resource scope name.");
+  }
+  return {
+    command: "/usr/bin/systemd-run",
+    args: [
+      "--user", "--scope", "--collect", "--quiet",
+      `--slice=${slice}`, `--unit=${unitPrefix}-${nonce}`,
+      "-p", `MemoryHigh=${memoryHigh}`,
+      "-p", `MemoryMax=${memoryMax}`,
+      "-p", `MemorySwapMax=${memorySwapMax}`,
+      "--", launch.command, ...launch.args
+    ]
+  };
 }
 
 interface PendingRequest {
@@ -49,6 +81,8 @@ export class CodexBridge extends EventEmitter {
   private readyPromise: Promise<void> | null = null;
   private restarting = false;
   private stopped = false;
+  private resourceMonitor: ReturnType<typeof setInterval> | null = null;
+  private pressureReported = false;
 
   constructor(private readonly launch: CodexBridgeLaunchOptions = {
     command: serverConfig.codexBin,
@@ -69,13 +103,41 @@ export class CodexBridge extends EventEmitter {
   }
 
   stop(): void {
+    if (this.resourceMonitor) clearInterval(this.resourceMonitor);
+    this.resourceMonitor = null;
     this.stopped = true;
     this.proc?.kill();
     this.proc = null;
   }
 
+  /** Stop the owned app-server and wait until it can no longer write rollouts. */
+  async stopAndWait(timeoutMs = 10_000): Promise<void> {
+    const proc = this.proc;
+    if (!proc) {
+      this.stop();
+      return;
+    }
+    const exited = new Promise<void>((resolve) => proc.once("exit", () => resolve()));
+    this.stop();
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        exited,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("Codex app-server did not stop before the rollback timeout.")), timeoutMs);
+        })
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
   async request(method: string, params?: unknown, timeoutMs = 120_000): Promise<unknown> {
     await this.start();
+    if (["turn/start", "thread/start", "thread/queue/start", "thread/queue/add"].includes(method)) {
+      const headroom = this.getMemoryHeadroom();
+      if (headroom !== null && headroom < 512 * 1024 * 1024) throw new AppError("memory_pressure", "运行资源不足，暂时无法开始新任务。", "memory_pressure: 运行时可用内存不足 512 MiB，已阻止新增任务。");
+    }
     return this.sendRequest(method, params, timeoutMs);
   }
 
@@ -103,10 +165,36 @@ export class CodexBridge extends EventEmitter {
     return Array.from(this.serverRequests.values());
   }
 
+  /** Budget of the owned account scope, including its active tools/children. */
+  getMemoryHeadroom(): number | null {
+    if (!this.launch.scope || !this.proc?.pid) return null;
+    try {
+      const relative = fs.readFileSync(`/proc/${this.proc.pid}/cgroup`, "utf8")
+        .split("\n").find(line => line.startsWith("0::"))?.slice(3);
+      if (!relative || !relative.includes(`/${this.launch.scope.unitPrefix}-`)) return 0;
+      const directory = path.join("/sys/fs/cgroup", relative);
+      const budgets: number[] = [];
+      for (const group of [directory, path.dirname(directory)]) {
+        const limits = ["memory.high", "memory.max"].map(file => fs.readFileSync(path.join(group, file), "utf8").trim()).filter(value => value !== "max").map(Number);
+        if (!limits.length) continue;
+        const current = Number(fs.readFileSync(path.join(group, "memory.current"), "utf8").trim());
+        const stats = fs.readFileSync(path.join(group, "memory.stat"), "utf8");
+        const inactive = Number(stats.match(/^inactive_file (\d+)/m)?.[1] ?? 0);
+        const dirty = Number(stats.match(/^file_dirty (\d+)/m)?.[1] ?? 0) + Number(stats.match(/^file_writeback (\d+)/m)?.[1] ?? 0);
+        budgets.push(Math.max(0, Math.min(...limits) - current + Math.min(current, Math.max(0, inactive - dirty))));
+      }
+      return budgets.length ? Math.min(...budgets) : null;
+    } catch { return 0; } // Fail closed instead of risking a shared runtime OOM.
+  }
+
   private async spawnServer(): Promise<void> {
-    this.proc = spawn(this.launch.command, [...this.launch.args], {
+    const command = codexProcessCommand(this.launch);
+    const runtimeEnvironment = { ...(this.launch.env ?? process.env) };
+    // OAuth app credentials belong to the web backend, never to agent shells.
+    for (const key of Object.keys(runtimeEnvironment)) if (key.startsWith("FEISHU_")) delete runtimeEnvironment[key];
+    this.proc = spawn(command.command, command.args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: this.launch.env ?? process.env,
+      env: runtimeEnvironment,
       shell: false
     });
 
@@ -130,6 +218,8 @@ export class CodexBridge extends EventEmitter {
     });
 
     proc.on("exit", (code, signal) => {
+      if (this.resourceMonitor) clearInterval(this.resourceMonitor);
+      this.resourceMonitor = null;
       this.emit("status", { state: "exited", code, signal });
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timer);
@@ -155,6 +245,17 @@ export class CodexBridge extends EventEmitter {
     });
     this.notify("initialized", {});
     this.emit("status", { state: "ready" });
+    if (this.launch.scope) {
+      this.pressureReported = false;
+      this.resourceMonitor = setInterval(() => {
+        const headroom = this.getMemoryHeadroom();
+        if (headroom !== null && headroom < 256 * 1024 * 1024 && !this.pressureReported) {
+          this.pressureReported = true;
+          this.emit("status", { state: "resource_pressure", message: "memory_pressure: 运行时可用内存低于 256 MiB，正在请求安全暂停当前轮次。" });
+        } else if (headroom === null || headroom > 512 * 1024 * 1024) this.pressureReported = false;
+      }, 5000);
+      this.resourceMonitor.unref?.();
+    }
   }
 
   private scheduleRestart(): void {
@@ -232,6 +333,10 @@ export class CodexBridge extends EventEmitter {
       return;
     }
 
+    if (message.method === "serverRequest/resolved") {
+      const requestId = (message.params as { requestId?: number | string } | null)?.requestId;
+      if (requestId !== undefined) this.serverRequests.delete(requestId);
+    }
     this.emit("notification", message);
   }
 

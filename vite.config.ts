@@ -1,8 +1,12 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
+import { fileURLToPath } from "node:url";
+
+const superDocRuntime = fileURLToPath(new URL("./src/writing/SuperDocRuntime.ts", import.meta.url));
 
 export default defineConfig({
   plugins: [react()],
+  resolve: { alias: [{ find: /^superdoc$/, replacement: superDocRuntime }] },
   build: {
     // Keep old content-hashed bundles available to tabs that loaded before deployment.
     emptyOutDir: false

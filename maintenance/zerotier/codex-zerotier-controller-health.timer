@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Codex ZeroTier controller every 30 seconds
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=codex-zerotier-controller-health.service
+
+[Install]
+WantedBy=timers.target
