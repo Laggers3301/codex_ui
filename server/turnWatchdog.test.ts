@@ -1,7 +1,22 @@
 import { describe, expect, it } from "vitest";
-import { meaningfulTurnProgressMethod, TurnWatchdog } from "./turnWatchdog.js";
+import { meaningfulTurnProgressMethod, phaseFromProbe, TurnWatchdog } from "./turnWatchdog.js";
 
 describe("TurnWatchdog", () => {
+  it("keeps a long user-input wait distinct from a stalled turn, then invalidates old probes after the answer", () => {
+    const watchdog = new TurnWatchdog();
+    const turn = watchdog.start("user-a", "account-a", "thread-a", "turn-a", 0);
+    expect(phaseFromProbe(["waitingOnUserInput"])).toBe("waiting_user_input");
+    watchdog.setPhase("user-a", "account-a", "thread-a", "turn-a", "waiting_user_input");
+    const probe = watchdog.claimDueProbes(30 * 60_000)[0]!;
+    watchdog.resolveProbe("user-a", "account-a", "thread-a", "turn-a", probe.token, "active", []);
+    expect(turn.phase).toBe("waiting_user_input");
+    expect(turn.lastProgressAt).toBe(0);
+    const oldProbe = watchdog.claimDueProbes(31 * 60_000)[0]!;
+    watchdog.progress("user-a", "account-a", "thread-a", "turn-a", "serverRequest/resolved", 31 * 60_000 + 1);
+    expect(watchdog.resolveProbe("user-a", "account-a", "thread-a", "turn-a", oldProbe.token, "active", ["waitingOnUserInput"])).toBeNull();
+    expect(turn.phase).toBe("running");
+    expect(watchdog.diagnosedForUser("user-a")).toEqual([]);
+  });
   it("diagnoses after two quiet minutes and resets only on real turn progress", () => {
     const watchdog = new TurnWatchdog();
     const start = 1_000_000;

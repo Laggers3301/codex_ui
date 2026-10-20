@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
 import type { CreateProjectInput, LocalSendSettings, Project, ReasoningEffort, UpdateLocalSendSettingsInput, UpdateProjectInput, UserProfile } from "./types.js";
+import type { TurnRecoveryState } from "./turnRetry.js";
 
 export const ADMIN_USER_ID = "admin";
 export const DEFAULT_USER_ID = ADMIN_USER_ID;
@@ -250,6 +251,9 @@ export class ProjectStore {
       PRAGMA synchronous = NORMAL;
     `);
     this.migrate();
+    this.db.exec(`CREATE TABLE IF NOT EXISTS thread_recovery_state (
+      thread_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, state_json TEXT NOT NULL
+    )`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS conversation_timeline (
       thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL,
       item_json TEXT NOT NULL, PRIMARY KEY(thread_id, turn_id, item_id)
@@ -637,6 +641,31 @@ export class ProjectStore {
     };
   }
 
+  getTurnRecoveryState(threadId: string): TurnRecoveryState | null {
+    const row = this.db.prepare(`SELECT s.state_json FROM thread_recovery_state s
+      JOIN thread_owners o ON o.thread_id=s.thread_id AND o.user_id=s.user_id WHERE s.thread_id=?`).get(threadId) as { state_json: string } | undefined;
+    return row ? JSON.parse(row.state_json) as TurnRecoveryState : null;
+  }
+
+  isThreadArchivedLocal(threadId: string, userId: string): boolean {
+    const row = this.db.prepare("SELECT is_archived_local FROM thread_owners WHERE thread_id=? AND user_id=?").get(threadId, userId) as { is_archived_local: number } | undefined;
+    return !row || row.is_archived_local === 1;
+  }
+
+  listTurnRecoveryStates(userId?: string): TurnRecoveryState[] {
+    const rows = this.db.prepare(`SELECT s.state_json FROM thread_recovery_state s
+      JOIN thread_owners o ON o.thread_id=s.thread_id AND o.user_id=s.user_id
+      WHERE (? IS NULL OR s.user_id=?)`).all(userId ?? null, userId ?? null) as Array<{ state_json: string }>;
+    return rows.map(row => JSON.parse(row.state_json) as TurnRecoveryState);
+  }
+
+  setTurnRecoveryState(state: TurnRecoveryState): void {
+    if (this.getThreadOwner(state.threadId)?.userId !== state.userId) throw new Error("会话不属于当前用户。");
+    this.db.prepare(`INSERT INTO thread_recovery_state(thread_id,user_id,state_json) VALUES(?,?,?)
+      ON CONFLICT(thread_id) DO UPDATE SET user_id=excluded.user_id,state_json=excluded.state_json`)
+      .run(state.threadId, state.userId, JSON.stringify(state));
+  }
+
   touchThreadOwner(threadId: string): void {
     const cleanThreadId = threadId.trim();
     if (cleanThreadId) {
@@ -703,10 +732,19 @@ export class ProjectStore {
     return new Set(rows.map(row => row.thread_id));
   }
 
-  setThreadLocallyArchived(threadId: string, userId: string, projectId: string, archived: boolean): boolean {
+  explicitThreadArchiveDecisions(userId:string,projectId:string):Map<string,{archived:boolean;at:number}> {
+    const rows=this.db.prepare('SELECT thread_id,is_archived_local,archive_decided_at FROM thread_owners WHERE user_id=? AND project_id=? AND archive_decided_at IS NOT NULL').all(userId,projectId) as Array<{thread_id:string;is_archived_local:number;archive_decided_at:string}>;
+    return new Map(rows.map(row=>[row.thread_id,{archived:row.is_archived_local===1,at:Date.parse(row.archive_decided_at)/1000}]));
+  }
+
+  unusedThreadIds(userId:string,projectId:string):string[] {
+    return (this.db.prepare('SELECT thread_id FROM unuse WHERE user_id=? AND project_id=?').all(userId,projectId) as Array<{thread_id:string}>).map(row=>row.thread_id);
+  }
+
+  setThreadLocallyArchived(threadId: string, userId: string, projectId: string, archived: boolean, explicit=true): boolean {
     const result = this.db.prepare(
-      "UPDATE thread_owners SET is_archived_local = ? WHERE thread_id = ? AND user_id = ? AND project_id = ?"
-    ).run(archived ? 1 : 0, threadId, userId, projectId);
+      "UPDATE thread_owners SET is_archived_local = ?,archive_decided_at=CASE WHEN ? THEN ? ELSE archive_decided_at END WHERE thread_id = ? AND user_id = ? AND project_id = ?"
+    ).run(archived ? 1 : 0, explicit?1:0,new Date().toISOString(),threadId, userId, projectId);
     return result.changes > 0;
   }
 
@@ -1171,6 +1209,7 @@ export class ProjectStore {
     if (!hasColumn("is_archived_local")) {
       this.db.exec("ALTER TABLE thread_owners ADD COLUMN is_archived_local INTEGER NOT NULL DEFAULT 0");
     }
+    if(!hasColumn('archive_decided_at'))this.db.exec('ALTER TABLE thread_owners ADD COLUMN archive_decided_at TEXT');
     if (!hasColumn("manual_order")) {
       this.db.exec("ALTER TABLE thread_owners ADD COLUMN manual_order INTEGER");
     }

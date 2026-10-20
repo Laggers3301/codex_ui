@@ -15,6 +15,7 @@ describe("scoped turn progress", () => {
     expect(readTurnProgress({ threadId: "a" })).toBeNull();
     const progress = readTurnProgress({ threadId: "a", turnId: "t", state: "waiting_approval", silentForMs: 200_000 })!;
     expect(turnProgressText(progress)).toContain("等待操作批准");
+    expect(turnProgressText({ ...progress, state: "waiting_user_input", silentForMs: 60 * 60_000 })).toBe("正在等待你回答问题，回答后会继续。");
     expect(turnProgressText({ ...progress, state: "waiting_subagents" })).toContain("子代理状态更新");
     expect(turnProgressText({ ...progress, state: "no_progress" })).toContain("核对运行状态");
   });

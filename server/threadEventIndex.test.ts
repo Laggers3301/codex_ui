@@ -3,6 +3,33 @@ import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
 
+it("restores the latest native collaboration mode when a page omits turn_context or displays older history", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-index-mode-"));
+  vi.stubEnv("CODEX_THREAD_INDEX_DB", path.join(root, "index.sqlite"));
+  vi.stubEnv("CODEX_WEB_CODEX_SESSION_ROOTS", root); vi.resetModules();
+  try {
+    const file = path.join(root, "rollout-thread.jsonl");
+    const lines = (records: unknown[]) => records.map(record => JSON.stringify(record)).join("\n") + "\n";
+    const turn = (id: string, mode: string, text: string) => [
+      { type: "event_msg", payload: { type: "task_started", turn_id: id } },
+      { type: "turn_context", payload: { turn_id: id, collaboration_mode: { mode, settings: { developer_instructions: "private native instructions" } } } },
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text }] } },
+      { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "response" }] } },
+      { type: "event_msg", payload: { type: "task_complete", turn_id: id } }
+    ];
+    await fs.writeFile(file, lines([{ type: "session_meta", payload: { id: "thread" } }, ...turn("plan", "plan", "plan please")]));
+    const { readIndexedThreadPage } = await import("./threadEventIndex.js");
+    const planned = await readIndexedThreadPage(file, "thread", { limit: 1 });
+    expect(planned.thread.collaborationMode).toBe("plan");
+    expect(JSON.stringify(planned)).not.toContain("private native instructions");
+    await fs.appendFile(file, lines(turn("default", "default", "implement please")));
+    expect((await readIndexedThreadPage(file, "thread", { limit: 1 })).thread.collaborationMode).toBe("default");
+    const older = await readIndexedThreadPage(file, "thread", { limit: 1, before: 2 });
+    expect(older.thread.collaborationMode).toBe("default");
+    expect(JSON.stringify(older)).toContain("plan");
+  } finally { vi.unstubAllEnvs(); await fs.rm(root, { recursive: true, force: true }); }
+});
+
 it("removes a rolled-back legacy turn from incremental and fresh history reads", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-index-rollback-"));
   vi.stubEnv("CODEX_THREAD_INDEX_DB", path.join(root, "index.sqlite"));

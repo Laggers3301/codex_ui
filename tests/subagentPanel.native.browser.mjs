@@ -3,10 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 
-const appRoot = process.env.SUBAGENT_NATIVE_QA_APP_ROOT || process.cwd();
-const username = process.env.DOCUMENT_QA_USER || "qaUser";
-const parentId = process.env.SUBAGENT_NATIVE_QA_THREAD;
-assert.ok(parentId, "Set SUBAGENT_NATIVE_QA_THREAD to an owned QA thread");
+const appRoot = "/srv/codex-ui";
+const parentId = "01a0db3e-315e-7461-b9a9-8a7a9236a84e";
 const production = process.env.SUBAGENT_NATIVE_QA_PRODUCTION === "1";
 const baseline = process.env.SUBAGENT_POLISH_BASELINE === "1";
 const origin = process.env.SUBAGENT_NATIVE_QA_ORIGIN ?? (production ? "http://127.0.0.1:4575" : "http://127.0.0.1:4590");
@@ -15,19 +13,18 @@ const signedSession = process.env.SUBAGENT_QA_SESSION;
 assert.ok(password || signedSession, "Supply this user's portal password or a short-lived signed session for QA");
 const screenshots = await fs.mkdtemp("/tmp/codex-subagent-native-");
 let injected, store, project;
-const db = new DatabaseSync(process.env.SUBAGENT_NATIVE_QA_DB || `${appRoot}/.codex-web/codex-web.sqlite`, { readOnly: true });
+const db = new DatabaseSync(`${appRoot}/data/backend/codex-web.sqlite`, { readOnly: true });
 const owner = db.prepare("SELECT project_id, user_id FROM thread_owners WHERE thread_id = ?").get(parentId);
-assert.ok(owner, "Owned QA thread not found");
-assert.equal(owner.user_id, username);
+assert.equal(owner.user_id, "qa-user");
 const actualProject = db.prepare("SELECT root_path FROM projects WHERE id=?").get(owner.project_id);
 db.close();
 if (!production && process.env.SUBAGENT_NATIVE_ROUTES !== "1") {
-  assert.ok(process.env.CODEX_HOME, "Set CODEX_HOME to the authorized QA runtime");
-  process.env.CODEX_WEB_ACCOUNT_POOL_FILE ||= `${appRoot}/account-pool.json`;
+  process.env.CODEX_HOME = "/home/example/codex_zerotier_remote/runtime/account-pool/100001";
+  process.env.CODEX_WEB_ACCOUNT_POOL_FILE = `${appRoot}/account-pool.json`;
   process.env.CODEX_WEB_DATA_DIR = screenshots;
   const { default: Fastify } = await import("fastify");
-  const { ProjectStore } = await import("../server/db.ts");
-  const { registerRoutes } = await import("../server/routes.ts");
+  const { ProjectStore } = await import("../../backend/server/db.ts");
+  const { registerRoutes } = await import("../../backend/server/routes.ts");
   store = new ProjectStore(`${screenshots}/readonly-test.sqlite`);
   // The isolated route harness has no portal auth middleware. Its single
   // owner is the default test identity; the real parent was checked above.
@@ -36,22 +33,22 @@ if (!production && process.env.SUBAGENT_NATIVE_ROUTES !== "1") {
   injected = Fastify();
   registerRoutes(injected, { request: () => { throw new Error("Native history QA may not start or resume a model"); } }, store, { backgroundIndexing: false });
 }
-const browser = await chromium.launch({ executablePath: process.env.DOCUMENT_QA_CHROMIUM || undefined, headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+const browser = await chromium.launch({ executablePath: "/home/example/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome", headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 let page;
 try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 960 }, reducedMotion: "no-preference" });
   if (signedSession) {
     await context.addCookies([{ name: "codex_remote_session_4575", value: signedSession, domain: "127.0.0.1", path: "/", httpOnly: true, sameSite: "Lax" }]);
   } else {
-    const login = await context.request.post(`${origin}/api/auth/login`, { data: { username, password } });
+    const login = await context.request.post(`${origin}/api/auth/login`, { data: { username: "qa-user", password } });
     assert.equal(login.status(), 200);
   }
-  await context.addInitScript(({ projectId, username }) => {
-    localStorage.setItem("codex-web-user-id", username);
+  await context.addInitScript(({ projectId }) => {
+    localStorage.setItem("codex-web-user-id", "qa-user");
     localStorage.setItem("codex-web-color-theme", "dark");
-    localStorage.setItem(`codex-v2-project-${username}`, projectId);
-    localStorage.setItem(`codex-v2-expanded-projects-${username}`, JSON.stringify([projectId]));
-  }, { projectId: owner.project_id, username });
+    localStorage.setItem("codex-v2-project-qa-user", projectId);
+    localStorage.setItem("codex-v2-expanded-projects-qa-user", JSON.stringify([projectId]));
+  }, { projectId: owner.project_id });
   page = await context.newPage();
   const errors = [];
   page.on("pageerror", error => errors.push(error.message));
@@ -65,11 +62,11 @@ try {
     assert.equal(request.method(), "GET");
     const url = new URL(request.url());
     const replaced = url.pathname.replace(`/projects/${owner.project_id}/`, `/projects/${project.id}/`);
-    const response = await injected.inject({ method: "GET", url: replaced + url.search, headers: { "x-codex-web-user-id": username } });
+    const response = await injected.inject({ method: "GET", url: replaced + url.search, headers: { "x-codex-web-user-id": "qa-user" } });
     await route.fulfill({ status: response.statusCode, contentType: "application/json", body: response.body });
   });
   await page.goto(`${origin}/?thread=${parentId}&project=${owner.project_id}`, { waitUntil: "domcontentloaded" });
-  await page.locator(".conversationHeader h2").waitFor({ state: "attached", timeout: 60000 });
+  await page.locator(".conversationHeader h2").filter({ hasText: /codex迭代/ }).waitFor({ state: "attached", timeout: 60000 });
   await page.locator(".messages [data-message-key]").first().waitFor({ timeout: 30000 });
   // Directory discovery must not require loading the old dispatch message.
   await page.locator(".subagentActivity .subagentHistoryButton").waitFor({ timeout: 30000 });

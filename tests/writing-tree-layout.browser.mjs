@@ -4,22 +4,21 @@ import { chromium, expect } from "@playwright/test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 
-const username = process.env.DOCUMENT_QA_USER || "qaUser";
-const url = process.env.DOCUMENT_QA_URL || "http://127.0.0.1:4575";
-const root = process.env.DOCUMENT_QA_ROOT || process.cwd();
+const url = process.env.DOCUMENT_QA_URL || "https://codex-alt.example.com";
+const root = process.env.DOCUMENT_QA_ROOT || "/srv/codex-ui/data/users/qa-user";
 const inspect = process.env.WRITING_TREE_INSPECT === "1";
 if (!process.env.DOCUMENT_QA_PASSWORD) throw new Error("Authorized QA login required.");
 const screenshots = await fs.mkdtemp("/tmp/codex-writing-tree-");
-const browser = await chromium.launch({ executablePath: process.env.DOCUMENT_QA_CHROMIUM || undefined, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+const browser = await chromium.launch({ executablePath: "/home/example/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome", args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 try {
   const context = await browser.newContext({ viewport: { width: 1560, height: 960 }, reducedMotion: "no-preference" });
-  const login = await context.request.post(`${url}/api/auth/login`, { data: { username, password: process.env.DOCUMENT_QA_PASSWORD } });
+  const login = await context.request.post(`${url}/api/auth/login`, { data: { username: "qa-user", password: process.env.DOCUMENT_QA_PASSWORD } });
   assert.ok(login.ok());
-  const projects = await context.request.get(`${url}/api/projects`, { headers: { "x-codex-web-user-id": username } });
+  const projects = await context.request.get(`${url}/api/projects`, { headers: { "x-codex-web-user-id": "qa-user" } });
   assert.ok(projects.ok());
   const project = (await projects.json()).data.find(candidate => candidate.rootPath === root);
   assert.ok(project, "an existing owned workspace is required");
-  await context.addInitScript(username => { localStorage.setItem("codex-web-user-id", username); localStorage.setItem("codex-web-color-theme", "light"); localStorage.setItem("codex-web-thread-list-collapsed", "false"); }, username);
+  await context.addInitScript(() => { localStorage.setItem("codex-web-user-id", "qa-user"); localStorage.setItem("codex-web-color-theme", "light"); localStorage.setItem("codex-web-thread-list-collapsed", "false"); });
   const page = await context.newPage();
   const errors = []; page.on("pageerror", error => errors.push(error.message));
   const settle = () => page.evaluate(async () => {

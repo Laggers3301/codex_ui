@@ -591,10 +591,10 @@ export function startThreadReview(projectId: string, threadId: string, branch?: 
   });
 }
 
-export function editLatestThreadTurn(projectId: string, threadId: string, turnId: string): Promise<{ data: unknown }> {
+export function editLatestThreadTurn(projectId: string, threadId: string, turnId: string, edit?: { expectedLatestTurnId: string; allowHistoryRewrite: boolean }): Promise<{ data: unknown }> {
   return request(`/api/projects/${projectId}/threads/${threadId}/edit-latest`, {
     method: "POST",
-    body: JSON.stringify({ turnId })
+    body: JSON.stringify({ turnId, ...edit })
   });
 }
 

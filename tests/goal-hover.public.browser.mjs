@@ -3,12 +3,12 @@ import { chromium, expect } from "@playwright/test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 
-const url = process.env.GOAL_HOVER_QA_URL || "http://127.0.0.1:4575";
-const threadId = process.env.GOAL_HOVER_QA_THREAD;
-const username = process.env.DOCUMENT_QA_USER || "qaUser";
+const url = process.env.GOAL_HOVER_QA_URL || "https://codex-alt.example.com";
+const threadId = process.env.GOAL_HOVER_QA_THREAD || "01a0db3e-315e-7461-b9a9-8a7a9236a84e";
+const username = process.env.DOCUMENT_QA_USER || "qa-user";
 if (!process.env.DOCUMENT_QA_PASSWORD) throw new Error("Authorized read-only QA login required.");
 const screenshots = await fs.mkdtemp("/tmp/codex-goal-hover-public-");
-const browser = await chromium.launch({ executablePath: process.env.DOCUMENT_QA_CHROMIUM || undefined, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+const browser = await chromium.launch({ executablePath: "/home/example/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome", args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 960 }, reducedMotion: "no-preference" });
   const login = await context.request.post(`${url}/api/auth/login`, { data: { username, password: process.env.DOCUMENT_QA_PASSWORD } });

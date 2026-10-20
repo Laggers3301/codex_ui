@@ -11,9 +11,13 @@ import { findThreadJsonlPathById } from "./threadFallback.js";
 export const userHandoffFormat = "codex-web-user-handoff";
 export const userHandoffVersion = 1;
 
-const handoffSourceAliases = new Map<string, string[]>(
-  Object.entries(JSON.parse(process.env.CODEX_WEB_HANDOFF_SOURCE_ALIASES ?? "{}"))
-);
+const handoffSourceAliases = new Map<string, string[]>([
+  ["wjm", ["jiaming"]],
+  ["jyh", ["jiangyuhua"]],
+  ["wxr", ["wangxuran"]],
+  ["wm", ["wuming", "吴明"]],
+  ["xjy", ["xujiayu", "x'j'y"]]
+]);
 
 export interface UserHandoffSession {
   threadId: string;

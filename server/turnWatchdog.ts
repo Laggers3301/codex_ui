@@ -1,4 +1,4 @@
-export type TurnWatchdogPhase = "running" | "tool_running" | "waiting_approval" | "waiting_subagents" | "unknown";
+export type TurnWatchdogPhase = "running" | "tool_running" | "waiting_approval" | "waiting_user_input" | "waiting_subagents" | "unknown";
 
 export interface WatchdogTurn {
   userId: string;
@@ -38,6 +38,7 @@ function normalizedFlag(value: unknown): string {
 export function phaseFromProbe(activeFlags: unknown): TurnWatchdogPhase {
   const flags = Array.isArray(activeFlags) ? activeFlags.map(normalizedFlag) : [];
   if (flags.some((flag) => flag.includes("approval"))) return "waiting_approval";
+  if (flags.some((flag) => flag.includes("userinput"))) return "waiting_user_input";
   if (flags.some((flag) => flag.includes("subagent") || flag.includes("collabagent"))) return "waiting_subagents";
   return "running";
 }
@@ -119,7 +120,7 @@ export class TurnWatchdog {
     if (!turn || turn.turnId !== turnId || turn.probeToken !== token) return null;
     const flags = Array.isArray(activeFlags) ? activeFlags.map((flag) => String(flag)).slice(0, 16) : [];
     const nextPhase = Array.isArray(activeFlags) && activeFlags.length === 0
-      && (turn.phase === "waiting_approval" || turn.phase === "waiting_subagents")
+      && (turn.phase === "waiting_approval" || turn.phase === "waiting_user_input" || turn.phase === "waiting_subagents")
       ? turn.phase
       : phaseFromProbe(activeFlags);
     const nextState = `${status}:${flags.join(",")}`;

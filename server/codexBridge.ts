@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { serverConfig } from "./config.js";
 import type { RpcEnvelope } from "./types.js";
+import { AppError } from "./appErrors.js";
 
 /**
  * The process used as the JSON-RPC transport for a Codex app-server.
@@ -72,6 +73,15 @@ export function classifyRpcEnvelope(message: RpcEnvelope): "response" | "serverR
   return "notification";
 }
 
+/** A reclaim/throttle watermark is not an allocation ceiling. Debounce transient
+ * tool allocations before interrupting work, without disabling the hard cap. */
+export function memoryPressureWindow(headroom: number | null, since: number | null, now: number):
+  { since: number | null; pause: boolean } {
+  if (headroom === null || headroom >= 256 * 1024 * 1024) return { since: null, pause: false };
+  const started = since ?? now;
+  return { since: started, pause: now - started >= 30_000 };
+}
+
 export class CodexBridge extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
@@ -80,6 +90,9 @@ export class CodexBridge extends EventEmitter {
   private readyPromise: Promise<void> | null = null;
   private restarting = false;
   private stopped = false;
+  private resourceMonitor: ReturnType<typeof setInterval> | null = null;
+  private pressureReported = false;
+  private lowMemorySince: number | null = null;
 
   constructor(private readonly launch: CodexBridgeLaunchOptions = {
     command: serverConfig.codexBin,
@@ -100,6 +113,8 @@ export class CodexBridge extends EventEmitter {
   }
 
   stop(): void {
+    if (this.resourceMonitor) clearInterval(this.resourceMonitor);
+    this.resourceMonitor = null;
     this.stopped = true;
     this.proc?.kill();
     this.proc = null;
@@ -129,6 +144,10 @@ export class CodexBridge extends EventEmitter {
 
   async request(method: string, params?: unknown, timeoutMs = 120_000): Promise<unknown> {
     await this.start();
+    if (["turn/start", "thread/start", "thread/queue/start", "thread/queue/add"].includes(method)) {
+      const headroom = this.getMemoryHeadroom();
+      if (headroom !== null && headroom < 512 * 1024 * 1024) throw new AppError("memory_pressure", "运行资源不足，暂时无法开始新任务。", "memory_pressure: 运行时可用内存不足 512 MiB，已阻止新增任务。");
+    }
     return this.sendRequest(method, params, timeoutMs);
   }
 
@@ -164,15 +183,20 @@ export class CodexBridge extends EventEmitter {
         .split("\n").find(line => line.startsWith("0::"))?.slice(3);
       if (!relative || !relative.includes(`/${this.launch.scope.unitPrefix}-`)) return 0;
       const directory = path.join("/sys/fs/cgroup", relative);
-      const limit = fs.readFileSync(path.join(directory, "memory.max"), "utf8").trim();
-      if (limit === "max") return null;
-      const current = Number(fs.readFileSync(path.join(directory, "memory.current"), "utf8").trim());
-      const stats = fs.readFileSync(path.join(directory, "memory.stat"), "utf8");
-      const inactiveFile = Number(stats.match(/^inactive_file (\d+)/m)?.[1] ?? 0);
-      const dirtyFile = Number(stats.match(/^file_dirty (\d+)/m)?.[1] ?? 0)
-        + Number(stats.match(/^file_writeback (\d+)/m)?.[1] ?? 0);
-      const reclaimable = Math.min(current, Math.max(0, inactiveFile - dirtyFile));
-      return Math.max(0, Number(limit) - current + reclaimable);
+      const budgets: number[] = [];
+      for (const group of [directory, path.dirname(directory)]) {
+        // memory.high throttles/reclaims; it is NOT the available-memory ceiling.
+        // Counting it as a hard limit prematurely stops healthy tools while Linux
+        // is still reclaiming cache, even with a full GiB left below memory.max.
+        const limits = ["memory.max"].map(file => fs.readFileSync(path.join(group, file), "utf8").trim()).filter(value => value !== "max").map(Number);
+        if (!limits.length) continue;
+        const current = Number(fs.readFileSync(path.join(group, "memory.current"), "utf8").trim());
+        const stats = fs.readFileSync(path.join(group, "memory.stat"), "utf8");
+        const inactive = Number(stats.match(/^inactive_file (\d+)/m)?.[1] ?? 0);
+        const dirty = Number(stats.match(/^file_dirty (\d+)/m)?.[1] ?? 0) + Number(stats.match(/^file_writeback (\d+)/m)?.[1] ?? 0);
+        budgets.push(Math.max(0, Math.min(...limits) - current + Math.min(current, Math.max(0, inactive - dirty))));
+      }
+      return budgets.length ? Math.min(...budgets) : null;
     } catch { return 0; } // Fail closed instead of risking a shared runtime OOM.
   }
 
@@ -207,6 +231,8 @@ export class CodexBridge extends EventEmitter {
     });
 
     proc.on("exit", (code, signal) => {
+      if (this.resourceMonitor) clearInterval(this.resourceMonitor);
+      this.resourceMonitor = null;
       this.emit("status", { state: "exited", code, signal });
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timer);
@@ -232,6 +258,21 @@ export class CodexBridge extends EventEmitter {
     });
     this.notify("initialized", {});
     this.emit("status", { state: "ready" });
+    if (this.launch.scope) {
+      this.pressureReported = false;
+      this.lowMemorySince = null;
+      this.resourceMonitor = setInterval(() => {
+        const headroom = this.getMemoryHeadroom();
+        const pressure = memoryPressureWindow(headroom, this.lowMemorySince, Date.now());
+        this.lowMemorySince = pressure.since;
+        if (pressure.pause && !this.pressureReported) {
+          this.pressureReported = true;
+          console.warn("[memory.pressure.pause]", JSON.stringify({ scope: this.launch.scope?.unitPrefix, headroomBytes: headroom, lowSince: this.lowMemorySince }));
+          this.emit("status", { state: "resource_pressure", message: "memory_pressure: 任务内存硬限额余量持续 30 秒低于 256 MiB，正在请求安全暂停当前轮次。" });
+        } else if (headroom === null || headroom > 512 * 1024 * 1024) this.pressureReported = false;
+      }, 5000);
+      this.resourceMonitor.unref?.();
+    }
   }
 
   private scheduleRestart(): void {
@@ -309,6 +350,10 @@ export class CodexBridge extends EventEmitter {
       return;
     }
 
+    if (message.method === "serverRequest/resolved") {
+      const requestId = (message.params as { requestId?: number | string } | null)?.requestId;
+      if (requestId !== undefined) this.serverRequests.delete(requestId);
+    }
     this.emit("notification", message);
   }
 

@@ -4,9 +4,11 @@ import path from 'node:path';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 import {appRoot,candidateFile,stableVersion,newerVersion,runtimeBinary,writeState} from '../scripts/runtime-update-state.mjs';
+import {inspectCapabilities,validationRevision} from '../scripts/runtime-capabilities.mjs';
 const run=promisify(execFile);
 const npm=path.join(path.dirname(process.execPath),'npm');
 const reportFile=path.join(appRoot,'bin/runtime-update-status.json');
+const capabilitiesFile=path.join(appRoot,'bin/runtime-capabilities.json');
 function report(event,extra={}) {
   const state={at:new Date().toISOString(),event,...extra};
   console.log(JSON.stringify(state));writeState(reportFile,state);
@@ -19,7 +21,7 @@ async function main() {
   if(!stableVersion(version))throw new Error('Registry latest is not a stable release');
   let previous;
   try{previous=JSON.parse(fs.readFileSync(candidateFile,'utf8'));}catch{}
-  if(previous?.validated===true&&!newerVersion(version,previous.version)){report('already_validated',{version});return;}
+  if(previous?.validated===true&&previous.validationRevision===validationRevision&&!newerVersion(version,previous.version)){report('already_validated',{version});return;}
   const disk=fs.statfsSync(appRoot);
   if(disk.bavail*disk.bsize<8*1024**3){report('deferred_low_disk',{version});return;}
   const root=path.join(appRoot,`bin/codex-${version}`);
@@ -35,6 +37,10 @@ async function main() {
   const schema=fs.mkdtempSync(path.join(os.tmpdir(),'codex-update-schema-'));
   await run(binary,['app-server','generate-ts','--experimental','--out',schema],{timeout:30000,maxBuffer:65536});
   const protocol=fs.readFileSync(path.join(schema,'ClientRequest.ts'),'utf8');
+  const features=await run(binary,['features','list'],{timeout:5000,maxBuffer:65536});
+  let previousCapabilities={};try{previousCapabilities=JSON.parse(fs.readFileSync(capabilitiesFile,'utf8'));}catch{}
+  const capabilities=inspectCapabilities(version,protocol,features.stdout,previousCapabilities);
+  writeState(capabilitiesFile,{...capabilities,compatibilityPassed:false});
   const methods=new Set([...protocol.matchAll(/"method":\s*"([^\"]+)"/g)].map(m=>m[1]));
   for(const method of ['thread/start','thread/read','thread/resume','thread/fork','turn/start','turn/interrupt','thread/queue/list','thread/queue/add','thread/settings/update','thread/goal/get','thread/backgroundTerminals/list']) {
     if(!methods.has(method))throw new Error(`Required protocol method missing: ${method}`);
@@ -43,7 +49,14 @@ async function main() {
   const records=smoke.stdout.trim().split('\n').map(line=>JSON.parse(line));
   if(!records.some(r=>r.passed===true&&r.accountCredentialsUsed===false))throw new Error('Isolated compatibility test did not pass');
   const prediction=records.find(r=>r.predictionRequest);
-  writeState(candidateFile,{version,validated:true,validatedAt:new Date().toISOString(),previousVersion:previous?.version??null,prediction:prediction?.predictionRequest??'unknown',predictionReason:prediction?.reason??null});
+  let storageTest=null;
+  if(methods.has('rollout/compress')) {
+    const check=await run(process.execPath,['--import','tsx','scripts/check-local-storage-compression.ts',binary],{cwd:appRoot,timeout:90000,maxBuffer:65536});
+    storageTest=check.stdout.trim().split('\n').map(line=>JSON.parse(line)).find(r=>r.enabled===true);
+    if(!storageTest||storageTest.lossless!==true||storageTest.productionAccountsTouched!==0||storageTest.modelCalls!==0) throw new Error('Storage compatibility test failed');
+  }
+  writeState(capabilitiesFile,{...capabilities,compatibilityPassed:true,prediction:prediction?.predictionRequest??'unknown',storageTest});
+  writeState(candidateFile,{version,validated:true,validationRevision,validatedAt:new Date().toISOString(),previousVersion:previous?.version??null,prediction:prediction?.predictionRequest??'unknown',predictionReason:prediction?.reason??null});
   report('validated_waiting_for_idle',{version,prediction:prediction?.predictionRequest??'unknown'});
 }
 main().catch(error=>{report('failed',{error:error.message});process.exitCode=1;});

@@ -7,8 +7,9 @@ import { CodexBridge } from "./codexBridge.js";
 import { serverConfig } from "./config.js";
 import { ensureDefaultAgentLanguage } from "./agentLanguage.js";
 import { responsesCompatibleModelCatalog } from "./modelCatalogCompatibility.js";
-import { appendLegacyRollbackMarker, removeAppendedRollbackMarker, LegacyRollbackConflictError, type AppendedRollbackMarker } from "./legacyRollback.js";
-import { installedRuntimeVersion, isNewerRuntime, runtimeIsIdle, runtimeSelectionPath, writeRuntimeSelection } from "./runtimeUpgrade.js";
+import { appendLegacyRollbackMarker, removeAppendedRollbackMarker, readLegacyTailMetadata, LegacyRollbackConflictError, type AppendedRollbackMarker } from "./legacyRollback.js";
+import { installedRuntimeVersion, isNewerRuntime, runtimeIsIdle, runtimeSelectionPath, writeRuntimeSelection, RuntimeUpgradeFailure, nextRuntimeUpgradeRetry, type RuntimeBusyReason, type RuntimeUpgradeStage, type RuntimeUpgradeRetry } from "./runtimeUpgrade.js";
+import {readableRolloutPath} from './rolloutStorage.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -263,7 +264,7 @@ function accountSupportedModels(codexHome: string): Set<string> | null {
   }
 }
 
-function createAccountBridge(codexHome: string, accountId: string): CodexBridge {
+function createAccountBridge(codexHome: string, accountId: string, adoptCandidate = false): CodexBridge {
   const scope = process.env.CODEX_WEB_ISOLATE_AGENT_SCOPES === "1" ? {
     unitPrefix: `codex-agent-${accountId.replace(/[^A-Za-z0-9-]/g, "-")}`,
     slice: "codex-workers.slice",
@@ -279,7 +280,7 @@ function createAccountBridge(codexHome: string, accountId: string): CodexBridge 
       path.join(codexHome, ".web-runtime.lock"), process.execPath,
       fileURLToPath(new URL("../scripts/run-account-runtime.mjs", import.meta.url)),
       serverConfig.codexBin, ...accountAppServerArgs(codexHome)],
-    env: { ...process.env, CODEX_HOME: codexHome },
+    env: { ...process.env, CODEX_HOME: codexHome, CODEX_WEB_RUNTIME_ADOPT_CANDIDATE: adoptCandidate ? "1" : "0" },
     scope
   });
 }
@@ -305,7 +306,35 @@ export class AccountPoolBridge extends EventEmitter {
   private readonly accountMaintenance = new Map<string, Promise<void>>();
   private runtimeUpgradeTimer: ReturnType<typeof setInterval> | undefined;
   private runtimeUpgradeChecking = false;
-  private readonly rejectedRuntimeVersions = new Set<string>();
+  private storageTimer: ReturnType<typeof setInterval> | undefined;
+  private storageInitialTimer: ReturnType<typeof setTimeout> | undefined;
+  private storageChecking = false;
+  private readonly storageScheduledAt=new Map<string,number>();
+
+  private async maintainCompressedStorage(): Promise<void> {
+    if(this.storageChecking) return;
+    const policyPath=path.join(serverConfig.dataDir,'native-storage-policy.json');
+    try {
+      const policy=JSON.parse(fs.readFileSync(policyPath,'utf8'));
+      if(policy.enabled!==true||policy.adapterRevision!==1) return;
+    } catch { return; }
+    this.storageChecking=true;
+    try {
+      for(const account of this.accounts) {
+        if(Date.now()-(this.storageScheduledAt.get(account.id)??0)<24*60*60*1000) continue;
+        if(account.activeRequests||this.accountMaintenance.has(account.id)||account.bridge.getPendingServerRequests().length) continue;
+        try {
+          if(!await runtimeIsIdle(account.bridge)) continue;
+          await this.invokeAccount(account,'rollout/compress',undefined,30_000);
+          this.storageScheduledAt.set(account.id,Date.now());
+          // This RPC acknowledges scheduling, not completion or savings.
+          console.info('storage.native_compression_scheduled',{accountId:account.id});
+        } catch { console.warn('storage.native_compression_deferred',{accountId:account.id}); }
+      }
+    } finally { this.storageChecking=false; }
+  }
+  private readonly runtimeUpgradeRetries = new Map<string, RuntimeUpgradeRetry>();
+  private readonly runtimeUpgradeBusy = new Map<string, { signature: string; at: number }>();
   private readonly pendingCredentialReloads = new Set<string>();
 
   private markReadyUnlessAuthFailure(account: AccountRuntime): void {
@@ -360,7 +389,12 @@ export class AccountPoolBridge extends EventEmitter {
     if (!parsed || !Array.isArray(parsed.accounts)) {
       throw new Error("Invalid account pool file.");
     }
-    return new AccountPoolBridge(parsed, path.dirname(absolute));
+    const launchedHomes = new Set<string>();
+    return new AccountPoolBridge(parsed, path.dirname(absolute), (home, id) => {
+      const coldStart = !launchedHomes.has(home);
+      launchedHomes.add(home);
+      return createAccountBridge(home, id, coldStart && process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE === "1");
+    });
   }
 
   constructor(
@@ -429,6 +463,16 @@ export class AccountPoolBridge extends EventEmitter {
 
   private forwardEvents(account: AccountRuntime, bridge: CodexBridge): void {
     bridge.on("notification", (message) => {
+      if (asRecord(message).method === "serverRequest/resolved") {
+        const params = asRecord(asRecord(message).params);
+        const routed = [...this.serverRequestAccounts].find(([, route]) => route.bridge === bridge && route.originalId === params.requestId);
+        // Answers are resolved locally when written. The native notification
+        // also clears questions cancelled by a completed/interrupted turn.
+        if (!routed) return;
+        this.serverRequestAccounts.delete(routed[0]);
+        this.emit("notification", { ...asRecord(message), params: { ...params, requestId: routed[0] }, accountId: account.id, accountLabel: account.label });
+        return;
+      }
       this.emit("notification", { ...asRecord(message), accountId: account.id, accountLabel: account.label });
     });
     bridge.on("serverRequest", (request) => {
@@ -557,7 +601,23 @@ export class AccountPoolBridge extends EventEmitter {
 
   async start(): Promise<void> {
     const results = await Promise.allSettled(this.accounts.map(async (account) => {
-      await account.bridge.start();
+      const file=runtimeSelectionPath(account.codexHome);
+      const previous=fs.existsSync(file)?fs.readFileSync(file,"utf8"):null;
+      const before=installedRuntimeVersion(account.codexHome,serverConfig.codexBin);
+      try { await account.bridge.start(); }
+      catch(error) {
+        const selected=installedRuntimeVersion(account.codexHome,serverConfig.codexBin);
+        if(process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE!=="1"||!isNewerRuntime(selected,before))throw error;
+        // Cold-start adoption is under the native lease. If that launch fails,
+        // restore the previous pin and use a non-adopting recovery bridge.
+        await account.bridge.stopAndWait();
+        if(previous===null)fs.rmSync(file,{force:true});else writeFileAtomically(file,previous);
+        const recovery=this.bridgeFactory(account.codexHome,account.id);
+        account.bridge=recovery;this.forwardEvents(account,recovery);
+        await recovery.start();
+        this.runtimeUpgradeRetries.set(`${account.id}:${selected}`,nextRuntimeUpgradeRetry(undefined,"replacement"));
+        console.warn("Codex cold-start upgrade restored previous runtime",{accountId:account.id,version:selected,restored:before});
+      }
       this.markReadyUnlessAuthFailure(account);
     }));
     if (results.every((result) => result.status === "rejected")) {
@@ -568,9 +628,18 @@ export class AccountPoolBridge extends EventEmitter {
       this.runtimeUpgradeTimer = setInterval(() => { void this.checkRuntimeUpgrade(); }, 60_000);
       this.runtimeUpgradeTimer.unref();
     }
+    if(!this.storageTimer) {
+      this.storageTimer=setInterval(()=>{void this.maintainCompressedStorage();},15*60*1000);
+      this.storageTimer.unref();
+      this.storageInitialTimer=setTimeout(()=>{void this.maintainCompressedStorage();},60_000); this.storageInitialTimer.unref();
+    }
   }
 
   stop(): void {
+    if(this.storageInitialTimer) clearTimeout(this.storageInitialTimer);
+    this.storageInitialTimer=undefined;
+    if(this.storageTimer) clearInterval(this.storageTimer);
+    this.storageTimer=undefined;
     if (this.runtimeUpgradeTimer) clearInterval(this.runtimeUpgradeTimer);
     this.runtimeUpgradeTimer = undefined;
     for (const account of this.accounts) {
@@ -584,35 +653,55 @@ export class AccountPoolBridge extends EventEmitter {
     if (!account) throw new Error("Unknown account");
     const current = installedRuntimeVersion(account.codexHome, serverConfig.codexBin);
     if (!isNewerRuntime(version,current)) return "unchanged";
-    if (account.authFailureCode || this.accountMaintenance.has(account.id)) return "busy";
+    const busy = (details: RuntimeBusyReason): "busy" => {
+      const key = `${account.id}:${version}`, signature = JSON.stringify(details), previous = this.runtimeUpgradeBusy.get(key);
+      if (!previous || previous.signature !== signature || Date.now() - previous.at >= 600_000) {
+        this.runtimeUpgradeBusy.set(key, { signature, at: Date.now() });
+        console.info("Codex runtime update waiting for idle", { accountId: account.id, version, ...details });
+      }
+      writeFileAtomically(path.join(account.codexHome, ".web-runtime-upgrade-status.json"), JSON.stringify({ version, current, checkedAt: new Date().toISOString(), ...details }));
+      return "busy";
+    };
+    if (account.authFailureCode) return busy({ reason: "authorization_required" });
+    if (this.accountMaintenance.has(account.id)) return busy({ reason: "account_maintenance" });
     let release!: () => void;
     this.accountMaintenance.set(account.id,new Promise<void>(resolve => {release=resolve;}));
     const file=runtimeSelectionPath(account.codexHome);
     const previous=fs.existsSync(file)?fs.readFileSync(file,"utf8"):null;
     let stopped=false;
+    let stage: RuntimeUpgradeStage = "preflight";
     try {
-      if (account.activeRequests || account.bridge.getPendingServerRequests().length) return "busy";
-      if (!await runtimeIsIdle(account.bridge)) return "busy";
+      if (account.activeRequests) return busy({ reason: "active_requests", count: account.activeRequests });
+      if (account.bridge.getPendingServerRequests().length) return busy({ reason: "pending_approval" });
+      let reason: RuntimeBusyReason = { reason: "unknown" };
+      if (!await runtimeIsIdle(account.bridge, value => { reason = value; })) return busy(reason);
       // Incoming requests are waiting at the barrier; goals/queues/terminals
       // were checked natively, so no model turn is interrupted here.
+      stage = "replacement";
       await account.bridge.stopAndWait(); stopped=true;
       writeRuntimeSelection(account.codexHome,version);
       const replacement=this.bridgeFactory(account.codexHome,account.id);
       account.bridge=replacement;this.forwardEvents(account,replacement);
       await replacement.start(); stopped=false;
       this.markReadyUnlessAuthFailure(account);
+      this.runtimeUpgradeBusy.delete(`${account.id}:${version}`);
+      writeFileAtomically(path.join(account.codexHome, ".web-runtime-upgrade-status.json"), JSON.stringify({ version, checkedAt: new Date().toISOString(), reason: "upgraded" }));
       this.emit("accountRuntime",{accountId:account.id,event:"runtime_upgraded",version});
       return "reloaded";
     } catch(error) {
       if(stopped) {
-        await account.bridge.stopAndWait();
-        if(previous===null) fs.rmSync(file,{force:true});
-        else writeFileAtomically(file,previous);
-        const recovery=this.bridgeFactory(account.codexHome,account.id);
-        account.bridge=recovery;this.forwardEvents(account,recovery);
-        await recovery.start();
+        try {
+          await account.bridge.stopAndWait();
+          if(previous===null) fs.rmSync(file,{force:true});
+          else writeFileAtomically(file,previous);
+          const recovery=this.bridgeFactory(account.codexHome,account.id);
+          account.bridge=recovery;this.forwardEvents(account,recovery);
+          await recovery.start();
+        } catch (rollbackError) {
+          throw new RuntimeUpgradeFailure("rollback", rollbackError);
+        }
       }
-      throw error;
+      throw new RuntimeUpgradeFailure(stage, error);
     } finally {this.accountMaintenance.delete(account.id);release();}
   }
 
@@ -629,13 +718,17 @@ export class AccountPoolBridge extends EventEmitter {
       fs.accessSync(binary,fs.constants.X_OK);
       for(const account of this.accounts) {
         const key=`${account.id}:${candidate.version}`;
-        if(this.rejectedRuntimeVersions.has(key)) continue;
+        const previousRetry = this.runtimeUpgradeRetries.get(key);
+        if(previousRetry && previousRetry.retryAt > Date.now()) continue;
         try {
           const result=await this.applyRuntimeVersionIfIdle(account.id,candidate.version);
+          if(result !== "busy") this.runtimeUpgradeRetries.delete(key);
           if(result==="reloaded") console.info("Codex runtime updated",{accountId:account.id,version:candidate.version});
         } catch(error) {
-          this.rejectedRuntimeVersions.add(key);
-          console.warn("Codex runtime update deferred after failure",{accountId:account.id,version:candidate.version,error:error instanceof Error?error.message:"runtime failure"});
+          const stage = error instanceof RuntimeUpgradeFailure ? error.stage : "preflight";
+          const retry = nextRuntimeUpgradeRetry(previousRetry, stage);
+          this.runtimeUpgradeRetries.set(key, retry);
+          console.warn("Codex runtime update deferred after failure",{accountId:account.id,version:candidate.version,stage,attempts:retry.attempts,retryAt:new Date(retry.retryAt).toISOString(),error:error instanceof Error?error.message:"runtime failure"});
         }
       }
     } catch(error) { console.warn("Codex update candidate unavailable",{error:error instanceof Error?error.message:"runtime failure"}); }
@@ -871,8 +964,22 @@ export class AccountPoolBridge extends EventEmitter {
     }
   }
 
-  /** Rewind one stopped legacy turn without changing the thread id. */
-  async rollbackLegacyLatest(threadId: string, expectedTurnId: string): Promise<unknown> {
+  /** Serialize a native history mutation against all pool requests. Calls
+   * inside the callback use the owning bridge to avoid waiting on our barrier. */
+  async withThreadMaintenance<T>(threadId: string, work: (bridge: CodexBridge) => Promise<T>): Promise<T> {
+    const account = await this.accountForRequest("thread/read", { threadId });
+    if (this.accountMaintenance.has(account.id) || account.activeRequests || account.bridge.getPendingServerRequests().length) {
+      throw new LegacyRollbackConflictError("该账号正在处理请求或审批，请稍后重试；草稿和附件仍保留。");
+    }
+    let release!: () => void;
+    this.accountMaintenance.set(account.id, new Promise<void>(resolve => { release = resolve; }));
+    try { return await work(account.bridge); }
+    finally { this.accountMaintenance.delete(account.id); release(); }
+  }
+
+  /** Rewind a stopped legacy suffix without changing the thread id. Original
+   * records stay in the log; Codex replays the rollback marker on reload. */
+  async rollbackLegacyLatest(threadId: string, expectedTurnId: string, edit?: { expectedLatestTurnId: string; allowHistoryRewrite: boolean }): Promise<unknown> {
     const account = await this.accountForRequest("thread/read", { threadId });
     if (this.accountMaintenance.has(account.id)) throw new LegacyRollbackConflictError("该账号正在处理另一项会话维护，请稍后重试。");
     let release!: () => void;
@@ -884,48 +991,43 @@ export class AccountPoolBridge extends EventEmitter {
       if (account.activeRequests || account.bridge.getPendingServerRequests().length) {
         throw new LegacyRollbackConflictError("该账号还有正在处理的请求或审批，请稍后重试撤回。");
       }
-      const loaded = asRecord(await account.bridge.request("thread/loaded/list", {}, 30_000));
-      const loadedIds = Array.isArray(loaded.data) ? loaded.data.filter((id): id is string => typeof id === "string") : [];
-      for (const loadedId of loadedIds) {
-        const snapshot = asRecord(asRecord(await account.bridge.request("thread/read", { threadId: loadedId, includeTurns: false }, 30_000)).thread);
-        if (asRecord(snapshot.status).type !== "idle") {
-          throw new LegacyRollbackConflictError("该账号还有运行中的会话，请等这些任务结束后重试；草稿和附件仍保留。");
-        }
-        const goal = asRecord(await account.bridge.request("thread/goal/get", { threadId: loadedId }, 30_000));
-        if (asRecord(goal.goal).status === "active") {
-          throw new LegacyRollbackConflictError("该账号还有持续目标在运行，请稍后重试撤回。");
-        }
-        const queue = asRecord(await account.bridge.request("thread/queue/list", { threadId: loadedId, limit: 1 }, 30_000));
-        if (Array.isArray(queue.data) && queue.data.length) {
-          throw new LegacyRollbackConflictError("该账号还有排队消息，请稍后重试撤回。");
-        }
-      }
-      const before = asRecord(asRecord(await account.bridge.request("thread/read", { threadId, includeTurns: true }, 60_000)).thread);
-      const turns = Array.isArray(before.turns) ? before.turns.map(asRecord) : [];
-      const last = turns.at(-1);
-      if (before.historyMode !== "legacy" || !last || last.id !== expectedTurnId) {
-        throw new LegacyRollbackConflictError("只能撤回当前会话的最后一轮；请刷新后重试。");
+      if (!await runtimeIsIdle(account.bridge)) throw new LegacyRollbackConflictError("该账号还有运行中会话、排队任务或后台终端，请稍后重试；草稿和附件仍保留。");
+      // Never serialize a legacy rollout into Node: it may be larger than the
+      // shared backend heap. Read only bounded structural metadata at its tail.
+      const before = asRecord(asRecord(await account.bridge.request("thread/read", { threadId, includeTurns: false }, 30_000)).thread);
+      if (typeof before.path !== "string" || !before.path) throw new Error("Codex 未提供该会话的日志路径。");
+      let metadata = await readLegacyTailMetadata(await readableRolloutPath(before.path), edit?.allowHistoryRewrite ? expectedTurnId : undefined);
+      const last = metadata.latest;
+      if (before.historyMode !== "legacy" || !last || last.id !== (edit?.expectedLatestTurnId ?? expectedTurnId) || !metadata.target || metadata.target.id !== expectedTurnId) {
+        throw new LegacyRollbackConflictError("会话已更新或待编辑的提问已撤回，请刷新后重试；原记录未改动。");
       }
       if (!["completed", "failed", "interrupted"].includes(String(last.status))) {
         throw new LegacyRollbackConflictError("最后一轮仍在运行，请等待完成或先终止回答。");
       }
-      if (!Array.isArray(last.items) || !last.items.some((item) => asRecord(item).type === "userMessage")) {
-        throw new LegacyRollbackConflictError("最后一轮不是用户提问，不能自动撤回。");
+      if (!metadata.target.hasUserMessage) {
+        throw new LegacyRollbackConflictError("目标轮次不是用户提问，不能自动撤回。");
       }
-      if (typeof before.path !== "string" || !before.path) throw new Error("Codex 未提供该会话的日志路径。");
+      if(!fs.existsSync(before.path)) {
+        // Only native Codex may recover a writable rollout and acquire its
+        // writer locks. A read cache is never used as the edit target.
+        await account.bridge.request('thread/resume',{threadId,excludeTurns:true},30_000);
+        metadata=await readLegacyTailMetadata(before.path, edit?.allowHistoryRewrite ? expectedTurnId : undefined);
+        if(metadata.latest?.id!==(edit?.expectedLatestTurnId ?? expectedTurnId) || metadata.target?.id!==expectedTurnId) throw new LegacyRollbackConflictError('恢复后的会话已变化，未执行撤回，请刷新后重试。');
+      }
       await account.bridge.stopAndWait();
       stopped = true;
-      marker = await appendLegacyRollbackMarker(account.codexHome, before.path, threadId);
+      marker = await appendLegacyRollbackMarker(account.codexHome, before.path, threadId, metadata, metadata.rollbackTurns);
       await account.bridge.start();
       stopped = false;
-      const after = asRecord(asRecord(await account.bridge.request("thread/read", { threadId, includeTurns: true }, 60_000)).thread);
-      const remaining = Array.isArray(after.turns) ? after.turns.map(asRecord) : [];
-      if (remaining.length !== turns.length - 1 || remaining.some((turn) => turn.id === expectedTurnId)) {
+      const after = asRecord(asRecord(await account.bridge.request("thread/read", { threadId, includeTurns: false }, 30_000)).thread);
+      const remaining = await readLegacyTailMetadata(before.path);
+      if (after.id !== threadId || after.historyMode !== "legacy" || remaining.latest?.id !== metadata.retainedPrevious?.id || remaining.latest?.id === expectedTurnId) {
         throw new Error("撤回标记未被当前 Codex 正确重放，正在恢复原记录。");
       }
       marker = null;
       this.markReadyUnlessAuthFailure(account);
-      return { thread: after };
+      return { thread: { id: threadId, path: before.path, historyMode: "legacy", turns: [] },
+        rolledBackTurnId: expectedTurnId, rolledBackTurns: metadata.rollbackTurns, latestTurnId: remaining.latest?.id ?? null };
     } catch (error) {
       let recoveryError: unknown = null;
       if (marker) {

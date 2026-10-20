@@ -11,9 +11,10 @@ import {serverConfig} from "./config.js";
 
 describe("sample-user dedicated account policy", () => {
   it("allows 100003 regardless of the old 50% cap and rejects another account's thread", async () => {
+    const previousUser = serverConfig.trackedQuotaUser;
+    serverConfig.trackedQuotaUser = "sample-user";
     const previous=serverConfig.trackedQuotaAllowedAccountId;serverConfig.trackedQuotaAllowedAccountId="100003";
     const previousEnforce=serverConfig.trackedQuotaEnforce;serverConfig.trackedQuotaEnforce=true;
-    const previousUser=serverConfig.trackedQuotaUser;serverConfig.trackedQuotaUser="sample-user";
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-sample-user-account-"));
     const oldHome = path.join(temporary, "old");
     const allowedHome = path.join(temporary, "allowed");
@@ -35,9 +36,9 @@ describe("sample-user dedicated account policy", () => {
       await expect(assertTrackedUserQuotaAvailable(pool as unknown as CodexBridge, store, "sample-user", "allowed-thread")).resolves.toBeUndefined();
       await expect(assertTrackedUserQuotaAvailable(pool as unknown as CodexBridge, store, "sample-user", "old-thread")).rejects.toThrow(/只能使用 100003/);
     } finally {
+      serverConfig.trackedQuotaUser = previousUser;
       serverConfig.trackedQuotaAllowedAccountId=previous;
       serverConfig.trackedQuotaEnforce=previousEnforce;
-      serverConfig.trackedQuotaUser=previousUser;
       pool.stop();
       store.close();
       fs.rmSync(temporary, { recursive: true, force: true });

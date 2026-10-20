@@ -43,7 +43,7 @@ function atomicJson(file: string, value: unknown): void {
 /** Local administrator publication only; no client can publish a global update. */
 export function publishUiUpdate(version: string, targets?: string[], notice?: string): void {
   if (!validVersion(version)) throw new UpdateError(400, "更新版本标识不合法。");
-  if (targets?.some(t => !["account", "plugins", "feishu"].includes(t))) throw new UpdateError(400, "更新入口不合法。");
+  if (targets?.some(t => !["account", "plugins", "feishu", "questions", "plan", "threads", "runtime"].includes(t))) throw new UpdateError(400, "更新入口不合法。");
   atomicJson(path.join(root(), "release.json"), { version, ...(targets ? { targets } : {}), ...(notice ? { notice: notice.slice(0, 500) } : {}), publishedAt: new Date().toISOString() });
 }
 
@@ -58,7 +58,7 @@ export function registerUiUpdateRoutes(app: FastifyInstance): void {
       const user = userFor(request), version = request.body?.version;
       if (!validVersion(version)) throw new UpdateError(400, "更新版本标识不合法。");
       const target = request.body.target ?? "account";
-      if (!["account", "plugins", "feishu"].includes(target)) throw new UpdateError(400, "更新入口不合法。");
+      if (!["account", "plugins", "feishu", "questions", "plan", "threads", "runtime"].includes(target)) throw new UpdateError(400, "更新入口不合法。");
       const current = state(user, target);
       if (current.version !== version) return reply.header("Cache-Control", "no-store").send(current);
       if (current.hasUnseen) {

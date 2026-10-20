@@ -261,6 +261,7 @@ export interface ThreadSummary {
   pinned?: boolean;
   configuredModel?: string | null;
   configuredReasoningEffort?: ReasoningEffort | null;
+  collaborationMode?: "plan" | "default";
   cwd: string;
   updatedAt: number;
   createdAt: number;
@@ -403,6 +404,7 @@ export interface ThreadHistoryPage {
 }
 
 export interface ThreadListResponse {
+  hiddenThreadIds?: string[];
   data: ThreadSummary[];
   nextCursor: string | null;
   backwardsCursor: string | null;

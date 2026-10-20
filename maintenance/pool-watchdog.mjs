@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import { processes, identity } from "./resource-guardian.mjs";
-import {confirmedEdgeCount,probeWebSocket,networkEvidence,NetworkRecoveryPolicy,recoverNetwork} from './network-health.mjs';
+import {confirmedEdgeCount,probeWebSocket,networkEvidence,NetworkRecoveryPolicy,recoverNetwork,lanIsDegraded} from './network-health.mjs';
 import {probeCloudRelay} from './cloud-relay-health.mjs';
 const networkRecovery=new NetworkRecoveryPolicy();
 let lastNetworkEvidence=null, lastNetworkEvidenceAt=0;
@@ -100,9 +100,9 @@ async function sample() {
       && workers.oomKills > previousWorkerOomKills;
     previousWorkerOomKills = workers.oomKills;
     const backendHealthy = backend.status === 200 || backend.status === 401;
-    const snapshot={backendStatus:backend.status,backendWS:backendWS.ok,frontendStatus:frontend.status,frontendWS:frontendWS.ok,mainConnections,quicConnections,cloudRelay};
-    const recovery=networkRecovery.evaluate(snapshot);
     if(Date.now()-lastNetworkEvidenceAt>=60000){lastNetworkEvidence=await networkEvidence();lastNetworkEvidenceAt=Date.now();}
+    const snapshot={backendStatus:backend.status,backendWS:backendWS.ok,frontendStatus:frontend.status,frontendWS:frontendWS.ok,mainConnections,quicConnections,cloudRelay,network:lastNetworkEvidence};
+    const recovery=networkRecovery.evaluate(snapshot);
     if(recovery)console.warn(JSON.stringify({time:new Date().toISOString(),event:'network-recovery',snapshot,result:await recoverNetwork(recovery)}));
     const disk = await fs.statfs('/');
     const diskAvailableGiB = Math.round(disk.bavail * disk.bsize / 1024 ** 3);
@@ -110,6 +110,7 @@ async function sample() {
     const critical = availableMb < 768 || fullPressure10 >= 25 || !backendHealthy
       || (mainConnections === 0 && !(quicConnections > 0)) || diskAvailableGiB < 32 || inodeAvailable < 1000;
     const warning = newWorkerOom || availableMb < 2_048 || fullPressure10 >= 10
+      || lanIsDegraded(lastNetworkEvidence) || (cloudRelay && cloudRelay.origin!==200)
       || (swapFreeMb < 200 && availableMb < 3_000)
       || !backendWS.ok || !frontendWS.ok || frontend.status!==200 || mainConnections===null
       || (!cloudRelay&&mainConnections!==null&&mainConnections<4) || (quicConnections!==null&&quicConnections<4) || diskAvailableGiB < 64 || inodeAvailable < 10000;

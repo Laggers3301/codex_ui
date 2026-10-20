@@ -2,9 +2,13 @@ import { Children, cloneElement, Fragment, createContext, isValidElement, memo, 
 import { createPortal } from "react-dom";
 import { lazy, Suspense } from "react";
 import { PreviewZoom } from "./PreviewZoom";
+import { SourceTextPreview } from "./SourceTextPreview";
+import {defaultHtmlPreview,isHtmlPreviewFile} from "./htmlFilePreview";
+const HtmlSourcePreview = lazy(() => import("./HtmlSourcePreview"));
 import { VoiceInput } from "./VoiceInput";
 import { resolvePromptTopAnchor } from "./promptTopAnchor";
 import { useComposerPrediction } from "./useComposerPrediction";
+import { applyLiveAgentUpdate, type AgentWireUpdate } from "./liveAgentUpdates";
 import {BranchToolArchive} from "./BranchToolArchive";
 import { X as PanelClose, FileText as PanelFile, ChevronDown as PanelDown, MoreHorizontal as PanelMore, Copy as ActionCopy, Branch as ActionBranch, Trash as ActionTrash } from "./PanelIcons";
 import { RemoteFolderSidebar, fileReferenceText } from "./RemoteFolderSidebar";
@@ -23,7 +27,9 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import { BubbleMenu } from "@tiptap/react/menus";
 import StarterKit from "@tiptap/starter-kit";
 import { toggleComposerList } from "./composerList";
-import { classifyProviderFailure, type ProviderFailureNotice } from "./providerFailure";
+import { classifyProviderFailure, providerFailureCopy, type ProviderFailureNotice } from "./providerFailure";
+import { finishActiveTurn, pendingTurnStart, rememberTerminalTurn } from "./turnLifecycle";
+import { localMessageBelongsToThread } from "./localMessageScope";
 import { readTurnProgress, turnProgressText, updateTurnProgress, type TurnProgress } from "./turnProgress";
 import { exhaustedAccountSuggestion, type ExhaustedAccountSuggestion } from "./accountExhaustion";
 import "katex/dist/katex.min.css";
@@ -75,13 +81,16 @@ import { SubagentAvatar } from "./SubagentAvatar";
 import { SelectionAskAction, type SelectionAskActionHandle } from "./SelectionAskAction";
 import { PetBuddy } from "./PetBuddy";
 import { AccountUpdateIndicator } from "./AccountUpdateIndicator";
+import { useConversationPlanMode } from "./useConversationPlanMode";
+import { TurnRecoveryNotice, historicalRecovery,isFreshRecoveryNotice, type TurnRecoveryView } from "./TurnRecoveryNotice";
 import { FeishuOffice } from "./FeishuOffice";
 import { useFeishuAttention, needsFeishuAuthorization } from "./useFeishuAttention";
 import { FeatureUpdateNotice } from "./FeatureUpdateNotice";
 import { collectAgents, parseAgentOperation, reconcileSubagents } from "./subagentPresentation";
 import { useSubagentDirectory } from "./subagentDirectory";
 import { useSidebarThreadLists } from "./sidebarThreadLists";
-import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage } from "./questionTool";
+import {setSidebarThreadHidden,sidebarVisibilityVersion,visibleSidebarThreads,reconcileSidebarVisibility} from './sidebarVisibility';
+import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, type UserInputRequest } from "./questionTool";
 import { ToolQuestionCard, ToolQuestionMessage } from "./ToolQuestionCard";
 import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
@@ -149,6 +158,8 @@ import { BrowserPanel } from "./BrowserPanel";
 import { RightWorkspace, WorkspaceOverview, WorkspaceIcon, type WorkspaceTab, type WorkspaceSection } from "./RightWorkspace";
 import { normalizeGfmTableBoundaries, normalizeMathMarkdown, stripInterruptArtifacts } from "./markdown";
 import { createRevealPass, emptyRevealSnapshot, StreamRevealSpan } from "./streamReveal";
+import { rehypeLatinApostrophes } from "./proseTypography";
+import { trimCodeTerminalLineFeed } from "./codeBlockText";
 import { exactSearchTurn, waitForSearchTarget } from "./searchNavigation";
 import type {
   ApprovalPolicy,
@@ -626,6 +637,21 @@ interface ComposerUpload extends ProjectFile {
 interface EditingPromptDraft {
   threadId: string;
   turnId: string;
+  expectedLatestTurnId: string;
+  laterTurns: number;
+}
+
+function EditingPromptNotice({draft,busy,confirmed,onConfirm,onCancel}:{draft:EditingPromptDraft|null;busy:boolean;confirmed:boolean;onConfirm:(value:boolean)=>void;onCancel:()=>void}) {
+  const snapshot=useRef(draft),presence=useExitPresence(Boolean(draft),200);
+  if(draft)snapshot.current=draft;
+  const shown=snapshot.current;
+  if(!presence.present||!shown)return null;
+  return <div className={`editingPromptNotice${presence.closing?" uiClosing":""}`} role="status" aria-hidden={presence.closing} inert={presence.closing}>
+    <PencilLine size={14}/><span>{shown.laterTurns>0?`正在编辑历史提问 · 发送将撤回此轮及后续 ${shown.laterTurns} 轮`:"正在编辑提问 · 发送后替换原问答"}
+      <small>不撤销已修改的文件；取消不会改变原记录</small>
+      {shown.laterTurns>0?<label className="editingHistoryConsent"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event=>onConfirm(event.target.checked)}/>确认撤回此轮及后续问答</label>:null}
+    </span><button type="button" onClick={onCancel} disabled={busy}>取消</button>
+  </div>;
 }
 
 interface PromptRequestContext {
@@ -634,6 +660,7 @@ interface PromptRequestContext {
   threadId: string | null;
   model: string;
   reasoningEffort: ReasoningEffort;
+  collaborationMode: "plan" | "default";
   sentPromptText: string;
   visibleText: string;
   remoteDraftId?: string;
@@ -878,8 +905,7 @@ const CopyableMarkdownPre = memo(function CopyableMarkdownPre({ children, ...pro
   // becomes a phantom final line. Remove exactly that LF, not authored blanks.
   const visibleChildren = Children.map(children, child => {
     if (!isValidElement<{ children?: ReactNode }>(child) || child.type !== "code") return child;
-    const text = child.props.children;
-    return typeof text === "string" ? cloneElement(child, { children: text.replace(/\n$/, "") }) : child;
+    return cloneElement(child, { children: trimCodeTerminalLineFeed(child.props.children) });
   });
   return (
     <div className="markdownCopyFrame markdownCodeCopyFrame">
@@ -1148,6 +1174,7 @@ function isInternalRuntimeUserText(value: string): boolean {
   return text.startsWith("<environment_context>")
     || text.startsWith("<codex_internal_context_recovery>")
     || text.startsWith("<codex_internal_continuation_recovery>")
+    || text.startsWith("<codex_internal_retry>")
     || text.startsWith("<recommended_plugins>")
     || text.startsWith("<permissions instructions>")
     || text.startsWith("<app-context>")
@@ -2038,7 +2065,8 @@ const MarkdownMessage = memo(function MarkdownMessage({
   }, [animateStreamingText, revealPass]);
   const rehypePlugins = useMemo<PluggableList>(() => [
     ...(animateStreamingText ? [revealPass.plugin] : []),
-    ...(renderMath ? markdownRehypePlugins : [])
+    ...(renderMath ? markdownRehypePlugins : []),
+    rehypeLatinApostrophes
   ], [animateStreamingText, revealPass, renderMath]);
 
   const markdownComponents = useMemo<Components>(
@@ -2286,6 +2314,17 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
   const [predictionAccepted,setPredictionAccepted]=useState(false);
   const predictionOpen=Boolean(prediction?.text&&!value&&!disabled&&!composingPrediction&&dismissedPrediction!==prediction.key);
   const predictionPresence=useExitPresence(predictionOpen,180);
+  const predictionGhostRef=useRef<HTMLSpanElement>(null);
+  const [predictionClipped,setPredictionClipped]=useState(false);
+  useLayoutEffect(()=>{
+    const ghost=predictionGhostRef.current;
+    if(!ghost){setPredictionClipped(false);return;}
+    const measure=()=>setPredictionClipped(ghost.scrollHeight>ghost.clientHeight+1);
+    const observer=new ResizeObserver(measure);
+    observer.observe(ghost);
+    measure();
+    return()=>observer.disconnect();
+  },[predictionPresence.present,prediction?.key,prediction?.text]);
   const visiblePredictionRef=useRef<{key:string;text:string}|null>(null);
   if(predictionOpen&&prediction?.text)visiblePredictionRef.current={key:prediction.key,text:prediction.text};
   const acceptPredictionRef=useRef<()=>boolean>(()=>false);
@@ -2484,7 +2523,8 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
   >
     <EditorContent editor={editor} />
     {predictionPresence.present&&visiblePredictionRef.current?.key===prediction?.key ? <span
-      className={`composerPredictionGhost${predictionPresence.closing?" closing":""}`}
+      ref={predictionGhostRef}
+      className={`composerPredictionGhost${predictionClipped?" clipped":""}${predictionPresence.closing?" closing":""}`}
       aria-hidden="true"
     >{visiblePredictionRef.current?.text}<span className="composerPredictionTabHint"><kbd>Tab</kbd><span>接受</span></span></span>:null}
     {slashPresence.present ? createPortal(
@@ -2671,19 +2711,30 @@ export const LiveAgentStreamMessage = memo(function LiveAgentStreamMessage({
 }) {
   const latestTextRef = useRef(text);
   const renderTimerRef = useRef<number | null>(null);
+  const longTaskUntilRef = useRef(0);
+  const longTaskPaceRef = useRef(64);
   const [displayText, setDisplayText] = useState(text);
   latestTextRef.current = text;
 
   useEffect(() => {
+    if (!globalThis.PerformanceObserver?.supportedEntryTypes?.includes("longtask")) return;
+    const observer = new PerformanceObserver(list => {
+      for (const task of list.getEntries()) if (task.duration >= 50) {
+        longTaskUntilRef.current = performance.now() + 400;
+        longTaskPaceRef.current = task.duration >= 150 ? 110 : 64;
+      }
+    });
+    observer.observe({type:"longtask"});
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
     if (renderTimerRef.current !== null) return;
-    // Keep short answers responsive, then reduce parse frequency as the live
-    // document grows. The opacity animation bridges these small intervals, so
-    // long Markdown answers stay smooth without monopolising the main thread.
-    const renderIntervalMs = latestTextRef.current.length > 6_000
-      ? 110
-      : latestTextRef.current.length > 2_000
-        ? 70
-        : 40;
+    // Queueing is not parser CPU time. Back off on actual browser long tasks,
+    // not React commit delay (which can otherwise lock healthy pages at 110ms).
+    const renderIntervalMs = performance.now() < longTaskUntilRef.current
+      ? longTaskPaceRef.current
+      : latestTextRef.current.length > 80_000 ? 64 : latestTextRef.current.length > 2_000 ? 32 : 16;
     renderTimerRef.current = window.setTimeout(() => {
       renderTimerRef.current = null;
       setDisplayText(latestTextRef.current);
@@ -3764,7 +3815,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
           <span>{usage.today} · {usage.timeZone}</span>
           <strong>今日估算占用 {percentText(usage.todayQuotaPercent)}%</strong>
         </div>
-        <em>{usage.unlimitedAccountId ? `仅可使用 ${usage.unlimitedAccountId}` : usage.blocked ? "已停止发起回答" : `距离上限还剩 ${percentText(Math.max(0, usage.dailyLimitPercent - usage.todayQuotaPercent))}%`}</em>
+        <em>{usage.todayQuotaPercent > 50 ? "今日超过 50%，仅作用量预警" : "仅统计用量，不限制使用"}</em>
       </section>
 
       <div className="trackedQuotaAccounts">
@@ -3796,7 +3847,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
         )) : <div className="emptyState">当前额度周期暂无 sample-user token 记录。</div>}
       </section>
 
-      <p className="trackedQuotaFootnote">个人百分比为估算值，并非 OpenAI 提供的个人扣额；多人共用账号时无法精确拆分。{usage.unlimitedAccountId ? `sample-user 仅可使用 ${usage.unlimitedAccountId}；其他账号的旧会话只可查看。` : `每日合计达到 ${percentText(usage.dailyLimitPercent)}% 后，后端禁止 sample-user 继续发起回答，但仍可登录和查看历史。`}</p>
+      <p className="trackedQuotaFootnote">个人百分比为估算值，并非 OpenAI 提供的个人扣额；多人共用账号时无法精确拆分。此面板仅恢复用量显示与预警，不恢复账号选择或每日额度限制。</p>
       <LeaderboardWarnings errors={usage.errors} />
     </div>
   );
@@ -4225,6 +4276,8 @@ export function App() {
   const globalSearchRequestRef = useRef(0);
   const threadSearchPanelRequestRef = useRef(0);
   const pendingLiveDeltasRef = useRef(new Map<string, LiveDeltaEntry>());
+  // Transport baselines advance synchronously, independently of React commits.
+  const liveAgentBasesRef = useRef(new Map<string, LiveDeltaEntry>());
   const liveDeltaFlushTimerRef = useRef<number | null>(null);
   const liveTimelineSequenceRef = useRef(0);
   const liveTimelineOrderRef = useRef(new Map<string, number>());
@@ -4305,7 +4358,7 @@ export function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>(() => {
     const userId = getApiUserId();
     const projectId = window.localStorage.getItem(sidebarProjectSelectionKey(userId)) ?? "";
-    return projectId ? storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(userId, projectId), []).filter((thread) => !isTemporaryAskThread(thread)) : [];
+    return projectId ? visibleSidebarThreads(userId,storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(userId, projectId), [])).filter((thread) => !isTemporaryAskThread(thread)) : [];
   });
   const sidebarThreadLists = useSidebarThreadLists(selectedUserId, projects.map(project => project.id), expandedProjectIds, selectedProjectId);
   const [draggingThreadId, setDraggingThreadId] = useState<string | null>(null);
@@ -4480,6 +4533,7 @@ export function App() {
   const [editingLastPrompt, setEditingLastPrompt] = useState(false);
   const editingCommitRef = useRef(false);
   const [editingPromptDraft, setEditingPromptDraft] = useState<EditingPromptDraft | null>(null);
+  const [editingHistoryConfirmed, setEditingHistoryConfirmed] = useState(false);
   const [departingTurnId, setDepartingTurnId] = useState<string | null>(null);
   const [lastStoppedTurnForEdit, setLastStoppedTurnForEdit] = useState<{ threadId: string; turnId: string } | null>(null);
   useEffect(() => {
@@ -4508,10 +4562,21 @@ export function App() {
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>("never");
   const [socketStatus, setSocketStatus] = useState<"connecting" | "open" | "closed">("closed");
   const [liveDeltas, setLiveDeltas] = useState<Record<string, LiveDeltaEntry>>({});
+  const liveDeltaGapRecoveryAtRef = useRef(0);
   const [liveTools, setLiveTools] = useState<Record<string, LiveToolEntry>>({});
   const [turnProgress, setTurnProgress] = useState<Record<string, TurnProgress>>({});
+  const [turnRecoveries, setTurnRecoveries] = useState<Record<string, TurnRecoveryView>>({});
   const [answeredQuestionItems, setAnsweredQuestionItems] = useState<Record<string, true>>({});
   const submittingQuestionItemsRef = useRef(new Set<string>());
+  const pendingUserInputsRef = useRef(new Map<string, UserInputRequest>());
+  const questionAnswerAcksRef = useRef(new Map<string, { resolve: (accepted: boolean) => void; timer: number }>());
+  useEffect(() => () => {
+    for (const pending of questionAnswerAcksRef.current.values()) {
+      window.clearTimeout(pending.timer);
+      pending.resolve(false);
+    }
+    questionAnswerAcksRef.current.clear();
+  }, []);
   const [expandedToolBundles, setExpandedToolBundles] = useState<Record<string, true>>({});
   const [expandedToolEntries, setExpandedToolEntries] = useState<Record<string, true>>({});
   const [pendingUserMessages, setPendingUserMessages] = useState<PendingUserMessage[]>([]);
@@ -4575,6 +4640,12 @@ export function App() {
   const [dismissedExhaustedThreadId, setDismissedExhaustedThreadId] = useState<string | null>(null);
   const [quotaPopoverOpen, setQuotaPopoverOpen] = useState(false);
   const [quotaPopoverPinned, setQuotaPopoverPinned] = useState(false);
+  const quotaHoverCloseTimer = useRef<number | null>(null);
+  function cancelQuotaHoverClose() {
+    if (quotaHoverCloseTimer.current !== null) window.clearTimeout(quotaHoverCloseTimer.current);
+    quotaHoverCloseTimer.current = null;
+  }
+  useEffect(() => cancelQuotaHoverClose, []);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [leaderboard, setLeaderboard] = useState<CodexLeaderboard | null>(() => storedJson<CodexLeaderboard | null>(`codex.v2.leaderboard.${getApiUserId()}`, null));
   const [leaderboardOpen, setLeaderboardOpen] = useState(false);
@@ -4587,7 +4658,7 @@ export function App() {
   const [skills, setSkills] = useState<CodexSkill[]>([]);
   const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsPickerOpen, setSkillsPickerOpen] = useState(false);
-  const [planMode, setPlanMode] = useState(false);
+  const [planMode, setPlanMode] = useConversationPlanMode(selectedUserId, selectedThread?.id ?? `draft:${remoteDraftId}`, selectedThread?.collaborationMode);
   const [skillSearch, setSkillSearch] = useState("");
   const [selectedSkillNames, setSelectedSkillNames] = useState<string[]>([]);
   useEffect(() => {
@@ -4603,6 +4674,7 @@ export function App() {
   const [handledLocationFileTarget, setHandledLocationFileTarget] = useState(false);
   const [activeTurnsByThread, setActiveTurnsByThread] = useState<Record<string, string>>({});
   const activeTurnsByThreadRef = useRef<Record<string, string>>({});
+  const terminalTurnIdsRef = useRef(new Set<string>());
   const [interruptingTurns, setInterruptingTurns] = useState<Record<string, true>>({});
   const [queuedInterruptPrompts, setQueuedInterruptPrompts] = useState<Record<string, true>>({});
   const [queuedSubmissions, setQueuedSubmissions] = useState<QueuedSubmission[]>([]);
@@ -4667,6 +4739,15 @@ export function App() {
   const [providerFailure, setProviderFailure] = useState<ProviderFailureNotice | null>(null);
   const [providerFailureOpen, setProviderFailureOpen] = useState(false);
   const providerFailurePresence = useExitPresence(providerFailureOpen, 260);
+  useEffect(()=>{
+    if(!providerFailureOpen)return;
+    let timer:number;
+    const hide=()=>{
+      if(document.querySelector('.providerFailureNotice details[open]')){timer=window.setTimeout(hide,1500);return;}
+      setProviderFailureOpen(false);
+    };
+    timer=window.setTimeout(hide,8000);return()=>window.clearTimeout(timer);
+  },[providerFailureOpen,providerFailure]);
   const [newThreadProjectPickerOpen, setNewThreadProjectPickerOpen] = useState(false);
   const [temporaryAsk, setTemporaryAsk] = useState<TemporaryAsk | null>(null);
   const [temporaryThread, setTemporaryThread] = useState<ThreadSummary | null>(null);
@@ -4819,32 +4900,16 @@ export function App() {
     setLiveDeltas((current) => {
       const next = { ...current };
       for (const [itemId, entry] of pending) {
-        const existing = next[itemId];
-        next[itemId] = {
-          threadId: entry.threadId ?? existing?.threadId ?? null,
-          turnId: entry.turnId ?? existing?.turnId ?? null,
-          text: `${existing?.text ?? ""}${entry.text}`,
-          startedAt: existing?.startedAt ?? entry.startedAt
-        };
+        next[itemId] = entry;
       }
       return next;
     });
   }
 
-  function enqueueLiveDelta(itemId: string, entry: LiveDeltaEntry): void {
-    // Codex may resume the same agent item after one or more tool calls. Its
-    // next delta is a new timeline segment and must follow those tools instead
-    // of retaining the item's original position near the start of the turn.
-    liveTimelineSequence("agent", itemId, true);
-    const existing = pendingLiveDeltasRef.current.get(itemId);
-    pendingLiveDeltasRef.current.set(itemId, {
-      threadId: entry.threadId ?? existing?.threadId ?? null,
-      turnId: entry.turnId ?? existing?.turnId ?? null,
-      text: `${existing?.text ?? ""}${entry.text}`,
-      startedAt: existing?.startedAt ?? entry.startedAt
-    });
+  function enqueueLiveAgentSnapshot(itemId: string, entry: LiveDeltaEntry): void {
+    pendingLiveDeltasRef.current.set(itemId, entry);
     if (liveDeltaFlushTimerRef.current === null) {
-      liveDeltaFlushTimerRef.current = window.setTimeout(flushPendingLiveDeltas, 24);
+      liveDeltaFlushTimerRef.current = window.setTimeout(flushPendingLiveDeltas, 16);
     }
   }
 
@@ -5695,6 +5760,8 @@ export function App() {
     try {
       setError("");
       await deleteThread(projectId, thread.id);
+      threadSearchRequestRef.current+=1;
+      setSidebarThreadHidden(selectedUserId,projectId,thread.id,true);
       setPendingDeleteThreadId(null);
       setThreads((current) => current.filter((entry) => entry.id !== thread.id));
       threadsRef.current = threadsRef.current.filter((entry) => entry.id !== thread.id);
@@ -5722,7 +5789,7 @@ export function App() {
     setThreadContextMenu({
       thread,
       x: Math.max(8, Math.min(event.clientX, window.innerWidth - 224)),
-      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 56))
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 160))
     });
   }
 
@@ -5806,7 +5873,11 @@ export function App() {
         return { name, path, relativePath, size, mime, rawUrl, sourceFile: null, isImage: attachment.isImage };
       }));
       if (selectedThreadRef.current?.id !== thread.id) return;
-      setEditingPromptDraft({ threadId: thread.id, turnId });
+      const index = thread.turns.findIndex(turn => turn.id === turnId);
+      setEditingHistoryConfirmed(false);
+      setEditingPromptDraft({ threadId: thread.id, turnId,
+        expectedLatestTurnId: index < 0 ? turnId : thread.turns.at(-1)!.id,
+        laterTurns: index < 0 ? 0 : thread.turns.length - index - 1 });
       setPrompt(text);
       setUploadedFiles(restoredUploads);
       window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".composerRichInput")?.focus());
@@ -6429,6 +6500,14 @@ export function App() {
   }, [selectedThread?.id]);
 
   useEffect(() => {
+    void refreshTrackedQuota(false);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshTrackedQuota(false);
+    }, trackedQuotaAutoRefreshMs);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     const threadId = selectedThread?.id;
     setExhaustedAccountNotice(null);
     setDismissedExhaustedThreadId(null);
@@ -6658,7 +6737,7 @@ export function App() {
     setApprovalPolicy(selectedProject.defaultApprovalPolicy || "never");
     setLocalMessages([]);
     const cachedThreads = dedupeThreadListById(
-      storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(selectedUserId, selectedProject.id), []).filter((thread) => !isTemporaryAskThread(thread))
+      visibleSidebarThreads(selectedUserId,storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(selectedUserId, selectedProject.id), [])).filter((thread) => !isTemporaryAskThread(thread))
     );
     setThreads(cachedThreads);
     threadsRef.current = cachedThreads;
@@ -6947,7 +7026,7 @@ export function App() {
     }
     try {
       const result = await refresh;
-      if (result.error) setError(result.error);
+      if (result.error && (showDialog || force)) setError(result.error);
       return result.usage;
     } finally {
       setTrackedQuotaLoading(false);
@@ -7093,6 +7172,9 @@ export function App() {
     setError("");
     try {
       await setThreadArchived(projectId, thread.id, archived);
+      threadSearchRequestRef.current+=1;
+      setSidebarThreadHidden(selectedUserId,projectId,thread.id,archived);
+      if(archived){threadsRef.current=threadsRef.current.filter(item=>item.id!==thread.id);setThreads(threadsRef.current);}
       if (archived) {
         if (selectedThreadRef.current?.id === thread.id) setSelectedThread(null);
       } else {
@@ -7201,13 +7283,15 @@ export function App() {
       return;
     }
     const searchRequestId = ++threadSearchRequestRef.current;
+    const requestedAt=Date.now();
+    const visibilityVersion=sidebarVisibilityVersion(selectedUserId,projectId);
     const searching = Boolean(search.trim());
     if (searching) {
       setThreadSearchLoading(true);
     }
     try {
       const response = await listThreads(projectId, search);
-      if (searchRequestId !== threadSearchRequestRef.current) {
+      if (searchRequestId !== threadSearchRequestRef.current || projectId!==selectedProjectIdRef.current || visibilityVersion!==sidebarVisibilityVersion(selectedUserId,projectId)) {
         return;
       }
       if (!Array.isArray(response?.data)) throw new Error("会话列表响应不完整，已保留当前记录，请稍后刷新重试。");
@@ -7220,7 +7304,7 @@ export function App() {
       for (const thread of leakedTemporaryThreads) {
         void deleteThread(projectId, thread.id);
       }
-      const visibleThreads = dedupeThreadListById(response.data
+      const visibleThreads = dedupeThreadListById(reconcileSidebarVisibility(selectedUserId,projectId,response.data,response.hiddenThreadIds,requestedAt)
         .filter((thread) => !temporaryThreadIdsRef.current.has(thread.id) && !isTemporaryAskThread(thread))
         .map((thread) => sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, thread, modelProfiles))));
       setThreads(visibleThreads);
@@ -7558,6 +7642,10 @@ export function App() {
     const previousEffort = thread.configuredReasoningEffort ?? selectedProject?.defaultReasoningEffort ?? profile.effort;
     setError("");
     setSavingThreadModel(true);
+    if(turnRecoveries[`${selectedUserId}:${thread.id}`]?.job?.status==='waiting') {
+      codexSocket.send({type:'turn.retry.cancel',threadId:thread.id,requestId:`recovery-model-${requestToken()}`});
+      setTurnRecoveries(current=>({...current,[`${selectedUserId}:${thread.id}`]:{...current[`${selectedUserId}:${thread.id}`],job:null}}));
+    }
     if (isCatalogProfile) {
       setNewThreadModelProfileId(profile.id);
       window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, projectId), profile.id);
@@ -7924,6 +8012,7 @@ export function App() {
       const response = await previewProjectFile(projectId, filePath);
       if (requestId !== filePreviewRequestIdRef.current) return;
       setFilePreview(response.data);
+      setRunnablePreview(defaultHtmlPreview(response.data));
       if (response.data.kind === "image" || response.data.kind === "video") {
         const blob = await fetchProjectFileBlob(projectId, response.data.relativePath);
         if (requestId !== filePreviewRequestIdRef.current) return;
@@ -8251,6 +8340,7 @@ export function App() {
   }
 
   async function sendPreviewFileToLocal() {
+    const transferThreadId = selectedThreadRef.current?.id ?? null;
     const projectId = imageGallery?.projectId ?? selectedProject?.id;
     const filePath = activeImageTarget || filePreview?.relativePath;
     if (!projectId || !filePath) {
@@ -8265,7 +8355,9 @@ export function App() {
 - 源文件：${response.data.sourcePath}
 - 访问设备：${response.data.sshUser}@${response.data.sshHost}:${response.data.remoteFile}`,
         "Codex Web · file transfer",
-        "tool"
+        "tool",
+        undefined,
+        { placement: "conversation", threadId: transferThreadId }
       );
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -8442,7 +8534,9 @@ export function App() {
 - [${exported.name}](${exported.relativePath})
 - 4090-left 临时中转路径：${exported.path}${localLine}`,
         "Codex Web · export",
-        "tool"
+        "tool",
+        undefined,
+        { placement: "conversation", threadId: selectedThread.id }
       );
       void openFilePreview(exported.relativePath);
     } catch (caught) {
@@ -8537,12 +8631,15 @@ export function App() {
         setPrompt("");
         return true;
       }
+      const transferThreadId = selectedThreadRef.current?.id ?? null;
       try {
         const response = await sendProjectFileToLocal(selectedProject.id, argument);
         addLocalMessage(
           `已通过 SSH 发送到当前设备：\n- 源文件：${response.data.sourcePath}\n- 访问设备：${response.data.sshUser}@${response.data.sshHost}:${response.data.remoteFile}`,
           "Codex Web · file transfer",
-          "tool"
+          "tool",
+          undefined,
+          { placement: "conversation", threadId: transferThreadId }
         );
       } catch (caught) {
         setError(caught instanceof Error ? caught.message : String(caught));
@@ -8733,6 +8830,7 @@ export function App() {
 
   async function sendPrompt(mode: "queue" | "steer" = "queue", questionAnswer?: string, predictedPrompt?: string): Promise<boolean> {
     const isQuestionAnswer = questionAnswer !== undefined;
+    const isEditedPrompt = Boolean(editingPromptDraft);
     const promptText = (questionAnswer ?? predictedPrompt ?? prompt).trim();
     if ((!isQuestionAnswer && uploadingFiles) || editingLastPrompt || editingCommitRef.current || !selectedProject || (!promptText && (isQuestionAnswer || !uploadedFiles.length))) {
       return false;
@@ -8752,7 +8850,15 @@ export function App() {
       setError("计划模式请等当前轮次结束后发送；如需排队或立即纠偏，请先关闭计划模式。");
       return false;
     }
+    if (!planMode && selectedActiveTurnId && selectedThread?.collaborationMode === "plan" && !isQuestionAnswer) {
+      setError("当前轮次仍在计划模式中。请停止或等本轮结束，再发送新消息以切换到普通模式。");
+      return false;
+    }
     if (editingPromptDraft) {
+      if (!codexSocket.isOpen) {
+        setError("连接尚未恢复，未撤回原提问；草稿和附件仍保留，请连通后再发送。");
+        return false;
+      }
       if (selectedThread?.id !== editingPromptDraft.threadId || selectedActiveTurnId) {
         setError("原会话仍在运行或已切换，请停止回答并重新打开会话后再发送。");
         return false;
@@ -8760,13 +8866,30 @@ export function App() {
       editingCommitRef.current = true;
       setEditingLastPrompt(true);
       try {
-        await editLatestThreadTurn(selectedProject.id, selectedThread.id, editingPromptDraft.turnId);
+        if (editingPromptDraft.laterTurns > 0 && !editingHistoryConfirmed) {
+          setError("请先在编辑提示中确认撤回后续问答；原记录未改动。");
+          return false;
+        }
+        await editLatestThreadTurn(selectedProject.id, selectedThread.id, editingPromptDraft.turnId, {
+          expectedLatestTurnId: editingPromptDraft.expectedLatestTurnId, allowHistoryRewrite: editingPromptDraft.laterTurns > 0
+        });
+        // Invalidate reads that began before the committed rewind. Otherwise
+        // a late history page can resurrect the removed question/answer.
+        threadViewTokenRef.current += 1;
+        olderHistoryLoadingRef.current = false;
+        olderHistoryRearmPendingRef.current = false;
+        olderHistoryRearmTopRef.current = null;
+        setLoadingOlderHistory(false);
+        conversationVirtualRef.current?.cancelScroll();
+        manualMessageScrollLockRef.current = false;
         setDepartingTurnId(editingPromptDraft.turnId);
         await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
-        setPendingUserMessages((current) => current.filter((entry) => entry.turnId !== editingPromptDraft.turnId));
-        setLiveDeltas((current) => Object.fromEntries(Object.entries(current).filter(([, entry]) => entry.turnId !== editingPromptDraft.turnId)));
-        setLiveTools((current) => Object.fromEntries(Object.entries(current).filter(([, entry]) => entry.turnId !== editingPromptDraft.turnId)));
-        const revertedThread = { ...selectedThread, turns: selectedThread.turns.filter((turn) => turn.id !== editingPromptDraft.turnId) };
+        const index = selectedThread.turns.findIndex(turn => turn.id === editingPromptDraft.turnId);
+        const removed = new Set(index < 0 ? [editingPromptDraft.turnId] : selectedThread.turns.slice(index).map(turn => turn.id));
+        setPendingUserMessages((current) => current.filter((entry) => !removed.has(entry.turnId ?? "")));
+        setLiveDeltas((current) => Object.fromEntries(Object.entries(current).filter(([, entry]) => !removed.has(entry.turnId ?? ""))));
+        setLiveTools((current) => Object.fromEntries(Object.entries(current).filter(([, entry]) => !removed.has(entry.turnId ?? ""))));
+        const revertedThread = { ...selectedThread, turns: selectedThread.turns.filter((turn) => !removed.has(turn.id)) };
         selectedThreadRef.current = revertedThread;
         setSelectedThread(revertedThread);
         threadPageCacheRef.current.delete(`${selectedProject.id}:${selectedThread.id}`);
@@ -8791,8 +8914,10 @@ export function App() {
     if (selectedThread && selectedActiveTurnId && mode === "queue") {
       const requestId = `queue-add-${requestToken()}`;
       try {
+        const accepted = isQuestionAnswer ? waitForQuestionAnswerAck(requestId) : null;
         codexSocket.send({
           type: "turn.queue.add",
+          serviceTier: resolveServiceTier(codexFastModeEnabled),
           requestId,
           projectId: selectedProject.id,
           threadId: selectedThread.id,
@@ -8810,8 +8935,9 @@ export function App() {
           setSelectedSkillNames([]);
           setDocumentReference(null);
         }
-        return true;
+        return accepted ? await accepted : true;
       } catch (caught) {
+        finishQuestionAnswerAck(requestId, false);
         setError(caught instanceof Error ? caught.message : String(caught));
         return false;
       }
@@ -8828,7 +8954,8 @@ export function App() {
       model: selectedModelProfile.model,
       reasoningEffort: selectedModelProfile.effort,
       sentPromptText,
-      visibleText
+      visibleText,
+      collaborationMode: planMode ? "plan" : "default"
     });
     const payload = selectedThread && selectedActiveTurnId && mode === "steer"
       ? {
@@ -8879,6 +9006,7 @@ export function App() {
           ...(threadContextFeatureEnabled && newThreadContextPin.trim() ? { contextPin: newThreadContextPin.trim() } : {})
         };
     try {
+      const accepted = isQuestionAnswer || isEditedPrompt ? waitForQuestionAnswerAck(requestId, isEditedPrompt ? "尚未确认修改后的提问已被接收，草稿和附件仍保留，请核对会话后重试。" : undefined) : null;
       codexSocket.send(payload);
       if (payload.type !== "turn.steer") {
         setTopAnchoredPrompt({ requestId, threadId: selectedThread?.id ?? null, turnId: null, viewToken: requestViewToken });
@@ -8901,14 +9029,26 @@ export function App() {
         }
       ]);
       releasePendingPromptBottomHold(requestId, keepAtBottomUntil);
+      if (isEditedPrompt && accepted) {
+        setEditingLastPrompt(true);
+        try { if (!await accepted) return false; }
+        finally { setEditingLastPrompt(false); }
+        if (selectedThreadRef.current?.id !== selectedThread?.id) return true;
+        setPrompt(current => current.trim() === promptText ? "" : current);
+        setUploadedFiles(current => current.filter(file => !promptUploads.includes(file)));
+        setSelectedSkillNames(current => current.filter(name => !skillNames.includes(name)));
+        setDocumentReference(null);
+        return true;
+      }
       if (!isQuestionAnswer) {
         setPrompt("");
         setUploadedFiles([]);
         setSelectedSkillNames([]);
         setDocumentReference(null);
       }
-      return true;
+      return accepted ? await accepted : true;
     } catch (caught) {
+      finishQuestionAnswerAck(requestId, false);
       promptRequestContextsRef.current.delete(requestId);
       setError(caught instanceof Error ? caught.message : String(caught));
       return false;
@@ -8918,25 +9058,97 @@ export function App() {
   function questionIsAnswered(itemId: string, turnId?: string, visibleItems?: ThreadItem[]): boolean {
     const threadId = selectedThread?.id;
     if (!threadId) return false;
+    if ([...pendingUserInputsRef.current.values()].some(request => request.params.threadId === threadId && request.params.itemId === itemId)) return false;
     if (answeredQuestionItems[`${threadId}:${itemId}`]) return true;
+    const liveItem = liveTools[itemId];
+    if (liveItem?.threadId === threadId && synchronousQuestionHasResult(liveItem)) return true;
     if (visibleItems && questionHasLaterUserMessage(visibleItems, itemId)) return true;
     const turns = selectedThread.turns;
     const turnIndex = turns.findIndex((turn) => turn.id === turnId || (turn.items ?? []).some((item) => item.id === itemId));
     if (turnIndex < 0) return false;
+    if (synchronousQuestionHasResult((turns[turnIndex].items ?? []).find(item => item.id === itemId) ?? {})) return true;
     if (questionHasLaterUserMessage(turns[turnIndex].items ?? [], itemId)) return true;
     return turns.slice(turnIndex + 1).some((turn) => turnHasUserItem(turn) || Boolean(turnUserText(turn)));
   }
 
-  async function chooseToolQuestion(itemId: string, answer: string): Promise<boolean> {
+  function waitForQuestionAnswerAck(requestId: string, timeoutMessage = "尚未确认答案已被接收，请刷新会话后重试。"): Promise<boolean> {
+    return new Promise(resolve => {
+      const timer = window.setTimeout(() => {
+        questionAnswerAcksRef.current.delete(requestId);
+        setError(timeoutMessage);
+        resolve(false);
+      }, 30_000);
+      questionAnswerAcksRef.current.set(requestId, { resolve, timer });
+    });
+  }
+
+  function finishQuestionAnswerAck(requestId: string, accepted: boolean): void {
+    const pending = questionAnswerAcksRef.current.get(requestId);
+    if (!pending) return;
+    window.clearTimeout(pending.timer);
+    questionAnswerAcksRef.current.delete(requestId);
+    pending.resolve(accepted);
+  }
+
+  function receiveUserInputRequest(value: unknown): void {
+    const request = readUserInputRequest(value);
+    if (!request) return;
+    pendingUserInputsRef.current.set(String(request.id), request);
+    const { threadId, turnId, itemId } = request.params;
+    setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "waiting_user_input", silentForMs: 0 }, activeTurnsByThreadRef.current[threadId]));
+    setAnsweredQuestionItems(current => {
+      const next = { ...current };
+      delete next[`${threadId}:${itemId}`];
+      return next;
+    });
+    const now = new Date().toISOString();
+    setLiveTools(current => ({ ...current, [itemId]: {
+      ...current[itemId], itemId, threadId, turnId, tool: "request_user_input", input: JSON.stringify({ questions: request.params.questions }),
+      output: "", completed: false, startedAt: current[itemId]?.startedAt ?? now, updatedAt: now
+    } }));
+  }
+
+  function resolveUserInputRequest(requestId: unknown): void {
+    const request = pendingUserInputsRef.current.get(String(requestId));
+    if (!request) return;
+    pendingUserInputsRef.current.delete(String(requestId));
+    const { threadId, turnId, itemId } = request.params;
+    setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "active", silentForMs: 0 }));
+    setAnsweredQuestionItems(current => ({ ...current, [`${threadId}:${itemId}`]: true }));
+    setLiveTools(current => current[itemId] ? { ...current, [itemId]: { ...current[itemId], completed: true } } : current);
+  }
+
+  async function chooseToolQuestion(itemId: string, answer: string, answers: string[]): Promise<boolean> {
     const threadId = selectedThread?.id;
     if (!threadId || !selectedProject || !answer.trim()) return false;
     const key = `${threadId}:${itemId}`;
     if (submittingQuestionItemsRef.current.has(key) || questionIsAnswered(itemId)) return false;
     submittingQuestionItemsRef.current.add(key);
     try {
+      const request = [...pendingUserInputsRef.current.values()].find(request => request.params.threadId === threadId && request.params.itemId === itemId);
+      if (request) {
+        const result = userInputAnswerResult(request, answers);
+        const requestId = `question-answer-${requestToken()}`;
+        const accepted = waitForQuestionAnswerAck(requestId);
+        try {
+          codexSocket.send({ type: "userInput.respond", requestId, codexRequestId: request.id, threadId, result });
+        } catch (caught) {
+          finishQuestionAnswerAck(requestId, false);
+          throw caught;
+        }
+        return await accepted;
+      }
+      const item = liveTools[itemId] ?? selectedThread?.turns.flatMap(turn => turn.items ?? []).find(item => item.id === itemId);
+      if (item && typeof item.tool === "string" && /(?:^|\.)request_user_input$/.test(item.tool)) {
+        setError("该提问的待回答请求尚未同步，请刷新会话后再回答。");
+        return false;
+      }
       const accepted = await sendPrompt(selectedActiveTurnId ? "steer" : "queue", answer);
       if (accepted) setAnsweredQuestionItems((current) => ({ ...current, [key]: true }));
       return accepted;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      return false;
     } finally {
       submittingQuestionItemsRef.current.delete(key);
     }
@@ -8964,7 +9176,8 @@ export function App() {
       model: selectedModelProfile.model,
       reasoningEffort: selectedModelProfile.effort,
       sentPromptText: continuation.sentPromptText,
-      visibleText: continuation.visibleText
+      visibleText: continuation.visibleText,
+      collaborationMode: planMode ? "plan" : "default"
     });
     try {
       codexSocket.send({
@@ -9183,6 +9396,7 @@ export function App() {
     // A completed turn is removed from the server's live snapshot before its
     // JSONL history is always readable. Preserve the temporary panel's live
     // copy until promoteTemporaryTurn confirms the persisted replacement.
+    liveAgentBasesRef.current = new Map(Object.entries(snapshotDeltas));
     setLiveDeltas((current) => {
       const next = { ...snapshotDeltas };
       const temporaryThreadId = temporaryAskRef.current?.threadId;
@@ -9232,7 +9446,8 @@ export function App() {
       entry.threadId === thread.id && entry.keepAtBottomUntil > now
     ));
     const isPending = hasPendingForThread || thread.status === "starting";
-    if (!isRunning && !isPending) {
+    const wasRunning = Boolean(activeTurnsByThreadRef.current[thread.id]) || thread.turns.some(turn => isRunningStatus(turn.status));
+    if (!isRunning && !isPending && !wasRunning) {
       return;
     }
     const localActiveTurn = activeTurnsByThread[thread.id];
@@ -9256,6 +9471,11 @@ export function App() {
   }
 
   function handleSocketMessage(message: SocketMessage) {
+    if (message.type === "turn.recovery") {
+      const state = message.data as TurnRecoveryView | undefined;
+      if (state?.threadId) setTurnRecoveries(current => ({ ...current, [`${selectedUserId}:${state.threadId}`]: state }));
+      return;
+    }
     if (message.type === "turn.progress") {
       const progress = readTurnProgress(message.data);
       if (progress) setTurnProgress(current => updateTurnProgress(current, selectedUserId, progress, activeTurnsByThreadRef.current[progress.threadId]));
@@ -9269,7 +9489,9 @@ export function App() {
       return;
     }
     if (message.type === "hello") {
-      const data = message.data as { liveState?: LiveStateSnapshot; turnProgress?: unknown[]; pendingServerRequests?: Array<{ id: string | number; method: string; params: Record<string, unknown> }> } | undefined;
+      const data = message.data as { liveState?: LiveStateSnapshot; turnProgress?: unknown[]; turnRecoveries?: TurnRecoveryView[]; pendingServerRequests?: Array<{ id: string | number; method: string; params: Record<string, unknown> }> } | undefined;
+      setTurnRecoveries(current => ({ ...Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${selectedUserId}:`))),
+        ...Object.fromEntries((data?.turnRecoveries ?? []).map(state => [`${selectedUserId}:${state.threadId}`, state])) }));
       hydrateLiveState(data?.liveState);
       refreshSelectedThreadFromLiveState(data?.liveState);
       setTurnProgress(current => {
@@ -9283,6 +9505,8 @@ export function App() {
       setPendingApprovals(Object.fromEntries((data?.pendingServerRequests ?? [])
         .filter((request) => request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")
         .map((request) => [String(request.id), request])));
+      pendingUserInputsRef.current.clear();
+      for (const request of data?.pendingServerRequests ?? []) receiveUserInputRequest(request);
       return;
     }
 
@@ -9310,6 +9534,7 @@ export function App() {
           id: request.id!, method: request.method!, params: request.params ?? {}
         } }));
       }
+      receiveUserInputRequest(request);
       return;
     }
 
@@ -9336,25 +9561,23 @@ export function App() {
       return;
     }
 
-    if (message.type === "live.agent") {
-      const item = message.data as LiveAgentMessage | undefined;
+    if (message.type === "live.agent" || message.type === "live.agent.delta") {
+      const item = message.data as (AgentWireUpdate & {itemId:string}) | undefined;
       if (item?.itemId) {
         markLiveEvent(item.threadId);
         if (typeof item.sequence === "number") {
           liveTimelineOrderRef.current.set(`agent:${item.itemId}`, item.sequence);
           liveTimelineSequenceRef.current = Math.max(liveTimelineSequenceRef.current, item.sequence);
         }
-        setLiveDeltas((current) => ({
-          ...current,
-          [item.itemId]: {
-            threadId: item.threadId,
-            turnId: item.turnId,
-            text: item.text,
-            startedAt: item.startedAt,
-            sequence: item.sequence,
-            sourceItemId: item.sourceItemId
-          }
-        }));
+        const next = applyLiveAgentUpdate(liveAgentBasesRef.current.get(item.itemId), item);
+        if (next) {
+          liveAgentBasesRef.current.set(item.itemId,next);
+          enqueueLiveAgentSnapshot(item.itemId, next);
+        }
+        else if (Date.now() - liveDeltaGapRecoveryAtRef.current > 1000 && codexSocket.isOpen) {
+          liveDeltaGapRecoveryAtRef.current = Date.now();
+          codexSocket.send({type:"live.state",requestId:`live-gap-${requestToken()}`});
+        }
       }
       return;
     }
@@ -9368,6 +9591,11 @@ export function App() {
     }
 
     if (message.type === "ack") {
+      if (message.requestId) finishQuestionAnswerAck(message.requestId, message.ok === true);
+      if (message.requestId?.startsWith("question-answer-")) {
+        if (!message.ok) setError(`回答发送失败：${message.error ?? "请重试"}`);
+        return;
+      }
       // The embedded terminal owns its errors; they must not become a chat banner.
       if (message.requestId?.startsWith("term-")) return;
       // The thread-scoped Goal controller owns its confirmation and errors.
@@ -9628,6 +9856,7 @@ export function App() {
         }
         const normalizedThread = {
           ...newThread,
+          collaborationMode: requestContext?.collaborationMode ?? newThread.collaborationMode,
           pinned: false,
           configuredModel: requestContext?.model ?? newThread.configuredModel ?? null,
           configuredReasoningEffort: requestContext?.reasoningEffort ?? newThread.configuredReasoningEffort ?? null,
@@ -9674,8 +9903,10 @@ export function App() {
             : entry
           ));
         }
-        activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [promptThreadId]: acknowledgedTurnId };
-        setActiveTurnsByThread((current) => ({ ...current, [promptThreadId]: acknowledgedTurnId }));
+        if (!terminalTurnIdsRef.current.has(acknowledgedTurnId)) {
+          activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [promptThreadId]: acknowledgedTurnId };
+          setActiveTurnsByThread((current) => ({ ...current, [promptThreadId]: acknowledgedTurnId }));
+        }
         if (message.requestId && interruptQueuedForPrompt) {
           clearQueuedInterrupt(message.requestId);
           interruptCurrentTurn(promptThreadId, acknowledgedTurnId, requestContext?.projectId ?? selectedProjectIdRef.current);
@@ -9707,6 +9938,16 @@ export function App() {
 
     if (message.type === "codex.notification") {
       const notification = message.data as CodexNotification;
+      if (notification.method === "serverRequest/resolved") {
+        const requestId = isRecord(notification.params) ? notification.params.requestId : undefined;
+        resolveUserInputRequest(requestId);
+        setPendingApprovals(current => {
+          const next = { ...current };
+          delete next[String(requestId)];
+          return next;
+        });
+        return;
+      }
       const params = notification.params ?? {};
       if (notification.method === "turn/diff/updated") {
         const turnId = notificationTurnId(params);
@@ -9784,11 +10025,16 @@ export function App() {
         }
       }
       if (notification.method === "turn/completed") {
+        for (const request of pendingUserInputsRef.current.values()) {
+          if (request.params.threadId === notificationThreadId(params) && request.params.turnId === notificationTurnId(params)) resolveUserInputRequest(request.id);
+        }
         const turnId = notificationTurnId(params);
         const threadId = notificationThreadId(params) ?? (turnId ? turnThreadIdsRef.current.get(turnId) ?? null : null);
         if (threadId && turnId) setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "completed", silentForMs: 0 }));
         const completedTurn = params.turn && typeof params.turn === "object" ? params.turn as Record<string, unknown> : {};
         const completedStatus = typeof completedTurn.status === "string" ? completedTurn.status : "completed";
+        if (turnId) rememberTerminalTurn(terminalTurnIdsRef.current, turnId);
+        if (threadId) activeTurnsByThreadRef.current = finishActiveTurn(activeTurnsByThreadRef.current, threadId, turnId);
         if (threadId && selectedThreadRef.current?.id === threadId && selectedProjectIdRef.current) {
           const projectId = selectedProjectIdRef.current;
           setWritingRevisions(current => ({ ...current, [projectId]: (current[projectId] ?? 0) + 1 }));
@@ -9800,6 +10046,9 @@ export function App() {
             setProviderFailure(providerNotice);
             setProviderFailureOpen(true);
             setError("");
+          } else {
+            const nativeError = completedTurn.error as { message?: unknown } | null;
+            setError(`本轮回答失败，已停止：${typeof nativeError?.message === "string" ? nativeError.message : "上游未能完成请求，请稍后重试。"}`);
           }
         }
         if (completedStatus === "completed" && threadId && selectedThreadRef.current?.id === threadId) {
@@ -9808,6 +10057,7 @@ export function App() {
         }
         if (turnId) turnModelsRef.current.delete(turnId);
         flushPendingLiveDeltas();
+        for (const [itemId,item] of liveAgentBasesRef.current) if (item.turnId === turnId) liveAgentBasesRef.current.delete(itemId);
         markLiveEvent(threadId);
         if (!threadId) {
           if (turnId) {
@@ -9832,14 +10082,7 @@ export function App() {
         if (turnId) {
           turnThreadIdsRef.current.delete(turnId);
         }
-        setActiveTurnsByThread((current) => {
-          if (!current[threadId]) {
-            return current;
-          }
-          const next = { ...current };
-          delete next[threadId];
-          return next;
-        });
+        setActiveTurnsByThread((current) => finishActiveTurn(current, threadId, turnId));
         const clearCompletedLiveItems = () => {
           setLiveDeltas((current) => Object.fromEntries(
             Object.entries(current).filter(([, entry]) => entry.threadId !== threadId && (!turnId || entry.turnId !== turnId))
@@ -9888,7 +10131,7 @@ export function App() {
         }
         const threadProjectId = threadProjectIdsRef.current.get(threadId) ?? selectedProjectIdRef.current;
         const isTemporaryThread = temporaryAskRef.current?.threadId === threadId;
-        if (!wasInterrupted && threadProjectId && !isTemporaryThread) {
+        if (!wasInterrupted && completedStatus === "completed" && threadProjectId && !isTemporaryThread) {
           scheduleAutoSendGeneratedFiles(threadId, threadProjectId, turnId);
         }
         if (isTemporaryThread && !wasInterrupted) {
@@ -9968,11 +10211,11 @@ export function App() {
     const collaborationItem = { ...liveToolItem, aggregatedOutput: entry.output, completed: entry.completed };
     if (parseAgentOperation(collaborationItem)) return <article className="messageItem kind-tool subagentMessage" key={entry.id}><SubagentToolCard item={collaborationItem} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} /></article>;
     const liveQuestions = parseQuestionTool(safeText(entry.tool), entry.input);
-    if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} onChoose={(answer) => chooseToolQuestion(entry.id, answer)} />;
+    if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} />;
     return (
       <article className="messageItem kind-tool type-toolCall live" key={entry.id}>
         <div className="messageMeta">{entry.completed ? "工具输出" : "调用工具"} · {entry.tool}</div>
-        {liveQuestions ? <ToolQuestionCard questions={liveQuestions} onChoose={(answer) => chooseToolQuestion(entry.id, answer)} /> : entry.input ? <pre>{safeText(entry.input)}</pre> : null}
+        {liveQuestions ? <ToolQuestionCard questions={liveQuestions} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} /> : entry.input ? <pre>{safeText(entry.input)}</pre> : null}
         <MessageImagePreviews item={liveToolItem} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
         {!liveQuestions && entry.output ? <pre className="outputBlock">{displayOutputText(entry.output)}</pre> : entry.completed || liveQuestions ? null : <div className="messageBody">正在执行...</div>}
       </article>
@@ -10153,7 +10396,7 @@ export function App() {
       >
         <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
         <ToolReveal open={expanded}>
-        {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer) => chooseToolQuestion(call.id, answer)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
+        {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer, answers) => chooseToolQuestion(call.id, answer, answers)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
         <MessageImagePreviews item={call} projectId={contextProjectId} onOpenFileLink={openFilePreview} />
         {hasChanges ? <button className="openDiffReviewButton" type="button" onClick={(event) => { event.stopPropagation(); openDiffReview(call.changes ?? [], "本轮文件变更", contextTurnId, call.id, contextThreadId); }}><FileText size={14} /> 查看变更 · {call.changes?.length ?? 0} 个文件</button> : null}
         {!agentOperation && (!questions || historyContext?.readOnly) && (outputText || deferredOutputItem) ? <DeferredToolOutput text={displayOutputText(outputText)} deferred={Boolean(deferredOutputItem)} threadId={contextThreadId} itemId={String(deferredOutputItem?.outputItemId ?? deferredOutputItem?.id ?? call.id)} projectId={contextProjectId} loadOutput={historyContext?.loadOutput} /> : null}
@@ -10321,10 +10564,10 @@ export function App() {
             >
               <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
             </button>
-            {turn.id === displayedConversationTurns.at(-1)?.id && (turn.items ?? []).filter((entry) => itemKind(entry) === "user").length < 2 && (!selectedActiveTurnId || lastStoppedTurnForEdit?.turnId === turn.id) && (["interrupted", "failed"].some((status) => normalizedToken(turn.status).includes(status)) || (lastStoppedTurnForEdit?.threadId === selectedThread?.id && lastStoppedTurnForEdit?.turnId === turn.id)) ? <button
+            {(turn.items ?? []).filter((entry) => itemKind(entry) === "user").length < 2 && (!selectedActiveTurnId || (turn.id === displayedConversationTurns.at(-1)?.id && lastStoppedTurnForEdit?.threadId === selectedThread?.id && lastStoppedTurnForEdit?.turnId === turn.id)) && (Boolean(turn.completedAt) || ["completed", "succeeded", "interrupted", "failed", "cancelled", "canceled", "aborted"].some((status) => normalizedToken(turn.status).includes(status)) || (lastStoppedTurnForEdit?.threadId === selectedThread?.id && lastStoppedTurnForEdit?.turnId === turn.id)) ? <button
               type="button"
-              title="编辑最后一条提问"
-              aria-label="编辑最后一条提问"
+              title={turn.id === displayedConversationTurns.at(-1)?.id ? "编辑最后一条提问" : "编辑此条提问（发送后撤回后续问答）"}
+              aria-label="编辑提问"
               disabled={editingLastPrompt || Boolean(editingPromptDraft)}
               onClick={() => void editLatestPrompt(turn.id, userVisibleText, rawItemText)}
             >
@@ -10570,7 +10813,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       && !interruptingTurns[turnId]
       && isRunningStatus(turn.status);
   }
-  const currentPendingTurnStart = visiblePendingUserMessages[visiblePendingUserMessages.length - 1] ?? null;
+  const currentPendingTurnStart = pendingTurnStart(visiblePendingUserMessages);
   const selectedActiveTurnId = getRunningTurnIdForThread(selectedThread);
   useEffect(() => {
     if (!selectedThread || !selectedActiveTurnId) return;
@@ -10598,6 +10841,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     } as Turn];
   }, [selectedActiveTurnId, selectedSnapshotTurnId, selectedThread]);
   const latestDisplayedTurn = displayedConversationTurns.at(-1);
+  const departingTurnIndex = displayedConversationTurns.findIndex(turn => turn.id === departingTurnId);
+  const departingTurnIds = new Set(departingTurnIndex < 0 ? [] : displayedConversationTurns.slice(departingTurnIndex).map(turn => turn.id));
   const { turnId: topAnchoredTurnId, liveTail: topAnchoredLiveTail } = resolvePromptTopAnchor(
     topAnchoredPrompt,
     threadViewTokenRef.current,
@@ -10654,6 +10899,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     const currentTurnIds = new Set(displayedConversationTurns.map((turn) => turn.id));
 
     for (const entry of localMessages) {
+      if (!localMessageBelongsToThread(entry, currentThreadId)) continue;
       if (entry.placement !== "conversation") {
         tail.push(entry);
         continue;
@@ -11090,7 +11336,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         )}
       />
 
-      {threadContextMenu ? (
+      {threadContextMenu ? createPortal(
         <div
           className="threadContextMenu"
           role="menu"
@@ -11102,6 +11348,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           <button type="button" role="menuitem" onClick={() => void copyThreadSessionId(threadContextMenu.thread)}>
             <Copy size={15} />
             复制会话 ID
+            <AccountUpdateIndicator key={`threads:${selectedUserId}`} userId={selectedUserId} menuOpen={false} target="threads" dismissOnRefresh />
           </button>
           <button type="button" role="menuitem" onClick={() => beginThreadRename(threadContextMenu.thread)}>
             <PencilLine size={15} />
@@ -11114,7 +11361,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           <button type="button" role="menuitem" onClick={() => void changeThreadArchive(threadContextMenu.thread, true)}>
             <Archive size={15} />归档会话
           </button>
-        </div>
+        </div>, document.body
       ) : null}
 
       {newThreadProjectPickerPresence.present ? <div className={`workspaceFeatureScrim${newThreadProjectPickerPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={newThreadProjectPickerPresence.closing} inert={newThreadProjectPickerPresence.closing} onMouseDown={(event) => { if (event.target === event.currentTarget) setNewThreadProjectPickerOpen(false); }}>
@@ -11665,7 +11912,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <input
                     value={localSendSettings.sshUser}
                     onChange={(event) => updateLocalSendSetting("sshUser", event.target.value)}
-                    placeholder="例如 teammate"
+                    placeholder="例如 wxr"
                   />
                 </label>
                 <label>
@@ -11758,26 +12005,39 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <p>{selectedProject?.rootPath ?? projectRoot}</p>
             {selectedProject ? <span className="recordMapping">记录来源：cwd 匹配该目录的 Codex threads</span> : null}
           </div>
-          <div className="controls">
+          <div className="controls trackedQuotaVisible">
             <button className="iconTextButton v2SettingsBridge v2MovedIntoPlus" type="button" onClick={() => void openSettingsDialog()} title="设置当前访问设备 SSH 发送路径" aria-hidden="true" tabIndex={-1}>
               <Settings2 size={17} />
               设置
             </button>
+            <button className={`trackedQuotaButton${trackedQuotaUsage && trackedQuotaUsage.todayQuotaPercent > 50 ? " warning" : ""}`}
+              type="button" onClick={() => void refreshTrackedQuota(true)} title="查看 sample-user 今日估算用量和历史统计（仅显示，不限制使用）" aria-label="sample-user 额度占用">
+              sample-user {trackedQuotaUsage ? `${percentText(trackedQuotaUsage.todayQuotaPercent)}%` : "--"}
+            </button>
             <div
               className="quotaPopoverAnchor"
-              onMouseEnter={() => {
-                setQuotaPopoverOpen(true);
-                void refreshQuota(false, { background: true });
-              }}
+              // Only the trigger may open the panel. Exit animations/inert can
+              // change descendant hit testing and generate a parent re-entry.
+              onMouseEnter={cancelQuotaHoverClose}
               onMouseLeave={() => {
+                cancelQuotaHoverClose();
                 if (quotaPopoverPinned) return;
-                setQuotaPopoverOpen(false);
+                quotaHoverCloseTimer.current = window.setTimeout(() => {
+                  quotaHoverCloseTimer.current = null;
+                  setQuotaPopoverOpen(false);
+                }, 140);
               }}
             >
               <button
                 className="quotaButton v2QuotaTopButton"
                 type="button"
+                onMouseEnter={() => {
+                  cancelQuotaHoverClose();
+                  setQuotaPopoverOpen(true);
+                  void refreshQuota(false, { background: true });
+                }}
                 onClick={() => {
+                  cancelQuotaHoverClose();
                   setQuotaPopoverPinned((current) => {
                     const next = !current;
                     setQuotaPopoverOpen(next);
@@ -11839,21 +12099,17 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         <BranchToolArchive key={`${selectedUserId}:${selectedThread?.id}`} userId={selectedUserId} projectId={selectedProject?.id} threadId={selectedThread?.id}/>
         </div>
 
-        {providerFailurePresence.present && providerFailure ? (
+        {providerFailurePresence.present && providerFailure && !isFreshRecoveryNotice(selectedThread?turnRecoveries[`${selectedUserId}:${selectedThread.id}`]:undefined) ? (
           <div className={`providerFailureNotice${providerFailurePresence.closing ? " uiClosing" : ""}`}
             role="alertdialog" aria-label="模型请求失败" aria-hidden={providerFailurePresence.closing} inert={providerFailurePresence.closing}>
-            <strong>{providerFailure.kind === "limit" ? "供应商额度或请求频率受限" : "模型本轮请求失败"}</strong>
-            <p>{providerFailure.kind === "limit"
-              ? `${providerFailure.model} 返回了额度或限流错误，无法完成本轮回答。`
-              : providerFailure.kind === "stream"
-              ? `${providerFailure.model} 的响应流中断，本轮回答未完成。现有消息仍保留；这不等于账号登录失效。`
-              : `${providerFailure.model} 没有完成本轮回答；这不一定是额度问题。`}</p>
+            <strong>{providerFailureCopy(providerFailure).title}</strong>
+            <p>{providerFailureCopy(providerFailure).message}</p>
+            {providerFailure.detail ? <details><summary>错误详情{providerFailure.httpStatusCode ? ` · HTTP ${providerFailure.httpStatusCode}` : ""}</summary><pre>{providerFailure.detail}</pre></details> : null}
             <div className="providerFailureActions">
               <button type="button" onClick={() => {
                 setProviderFailureOpen(false);
-                resetToNewThread(true);
                 window.setTimeout(() => document.querySelector<HTMLButtonElement>(".composerTools .groupedModelPicker .polishedSelectTrigger")?.click(), 100);
-              }}>新对话·选模型</button>
+              }}>选择其他模型</button>
               <button type="button" onClick={() => setProviderFailureOpen(false)}>关闭</button>
             </div>
           </div>
@@ -12028,7 +12284,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         const projectThreads = projectSelected && initializedProjectIdRef.current === project.id
                           ? threads
                           : dedupeThreadListById(
-                            (sidebarThreadLists.lists[project.id] ?? storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(selectedUserId, project.id), []))
+                            visibleSidebarThreads(selectedUserId,(sidebarThreadLists.lists[project.id] ?? storedJson<ThreadSummary[]>(sidebarThreadsCacheKey(selectedUserId, project.id), [])))
                               .filter((thread) => !isTemporaryAskThread(thread))
                           );
                         return (
@@ -12654,7 +12910,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     const inlineQuestions = kind === "tool" ? parseQuestionToolItem(item) : null;
                     if (inlineQuestions) {
                       toolGroupIndex = flushToolGroup(toolGroupIndex, true);
-                      renderedHistoryItems.push(<ToolQuestionMessage key={`${turn.id}-${item.id}-question`} open={!questionIsAnswered(item.id, turn.id, items)} questions={inlineQuestions} onChoose={(answer) => chooseToolQuestion(item.id, answer)} />);
+                      renderedHistoryItems.push(<ToolQuestionMessage key={`${turn.id}-${item.id}-question`} open={!questionIsAnswered(item.id, turn.id, items)} questions={inlineQuestions} onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers)} />);
                       continue;
                     }
                     if (kind === "tool" || kind === "reasoning") {
@@ -12744,7 +13000,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   if (thinkingNode && !thinkingInserted) renderedHistoryItems.push(thinkingNode);
                   const renderedHistoryTurnItems = renderedHistoryItems.flatMap((item) => (item ? [item] : []));
                   return (
-                    <section className={`conversationTurnRow${turn.id === topAnchoredTurnId ? " topAnchoredTurn" : ""}${turn.id === editingPromptDraft?.turnId ? " editingOriginalTurn" : ""}${turn.id === departingTurnId ? " departingTurn" : ""}`} data-turn-id={turn.id} key={`turn:${turn.id}`}>
+                    <section className={`conversationTurnRow${turn.id === topAnchoredTurnId ? " topAnchoredTurn" : ""}${turn.id === editingPromptDraft?.turnId ? " editingOriginalTurn" : ""}${departingTurnIds.has(turn.id) ? " departingTurn" : ""}`} data-turn-id={turn.id} key={`turn:${turn.id}`}>
                       {[
                         ...renderedHistoryTurnItems,
                         ...(liveTurnDiffs[turn.id] && !turnChangeCard && !items.some((item) => Array.isArray(item.changes) && item.changes.some((change) => isRecord(change) && typeof change.diff === "string" && change.diff))
@@ -12937,19 +13193,20 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 title="拖动输入框顶部边缘调整高度"
                 onMouseDown={(event) => beginVerticalResize(event, composerHeight, setComposerHeight, composerHeightStorageKey, 38, Math.min(320, window.innerHeight - 260))}
               />
-              {editingPromptDraft ? <div className="editingPromptNotice" role="status">
-                <PencilLine size={14} /> 正在编辑上一条提问
-                <button type="button" onClick={cancelEditingPrompt} disabled={editingLastPrompt}>取消</button>
-              </div> : null}
+              <EditingPromptNotice draft={editingPromptDraft} busy={editingLastPrompt} confirmed={editingHistoryConfirmed} onConfirm={setEditingHistoryConfirmed} onCancel={cancelEditingPrompt}/>
               <div className="composerBody">
                 <div className="composerThreadActivity">
+                  <TurnRecoveryNotice key={`recovery:${selectedUserId}:${selectedThread?.id}`} state={selectedThread ? turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1)) : undefined} userId={selectedUserId} turnId={selectedThread?.turns.at(-1)?.id} onSelectModel={()=>document.querySelector<HTMLButtonElement>('.composerTools .groupedModelPicker .polishedSelectTrigger')?.click()} onAction={action => {
+                    if (!selectedThread) return;
+                    codexSocket.send({ type: action === "dismiss" ? "turn.error.dismiss" : action === "now" ? "turn.retry.now" : "turn.retry.cancel", threadId: selectedThread.id, requestId: `recovery-${requestToken()}` });
+                  }} />
                   <ToolReveal key={`progress:${selectedUserId}:${selectedThread?.id ?? "new"}`} open={Boolean(selectedThread?.id && turnProgress[`${selectedUserId}:${selectedThread.id}`]?.turnId === selectedActiveTurnId)}><div className="composerRunNotice" role="status">{turnProgressText(selectedThread?.id ? turnProgress[`${selectedUserId}:${selectedThread.id}`] : undefined)}</div></ToolReveal>
                   <GoalProgress key={`goal:${selectedUserId}:${selectedThread?.id ?? "new"}`} controller={threadGoal} running={conversationRunState === "running"} />
                   <SubagentActivity key={`agents:${selectedUserId}:${selectedThread?.id ?? "new"}`} agents={composerAgents} directoryPage={subagentDirectory.page} parentRunning={Boolean(selectedActiveTurnId)} taskKey={selectedActiveTurnId ?? "idle"} onOpen={openSubagentReview} onOpenHistory={() => openSubagentReview(undefined, "history")} />
                   <ToolReveal open={Boolean(documentReference && documentReference.projectId === selectedProject?.id)}><div className="composerDocumentReference"><FileText size={14} /><span title={documentReference?.text}><strong>{documentReference?.path}</strong> · {documentReference?.text.slice(0, 120)}</span><button type="button" aria-label="移除文档引用" onClick={() => setDocumentReference(null)}><X size={14} /></button></div></ToolReveal>
                 </div>
                 <div className="composerTools">
-                  {planMode ? <button className="v2PlanActiveChip" type="button" onClick={() => setPlanMode(false)} title="关闭计划模式，恢复可执行改动"><Lightbulb size={14} />计划</button> : null}
+                  {planMode ? <button className="v2PlanActiveChip" type="button" onClick={() => setPlanMode(false)} title="关闭计划模式，下次发送可执行改动"><Lightbulb size={14} />计划<AccountUpdateIndicator key={`plan:${selectedUserId}`} userId={selectedUserId} menuOpen={false} target="plan" dismissOnRefresh /></button> : null}
                   {selectedSkills.map((skill) => (
                     <button className="selectedSkillChip" type="button" key={skill.name} onClick={() => toggleSelectedSkill(skill.name)} title={`移除 $${skill.name}`}>
                       <span>{localizedSkill(skill).name}</span>
@@ -12987,7 +13244,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <ModelGroupedSelect
                     value={activeModelProfileId}
                     onChange={(profileId) => void changeConversationModelProfile(profileId)}
-                    disabled={savingThreadModel || conversationRunState === "running"}
+                    disabled={savingThreadModel || conversationRunState === "running" || Boolean(selectedThread && turnRecoveries[`${selectedUserId}:${selectedThread.id}`]?.job?.status === "running")}
                     title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
                     profiles={selectableModelProfiles}
                   />
@@ -13229,7 +13486,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               <div className="imageViewerHeaderActions">
                 <button className="imageViewerRoundButton" type="button" aria-label={previewDocked ? "全屏预览" : "返回右栏"} title={previewDocked ? "全屏预览" : "返回右栏"} onClick={() => setPreviewDocked(value => !value)}><WorkspaceIcon name="layout" /></button>
                 {!runnablePreview && filePreview?.kind === "text" && !filePreview.truncated && /\.(?:html?|mmd|mermaid)$/i.test(filePreview.name) ? (
-                  <button className="iconTextButton" type="button" onClick={() => setRunnablePreview({ kind: /\.(?:mmd|mermaid)$/i.test(filePreview.name) ? "mermaid" : "html", title: filePreview.name, source: filePreview.content ?? "" })}>运行</button>
+                  <button className="iconTextButton" type="button" onClick={() => setRunnablePreview({ kind: /\.(?:mmd|mermaid)$/i.test(filePreview.name) ? "mermaid" : "html", title: filePreview.name, source: filePreview.content ?? "" })}>{isHtmlPreviewFile(filePreview.name)?'渲染预览':'运行'}</button>
                 ) : null}
                 {runnablePreview && filePreview ? <button className="iconTextButton" type="button" onClick={() => setRunnablePreview(null)}>查看源码</button> : null}
                 {filePreview?.kind === "image" ? (
@@ -13259,13 +13516,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               {!runnablePreview && !filePreviewLoading && filePreviewError ? <div className="filePreviewError">{filePreviewError}</div> : null}
               {!runnablePreview && !filePreviewLoading && filePreview ? (
                 <>
-                  {["markdown","text","image","video"].includes(filePreview.kind) ? <PreviewZoom>
+                  {filePreview.kind==='text'&&isHtmlPreviewFile(filePreview.name)?<Suspense fallback={<div className="documentPreviewStatus" role="status">正在加载源码查看器…</div>}><HtmlSourcePreview source={filePreview.content??''}/></Suspense>:null}
+                  {["markdown","text","image","video"].includes(filePreview.kind)&&!(filePreview.kind==='text'&&isHtmlPreviewFile(filePreview.name)) ? <PreviewZoom>
                   {filePreview.kind === "markdown" ? (
                     <div className="fileMarkdownPreview">
                       <MarkdownMessage text={filePreview.content ?? ""} projectId={selectedProject?.id} onOpenFileLink={(target) => void openFilePreview(target)} />
                     </div>
                   ) : null}
-                  {filePreview.kind === "text" ? <pre className="fileTextPreview">{filePreview.content ?? ""}</pre> : null}
+                  {filePreview.kind === "text" ? <SourceTextPreview source={filePreview.content ?? ""} name={filePreview.name} /> : null}
                   {filePreview.kind === "image" && filePreviewObjectUrl ? (
                     <img className="fileImagePreview" src={filePreviewObjectUrl} alt={filePreview.name} onLoad={(event) => {
                       const image = event.currentTarget;

@@ -5,6 +5,7 @@ import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { pipeline } from "node:stream/promises";
 import {archivedOutputPreview,createToolOutputArchive,type ToolArchiveSummary} from "./toolOutputArchive.js";
+import {openReadableRollout,rolloutSourcePath} from './rolloutStorage.js';
 
 export const largeThreadForkBytes = 128 * 1024 * 1024;
 const maxRecordBytes = 64 * 1024 * 1024;
@@ -66,7 +67,7 @@ export interface LegacyForkCopy {
 }
 
 export async function isLegacyRollout(filePath: string): Promise<boolean> {
-  const file = await fsp.open(filePath, "r");
+  const file = await openReadableRollout(filePath);
   try {
     const size = Math.min((await file.stat()).size, 4 * 1024 * 1024);
     if (!size) return false;
@@ -94,10 +95,11 @@ export async function copyLargeThreadBranch(options: {
   cwd: string;
   toolArchiveRoot?: string;
 }): Promise<LegacyForkCopy> {
-  const sourcePath = await fsp.realpath(options.sourcePath);
+  const sourcePath = await rolloutSourcePath(options.sourcePath);
+  const sourceBefore = await fsp.stat(sourcePath);
   const sourceRoot = await fsp.realpath(options.sourceSessionsRoot);
   if (!inside(sourcePath, sourceRoot)) throw new BranchConflictError("分支源会话不在所属账号的 sessions 目录中。");
-  const file = await fsp.open(sourcePath, "r");
+  const file = await openReadableRollout(options.sourcePath);
   let stagedPath: string | null = null;
   let archive: Awaited<ReturnType<typeof createToolOutputArchive>> | null = null;
   let archiveComplete=false;
@@ -211,8 +213,8 @@ export async function copyLargeThreadBranch(options: {
     const copied = await fsp.open(stagedPath, "r+");
     try { await copied.sync(); } finally { await copied.close(); }
     const currentSource = await fsp.stat(sourcePath);
-    if (currentSource.ino !== before.ino || currentSource.size < before.size
-        || (currentSource.size === before.size && currentSource.mtimeMs !== before.mtimeMs)) {
+    if (currentSource.ino !== sourceBefore.ino || currentSource.size < sourceBefore.size
+        || (currentSource.size === sourceBefore.size && currentSource.mtimeMs !== sourceBefore.mtimeMs)) {
       throw new BranchConflictError("复制时原会话发生变更，已停止分支；请重试。");
     }
     await fsp.rename(stagedPath, destination);

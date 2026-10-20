@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { listThreads } from "./api";
 import type { ThreadSummary } from "./types";
+import {sidebarVisibilityEvent,sidebarHiddenKey,sidebarVisibilityVersion,visibleSidebarThreads,reconcileSidebarVisibility} from './sidebarVisibility';
 
 type SidebarLists = {
   userId: string;
@@ -20,6 +21,16 @@ export function useSidebarThreadLists(
 ) {
   const [state, setState] = useState<SidebarLists>(() => ({ userId, lists: {}, loading: {}, errors: {} }));
   const [revision, setRevision] = useState(0);
+  useEffect(()=>{
+    const changed=()=>{
+      setState(value=>({...value,lists:Object.fromEntries(Object.entries(value.lists).map(([id,rows])=>[id,visibleSidebarThreads(userId,rows)]))}));
+      setRevision(value=>value+1);
+    };
+    const local=(event:Event)=>{if((event as CustomEvent).detail?.userId===userId)changed();};
+    const remote=(event:StorageEvent)=>{if(event.key===sidebarHiddenKey(userId))changed();};
+    window.addEventListener(sidebarVisibilityEvent,local);window.addEventListener('storage',remote);
+    return()=>{window.removeEventListener(sidebarVisibilityEvent,local);window.removeEventListener('storage',remote);};
+  },[userId]);
   const available = new Set(projectIds);
   const key = JSON.stringify(expandedProjectIds.filter(id => available.has(id) && id !== selectedProjectId));
 
@@ -35,10 +46,14 @@ export function useSidebarThreadLists(
       while (!cancelled && next < ids.length) {
         const projectId = ids[next++];
         try {
+          const requestedAt=Date.now();
+          const visibilityVersion=sidebarVisibilityVersion(userId,projectId);
           const response = await listThreads(projectId);
           if (cancelled) return;
-          update(value => ({ ...value, lists: { ...value.lists, [projectId]: response.data }, loading: { ...value.loading, [projectId]: false } }));
-          try { window.localStorage.setItem(`codex-v2-threads-${userId}-${projectId}`, JSON.stringify(response.data)); } catch { /* A full browser cache must not hide server results. */ }
+          if(visibilityVersion!==sidebarVisibilityVersion(userId,projectId))continue;
+          const data=reconcileSidebarVisibility(userId,projectId,response.data,response.hiddenThreadIds,requestedAt);
+          update(value => ({ ...value, lists: { ...value.lists, [projectId]: data }, loading: { ...value.loading, [projectId]: false } }));
+          try { window.localStorage.setItem(`codex-v2-threads-${userId}-${projectId}`, JSON.stringify(data)); } catch { /* A full browser cache must not hide server results. */ }
         } catch (error) {
           if (cancelled) return;
           update(value => ({ ...value, loading: { ...value.loading, [projectId]: false }, errors: { ...value.errors, [projectId]: error instanceof Error ? error.message : String(error) } }));

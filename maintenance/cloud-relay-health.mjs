@@ -12,7 +12,7 @@ export async function probeCloudRelay() {
     const result=await execute('/usr/bin/ssh',[...relaySshArgs,'health'],{timeout:6500,maxBuffer:8192});
     const value=JSON.parse(result.stdout.trim());
     return {ready:value.ready===200?200:503,origin:value.origin===200?200:0};
-  }catch{return {ready:0,origin:0};}
+  }catch{return {ready:0,origin:0,reachable:false};}
 }
 export async function restartCloudTunnel() {
   const result=await execute('/usr/bin/ssh',[...relaySshArgs,'restart-tunnel'],{timeout:6500,maxBuffer:8192});

@@ -14,6 +14,7 @@ import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { ComposerPredictions } from "./composerPredictions.js";
 import { LegacyRollbackConflictError } from "./legacyRollback.js";
+import {readableRolloutPath, rolloutLogicalStat, rolloutReadStream} from './rolloutStorage.js';
 import { inheritedBillingTurnIds } from "./leaderboardForkUsage.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
 import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
@@ -987,8 +988,9 @@ function walkJsonlFiles(root: string): string[] {
       const nextPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
         pending.push(nextPath);
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-        result.push(nextPath);
+      } else if (entry.isFile() && /\.jsonl(?:\.zst)?$/.test(entry.name)) {
+        const canonical=nextPath.replace(/\.zst$/,'');
+        if(!result.includes(canonical)) result.push(canonical);
       }
     }
   }
@@ -1312,7 +1314,7 @@ export async function summarizeLeaderboardFile(
   resolveSessionOwner: (sessionId: string) => string | null,
   preciseTimestamps = false
 ): Promise<LeaderboardFileSummary> {
-  const stat = fs.statSync(filePath);
+  const stat = await rolloutLogicalStat(filePath);
   const usageByKey = new Map<string, LeaderboardFileUsage>();
   let sessionId = path.basename(filePath, ".jsonl");
   let userId: string | null = null;
@@ -1327,7 +1329,7 @@ export async function summarizeLeaderboardFile(
     if (!knownUsers.has(id)) knownUsers.set(id, store.getUser(id) !== null);
     return knownUsers.get(id)!;
   };
-  const input = fs.createReadStream(filePath, { encoding: "utf8", highWaterMark: 256 * 1024 });
+  const input = await rolloutReadStream(filePath, { encoding: "utf8", highWaterMark: 256 * 1024 });
   const lines = createInterface({ input, crlfDelay: Infinity });
 
   for await (const line of lines) {
@@ -1451,9 +1453,9 @@ async function readCodexLeaderboard(
   const liveFiles = new Set(files);
   for (const filePath of files) {
     try {
-      const stat = fs.statSync(filePath);
+      const stat = await rolloutLogicalStat(filePath);
       let summary = leaderboardFileCache.get(filePath);
-      if (summary && summary.billingVersion !== 2 && !sessionMetadataFromFileStart(filePath)?.forked_from_id) {
+      if (summary && summary.billingVersion !== 2 && !sessionMetadataFromFileStart(await readableRolloutPath(filePath))?.forked_from_id) {
         // Existing non-fork summaries remain valid: avoid reparsing the full
         // historical corpus merely to correct copied fork records.
         summary.billingVersion = 2;
@@ -1472,7 +1474,7 @@ async function readCodexLeaderboard(
         cacheChanged = true;
       }
       if (summary.usage.some((entry) => entry.userId === "unknown")) {
-        const cwdUser = userIdFromSessionCwd(sessionCwdFromFileStart(filePath), (id) => store.getUser(id) !== null);
+        const cwdUser = userIdFromSessionCwd(sessionCwdFromFileStart(await readableRolloutPath(filePath)), (id) => store.getUser(id) !== null);
         if (cwdUser) {
           for (const entry of summary.usage) {
             if (entry.userId === "unknown") entry.userId = cwdUser;
@@ -3740,12 +3742,24 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         // personal `我的工作区` list for the same user.
         const ownedThreadIds = store.ownedThreadIds(userId, project.id);
         const locallyArchivedIds = store.locallyArchivedThreadIds(userId, project.id);
+        // Native archive moves/metadata are also authoritative. The fast JSONL
+        // summary path must not resurrect them merely because Web flags lag.
+        const nativeArchiveIndex=await readArchivedThreadIndex(threadHistoryRuntimeHomes(),ownedThreadIds);
+        const decisions=store.explicitThreadArchiveDecisions(userId,project.id);
+        const nativeArchives=nativeArchiveIndex.data.filter(item=>{
+          const decision=decisions.get(item.id);
+          return ownedThreadIds.has(item.id)&&!(decision&&!decision.archived&&decision.at>=Number(item.updatedAt??0));
+        });
+        for(const item of nativeArchives)locallyArchivedIds.add(item.id);
+        const hiddenThreadIds=[...new Set([...locallyArchivedIds,...store.unusedThreadIds(userId,project.id)])];
+        reply.header('Cache-Control','no-store');
         const searchTerm = normalizeSearchTerm(request.query.search);
         if (searchTerm) {
           const owners = store.listVisibleThreadOwnersForUser(userId).filter(owner => owner.projectId === project.id && !locallyArchivedIds.has(owner.threadId));
           const result = await searchChatThreads(owners, searchTerm, { limit: 80 });
           return {
             ...result,
+            hiddenThreadIds,
             data: sortThreadsForUser(store, userId, result.data),
             nextCursor: null,
             backwardsCursor: null
@@ -3753,8 +3767,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         }
         const archived = request.query.archived === "true";
         if (archived) {
-          const index=await readArchivedThreadIndex(threadHistoryRuntimeHomes(),ownedThreadIds);
-          let native=index.data as unknown[];
+          const index=nativeArchiveIndex;
+          let native=nativeArchives as unknown[];
           // Old runtimes without a usable state index get a bounded, DB-only
           // fallback. Never request JSONL scanning/repair for this dialog.
           if (!index.available && !locallyArchivedIds.size) {
@@ -3769,7 +3783,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           }
           const data=new Map<string,unknown>();
           for(const item of native){const id=threadIdFromListItem(item);if(id&&ownedThreadIds.has(id)){
-            data.set(id,item);store.setThreadLocallyArchived(id,userId,project.id,true);
+            data.set(id,item);store.setThreadLocallyArchived(id,userId,project.id,true,false);
           }}
           // Web archive flags remain authoritative if native metadata lags.
           // Owner metadata is enough for a restore entry: no full-history load.
@@ -3784,12 +3798,14 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
             archiveIndexIncomplete:index.incomplete||(!index.available&&locallyArchivedIds.size>0)};
         }
         const fast = request.query.fast !== "false" && !archived;
-        warmOwnedThreadIndexes(ownedThreadIds);
+        const visibleOwnedThreadIds=new Set([...ownedThreadIds].filter(id=>!locallyArchivedIds.has(id)));
+        warmOwnedThreadIndexes(visibleOwnedThreadIds);
         if (fast) {
-          const summaries = await readOwnedThreadSummariesFromJsonl(new Set([...ownedThreadIds].filter(id => !locallyArchivedIds.has(id))));
+          const summaries = await readOwnedThreadSummariesFromJsonl(visibleOwnedThreadIds);
           if (summaries) {
             return {
               data: sortThreadsForUser(store, userId, summaries),
+              hiddenThreadIds,
               nextCursor: null,
               backwardsCursor: null
             };
@@ -3816,7 +3832,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           if (!archived || !locallyArchivedIds.size) throw error;
           result = { data: [], nextCursor: null, backwardsCursor: null };
         }
-        const nativeData = await filterOwnedThreadList(bridge, result.data, ownedThreadIds, "", !archived);
+        const nativeData = await filterOwnedThreadList(bridge, result.data, archived?ownedThreadIds:visibleOwnedThreadIds, "", !archived);
         if (archived) {
           for (const item of nativeData) {
             const threadId = threadIdFromListItem(item);
@@ -3835,6 +3851,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         }
         return {
           ...result,
+          hiddenThreadIds,
           data: sortThreadsForUser(store, userId, data),
           nextCursor: null,
           backwardsCursor: null
@@ -4194,7 +4211,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       try {
         const sourcePath = persistedSourcePath ?? stringOrNull(sourceThread.path) ?? stringOrNull(sourceThread.rolloutPath);
         const sourceSessionsRoot = sourcePath ? threadJsonlSessionsRoot(sourcePath) : null;
-        const sourceSize = sourcePath ? (await fs.promises.stat(sourcePath)).size : 0;
+        const sourceSize = sourcePath ? (await rolloutLogicalStat(sourcePath)).size : 0;
         const legacySource=(sourceSize>=largeThreadForkBytes||input.archiveToolOutputs)&&sourcePath?await isLegacyRollout(sourcePath):false;
         if(input.archiveToolOutputs&&(!poolBridge||!routing||!sourcePath||!sourceSessionsRoot||!legacySource))throw new BranchConflictError("此历史格式暂不支持安全归档工具结果；原会话未修改。");
         // User-authorized pool-wide policy: large compatible histories are
@@ -4379,7 +4396,10 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
         return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
       }
-      const { turnId } = z.object({ turnId: z.string().min(1) }).strict().parse(request.body ?? {});
+      const { turnId, expectedLatestTurnId, allowHistoryRewrite } = z.object({
+        turnId: z.string().min(1), expectedLatestTurnId: z.string().min(1).optional(), allowHistoryRewrite: z.boolean().default(false)
+      }).strict().parse(request.body ?? {});
+      if (allowHistoryRewrite && !expectedLatestTurnId) return reply.code(400).send({ error: "编辑历史提问必须校验当前末轮，原记录未改动。" });
       const summary = await bridge.request("thread/read", { threadId: request.params.threadId, includeTurns: false }, 30_000);
       const historyMode = asRecord(asRecord(summary).thread).historyMode;
       const goalState = await bridge.request("thread/goal/get", { threadId: request.params.threadId }, 30_000) as { goal?: { status?: string } | null };
@@ -4394,44 +4414,71 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         // The guarded compatibility path stops only an idle owning runtime,
         // appends the Codex replay marker, and verifies/reverses it on failure.
         // Do not call paginated turns/list or revert for a legacy rollout.
-        const result = await bridge.rollbackLegacyLatest(request.params.threadId, turnId);
+        const result = await bridge.rollbackLegacyLatest(request.params.threadId, turnId,
+          expectedLatestTurnId ? { expectedLatestTurnId, allowHistoryRewrite } : undefined);
         store.touchThreadOwner(request.params.threadId);
-        const rolloutPath = asRecord(asRecord(result).thread).path;
-        if (typeof rolloutPath === "string") {
-          // Complete the local history projection before acknowledging edit.
-          // A projection error must not imply that the successful rollback
-          // failed and invite the client to roll back a second turn.
-          await warmThreadIndex(rolloutPath, request.params.threadId).catch((error) => {
-            console.warn("Could not refresh history after legacy rollback", { threadId: request.params.threadId, error });
-          });
-        }
+        // History reads update their incremental index from the appended marker.
+        // An edit acknowledgement must not scan/render the full history or turn
+        // a successfully committed rollback into a timeout and a second rollback.
         return { data: result };
       }
       if (historyMode !== "paginated") {
         return reply.code(409).send({ error: "当前运行时不支持安全撤回此会话；草稿和附件仍保留。" });
       }
-      const latest = await bridge.request("thread/turns/list", {
+      const mutate = async (runtime: CodexBridge) => {
+      // Recheck goal/queue under the request barrier; a second browser must
+      // never sneak a new turn between latest-turn validation and the revert.
+      const goal = asRecord(await runtime.request("thread/goal/get", { threadId: request.params.threadId }, 30_000));
+      const queue = asRecord(await runtime.request("thread/queue/list", { threadId: request.params.threadId, limit: 1 }, 30_000));
+      if (!("goal" in goal) || asRecord(goal.goal).status === "active" || !Array.isArray(queue.data) || queue.data.length || queue.nextCursor) throw new LegacyRollbackConflictError("会话有持续目标或排队消息，请先暂停处理；草稿仍保留。");
+      const latest = await runtime.request("thread/turns/list", {
         threadId: request.params.threadId,
         limit: 1,
+        itemsView: "notLoaded",
         sortDirection: "desc"
       }, 30_000) as { data?: Array<{ id?: string; status?: string }> };
       const lastTurn = latest.data?.[0];
-      if (!lastTurn || lastTurn.id !== turnId) {
-        return reply.code(409).send({ error: "只能撤回当前会话最后一轮；请刷新后重试。" });
+      if (!lastTurn || lastTurn.id !== (expectedLatestTurnId ?? turnId) || (!allowHistoryRewrite && lastTurn.id !== turnId)) {
+        throw new LegacyRollbackConflictError("会话已更新，请刷新后重试；原记录未改动。");
       }
       if (lastTurn.status !== "completed" && lastTurn.status !== "failed" && lastTurn.status !== "interrupted") {
-        return reply.code(409).send({ error: "这轮仍在运行，请等待完成后再撤回。" });
+        throw new LegacyRollbackConflictError("这轮仍在运行，请等待完成后再撤回。");
       }
       // Paginated revert operates on a loaded thread. This does not undo
       // filesystem changes made during that turn.
-      await bridge.request("thread/resume", {
+      await runtime.request("thread/resume", {
         threadId: request.params.threadId,
+        excludeTurns: true,
         config: browserMcpForThread(request.params.threadId),
         cwd: project.rootPath,
         approvalPolicy: project.defaultApprovalPolicy,
         sandbox: project.defaultSandbox
       }, 30_000);
-      const result = await bridge.request("thread/revert", { threadId: request.params.threadId, beforeTurnId: turnId }, 60_000);
+      // Native paginated revert deletes its suffix. Preserve a recoverable,
+      // owner-scoped native snapshot first (no full-history response in Node).
+      // This is an archived safety copy, not the conversation the user sends to.
+      const backup = asRecord(asRecord(await runtime.request("thread/fork", {
+        threadId: request.params.threadId, lastTurnId: lastTurn.id, excludeTurns: true
+      }, 60_000)).thread);
+      const backupId = typeof backup.id === "string" ? backup.id : "";
+      if (!backupId || backupId === request.params.threadId) throw new Error("未能保存编辑前备份，原问答未撤回。");
+      if (isAccountPoolBridge(bridge)) {
+        const account = bridge.getKnownThreadAccount(request.params.threadId);
+        if (!account) throw new Error("无法确认编辑备份的所属账号，原问答未撤回。");
+        bridge.assignThreadsToAccount([backupId], account.id);
+      }
+      store.registerThreadOwner({ threadId: backupId, userId, projectId: project.id, rootPath: project.rootPath });
+      const original = asRecord(asRecord(summary).thread);
+      const presentation = store.getThreadPresentation(userId, [request.params.threadId]).get(request.params.threadId);
+      const name = `编辑前备份 · ${presentation?.displayName ?? original.name ?? original.preview ?? "会话"} · ${new Date().toISOString()}`;
+      store.updateThreadDisplayName(backupId, userId, name);
+      store.setThreadLocallyArchived(backupId, userId, project.id, true);
+      await runtime.request("thread/name/set", { threadId: backupId, name }, 30_000);
+      await runtime.request("thread/archive", { threadId: backupId }, 30_000);
+      const reverted = asRecord(await runtime.request("thread/revert", { threadId: request.params.threadId, beforeTurnId: turnId }, 60_000));
+      return { ...reverted, recoveryThreadId: backupId };
+      };
+      const result = isAccountPoolBridge(bridge) ? await bridge.withThreadMaintenance(request.params.threadId, mutate) : await mutate(bridge);
       store.touchThreadOwner(request.params.threadId);
       return { data: result };
     } catch (error) {

@@ -1,0 +1,7 @@
+.htmlSourceViewer{--html-syntax-tag:#86caff;--html-syntax-property:#dfc194;--html-syntax-string:#b3d99b;--html-syntax-number:#edba87;--html-syntax-keyword:#d7adf2;--html-syntax-comment:#9ca8b3;display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:auto minmax(0,1fr);width:100%;height:100%;min-height:0;min-width:0;overflow:hidden;color:var(--ui-content);animation:filePreviewContentIn .25s cubic-bezier(.22,1,.36,1) both}
+:root[data-theme="light"] .htmlSourceViewer{--html-syntax-tag:#175e9a;--html-syntax-property:#805619;--html-syntax-string:#347341;--html-syntax-number:#a14e25;--html-syntax-keyword:#78469e;--html-syntax-comment:#6a7480}
+.htmlSourceToolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 9px;border-bottom:1px solid var(--ui-divider);color:var(--ui-content-muted);font:12px/1.5 var(--pool-ui-font),sans-serif}
+.htmlSourceToolbar button{border:0;border-radius:6px;padding:3px 7px;background:var(--ui-hover);color:inherit;font:inherit;cursor:pointer;transition:background .2s ease,opacity .2s ease}
+.htmlSourceToolbar button:disabled{opacity:.45;cursor:default}.htmlSourceToolbar small{margin-left:auto;font:inherit}
+.htmlSourceEditor{min-width:0;min-height:0;overflow:hidden}.htmlSourceEditor .cm-editor{height:100%}.htmlSourceEditor .cm-scroller{overscroll-behavior:contain}.htmlSourceEditor .cm-line{white-space:pre}
+@media(prefers-reduced-motion:reduce){.htmlSourceViewer{animation:none}.htmlSourceToolbar button{transition:none}}

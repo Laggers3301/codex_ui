@@ -1,16 +1,15 @@
 // Read-only visual check of the isolated native DOCX fixture at phone width.
 import { chromium, expect } from "@playwright/test";
 import fs from "node:fs/promises";
-const username = process.env.DOCUMENT_QA_USER || "qaUser";
 const url = process.env.DOCUMENT_QA_URL || "http://127.0.0.1:4575";
-const projectId = process.env.DOCUMENT_QA_PROJECT;
+const projectId = process.env.DOCUMENT_QA_PROJECT || "08462b85-8c6d-443f-96d9-bd49e7c14ab2";
 const texOnly = process.env.DOCUMENT_QA_FILE === "paper.tex";
 if (!process.env.DOCUMENT_QA_PASSWORD) throw new Error("Authorized QA password required.");
-const browser = await chromium.launch({ executablePath: process.env.DOCUMENT_QA_CHROMIUM || undefined, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+const browser = await chromium.launch({ executablePath: "/home/example/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome", args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 try {
   const context = await browser.newContext({ viewport: { width: 1200, height: 900 } });
-  await context.request.post(`${url}/api/auth/login`, { data: { username, password: process.env.DOCUMENT_QA_PASSWORD } });
-  await context.addInitScript(({ theme, username }) => { localStorage.setItem("codex-web-user-id", username); localStorage.setItem("codex-web-color-theme", theme); }, { theme: texOnly ? "light" : "dark", username });
+  await context.request.post(`${url}/api/auth/login`, { data: { username: "qa-user", password: process.env.DOCUMENT_QA_PASSWORD } });
+  await context.addInitScript(theme => { localStorage.setItem("codex-web-user-id", "qa-user"); localStorage.setItem("codex-web-color-theme", theme); }, texOnly ? "light" : "dark");
   const page = await context.newPage();
   await page.goto(url);
   await page.locator(`.v2WorkspaceGroup[data-project-id="${projectId}"] .projectNewThreadButton`).click();

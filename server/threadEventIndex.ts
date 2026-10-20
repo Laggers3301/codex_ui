@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { serverConfig } from "./config.js";
 import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { readThreadFromJsonl } from "./threadFallback.js";
+import {rolloutLogicalStat, rolloutStat,openReadableRollout,rolloutReadStream} from './rolloutStorage.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -238,7 +239,7 @@ async function indexedRecordBoundaryMatches(filePath: string, threadId: string):
   if (row?.start_offset === undefined) return true;
   const startOffset = Number(row.start_offset);
   if (!Number.isSafeInteger(startOffset) || startOffset < 0) return false;
-  const handle = await fs.open(filePath, "r");
+  const handle = await openReadableRollout(filePath);
   try {
     if (startOffset === 0) {
       const current = Buffer.allocUnsafe(1);
@@ -254,7 +255,7 @@ async function indexedRecordBoundaryMatches(filePath: string, threadId: string):
 }
 
 async function updateThreadIndex(filePath: string, threadId: string): Promise<void> {
-  const stat = await fs.stat(filePath);
+  const stat = await rolloutStat(filePath);
   let state = fileState(threadId);
   const boundaryMatches = !state || await indexedRecordBoundaryMatches(filePath, threadId);
   const mustReset = Boolean(state && (
@@ -316,7 +317,7 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
   // Parse the JSONL before opening a transaction. File streaming is asynchronous;
   // keeping BEGIN open across `await` lets another request enter the same sqlite
   // connection and caused intermittent "transaction within a transaction" 502s.
-  for await (const chunkValue of createReadStream(filePath, { start: lineStart })) {
+  for await (const chunkValue of await rolloutReadStream(filePath, { start: lineStart })) {
     const chunk = Buffer.isBuffer(chunkValue) ? chunkValue : Buffer.from(chunkValue);
     pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
     for (;;) {
@@ -449,7 +450,13 @@ export function warmThreadIndex(filePath: string, threadId: string): Promise<voi
     // large conversation must not delay a cursor jump into an indexed file.
     const state = fileState(threadId);
     if (state) {
-      const stat = await fs.stat(filePath);
+      // Native lossless compression changes physical inode, not logical bytes.
+      // Do not inflate the entire cold corpus during background index scans.
+      if (!await fs.stat(filePath).catch(()=>null)) {
+        const logical=await rolloutLogicalStat(filePath);
+        if(state.filePath===filePath&&state.size===logical.size&&state.indexedOffset===logical.size&&state.mtimeMs===logical.mtimeMs) return;
+      }
+      const stat = await rolloutStat(filePath);
       if (state.filePath === filePath && state.inode === Number(stat.ino)
         && state.size === stat.size && state.indexedOffset === stat.size && state.mtimeMs === stat.mtimeMs) return;
     }
@@ -476,6 +483,30 @@ function decodeCursor(cursor: string | undefined, threadId: string): number | nu
   }
 }
 
+async function indexedCollaborationMode(filePath: string, threadId: string): Promise<"plan" | "default" | undefined> {
+  // Read the indexed start of recent turns, even when the requested history
+  // page begins after turn_context or points to an older turn. Tool output can
+  // be very large, so a tail scan is insufficient and a full read is wasteful.
+  const turns = db.prepare("SELECT turn_id, start_offset FROM thread_turns WHERE thread_id = ? ORDER BY start_offset DESC LIMIT 4")
+    .all(threadId) as Array<{ turn_id: string; start_offset: number }>;
+  const handle = await openReadableRollout(filePath);
+  try {
+    const { size } = await handle.stat();
+    for (const turn of turns) {
+      const bytes = Buffer.alloc(Math.max(0, Math.min(256 * 1024, size - turn.start_offset)));
+      const { bytesRead } = await handle.read(bytes, 0, bytes.length, turn.start_offset);
+      for (const line of bytes.subarray(0, bytesRead).toString("utf8").split("\n")) {
+        let record: JsonRecord; try { record = asRecord(JSON.parse(line)); } catch { continue; }
+        const payload = asRecord(record.payload);
+        if (record.type !== "turn_context" || payload.turn_id !== turn.turn_id) continue;
+        const mode = asRecord(payload.collaboration_mode).mode;
+        if (mode === "plan" || mode === "default") return mode;
+      }
+    }
+  } finally { await handle.close(); }
+  return undefined;
+}
+
 export async function readIndexedThreadPage(
   filePath: string,
   threadId: string,
@@ -490,6 +521,8 @@ export async function readIndexedThreadPage(
   } else {
     await warmThreadIndex(filePath, threadId);
   }
+  const collaborationMode = await indexedCollaborationMode(filePath, threadId);
+  const withMode = (thread: JsonRecord) => collaborationMode ? { ...thread, collaborationMode } : thread;
   const totalRow = db.prepare("SELECT COUNT(*) AS value, COALESCE(MAX(ordinal), 0) AS max_ordinal FROM thread_records WHERE thread_id = ?")
     .get(threadId) as { value?: number; max_ordinal?: number };
   const totalItems = Number(totalRow.value ?? 0);
@@ -497,7 +530,7 @@ export async function readIndexedThreadPage(
   if (!totalItems) {
     const parsed = await readThreadFromJsonl(filePath, threadId);
     return {
-      thread: parsed.thread,
+      thread: withMode(parsed.thread),
       history: { totalItems: 0, returnedItems: 0, before: 0, nextBefore: 0, hasOlder: false, nextCursor: null, indexState: "fresh" as const }
     };
   }
@@ -515,7 +548,7 @@ export async function readIndexedThreadPage(
   if (!rows.length) {
     const parsed = await readThreadFromJsonl(filePath, threadId);
     return {
-      thread: { ...parsed.thread, turns: [] },
+      thread: { ...withMode(parsed.thread), turns: [] },
       history: { totalItems, returnedItems: 0, before: totalItems, nextBefore: totalItems, hasOlder: false, nextCursor: null, indexState: "fresh" as const }
     };
   }
@@ -536,7 +569,7 @@ export async function readIndexedThreadPage(
   });
   const hasOlder = first.ordinal > 1;
   return {
-    thread: parsed.thread,
+    thread: withMode(parsed.thread),
     history: {
       totalItems,
       returnedItems: rows.length,

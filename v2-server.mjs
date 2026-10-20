@@ -14,7 +14,7 @@ const sessionCookieName = process.env.CODEX_V2_SESSION_COOKIE_NAME?.trim() || "c
 const upstreamRetryDelaysMs = [100, 250, 500, 1_000, 2_000, 3_000];
 const upstreamAgent = new http.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 32 });
 const remoteFolders = createRemoteFoldersHandler({ upstreamHost, upstreamPort,
-  workspaceRoot: process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..") });
+  workspaceRoot: process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.resolve(process.env.CODEX_WEB_DATA_DIR ?? ".codex-web", "users") });
 
 const mime = new Map([
   [".html", "text/html; charset=utf-8"],

@@ -7,6 +7,34 @@ import { createSessionCookie } from "./auth.js";
 import { publishUiUpdate, registerUiUpdateRoutes } from "./uiUpdates.js";
 
 describe("generic account update dot", () => {
+  it("publishes the same release at questions and Plan without resetting either entry's acknowledgements", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ui-plan-update-")); process.env.CODEX_WEB_UI_UPDATE_DIR = tmp;
+    const app = Fastify(); registerUiUpdateRoutes(app);
+    const headers = { cookie: createSessionCookie("mode-alice").split(";")[0] };
+    try {
+      publishUiUpdate("mode-fix-one", ["questions", "plan", "threads"]);
+      for (const target of ["questions", "plan", "threads"]) {
+        expect((await app.inject({ url: `/api/ui-updates?target=${target}`, headers })).json().hasUnseen).toBe(true);
+        expect((await app.inject({ method: "POST", url: "/api/ui-updates/seen", headers, payload: { version: "mode-fix-one", target } })).statusCode).toBe(200);
+      }
+      publishUiUpdate("mode-fix-one", ["questions", "plan", "threads"]);
+      for (const target of ["questions", "plan", "threads", "account"]) expect((await app.inject({ url: `/api/ui-updates?target=${target}`, headers })).json().hasUnseen).toBe(false);
+    } finally { await app.close(); delete process.env.CODEX_WEB_UI_UPDATE_DIR; fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+  it("publishes question fixes at the question entry and acknowledges them per user", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ui-question-update-")); process.env.CODEX_WEB_UI_UPDATE_DIR = tmp;
+    const app = Fastify(); registerUiUpdateRoutes(app);
+    const alice = { cookie: createSessionCookie("question-alice").split(";")[0] }, bob = { cookie: createSessionCookie("question-bob").split(";")[0] };
+    try {
+      publishUiUpdate("question-fix-one", ["questions"]);
+      expect((await app.inject({ url: "/api/ui-updates?target=account", headers: alice })).json().hasUnseen).toBe(false);
+      expect((await app.inject({ url: "/api/ui-updates?target=plugins", headers: alice })).json().hasUnseen).toBe(false);
+      expect((await app.inject({ url: "/api/ui-updates?target=questions", headers: alice })).json().hasUnseen).toBe(true);
+      await app.inject({ method: "POST", url: "/api/ui-updates/seen", headers: alice, payload: { version: "question-fix-one", target: "questions" } });
+      expect((await app.inject({ url: "/api/ui-updates?target=questions", headers: alice })).json().hasUnseen).toBe(false);
+      expect((await app.inject({ url: "/api/ui-updates?target=questions", headers: bob })).json().hasUnseen).toBe(true);
+    } finally { await app.close(); delete process.env.CODEX_WEB_UI_UPDATE_DIR; fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
   it("places new plugin releases only at their real entry and preserves user separation", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ui-update-")); process.env.CODEX_WEB_UI_UPDATE_DIR = tmp;
     const app = Fastify(); registerUiUpdateRoutes(app);

@@ -1,7 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult } from "./questionTool";
 
 describe("question tool presentation", () => {
+  it("returns multiple choices by their native IDs, including a free-text answer with newlines", () => {
+    const request = readUserInputRequest({ id: "pool-8", method: "item/tool/requestUserInput", params: {
+      threadId: "thread-a", turnId: "turn-a", itemId: "call-q", questions: [
+        { id: "robot", question: "请选择范围", options: [{ label: "A" }] },
+        { id: "camera", question: "请选择范围", options: null }
+      ]
+    } })!;
+    expect(request.questions.map(question => question.id)).toEqual(["robot", "camera"]);
+    expect(userInputAnswerResult(request, ["A", "自定义\n另一行：内容"])).toEqual({ answers: {
+      robot: { answers: ["A"] }, camera: { answers: ["自定义\n另一行：内容"] }
+    } });
+    expect(() => userInputAnswerResult(request, ["A"])).toThrow();
+    expect(() => userInputAnswerResult(request, ["A", " "])).toThrow();
+    expect(readUserInputRequest({ ...request, params: { ...request.params, questions: [{ question: "缺少编号" }] } })).toBeNull();
+  });
+
+  it("closes resolved synchronous questions while keeping async accepted receipts open", () => {
+    expect(synchronousQuestionHasResult({ tool: "request_user_input", status: "completed" })).toBe(true);
+    expect(synchronousQuestionHasResult({ tool: "request_user_input", completed: false })).toBe(false);
+    expect(synchronousQuestionHasResult({ tool: "request_user_input_async", completed: true, output: '{"accepted":true}' })).toBe(false);
+  });
   it("extracts choices from the async question tool without exposing its JSON", () => {
     const input = JSON.stringify({ questions: [{ title: "是否执行？", options: ["先测试", "立即启用"] }] });
     expect(parseQuestionTool("functions.request_user_input_async", input)).toEqual([{ title: "是否执行？", options: ["先测试", "立即启用"] }]);

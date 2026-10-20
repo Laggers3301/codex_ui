@@ -76,7 +76,14 @@ async function run() {
     const stateFile = path.resolve(root, pool.stateFile ?? 'account-pool-state.json');
     // The old backend only logged terminal failures. Carry that classification
     // across deployment without issuing account/read or forcing real renewal.
-    const journal = execFileSync('journalctl', ['--user', '-u', 'codex-account-pool-4576.service', '--since', '7 days ago', '--grep', 'Account authentication requires device login', '-o', 'json', '--no-pager', '-n', '200'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+    let journal;
+    try {
+      journal = execFileSync('journalctl', ['--user', '-u', 'codex-account-pool-4576.service', '--since', '7 days ago', '--grep', 'Account authentication requires device login', '-o', 'json', '--no-pager', '-n', '200'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+    } catch (error) {
+      // journalctl --grep exits 1 when no records match; that is not a deployment failure.
+      if (error.status !== 1 || String(error.stdout ?? '').trim() || String(error.stderr ?? '').trim()) throw error;
+      journal = '';
+    }
     const authFailures = captureAuthFailures(pool.accounts, journal);
     // Validate state before stopping anything; it is re-read only after the old
     // process can no longer overwrite it.
@@ -135,6 +142,22 @@ async function run() {
     const failures = [];
     for (const turn of active) {
       try {
+      if ((await connect(turn.user)).some(t => t.threadId === turn.threadId)) {
+        log('already_running', { threadId: turn.threadId }); continue;
+      }
+      // A WebSocket hello proves only that Node is listening. The account's
+      // app-server may still be releasing/reacquiring its writer lease. Probe
+      // it read-only before sending a single continuation prompt.
+      const runtimeDeadline = Date.now() + 45_000;
+      let runtimeReady = false;
+      while (Date.now() < runtimeDeadline) {
+        try {
+          const probe = await connect(turn.user, { type: 'turn.queue.list', requestId: 'deployment-ready-' + crypto.randomUUID(), threadId: turn.threadId });
+          if (probe.type === 'ack' && probe.ok === true) { runtimeReady = true; break; }
+        } catch { /* Preserve the recovery snapshot if readiness never arrives. */ }
+        await pause(1000);
+      }
+      if (!runtimeReady) throw new Error('Account runtime not ready; recovery snapshot retained');
       if ((await connect(turn.user)).some(t => t.threadId === turn.threadId)) {
         log('already_running', { threadId: turn.threadId }); continue;
       }

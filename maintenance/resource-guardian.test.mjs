@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classify, identity, descendants } from './resource-guardian.mjs';
+import { classify, identity, descendants, manualWorkspaceRoot } from './resource-guardian.mjs';
 const base = { pid: 1, ppid: 0, start: '44', exe: '/usr/bin/python3', args: [],
-  cwd: '/home/example/codex_zerotier_remote/users/test-user/project', cgroup: '/session-2.scope', rss: 1024, name: 'python' };
+  cwd: `${manualWorkspaceRoot}/sample-user/project`, cgroup: '/session-2.scope', rss: 1024, name: 'python' };
 test('VS Code, Cursor and Windsurf remote servers are editors', () => {
   for (const dir of ['.vscode-server', '.vscode-server-insiders', '.cursor-server', '.windsurf-server'])
     assert.equal(classify({ ...base, exe: `/home/example/${dir}/bin/node` }), 'editor');
@@ -22,7 +22,7 @@ test('language servers and terminal descendants belong to editor, unrelated SSH 
 });
 test('telemetry never writes arguments/secrets', () => {
   const logged = identity({ ...base, args: ['--token', 'SECRET'] });
-  assert.equal(logged.owner, 'test-user');
+  assert.equal(logged.owner, 'sample-user');
   assert.equal(JSON.stringify(logged).includes('SECRET'), false);
   assert.equal('args' in logged, false);
 });

@@ -2,8 +2,10 @@ import { useState } from "react";
 import { Send } from "lucide-react";
 import { ToolReveal } from "./ToolReveal";
 import type { ToolQuestion } from "./questionTool";
+import { AccountUpdateIndicator } from "./AccountUpdateIndicator";
+import { getApiUserId } from "./api";
 
-export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuestion[]; onChoose: (answer: string) => Promise<boolean> }) {
+export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuestion[]; onChoose: (answer: string, answers: string[]) => Promise<boolean> }) {
   const [answers, setAnswers] = useState<(string | null)[]>(() => questions.map(() => null));
   const [customAnswers, setCustomAnswers] = useState<string[]>(() => questions.map(() => ""));
   const [submitting, setSubmitting] = useState(false);
@@ -16,7 +18,7 @@ export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuest
     setSubmitting(true);
     const reply = questions.length === 1 ? option : questions.map((question, index) => `${question.title}：${next[index]}`).join("\n");
     try {
-      if (!await onChoose(reply)) setSubmitting(false);
+      if (!await onChoose(reply, next.map(answer => answer!))) setSubmitting(false);
     } catch {
       setSubmitting(false);
     }
@@ -24,7 +26,7 @@ export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuest
   const hasChoices = questions.some((question) => question.options.length > 0);
   return <div className={`toolQuestionCard${submitting ? " submitting" : ""}`} aria-label="向用户提出的问题">
     {questions.map((question, index) => <section className="toolQuestionBlock" key={`${index}:${question.title}`}>
-      <div className="toolQuestionHeading"><span className="toolQuestionTag">{question.options.length ? "选择题" : "问题"} {questions.length > 1 ? index + 1 : ""}</span><span>{question.title}</span></div>
+      <div className="toolQuestionHeading"><span className="toolQuestionTag">{question.options.length ? "选择题" : "问题"} {questions.length > 1 ? index + 1 : ""}{index === 0 ? <AccountUpdateIndicator userId={getApiUserId()} menuOpen={answers.some(answer => answer !== null)} target="questions" /> : null}</span><span>{question.title}</span></div>
       <div className="toolQuestionOptions">
         {question.options.map((option, optionIndex) => <button type="button" className={`toolQuestionOption${answers[index] === option ? " selected" : ""}`} key={`${optionIndex}:${option}`} disabled={submitting} aria-pressed={answers[index] === option} onClick={(event) => { event.stopPropagation(); void selectOption(index, option); }} title="选择并发送答案">
           <span className="toolQuestionOptionNumber">{optionIndex + 1}</span><span>{option}</span>
@@ -51,7 +53,7 @@ export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuest
 }
 
 /** Receipt/completion does not close a question. Only an actual user reply does. */
-export function ToolQuestionMessage({ open, questions, onChoose }: { open: boolean; questions: ToolQuestion[]; onChoose: (answer: string) => Promise<boolean> }) {
+export function ToolQuestionMessage({ open, questions, onChoose }: { open: boolean; questions: ToolQuestion[]; onChoose: (answer: string, answers: string[]) => Promise<boolean> }) {
   return <ToolReveal open={open} className="toolQuestionPresence">
     <article className="messageItem kind-question">
       <ToolQuestionCard questions={questions} onChoose={onChoose} />
