@@ -6,6 +6,7 @@ import { SourceTextPreview } from "./SourceTextPreview";
 import {defaultHtmlPreview,isHtmlPreviewFile} from "./htmlFilePreview";
 const HtmlSourcePreview = lazy(() => import("./HtmlSourcePreview"));
 import { VoiceInput } from "./VoiceInput";
+import { ComposerAmbientGlow } from "./ambient/ComposerAmbientGlow";
 import { resolvePromptTopAnchor } from "./promptTopAnchor";
 import { useComposerPrediction } from "./useComposerPrediction";
 import { applyLiveAgentUpdate, type AgentWireUpdate } from "./liveAgentUpdates";
@@ -30,6 +31,9 @@ import { toggleComposerList } from "./composerList";
 import { classifyProviderFailure, providerFailureCopy, type ProviderFailureNotice } from "./providerFailure";
 import { finishActiveTurn, pendingTurnStart, rememberTerminalTurn } from "./turnLifecycle";
 import { localMessageBelongsToThread } from "./localMessageScope";
+import { isSuccessfulTransferReceipt, TRANSFER_RECEIPT_HOLD_MS } from "./transferReceipt";
+import { TransferReceipt } from "./TransferReceipt";
+import "./threadContextMenu.css";
 import { readTurnProgress, turnProgressText, updateTurnProgress, type TurnProgress } from "./turnProgress";
 import { exhaustedAccountSuggestion, type ExhaustedAccountSuggestion } from "./accountExhaustion";
 import "katex/dist/katex.min.css";
@@ -90,7 +94,7 @@ import { collectAgents, parseAgentOperation, reconcileSubagents } from "./subage
 import { useSubagentDirectory } from "./subagentDirectory";
 import { useSidebarThreadLists } from "./sidebarThreadLists";
 import {setSidebarThreadHidden,sidebarVisibilityVersion,visibleSidebarThreads,reconcileSidebarVisibility} from './sidebarVisibility';
-import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, type UserInputRequest } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, type UserInputRequest } from "./questionTool";
 import { ToolQuestionCard, ToolQuestionMessage } from "./ToolQuestionCard";
 import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
@@ -219,6 +223,7 @@ interface LocalMessage {
   placement?: "tail" | "conversation";
   threadId?: string | null;
   afterTurnId?: string | null;
+  expiresAt?: number;
 }
 
 const contextProfileOptions: Array<{
@@ -4439,6 +4444,10 @@ export function App() {
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
   const [pendingDeleteThreadId, setPendingDeleteThreadId] = useState<string | null>(null);
   const [threadContextMenu, setThreadContextMenu] = useState<ThreadContextMenu | null>(null);
+  const threadContextMenuSnapshot = useRef<ThreadContextMenu | null>(null);
+  if (threadContextMenu) threadContextMenuSnapshot.current = threadContextMenu;
+  const threadContextMenuPresence = useExitPresence(Boolean(threadContextMenu), 180);
+  const displayedThreadContextMenu = threadContextMenu ?? threadContextMenuSnapshot.current;
   const [creatingWorktree, setCreatingWorktree] = useState(false);
   const [worktreeOpen, setWorktreeOpen] = useState(false);
   const [worktreeRepositories, setWorktreeRepositories] = useState<Array<{ rootPath: string; name: string }>>([]);
@@ -4569,6 +4578,8 @@ export function App() {
   const [answeredQuestionItems, setAnsweredQuestionItems] = useState<Record<string, true>>({});
   const submittingQuestionItemsRef = useRef(new Set<string>());
   const pendingUserInputsRef = useRef(new Map<string, UserInputRequest>());
+  const liveQuestionIdentitiesRef = useRef(new Map<string, { threadId: string; turnId: string }>());
+  useEffect(() => { liveQuestionIdentitiesRef.current.clear(); }, [selectedUserId]);
   const questionAnswerAcksRef = useRef(new Map<string, { resolve: (accepted: boolean) => void; timer: number }>());
   useEffect(() => () => {
     for (const pending of questionAnswerAcksRef.current.values()) {
@@ -5788,8 +5799,8 @@ export function App() {
     setPendingDeleteThreadId(null);
     setThreadContextMenu({
       thread,
-      x: Math.max(8, Math.min(event.clientX, window.innerWidth - 224)),
-      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 160))
+      x: Math.max(8, Math.min(event.clientX, window.innerWidth - 184)),
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 136))
     });
   }
 
@@ -6889,17 +6900,20 @@ export function App() {
     id = `local-${requestToken()}`,
     options: LocalMessageOptions = {}
   ) {
-    setLocalMessages((current) => [...current, { id, meta, text, kind, ...options }]);
+    const expiresAt = isSuccessfulTransferReceipt(meta, text) ? Date.now() + TRANSFER_RECEIPT_HOLD_MS : undefined;
+    setLocalMessages((current) => [...current, { id, meta, text, kind, ...options, expiresAt }]);
   }
 
   function renderLocalMessage(entry: LocalMessage) {
     if (entry.meta === "Codex Web · 分支续接" || entry.meta === "Codex Web · status" || entry.meta === "Codex Web · Goal") return null;
-    return (
+    const message = (
       <article className={`messageItem kind-${entry.kind ?? "system"}`} key={entry.id}>
         <div className="messageMeta">{entry.meta}</div>
         <MarkdownMessage text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
       </article>
     );
+    return entry.expiresAt !== undefined ? <TransferReceipt key={entry.id} expiresAt={entry.expiresAt}
+      onExpired={() => setLocalMessages(current => current.filter(item => item.id !== entry.id))}>{message}</TransferReceipt> : message;
   }
 
   function appendLocalMessage(id: string, text: string, meta = "Codex Web · command", kind: LocalMessage["kind"] = "tool") {
@@ -9108,6 +9122,27 @@ export function App() {
     } }));
   }
 
+  function receiveLiveQuestion(value: unknown): void {
+    const question = readLiveQuestionNotification(value);
+    if (!question) return;
+    const identity = { threadId: question.threadId, turnId: question.turnId };
+    liveQuestionIdentitiesRef.current.set(question.itemId, identity);
+    liveQuestionIdentitiesRef.current.set(question.sourceItemId, identity);
+    while (liveQuestionIdentitiesRef.current.size > 512) liveQuestionIdentitiesRef.current.delete(liveQuestionIdentitiesRef.current.keys().next().value!);
+    markLiveEvent(question.threadId);
+    liveTimelineSequence("tool", question.itemId);
+    // The same native item must not also appear as ordinary JSON/text.
+    for (const id of [question.itemId, question.sourceItemId]) {
+      pendingLiveDeltasRef.current.delete(id);
+      liveAgentBasesRef.current.delete(id);
+    }
+    setLiveDeltas(current => Object.fromEntries(Object.entries(current).filter(([id]) => id !== question.itemId && id !== question.sourceItemId)));
+    const now = new Date().toISOString();
+    setLiveTools(current => ({ ...current, [question.itemId]: {
+      ...current[question.itemId], ...question, output: "", startedAt: current[question.itemId]?.startedAt ?? now, updatedAt: now
+    } }));
+  }
+
   function resolveUserInputRequest(requestId: unknown): void {
     const request = pendingUserInputsRef.current.get(String(requestId));
     if (!request) return;
@@ -9391,7 +9426,8 @@ export function App() {
     }
     const activeTurns = activeTurnsFromSnapshot(snapshot);
     activeTurnsByThreadRef.current = activeTurns;
-    const snapshotDeltas = liveDeltasFromSnapshot(snapshot, activeTurns);
+    const snapshotDeltas = Object.fromEntries(Object.entries(liveDeltasFromSnapshot(snapshot, activeTurns)).filter(([id, entry]) =>
+      liveQuestionIdentitiesRef.current.get(id)?.threadId !== entry.threadId));
     const snapshotTools = liveToolsFromSnapshot(snapshot);
     // A completed turn is removed from the server's live snapshot before its
     // JSONL history is always readable. Preserve the temporary panel's live
@@ -9564,6 +9600,7 @@ export function App() {
     if (message.type === "live.agent" || message.type === "live.agent.delta") {
       const item = message.data as (AgentWireUpdate & {itemId:string}) | undefined;
       if (item?.itemId) {
+        if (liveQuestionIdentitiesRef.current.get(item.itemId)?.threadId === item.threadId) return;
         markLiveEvent(item.threadId);
         if (typeof item.sequence === "number") {
           liveTimelineOrderRef.current.set(`agent:${item.itemId}`, item.sequence);
@@ -9949,6 +9986,7 @@ export function App() {
         return;
       }
       const params = notification.params ?? {};
+      receiveLiveQuestion(notification);
       if (notification.method === "turn/diff/updated") {
         const turnId = notificationTurnId(params);
         if (turnId && typeof params.diff === "string") {
@@ -10212,6 +10250,7 @@ export function App() {
     if (parseAgentOperation(collaborationItem)) return <article className="messageItem kind-tool subagentMessage" key={entry.id}><SubagentToolCard item={collaborationItem} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} /></article>;
     const liveQuestions = parseQuestionTool(safeText(entry.tool), entry.input);
     if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} />;
+    if (isQuestionToolName(entry.tool)) return <div className="v2ThinkingLine" role="status" key={entry.id}>正在生成问题…</div>;
     return (
       <article className="messageItem kind-tool type-toolCall live" key={entry.id}>
         <div className="messageMeta">{entry.completed ? "工具输出" : "调用工具"} · {entry.tool}</div>
@@ -11336,29 +11375,32 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         )}
       />
 
-      {threadContextMenu ? createPortal(
+      {threadContextMenuPresence.present && displayedThreadContextMenu ? createPortal(
         <div
-          className="threadContextMenu"
+          key={`${displayedThreadContextMenu.thread.id}:${displayedThreadContextMenu.x}:${displayedThreadContextMenu.y}`}
+          className={`threadContextMenu compactThreadContextMenu${threadContextMenu ? "" : " closing"}`}
           role="menu"
-          aria-label={`会话操作：${threadContextMenu.thread.name || threadContextMenu.thread.preview || "Untitled"}`}
-          style={{ left: threadContextMenu.x, top: threadContextMenu.y }}
+          aria-label={`会话操作：${displayedThreadContextMenu.thread.name || displayedThreadContextMenu.thread.preview || "Untitled"}`}
+          aria-hidden={!threadContextMenu}
+          inert={!threadContextMenu}
+          style={{ left: displayedThreadContextMenu.x, top: displayedThreadContextMenu.y }}
           onPointerDown={(event) => event.stopPropagation()}
           onContextMenu={(event) => event.preventDefault()}
         >
-          <button type="button" role="menuitem" onClick={() => void copyThreadSessionId(threadContextMenu.thread)}>
+          <button type="button" role="menuitem" onClick={() => void copyThreadSessionId(displayedThreadContextMenu.thread)}>
             <Copy size={15} />
             复制会话 ID
             <AccountUpdateIndicator key={`threads:${selectedUserId}`} userId={selectedUserId} menuOpen={false} target="threads" dismissOnRefresh />
           </button>
-          <button type="button" role="menuitem" onClick={() => beginThreadRename(threadContextMenu.thread)}>
+          <button type="button" role="menuitem" onClick={() => beginThreadRename(displayedThreadContextMenu.thread)}>
             <PencilLine size={15} />
             重命名会话
           </button>
-          <button type="button" role="menuitem" onClick={() => void toggleThreadPin(threadContextMenu.thread)}>
+          <button type="button" role="menuitem" onClick={() => void toggleThreadPin(displayedThreadContextMenu.thread)}>
             <Pin size={15} />
-            {threadContextMenu.thread.pinned ? "取消置顶" : "置顶会话"}
+            {displayedThreadContextMenu.thread.pinned ? "取消置顶" : "置顶会话"}
           </button>
-          <button type="button" role="menuitem" onClick={() => void changeThreadArchive(threadContextMenu.thread, true)}>
+          <button type="button" role="menuitem" onClick={() => void changeThreadArchive(displayedThreadContextMenu.thread, true)}>
             <Archive size={15} />归档会话
           </button>
         </div>, document.body
@@ -12582,7 +12624,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 </div>
               </aside>
             ) : null}
-            <div className="conversationContent">
+            <div className="conversationContent hasComposerAmbientGlow">
+              <ComposerAmbientGlow key={`ambient:${selectedUserId}`} theme={colorTheme} hasDraft={composerHasDraft} welcome={Boolean(selectedProject && !selectedThread && !openingThreadId && !openingThreadPresence.present && visiblePendingUserMessages.length === 0 && liveTimelineEntries.length === 0 && localMessages.length === 0)} />
               {showPromptNavigator ? (
                 <nav
                   className="promptNavigator"
@@ -12911,6 +12954,11 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     if (inlineQuestions) {
                       toolGroupIndex = flushToolGroup(toolGroupIndex, true);
                       renderedHistoryItems.push(<ToolQuestionMessage key={`${turn.id}-${item.id}-question`} open={!questionIsAnswered(item.id, turn.id, items)} questions={inlineQuestions} onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers)} />);
+                      continue;
+                    }
+                    if (kind === "tool" && isQuestionToolName(item.tool)) {
+                      toolGroupIndex = flushToolGroup(toolGroupIndex, true);
+                      renderedHistoryItems.push(<div className="v2ThinkingLine" role="status" key={`${turn.id}-${item.id}-question-pending`}>正在生成问题…</div>);
                       continue;
                     }
                     if (kind === "tool" || kind === "reasoning") {

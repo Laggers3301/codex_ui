@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { ProviderUsageTracker } from "./providerUsage.js";
 import { overlayJournal } from "./timelineJournal.js";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import path from "node:path";
@@ -765,6 +766,7 @@ type LeaderboardFileSummary = {
   usage: LeaderboardFileUsage[];
   granularity?: "day" | "event";
   billingVersion?: number;
+  providerUsageVersion?: number;
 };
 
 type LeaderboardFileCachePayload = {
@@ -995,10 +997,6 @@ function walkJsonlFiles(root: string): string[] {
     }
   }
   return result;
-}
-
-function countField(record: Record<string, unknown>, camel: string, snake: string): number {
-  return safeCount(record[camel]) ?? safeCount(record[snake]) ?? 0;
 }
 
 export function userIdFromSessionCwd(cwd: string | null, isKnownUser?: (userId: string) => boolean): string | null {
@@ -1324,6 +1322,7 @@ export async function summarizeLeaderboardFile(
   let tokenEventIndex = 0;
   let currentTurnId: string | null = null;
   let inheritedTurns = new Set<string>();
+  const usageTracker = new ProviderUsageTracker();
   const knownUsers = new Map<string, boolean>();
   const isKnownUser = (id: string): boolean => {
     if (!knownUsers.has(id)) knownUsers.set(id, store.getUser(id) !== null);
@@ -1366,7 +1365,11 @@ export async function summarizeLeaderboardFile(
       currentTurnId = stringOrNull(payload.turn_id) ?? currentTurnId;
     }
     if (type !== "event_msg" || stringOrNull(payload.type) !== "token_count") continue;
+    // Advance cumulative baseline even for inherited turns, before excluding
+    // their already-billed work from this fork.
+    const normalizedUsage = usageTracker.consume(payload.info);
     if (currentTurnId && inheritedTurns.has(currentTurnId)) continue;
+    if (!normalizedUsage) continue;
 
     const recordTimestamp = stringOrNull(record.timestamp);
     const parsedTimestampMs = recordTimestamp ? Date.parse(recordTimestamp) : Number.NaN;
@@ -1379,18 +1382,7 @@ export async function summarizeLeaderboardFile(
     if (!userId) {
       userId = resolveSessionOwner(sessionId) ?? userIdFromSessionCwd(stringOrNull(payload.cwd), isKnownUser) ?? "unknown";
     }
-    const info = asRecord(payload.info);
-    const usageRecord = asRecord(info.last_token_usage);
-    const fallbackUsageRecord = asRecord(info.total_token_usage);
-    const usageSource = Object.keys(usageRecord).length ? usageRecord : fallbackUsageRecord;
-    const usage: TokenAccumulator = {
-      inputTokens: countField(usageSource, "inputTokens", "input_tokens"),
-      cachedInputTokens: countField(usageSource, "cachedInputTokens", "cached_input_tokens"),
-      cacheWriteInputTokens: countField(usageSource, "cacheWriteInputTokens", "cache_write_input_tokens"),
-      outputTokens: countField(usageSource, "outputTokens", "output_tokens"),
-      reasoningOutputTokens: countField(usageSource, "reasoningOutputTokens", "reasoning_output_tokens"),
-      totalTokens: countField(usageSource, "totalTokens", "total_tokens")
-    };
+    const usage: TokenAccumulator = normalizedUsage;
     if (!usage.totalTokens) continue;
     const primary = asRecord(asRecord(payload.rate_limits).primary);
     const resetAt = safeCount(primary.resets_at) ?? safeCount(primary.resetsAt);
@@ -1408,7 +1400,7 @@ export async function summarizeLeaderboardFile(
     }
   }
 
-  return { size: stat.size, mtimeMs: stat.mtimeMs, startAt, usage: Array.from(usageByKey.values()), granularity: preciseTimestamps ? "event" : "day", billingVersion: 2 };
+  return { size: stat.size, mtimeMs: stat.mtimeMs, startAt, usage: Array.from(usageByKey.values()), granularity: preciseTimestamps ? "event" : "day", billingVersion: 2, providerUsageVersion: 1 };
 }
 
 async function readCodexLeaderboard(
@@ -1468,7 +1460,8 @@ async function readCodexLeaderboard(
         && summary.usage.some((entry) => entry.dayKey === undefined)
       );
       const needsEventTimestamps = source.kind === "api-provider" && summary?.granularity !== "event";
-      if (!summary || summary.billingVersion !== 2 || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs || needsCurrentCycleDailyBreakdown || needsEventTimestamps) {
+      const needsProviderUsage = source.kind === "api-provider" && summary?.providerUsageVersion !== 1;
+      if (!summary || summary.billingVersion !== 2 || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs || needsCurrentCycleDailyBreakdown || needsEventTimestamps || needsProviderUsage) {
         summary = await summarizeLeaderboardFile(filePath, store, resolveSessionOwner, source.kind === "api-provider");
         leaderboardFileCache.set(filePath, summary);
         cacheChanged = true;

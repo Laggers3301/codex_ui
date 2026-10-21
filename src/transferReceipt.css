@@ -1,0 +1,22 @@
+.transientTransferReceipt {
+  display: grid;
+  grid-template-rows: 1fr;
+  min-height: 0;
+  overflow-anchor: none;
+  opacity: 1;
+  transform: translateY(0);
+  transition: grid-template-rows 400ms cubic-bezier(.22, 1, .36, 1), opacity 300ms ease, transform 400ms cubic-bezier(.22, 1, .36, 1);
+  animation: transferReceiptEnter 260ms cubic-bezier(.16, 1, .3, 1) both;
+}
+.transientTransferReceiptInner { min-height: 0; overflow: hidden; }
+.transientTransferReceipt.closing {
+  animation: none;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translateY(-4px);
+  pointer-events: none;
+}
+@keyframes transferReceiptEnter { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) {
+  .transientTransferReceipt { animation: none; transform: none !important; transition: opacity 120ms ease; }
+}

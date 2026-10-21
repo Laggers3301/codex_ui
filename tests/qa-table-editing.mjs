@@ -5,10 +5,10 @@ import http from 'node:http';
 import path from 'node:path';
 import {createRequire} from 'node:module';
 import assert from 'node:assert/strict';
-const require=createRequire(import.meta.url),{chromium,webkit}=require('../node_modules/playwright');
+const require=createRequire(import.meta.url),{chromium,webkit}=require('../frontend/node_modules/playwright');
 const root=new URL('../',import.meta.url);
 const out=new URL('output/qa/table-editing-20261019/',root);await fs.mkdir(out,{recursive:true});
-const staticRoot=new URL('dist/',root).pathname;
+const staticRoot=new URL('frontend/dist/',root).pathname;
 const server=http.createServer(async(req,res)=>{
  try{
   const name=decodeURIComponent(new URL(req.url,'http://localhost').pathname),target=path.resolve(staticRoot,name==='/'?'index.html':'.'+name);

@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 
 const url = process.env.GOAL_HOVER_QA_URL || "https://codex-alt.example.com";
-const threadId = process.env.GOAL_HOVER_QA_THREAD || "01a0db3e-315e-7461-b9a9-8a7a9236a84e";
+const threadId = process.env.GOAL_HOVER_QA_THREAD;
+assert.ok(threadId, "Supply the authorized thread for read-only QA");
 const username = process.env.DOCUMENT_QA_USER || "qa-user";
 if (!process.env.DOCUMENT_QA_PASSWORD) throw new Error("Authorized read-only QA login required.");
 const screenshots = await fs.mkdtemp("/tmp/codex-goal-hover-public-");

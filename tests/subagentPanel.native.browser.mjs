@@ -4,7 +4,8 @@ import fs from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 
 const appRoot = "/srv/codex-ui";
-const parentId = "01a0db3e-315e-7461-b9a9-8a7a9236a84e";
+const parentId = process.env.SUBAGENT_NATIVE_QA_THREAD;
+assert.ok(parentId, "Supply the authorized parent thread for QA");
 const production = process.env.SUBAGENT_NATIVE_QA_PRODUCTION === "1";
 const baseline = process.env.SUBAGENT_POLISH_BASELINE === "1";
 const origin = process.env.SUBAGENT_NATIVE_QA_ORIGIN ?? (production ? "http://127.0.0.1:4575" : "http://127.0.0.1:4590");

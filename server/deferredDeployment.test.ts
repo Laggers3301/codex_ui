@@ -48,6 +48,7 @@ it("waits for the protected turn, restarts outside that turn, and resumes only t
     if (name === "node:fs") return { readFileSync: (file: string) => file.endsWith('account-pool.json') ? '{"accounts":[]}' : file.endsWith('account-pool-state.json') ? '{}' : "fixture-session-secret", writeFileSync: (_file: string, text: string) => writes.push(text) };
     if (name === "node:path") return path;
     if (name === "node:crypto") return crypto;
+    if (name === "node:net") return { connect: () => { throw new Error("Unexpected authorization connection in restart fixture"); } };
     if (name === "node:sqlite") return { DatabaseSync: FakeDB };
     if (name === "node:module") return { createRequire: () => () => FakeSocket };
     if (name === "./preserve-auth-failures.cjs") return {

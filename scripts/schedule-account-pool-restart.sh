@@ -3,9 +3,18 @@ set -euo pipefail
 protected_thread="${1:-}"
 [[ "$protected_thread" =~ ^[a-fA-F0-9-]{36}$ ]] || { printf '%s\n' 'Usage: bash schedule-account-pool-restart.sh <current-thread-id> [--restart-ui]'; exit 2; }
 shift
+verify_next=false
 for deploy_flag in "$@"; do
-  [[ "$deploy_flag" == "--restart-ui" ]] || { printf '%s\n' 'Only --restart-ui is accepted as an optional deployment flag.'; exit 2; }
+  if [[ "$verify_next" == true ]]; then
+    [[ "$deploy_flag" =~ ^[a-fA-F0-9-]{36}$ ]] || exit 2
+    verify_next=false
+  elif [[ "$deploy_flag" == "--verify-authorization" ]]; then
+    verify_next=true
+  else
+    [[ "$deploy_flag" == "--restart-ui" || "$deploy_flag" == "--all-idle" ]] || { printf '%s\n' 'Unsupported deployment flag.'; exit 2; }
+  fi
 done
+[[ "$verify_next" == false ]] || exit 2
 app_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 node_bin="${CODEX_POOL_NODE_BIN:-$(command -v node)}"
 unit_name="codex-pool-deploy-$(date +%s)-$$"

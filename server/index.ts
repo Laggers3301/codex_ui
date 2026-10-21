@@ -21,6 +21,8 @@ import { registerPetRoutes } from "./pets.js";
 import { registerUiUpdateRoutes } from "./uiUpdates.js";
 import { registerSpeechRoutes } from "./speech.js";
 import { registerFeishuRoutes } from "./feishu.js";
+import {AuthDiagnosticLog,type AuthDiagnostic} from "./authDiagnostics.js";
+import {DeviceAuthorization,startAuthorizationControl} from "./deviceAuthorization.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -114,6 +116,12 @@ const store = new ProjectStore();
 const bridge = serverConfig.accountPoolFile
   ? AccountPoolBridge.fromFile(serverConfig.accountPoolFile)
   : new CodexBridge();
+const authDiagnosticLog=new AuthDiagnosticLog(path.join(serverConfig.dataDir,"auth-diagnostics","events.jsonl"));
+const recordAuthDiagnostic=(row:AuthDiagnostic)=>{
+  try{authDiagnosticLog.append(row);}catch{app.log.warn("Auth diagnostic storage unavailable; credentials unchanged");}
+  app.log.info(row,"Account authentication diagnostic");
+};
+bridge.on("accountAuthDiagnostic",recordAuthDiagnostic);
 const modelCatalogUpdater = isAccountPoolBridge(bridge)
   ? new ModelCatalogAutoUpdater(
       bridge,
@@ -342,6 +350,7 @@ app.setNotFoundHandler((request, reply) => {
 attachSocketServer(app.server, bridge as CodexBridge, store, browserService);
 
 let shuttingDown = false;
+let closeAuthControl: (() => void) | undefined;
 async function shutdownServer(signal: string) {
   if (shuttingDown) {
     return;
@@ -351,6 +360,7 @@ async function shutdownServer(signal: string) {
     app.log.info({ signal }, "Shutting down Codex Web Console");
     await browserService.dispose();
     modelCatalogUpdater?.stop();
+    closeAuthControl?.();
     bridge.stop();
     store.close();
     process.exit(0);
@@ -369,5 +379,16 @@ process.on("SIGTERM", () => {
 });
 
 await bridge.start();
+if(isAccountPoolBridge(bridge)){
+  const manager=new DeviceAuthorization(bridge,path.join(serverConfig.dataDir,"device-authorizations"),recordAuthDiagnostic);
+  try{
+    const close=await startAuthorizationControl(manager,path.join(serverConfig.dataDir,"auth-control.sock"));
+    closeAuthControl=close;
+    app.addHook("onClose",async()=>{close();});
+    // Recover already-authorized credentials before serving new turns. A
+    // periodic-only retry can lose every idle window to reconnecting clients.
+    await manager.tick();
+  }catch{manager.close();app.log.warn("Local authorization control unavailable; existing accounts unchanged");}
+}
 await app.listen({ host: serverConfig.host, port: serverConfig.port });
 modelCatalogUpdater?.start();

@@ -1,0 +1,34 @@
+html, body, #root { min-width: 0; height: auto !important; min-height: 100%; overflow: visible !important; }
+body { background: var(--bg); }
+.ambientPreview { max-width: 1400px; margin: 0 auto; padding: 24px; font-size: 14px; color: var(--text); }
+.ambientPreview h1 { font-size: 20px; margin: 0 0 8px; }
+.ambientPreview p { color: var(--muted); }
+.ambientPreview nav { display: flex; flex-wrap: wrap; gap: 8px; }
+.ambientPreview nav button { padding: 9px 14px; border: 1px solid var(--line); border-radius: 10px; color: var(--text); background: var(--ui-surface-raised); cursor: pointer; }
+.ambientPreviewComparison { display: flex; align-items: start; gap: 28px; flex-wrap: wrap; }
+.ambientPreview figure { width: 393px; margin: 12px 0; min-width: 0; }
+.ambientPreview figcaption { margin-bottom: 10px; color: var(--muted); }
+.ambientReferenceCrop { height: 378px; overflow: hidden; background: #000; }
+.ambientReferenceCrop img { display: block; width: 393px; max-width: none; height: auto; transform: translateY(-99px); }
+.ambientPreview .ambientPreviewScreen { width: 100%; height: 378px; display: flex; min-height: 0; }
+.ambientPreview .conversationContent { flex: 1; min-height: 0; }
+.ambientPreview .messages { flex: 1; padding: 32px 24px; background: transparent !important; }
+.ambientPreview .composer { min-height: 132px !important; max-height: 190px !important; left: 16px !important; right: 16px !important; bottom: 14px !important; padding: 10px 12px 12px; }
+.ambientPreview .composerBody { min-height: 110px; width: 100%; }
+.ambientPreview .composerTools { display: flex; flex-wrap: nowrap; align-items: center; gap: 4px; padding-inline: 25px 60px; }
+.ambientPreview .composerTools button { font-size: 12px; padding: 3px 6px; white-space: nowrap; }
+.ambientPreview .composerTools { width: calc(100% - 75px) !important; padding-inline: 25px 0 !important; justify-content: flex-start !important; gap: 4px !important; }
+.ambientPreview .composerTools button { margin: 0 !important; flex: 0 1 auto !important; min-width: 0 !important; padding: 0 4px !important; font-size: 12px !important; width: auto !important; }
+.ambientPreview textarea { order: 20; min-height: 58px; padding: 4px 2px; resize: none; font-size: 16px; line-height: 1.5; width: 100%; }
+.ambientPreview .composerSendActions { position: absolute; right: 12px; bottom: 9px; display: flex; flex-direction: row; gap: 6px; }
+.ambientPreview .composerSendActions button, .ambientPreviewPlus { width: 30px; height: 30px; min-height: 0; padding: 0; }
+.ambientPreviewPlus { position: absolute; bottom: 9px; left: 12px; }
+.ambientShapeExamples { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 16px; }
+.ambientShapeExamples h2 { width: 100%; font-size: 14px; font-weight: 500; }
+.ambientShapeExamples > div { display: grid; place-items: center; position: relative; inset: auto; transform: none; opacity: 1; width: 180px; min-width: 0; height: 90px; padding: 16px; background: var(--ui-surface-raised); color: var(--text); border: 1px solid var(--line); }
+.ambientPreviewComparison.desktop figure:last-child { width: min(100%, 820px); }
+.ambientPreviewComparison.desktop .ambientPreviewScreen { height: 520px; }
+@media (max-width: 450px) { .ambientPreview { padding: 12px; } .ambientPreview figure { width: 100%; } }
+/* Keep the isolated controls onscreen on phones; the reference stays beside
+   the implementation at desktop widths, not as an extra mobile page above it. */
+@media (max-width: 450px) { .ambientPreviewComparison > figure:first-child { display: none; } }

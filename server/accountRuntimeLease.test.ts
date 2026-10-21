@@ -16,7 +16,8 @@ describe("account runtime credential lease", () => {
     const launch = () => spawn("/usr/bin/flock", ["--exclusive", "--nonblock", "--no-fork", "--conflict-exit-code", "75",
       path.join(home, ".web-runtime.lock"), process.execPath, wrapper, process.execPath, "-e",
       `const child=require('child_process').spawn('/bin/sleep',['30'],{stdio:'ignore'}); console.log(child.pid); process.stdin.resume(); process.on('SIGTERM',()=>process.exit(0));`],
-      { env: { ...process.env, CODEX_HOME: home } });
+      // Exercise the fixture, never adopt the production CLI candidate.
+      { env: { ...process.env, CODEX_HOME: home, CODEX_WEB_RUNTIME_ADOPT_CANDIDATE: "0" } });
     let first: ChildProcess | undefined, third: ChildProcess | undefined;
     const tools: number[] = [];
     let diagnostics = "";

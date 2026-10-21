@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { createSpeechPreupload, reportSpeechTiming } from "./api";
 import { Mic, LoaderCircle, X } from "./PanelIcons";
+import { startVoiceAmbient, VOICE_AMBIENT_EVENT } from "./ambient/voiceAmbient";
 import "./voiceInput.css";
 
 /** The parent keys this component by user/thread, preventing cross-thread dictation. */
@@ -17,7 +18,8 @@ export const VoiceInput = memo(function VoiceInput({ onText }: { onText: (text: 
     const timer = window.setTimeout(() => setNoticePresent(false), 240);
     return () => window.clearTimeout(timer);
   }, [noticeOpen, error, phase, seconds, cancelHint]);
-  type Recording = { cancelled: boolean; recorder: MediaRecorder | null; stream: MediaStream | null; controller: AbortController | null; timer: number; finalizeTimer: number; startedAt: number; stoppedAt: number; upload: ReturnType<typeof createSpeechPreupload> | null };
+  type Recording = { cancelled: boolean; recorder: MediaRecorder | null; stream: MediaStream | null; controller: AbortController | null; timer: number; finalizeTimer: number; startedAt: number; stoppedAt: number; upload: ReturnType<typeof createSpeechPreupload> | null; stopAmbient: (() => void) | null };
+  const voiceRoot = useRef<HTMLDivElement>(null);
   const current = useRef<Recording | null>(null);
   const mounted = useRef(true);
   const permitted = useRef(false);
@@ -25,6 +27,7 @@ export const VoiceInput = memo(function VoiceInput({ onText }: { onText: (text: 
   const suppressClick = useRef(false);
   const callback = useRef(onText); callback.current = onText;
   const release = (session: Recording) => {
+    session.stopAmbient?.(); session.stopAmbient = null;
     window.clearInterval(session.timer); window.clearTimeout(session.finalizeTimer);
     session.stream?.getTracks().forEach(track => track.stop());
   };
@@ -39,6 +42,7 @@ export const VoiceInput = memo(function VoiceInput({ onText }: { onText: (text: 
       release(session); if (mounted.current) setPhase("idle"); return;
     }
     if (session.recorder?.state !== "recording") return;
+    session.stopAmbient?.(); session.stopAmbient = null;
     session.stoppedAt = performance.now();
     if (mounted.current) setPhase("converting");
     session.finalizeTimer = window.setTimeout(() => {
@@ -60,7 +64,7 @@ export const VoiceInput = memo(function VoiceInput({ onText }: { onText: (text: 
     if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       setError("请通过 HTTPS 打开网页，并使用支持录音的浏览器"); return;
     }
-    const session: Recording = { cancelled: false, recorder: null, stream: null, controller: null, timer: 0, finalizeTimer: 0, startedAt: 0, stoppedAt: 0, upload: null };
+    const session: Recording = { cancelled: false, recorder: null, stream: null, controller: null, timer: 0, finalizeTimer: 0, startedAt: 0, stoppedAt: 0, upload: null, stopAmbient: null };
     current.current = session; setPhase("permission");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: { ideal: 1 } }, video: false });
@@ -118,6 +122,10 @@ export const VoiceInput = memo(function VoiceInput({ onText }: { onText: (text: 
       };
       recorder.onerror = () => { if (current.current === session) { stop(true); if (mounted.current) setError("录音中断，请检查麦克风"); } };
       recorder.start(2000); session.startedAt = performance.now(); setSeconds(0); setPhase("recording");
+      const composer = voiceRoot.current?.closest(".composer:not(.temporaryAskComposer)");
+      if (composer) session.stopAmbient = startVoiceAmbient(stream, detail => {
+        composer.dispatchEvent(new CustomEvent(VOICE_AMBIENT_EVENT, { detail }));
+      });
       let elapsed = 0;
       session.timer = window.setInterval(() => { if (current.current !== session) return; elapsed++; setSeconds(elapsed); if (elapsed >= 600) stop(); }, 1000);
     } catch (caught) {
@@ -126,7 +134,7 @@ export const VoiceInput = memo(function VoiceInput({ onText }: { onText: (text: 
       current.current = null; setPhase("idle"); setError(caught instanceof DOMException && caught.name === "NotAllowedError" ? "请在 Safari 的本网站设置中允许麦克风，然后重新录音" : "无法打开麦克风，请检查设备是否被占用");
     }
   }
-  return <div className="voiceInput">
+  return <div ref={voiceRoot} className="voiceInput">
     <button type="button" className={`iconButton voiceButton ${phase}`} aria-label={phase === "recording" ? "结束录音并转成文字" : "语音输入"}
       title="点击开始／结束录音；按住录音，上滑取消（最长 10 分钟）" disabled={phase === "converting" || phase === "permission"}
       onPointerDown={event => {

@@ -7,6 +7,7 @@ import path from "node:path";
 import { serverConfig } from "./config.js";
 import type { RpcEnvelope } from "./types.js";
 import { AppError } from "./appErrors.js";
+import {authDiagnostic} from "./authDiagnostics.js";
 
 /**
  * The process used as the JSON-RPC transport for a Codex app-server.
@@ -319,6 +320,16 @@ export class CodexBridge extends EventEmitter {
       return;
     }
 
+    // Malformed provider/native envelopes are not process-fatal and must not
+    // be interpreted as notifications or reflected into public error text.
+    if (!message || typeof message !== "object" || Array.isArray(message)
+      || (message.method !== undefined && typeof message.method !== "string")
+      || (message.id !== undefined && typeof message.id !== "number" && typeof message.id !== "string")
+      || (message.method === undefined && message.id === undefined)) {
+      this.emit("stderr", "Ignored malformed app-server envelope");
+      return;
+    }
+
     const kind = classifyRpcEnvelope(message);
 
     if (kind === "response") {
@@ -331,7 +342,13 @@ export class CodexBridge extends EventEmitter {
       clearTimeout(pending.timer);
       this.pending.delete(id);
       if (message.error) {
-        pending.reject(new Error(message.error.message));
+        const error=new Error(message.error.message);
+        if(["account/read","account/rateLimits/read","account/usage/read","account/login/start"].includes(pending.method)){
+          const safe=authDiagnostic("transport","health_verify","failure",message.error);
+          // Retain only explicitly allowed error context, not data/headers/body.
+          Object.defineProperties(error,{httpStatus:{value:safe.httpStatus},requestId:{value:safe.requestId},authCode:{value:safe.code}});
+        }
+        pending.reject(error);
       } else {
         pending.resolve(message.result);
       }

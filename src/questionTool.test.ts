@@ -1,7 +1,38 @@
 import { describe, expect, it } from "vitest";
-import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification } from "./questionTool";
 
 describe("question tool presentation", () => {
+  it("preserves the native async agentMessage metadata on started, before any history or tool receipt", () => {
+    const item = { type: "agentMessage", id: "call-native-q", delivery: "async", text: "请提供路径", questions: [{ title: "请提供路径", options: null }] };
+    const event = { method: "item/started", params: { threadId: "t", turnId: "r", item } };
+    const live = readLiveQuestionNotification(event)!;
+    expect(live).toMatchObject({ itemId: item.id, tool: "request_user_input_async", threadId: "t", turnId: "r", completed: false });
+    expect(parseQuestionTool(live.tool, live.input)).toEqual([{ title: "请提供路径", options: [] }]);
+    expect(parseQuestionToolItem(item)).toEqual([{ title: "请提供路径", options: [] }]);
+    expect(readLiveQuestionNotification({ ...event, method: "item/completed" })).toMatchObject({ completed: true });
+    expect(synchronousQuestionHasResult({ ...live, completed: true, output: '{"accepted":true}' })).toBe(false);
+  });
+  it("does not promote prose, JSON examples, unscoped events or accepted receipts", () => {
+    const make = (item: unknown) => ({ method: "item/started", params: { threadId: "t", turnId: "r", item } });
+    expect(readLiveQuestionNotification(make({ type: "agentMessage", id: "m", text: '{"questions":[{"title":"示例"}]}' }))).toBeNull();
+    expect(readLiveQuestionNotification(make({ type: "agentMessage", id: "m", delivery: "async", questions: null }))).toBeNull();
+    expect(readLiveQuestionNotification(make({ type: "functionCallOutput", id: "c", output: '{"accepted":true}' }))).toBeNull();
+    expect(readLiveQuestionNotification({ method: "item/started", params: { item: { type: "agentMessage", id: "q", delivery: "async", questions: [] } } })).toBeNull();
+  });
+  it("waits for complete typed tool parameters without guessing from partial JSON", () => {
+    const event = (input: string) => ({ method: "item/started", params: { threadId: "t", turnId: "r", item: { type: "functionCall", id: "q", name: "functions.request_user_input_async", arguments: input } } });
+    const partial = readLiveQuestionNotification(event('{"questions":['))!;
+    expect(partial.tool).toBe("functions.request_user_input_async");
+    expect(parseQuestionTool(partial.tool, partial.input)).toBeNull();
+    const full = readLiveQuestionNotification(event('{"questions":[{"title":"选一个","options":["A","B"]}]}'))!;
+    expect(parseQuestionTool(full.tool, full.input)?.[0].options).toEqual(["A", "B"]);
+  });
+  it("reads native functionCall name/arguments, not arbitrary model JSON", () => {
+    const args = JSON.stringify({ questions: [{ title: "允许独立浏览器验收吗？", options: ["允许", "暂不"] }] });
+    expect(parseQuestionToolItem({ name: "request_user_input_async", arguments: args })).toEqual([{ title: "允许独立浏览器验收吗？", options: ["允许", "暂不"] }]);
+    expect(parseQuestionToolItem({ name: "exec", arguments: args })).toBeNull();
+    expect(parseQuestionToolItem({ arguments: args })).toBeNull();
+  });
   it("returns multiple choices by their native IDs, including a free-text answer with newlines", () => {
     const request = readUserInputRequest({ id: "pool-8", method: "item/tool/requestUserInput", params: {
       threadId: "thread-a", turnId: "turn-a", itemId: "call-q", questions: [

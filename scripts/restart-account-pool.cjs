@@ -7,11 +7,16 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { execFileSync } = require('node:child_process');
+const net = require('node:net');
 const { createRequire } = require('node:module');
 const { captureAuthFailures, persistAuthFailures } = require('./preserve-auth-failures.cjs');
 const root = path.resolve(__dirname, '..');
 const WebSocket = createRequire(path.join(root, 'package.json'))('ws');
 const protectedThread = process.argv[process.argv.indexOf('--after-thread') + 1];
+const allIdle = process.argv.includes('--all-idle');
+const verificationIndex = process.argv.indexOf('--verify-authorization');
+const authorizationSession = verificationIndex < 0 ? null : process.argv[verificationIndex + 1];
+if (verificationIndex >= 0 && !/^[a-f0-9-]{36}$/i.test(authorizationSession ?? '')) throw new Error('Invalid authorization verification session');
 if (!process.argv.includes('--after-thread') || !/^[a-f0-9-]{36}$/i.test(protectedThread ?? '')) {
   throw new Error('Required: --after-thread <current-thread-id> [--check] [--now] [--restart-ui]');
 }
@@ -40,6 +45,22 @@ function connect(user, action) {
 }
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const log = (event, fields = {}) => console.log(JSON.stringify({ event, ...fields }));
+function authorizationStatus(sessionId) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(path.join(root, 'data/backend/auth-control.sock'));
+    let data = '';
+    const fail = () => { socket.destroy(); reject(new Error('Authorization verification endpoint unavailable')); };
+    socket.setTimeout(5000, fail); socket.once('error', fail);
+    socket.once('connect', () => socket.write(JSON.stringify({ action: 'status', sessionId }) + '\n'));
+    socket.on('data', chunk => {
+      data += chunk;
+      if (data.length > 8192) return fail();
+      if (!data.includes('\n')) return;
+      try { const result = JSON.parse(data.split('\n')[0]); socket.destroy(); result.ok ? resolve(result.data) : reject(new Error('Authorization status unavailable')); }
+      catch { fail(); }
+    });
+  });
+}
 async function run() {
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
@@ -67,6 +88,10 @@ async function run() {
           if (!thread) throw new Error('Active conversation ownership unavailable; no restart performed');
           if (turn.threadId !== protectedThread) active.push({ ...turn, user, projectId: thread.project_id });
         }
+      }
+      if (allIdle && active.length) {
+        log('waiting_for_all_conversations', { activeConversations: active.length });
+        await pause(5000); continue;
       }
       if (immediate || !await busy()) break;
     }
@@ -168,6 +193,24 @@ async function run() {
         failures.push(turn.threadId);
         log('conversation_resume_failed', { threadId: turn.threadId });
       }
+    }
+    // Recover interrupted conversations before any optional verification can
+    // fail, so an authorization problem never leaves unrelated users stopped.
+    if (authorizationSession) {
+      const verifyDeadline = Date.now() + 120_000;
+      let status;
+      while (Date.now() < verifyDeadline) {
+        status = await authorizationStatus(authorizationSession);
+        if (status.status === 'completed' || status.status === 'failed') break;
+        await pause(2000);
+      }
+      if (status?.status !== 'completed') throw new Error(`Authorization handover not verified: ${status?.status ?? 'unknown'}`);
+      const target = pool.accounts.find(account => account.id === status.accountId);
+      if (!target) throw new Error('Verified account missing');
+      const auth = JSON.parse(fs.readFileSync(path.join(target.codexHome, 'auth.json'), 'utf8'));
+      const claims = JSON.parse(Buffer.from(auth.tokens.access_token.split('.')[1], 'base64url').toString());
+      if (!Number.isFinite(claims.exp) || claims.exp * 1000 <= Date.now()) throw new Error('Installed access credential is expired');
+      log('authorization_handover_verified', { accountId: status.accountId, lastRefresh: auth.last_refresh, expiresAt: new Date(claims.exp * 1000).toISOString() });
     }
     log('deployment_complete', { resumedConversations: active.length - failures.length, failedConversations: failures.length });
     if (failures.length) throw new Error('Some conversations could not resume; recovery snapshot retained');
