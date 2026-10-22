@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createAmbientActivity } from "../src/ambient/ambientActivity.ts";
 
-test("mount/focus alone is idle, a real draft stays active even after long pauses", t => {
+test("mount alone is idle, a real draft stays active even after long pauses", t => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const changes = [];
   const activity = createAmbientActivity(value => changes.push(value));
@@ -32,6 +32,31 @@ test("Chinese IME composition stays active and cancels cleanly without committed
   activity.compositionStart(); activity.compositionEnd(true);
   activity.sync(false, false);
   assert.deepEqual(changes, [true, false, true, false]); activity.dispose();
+});
+test("a focused empty editor keeps the glow through draft sync and slow IME updates", () => {
+  const changes = [];
+  const activity = createAmbientActivity(value => changes.push(value));
+  activity.sync(false, true);
+  activity.focus(true);
+  activity.compositionStart();
+  activity.sync(false, false);
+  activity.sync(false, false);
+  assert.deepEqual(changes, [true]);
+  activity.compositionEnd(false);
+  assert.deepEqual(changes, [true]);
+  activity.focus(false);
+  assert.deepEqual(changes, [true, false]);
+  activity.dispose();
+});
+test("focus alone lights an empty editor and blur fades an empty existing conversation", () => {
+  const changes = [];
+  const activity = createAmbientActivity(value => changes.push(value));
+  activity.sync(false, false);
+  activity.focus(true); activity.sync(false, false); activity.input(false);
+  assert.deepEqual(changes, [true]);
+  activity.focus(false);
+  assert.deepEqual(changes, [true, false]);
+  activity.dispose();
 });
 test("sending during composition still clears the glow", () => {
   const changes = [];

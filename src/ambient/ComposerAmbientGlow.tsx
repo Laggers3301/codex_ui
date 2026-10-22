@@ -71,13 +71,19 @@ export const ComposerAmbientGlow = memo(function ComposerAmbientGlow({ theme, ha
       activity.recording(detail.recording);
     };
     const isEditor = (target: EventTarget | null) => target instanceof Element && Boolean(target.closest(".composerRichInput, textarea"));
+    const isFocusedEditor = (target: EventTarget | null) => isEditor(target) && target instanceof Element
+      && (composer.contains(target) || Boolean(target.closest(".temporaryAskComposer")));
     const hasContent = (target: EventTarget | null) => content.current.hasDraft || Boolean(target instanceof HTMLTextAreaElement ? target.value.trim() : target instanceof Element && target.textContent?.replace(/\u200b/g, "").trim());
     const input = (event: Event) => { if (isEditor(event.target)) activity.input(hasContent(event.target)); };
     const compositionStart = (event: Event) => { if (isEditor(event.target)) activity.compositionStart(); };
     const compositionEnd = (event: Event) => { if (isEditor(event.target)) activity.compositionEnd(hasContent(event.target)); };
     const focusIn = (event: Event) => {
-      // Warm only the small lazy module on focus; focus never makes the glow visible.
-      if (isEditor(event.target) && !motion.matches) void loadPaper().catch(() => {});
+      if (!isFocusedEditor(event.target)) return;
+      activity.focus(true);
+      if (!motion.matches) void loadPaper().catch(() => {});
+    };
+    const focusOut = (event: Event) => {
+      if (isFocusedEditor(event.target)) activity.focus(isFocusedEditor((event as FocusEvent).relatedTarget));
     };
     const visibility = () => {
       if (document.hidden || !visible) {
@@ -97,7 +103,9 @@ export const ComposerAmbientGlow = memo(function ComposerAmbientGlow({ theme, ha
     composer.addEventListener(VOICE_AMBIENT_EVENT, voice);
     composer.addEventListener("compositionstart", compositionStart);
     composer.addEventListener("compositionend", compositionEnd);
-    composer.addEventListener("focusin", focusIn);
+    document.addEventListener("focusin", focusIn);
+    document.addEventListener("focusout", focusOut);
+    activity.focus(isFocusedEditor(document.activeElement));
     document.addEventListener("visibilitychange", visibility);
     motion.addEventListener("change", motionChange);
     return () => {
@@ -110,7 +118,8 @@ export const ComposerAmbientGlow = memo(function ComposerAmbientGlow({ theme, ha
       composer.removeEventListener(VOICE_AMBIENT_EVENT, voice);
       composer.removeEventListener("compositionstart", compositionStart);
       composer.removeEventListener("compositionend", compositionEnd);
-      composer.removeEventListener("focusin", focusIn);
+      document.removeEventListener("focusin", focusIn);
+      document.removeEventListener("focusout", focusOut);
       document.removeEventListener("visibilitychange", visibility);
       motion.removeEventListener("change", motionChange);
       renderer.current?.dispose();

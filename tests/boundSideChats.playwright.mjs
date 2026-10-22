@@ -24,6 +24,24 @@ const quoteB = "第二段正文用于主会话 B 的侧边提问。";
 const panel = page => page.getByRole("complementary", { name: "临时侧边对话" });
 const composer = page => panel(page).locator('[contenteditable="true"]');
 
+async function checkPolicyMenu(page, trigger) {
+  await trigger.click();
+  const id = await trigger.getAttribute("aria-controls");
+  assert.ok(id, "the access control identifies its menu");
+  const menu = page.locator(`[id=${JSON.stringify(id)}]`);
+  await menu.waitFor();
+  await menu.evaluate(element => Promise.all(element.getAnimations().map(animation => animation.finished.catch(() => {}))));
+  const bounds = await menu.boundingBox(), viewport = page.viewportSize();
+  assert.ok(bounds.x >= 7 && bounds.y >= 7 && bounds.x + bounds.width <= viewport.width - 7 && bounds.y + bounds.height <= viewport.height - 7,
+    "access menus must fit the viewport: " + JSON.stringify({ bounds, viewport }));
+  assert.ok(await menu.evaluate(element => {
+    const first = element.querySelector('[role="option"]'), box = first.getBoundingClientRect();
+    return first.contains(document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2));
+  }), "access menu options remain above the side panel and other overlays");
+  await trigger.press("Escape");
+  await menu.waitFor({ state: "detached" });
+}
+
 async function selectQuote(page, text) {
   await page.locator("#conversation-messages").getByText(text, { exact: true }).evaluate(element => {
     const range = document.createRange(); range.selectNodeContents(element);
@@ -63,7 +81,29 @@ try {
   const first = await openPage("main-a", quoteA);
   assert.equal(await panel(first).count(), 0);
   await selectQuote(first, quoteA);
+  await checkPolicyMenu(first, first.locator('.topbarPolicySelect:not(.approvalSelect) .polishedSelectTrigger'));
+  const sideAccess = panel(first).locator('.polishedSelectTrigger').filter({ hasText: /完全访问|项目可写|只读/ });
+  await checkPolicyMenu(first, sideAccess);
+  await first.setViewportSize({ width: 1100, height: 500 });
+  await checkPolicyMenu(first, sideAccess);
+  await first.setViewportSize({ width: 393, height: 780 });
+  await checkPolicyMenu(first, sideAccess);
+  await first.setViewportSize({ width: 1600, height: 1000 });
+  const mainInput = first.locator('.composer:not(.temporaryAskComposer) [contenteditable="true"]').first();
+  const glow = first.locator('.composerAmbientGlow');
+  await mainInput.focus();
+  await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "true");
+  await mainInput.fill("真实页面中的草稿光效");
+  await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "true");
+  await mainInput.fill("");
+  assert.equal(await glow.getAttribute("data-active"), "true", "a focused empty editor keeps the glow after clearing text");
+  await mainInput.evaluate(element => element.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })));
+  await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "true");
+  await checkPolicyMenu(first, sideAccess);
+  assert.equal(await glow.getAttribute("data-active"), "true", "a delayed preedit keeps the glow through unrelated parent renders");
+  await mainInput.evaluate(element => element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "" })));
   await composer(first).fill("A 的草稿");
+  assert.equal(await glow.getAttribute("data-active"), "true", "the side composer also keeps the page glow while focused");
   const draftSaved = first.waitForResponse(response => response.url().includes("/side-chat") && response.request().method() === "PATCH");
   await switchMain(first, "main-c", "这个主会话还没有侧边会话。");
   await (await draftSaved).finished();
@@ -155,7 +195,8 @@ try {
     boundToParent: true, draftRestored: true, missingSideHidden: true, switchesBetweenSideChats: true,
     newTabRestoresRunningSideChat: true, restoredSideKeepsStreaming: true, reloadRestoresSideChat: true, followupReusesThread: true,
     lateAcknowledgementStaysWithParent: true, backgroundCompletionDoesNotSwitchPanel: true,
-    closeOnlyInterruptsMatchingSide: true, deletedSideDoesNotReturn: true, errorCanBeSelectedAndDismissed: true, pageErrors: errors }));
+    closeOnlyInterruptsMatchingSide: true, deletedSideDoesNotReturn: true, errorCanBeSelectedAndDismissed: true,
+    accessMenusFitViewport: true, draftAndPreeditKeepGlow: true, pageErrors: errors }));
 } finally {
   await browser?.close();
   for (const child of children.reverse()) {

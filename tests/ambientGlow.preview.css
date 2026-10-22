@@ -31,4 +31,4 @@ body { background: var(--bg); }
 @media (max-width: 450px) { .ambientPreview { padding: 12px; } .ambientPreview figure { width: 100%; } }
 /* Keep the isolated controls onscreen on phones; the reference stays beside
    the implementation at desktop widths, not as an extra mobile page above it. */
-@media (max-width: 450px) { .ambientPreviewComparison > figure:first-child { display: none; } }
+@media (max-width: 450px) { .ambientPreviewComparison > figure:has(.ambientReferenceCrop) { display: none; } }
