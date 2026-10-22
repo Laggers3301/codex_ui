@@ -7,6 +7,7 @@ import {defaultHtmlPreview,isHtmlPreviewFile} from "./htmlFilePreview";
 const HtmlSourcePreview = lazy(() => import("./HtmlSourcePreview"));
 import { VoiceInput } from "./VoiceInput";
 import { ComposerAmbientGlow } from "./ambient/ComposerAmbientGlow";
+import { selectMenuPosition } from "./selectMenuPosition";
 import { resolvePromptTopAnchor } from "./promptTopAnchor";
 import { useComposerPrediction } from "./useComposerPrediction";
 import { applyLiveAgentUpdate, type AgentWireUpdate } from "./liveAgentUpdates";
@@ -389,27 +390,73 @@ function PolishedSelect<T extends string>({
   const [open, setOpen] = useState(false);
   const menuPresence = useExitPresence(open);
   const selected = options.find((option) => option.value === value) ?? options[0];
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const menuId = useId();
+  const [menuPosition, setMenuPosition] = useState<ReturnType<typeof selectMenuPosition> | null>(null);
+  useLayoutEffect(() => {
+    if (!menuPresence.present) return;
+    const update = () => {
+      const trigger = triggerRef.current, menu = menuRef.current;
+      if (!trigger || !menu) return;
+      const viewport = window.visualViewport;
+      const next = selectMenuPosition(trigger.getBoundingClientRect(), className.includes("topbarPolicySelect") ? 245 : 230,
+        menu.scrollHeight + menu.offsetHeight - menu.clientHeight,
+        { width: viewport?.width ?? innerWidth, height: viewport?.height ?? innerHeight, left: viewport?.offsetLeft, top: viewport?.offsetTop });
+      setMenuPosition(current => current && current.left === next.left && current.top === next.top && current.width === next.width && current.maxHeight === next.maxHeight ? current : next);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    if (triggerRef.current) observer.observe(triggerRef.current);
+    if (menuRef.current) observer.observe(menuRef.current);
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    window.visualViewport?.addEventListener("resize", update);
+    window.visualViewport?.addEventListener("scroll", update);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+      window.visualViewport?.removeEventListener("resize", update);
+      window.visualViewport?.removeEventListener("scroll", update);
+    };
+  }, [menuPresence.present, className, options.length]);
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node) && !menuRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", dismiss, true);
+    return () => document.removeEventListener("pointerdown", dismiss, true);
+  }, [open]);
   return (
     <div
+      ref={rootRef}
       className={`polishedSelect ${className} ${open ? "open" : ""}`}
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false);
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null) && !menuRef.current?.contains(event.relatedTarget as Node | null)) setOpen(false);
       }}
+      onKeyDown={event => { if (event.key === "Escape") { setOpen(false); triggerRef.current?.focus(); } }}
     >
       <button
+        ref={triggerRef}
         className="polishedSelectTrigger"
         type="button"
         disabled={disabled}
         title={title}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
         onClick={() => setOpen((current) => !current)}
       >
         <span>{selected?.label ?? value}</span>
         <span className="polishedSelectChevron" aria-hidden="true" />
       </button>
-      {menuPresence.present ? (
-        <div className={`polishedSelectMenu${menuPresence.closing ? " uiClosing" : ""}`} role="listbox" aria-hidden={menuPresence.closing} inert={menuPresence.closing}>
+      {menuPresence.present ? createPortal((
+        <div className={`polishedSelectFloatingLayer ${className}`} style={{ position: "fixed", inset: 0, zIndex: 10050, pointerEvents: "none" }}>
+        <div ref={menuRef} id={menuId} className={`polishedSelectMenu${menuPresence.closing ? " uiClosing" : ""}`} role="listbox" aria-hidden={menuPresence.closing} inert={menuPresence.closing}
+          style={{ position: "fixed", left: menuPosition?.left ?? 0, top: menuPosition?.top ?? 0, right: "auto", bottom: "auto", width: menuPosition?.width ?? 230, maxHeight: menuPosition?.maxHeight ?? 360, visibility: menuPosition ? "visible" : "hidden", pointerEvents: "auto" }}>
           {options.map((option) => (
             <button
               className={`polishedSelectOption ${option.value === value ? "selected" : ""}`}
@@ -428,7 +475,8 @@ function PolishedSelect<T extends string>({
             </button>
           ))}
         </div>
-      ) : null}
+        </div>
+      ), document.body) : null}
     </div>
   );
 }
