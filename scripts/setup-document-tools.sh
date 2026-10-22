@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=$(realpath -m -- "${DOCUMENT_TOOLS_ROOT:-$PWD/.document-tools}")
-DOWNLOAD_ROOT=$(realpath -m -- "${DOCUMENT_TOOLS_DOWNLOAD_ROOT:-$ROOT/install-cache}")
+ROOT=/home/example/codex_zerotier_remote/runtime/document-tools
+DOWNLOAD_ROOT=/home/example/codex_zerotier_remote/runtime/document-tools-install-cache
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DOWNLOADS="$DOWNLOAD_ROOT/downloads"
 mkdir -p "$DOWNLOADS" "$ROOT/bin" "$ROOT/pandoc"
@@ -18,8 +18,7 @@ if [[ ! -x "$ROOT/texlive/2026/bin/x86_64-linux/latexmk" ]]; then
   tar -xzf "$DOWNLOADS/$TL_ARCHIVE" -C "$DOWNLOADS"
   INSTALLER=$(find "$DOWNLOADS" -maxdepth 2 -type f -path '*/install-tl' -print -quit)
   [[ -n "$INSTALLER" ]]
-  node --input-type=commonjs -e 'const fs=require("node:fs"); fs.writeFileSync(process.argv[2], fs.readFileSync(process.argv[1], "utf8").replaceAll("@DOCUMENT_TOOLS_ROOT@", process.argv[3]));' "$SCRIPT_DIR/document-tools-texlive.profile" "$DOWNLOADS/texlive.profile" "$ROOT"
-  perl "$INSTALLER" -no-gui -profile "$DOWNLOADS/texlive.profile" -repository https://mirror.ctan.org/systems/texlive/tlnet
+  perl "$INSTALLER" -no-gui -profile "$SCRIPT_DIR/document-tools-texlive.profile" -repository https://mirror.ctan.org/systems/texlive/tlnet
 fi
 
 TLBIN="$ROOT/texlive/2026/bin/x86_64-linux"

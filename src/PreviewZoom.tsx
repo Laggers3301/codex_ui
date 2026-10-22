@@ -9,16 +9,23 @@ export function PreviewZoom({ children, frame = false }: { children: ReactNode; 
   useEffect(() => {
     const stage=stageRef.current, content=contentRef.current;
     if (!stage || !content) return;
-    const sync=()=>setSize(previous=>{
-      const next={width:stage.clientWidth,height:stage.clientHeight,contentHeight:content.offsetHeight};
-      return JSON.stringify(previous)===JSON.stringify(next)?previous:next;
-    });
-    sync();const observer=new ResizeObserver(sync);observer.observe(stage);observer.observe(content);
-    return ()=>observer.disconnect();
+    let pending=0;
+    const sync=()=>{
+      pending=0;
+      const width=stage.clientWidth,height=stage.clientHeight,contentHeight=content.offsetHeight;
+      // Hidden/detached right-pane tabs have no geometry. Do not feed their
+      // zero width back into the document, turning every character into a row.
+      if(width<=0||height<=0)return;
+      setSize(previous=>previous.width===width&&previous.height===height&&previous.contentHeight===contentHeight
+        ?previous:{width,height,contentHeight});
+    };
+    const schedule=()=>{if(!pending)pending=requestAnimationFrame(sync);};
+    sync();const observer=new ResizeObserver(schedule);observer.observe(stage);observer.observe(content);
+    return ()=>{observer.disconnect();cancelAnimationFrame(pending);};
   },[]);
   return <div className="documentZoomViewer">
     <div className="documentZoomStage" ref={stageRef}>
-      <div className="documentZoomExtent" style={{width:size.width*zoom,height:Math.max(size.height,size.contentHeight*zoom)}}>
+      <div className="documentZoomExtent" style={{width:size.width?size.width*zoom:"100%",height:size.height?Math.max(size.height,size.contentHeight*zoom):undefined}}>
         <div ref={contentRef} className="documentZoomContent" style={{width:size.width || "100%",height:frame?size.height || "100%":undefined,transform:`scale(${zoom})`}}>{children}</div>
       </div>
     </div>

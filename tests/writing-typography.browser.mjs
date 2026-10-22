@@ -4,18 +4,17 @@ import { chromium, expect } from "@playwright/test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 
-const username = process.env.DOCUMENT_QA_USER || "qaUser";
-const url = process.env.DOCUMENT_QA_URL || "http://127.0.0.1:4575";
-const projectId = process.env.DOCUMENT_QA_PROJECT;
+const url = process.env.DOCUMENT_QA_URL || "https://codex-alt.example.com";
+const projectId = process.env.DOCUMENT_QA_PROJECT || "08462b85-8c6d-443f-96d9-bd49e7c14ab2";
 const inspect = process.env.WRITING_TYPOGRAPHY_INSPECT === "1";
 if (!process.env.DOCUMENT_QA_PASSWORD) throw new Error("Authorized QA login required.");
 const screenshots = await fs.mkdtemp("/tmp/codex-writing-typography-");
-const browser = await chromium.launch({ executablePath: process.env.DOCUMENT_QA_CHROMIUM || undefined, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+const browser = await chromium.launch({ executablePath: "/home/example/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome", args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 try {
   const context = await browser.newContext({ viewport: { width: 1560, height: 960 }, reducedMotion: "no-preference" });
-  const login = await context.request.post(`${url}/api/auth/login`, { data: { username, password: process.env.DOCUMENT_QA_PASSWORD } });
+  const login = await context.request.post(`${url}/api/auth/login`, { data: { username: "qa-user", password: process.env.DOCUMENT_QA_PASSWORD } });
   assert.ok(login.ok());
-  await context.addInitScript(username => { localStorage.setItem("codex-web-user-id", username); localStorage.setItem("codex-web-color-theme", "light"); localStorage.setItem("codex-web-thread-list-collapsed", "false"); }, username);
+  await context.addInitScript(() => { localStorage.setItem("codex-web-user-id", "qa-user"); localStorage.setItem("codex-web-color-theme", "light"); localStorage.setItem("codex-web-thread-list-collapsed", "false"); });
   const page = await context.newPage();
   const errors = []; page.on("pageerror", error => errors.push(error.message));
   const settle = async () => {

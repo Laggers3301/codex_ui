@@ -8,9 +8,11 @@
     "dev:server": "tsx watch server/index.ts",
     "dev:client": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && node scripts/build.mjs",
-    "test": "vitest run src server && node --test scripts/install-document-authoring-skill.test.mjs scripts/preserve-auth-failures.test.cjs remote-folders.test.mjs && python3 remote-folder-control.test.py",
+    "test": "vitest run src server --maxWorkers=2 && node --test scripts/*.test.mjs scripts/*.test.cjs maintenance/network-health.test.mjs maintenance/resource-guardian.test.mjs remote-folders.test.mjs && python3 remote-folder-control.test.py",
     "serve": "tsx server/index.ts",
-    "generate:codex-schema": "node scripts/generate-codex-schema.mjs"
+    "generate:codex-schema": "node scripts/generate-codex-schema.mjs",
+    "test:auth-monitor": "node --test maintenance/auth-renewal-monitor.test.mjs maintenance/device-authorize-client.test.mjs",
+    "test:ambient": "node --test tests/ambientActivity.test.mjs tests/ambientMotion.test.mjs tests/voiceAmbient.test.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",
@@ -54,7 +56,10 @@
     "vite": "^7.0.0",
     "web-push": "^3.6.7",
     "ws": "^8.18.0",
-    "zod": "^3.24.0"
+    "zod": "^3.24.0",
+    "@codemirror/lang-html": "^6.4.12",
+    "prettier": "^3.9.10",
+    "@paper-design/shaders": "0.0.81"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

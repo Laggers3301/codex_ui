@@ -1,8 +1,19 @@
-.turnRecoveryNotice { margin: 6px 0; padding: 10px 12px; border-radius: 9px; background: var(--ui-control-hover, #292b29); color: var(--text); font-size: 12px; }
-.turnRecoveryNotice strong { font-weight: 500; }
-.turnRecoveryNotice p { margin: 5px 0; }
-.turnRecoveryNotice details { margin-top: 6px; }
-.turnRecoveryNotice summary { cursor: pointer; }
-.turnRecoveryNotice pre { max-height: 140px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
-.turnRecoveryActions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
-.turnRecoveryActions button { background: var(--ui-control-hover, #393c39); color: inherit; padding: 5px 8px; border-radius: 6px; }
+/* Animate the frosted surface, not its parent backdrop root. */
+.turnRecoveryDock{position:fixed;z-index:115;display:grid;place-items:center;box-sizing:border-box;pointer-events:none;padding:12px}
+.turnRecoveryNotice{box-sizing:border-box;width:min(440px,100%);max-height:100%;overflow:auto;padding:18px;border:1px solid var(--ui-glass-border,var(--ui-divider));border-radius:18px;background:var(--ui-surface,#242624);background:var(--ui-glass-background,var(--ui-surface,#242624));backdrop-filter:blur(22px) saturate(1.08);-webkit-backdrop-filter:blur(22px) saturate(1.08);box-shadow:var(--ui-glass-shadow,0 18px 48px #0003);color:var(--ui-content);font:400 14px/1.6 var(--pool-ui-font),sans-serif;pointer-events:auto;animation:recoveryToastIn .34s cubic-bezier(.16,1,.3,1) both}
+.turnRecoveryDock.uiClosing .turnRecoveryNotice{animation:recoveryToastOut .24s cubic-bezier(.4,0,.7,1) both;pointer-events:none}
+.turnRecoveryHeading{display:flex;align-items:flex-start;gap:12px;padding-bottom:12px;border-bottom:1px solid var(--ui-divider)}
+.turnRecoveryHeading strong{flex:1;min-width:0;font:550 14px/1.6 var(--pool-ui-font),sans-serif}
+.turnRecoveryHeading button{display:grid;place-items:center;flex:none;width:28px;height:28px;padding:0;border:0;border-radius:8px;background:var(--ui-hover);color:var(--ui-content-muted);cursor:pointer;transition:background .2s ease,color .2s ease}
+.turnRecoveryHeading button:hover{background:var(--ui-control-hover);color:var(--ui-content)}
+.turnRecoveryNotice p{margin:10px 0;color:var(--ui-content-muted);font:inherit}
+.turnRecoveryNotice details{margin-top:12px;font:inherit}
+.turnRecoveryNotice summary{cursor:pointer;color:var(--ui-content-muted);font:inherit;overflow-wrap:anywhere}
+.turnRecoveryNotice pre{max-height:160px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 Consolas,"Cascadia Code",var(--pool-ui-font),monospace;background:var(--ui-hover);color:var(--ui-content-muted);border-radius:10px;padding:10px;margin:10px 0 0}
+.turnRecoveryActions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:8px;margin-top:14px}
+.turnRecoveryActions button{min-height:34px;display:flex;align-items:center;justify-content:center;border:1px solid var(--ui-divider);background:var(--ui-hover);color:var(--ui-content);font:inherit;padding:5px 11px;border-radius:9px;cursor:pointer;transition:background .2s ease,opacity .2s ease}
+.turnRecoveryActions button:hover{background:var(--ui-control-hover)}
+@keyframes recoveryToastIn{from{opacity:0;transform:translateY(12px) scale(.975)}to{opacity:1;transform:none}}
+@keyframes recoveryToastOut{from{opacity:1;transform:none}to{opacity:0;transform:translateY(8px) scale(.985)}}
+@media(max-width:600px){.turnRecoveryNotice{padding:15px;border-radius:16px}.turnRecoveryActions{justify-content:flex-start}}
+@media(prefers-reduced-motion:reduce){.turnRecoveryNotice,.turnRecoveryDock.uiClosing .turnRecoveryNotice{animation:none}.turnRecoveryActions button,.turnRecoveryHeading button{transition:none}}

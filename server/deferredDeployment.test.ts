@@ -10,10 +10,10 @@ afterEach(() => vi.useRealTimers());
 it("waits for the protected turn, restarts outside that turn, and resumes only the other conversation", async () => {
   vi.useFakeTimers();
   const script = fileURLToPath(new URL("../scripts/restart-account-pool.cjs", import.meta.url));
-  const protectedThread = "11111111-1111-4111-8111-111111111111";
-  const otherThread = "33badf5c-68ac-44a7-b93c-5fc14da60279";
-  let protectedBusy = true, restarted = false;
-  const sent: Array<{ threadId: string; prompt: string }> = [];
+  const protectedThread = "00000000-0000-4000-8000-000000000001";
+  const otherThread = "00000000-0000-4000-8000-000000000002";
+  let protectedBusy = true, restarted = false, stopped = false;
+  const sent: Array<{ type: string; threadId: string; prompt?: string }> = [];
   const writes: string[] = [];
   const events: string[] = [];
   let complete!: () => void;
@@ -45,29 +45,29 @@ it("waits for the protected turn, restarts outside that turn, and resumes only t
     close() { complete(); }
   }
   const mockedRequire = (name: string) => {
-    if (name === "node:fs") return {
-      readFileSync: (file: string) => file.endsWith("account-pool.json") ? JSON.stringify({ accounts: [], stateFile: "fixture-state.json" }) : file.endsWith("fixture-state.json") ? "{}" : "fixture-session-secret",
-      writeFileSync: (_file: string, text: string) => writes.push(text)
-    };
+    if (name === "node:fs") return { readFileSync: (file: string) => file.endsWith('account-pool.json') ? '{"accounts":[]}' : file.endsWith('account-pool-state.json') ? '{}' : "fixture-session-secret", writeFileSync: (_file: string, text: string) => writes.push(text) };
     if (name === "node:path") return path;
     if (name === "node:crypto") return crypto;
+    if (name === "node:net") return { connect: () => { throw new Error("Unexpected authorization connection in restart fixture"); } };
     if (name === "node:sqlite") return { DatabaseSync: FakeDB };
     if (name === "node:module") return { createRequire: () => () => FakeSocket };
-    if (name === "./preserve-auth-failures.cjs") return { captureAuthFailures: () => [], persistAuthFailures: () => 0 };
+    if (name === "./preserve-auth-failures.cjs") return {
+      captureAuthFailures: () => new Map(),
+      persistAuthFailures: () => { expect(stopped).toBe(true); expect(restarted).toBe(false); return 0; }
+    };
     if (name === "node:child_process") return { execFileSync: (command: string, args: string[]) => {
-      if (command === "journalctl") return "";
       expect(protectedBusy).toBe(false);
+      if (command === 'journalctl') return '';
       expect(command).toBe("systemctl");
-      expect(args[0]).toBe("--user");
-      expect(["stop", "start"]).toContain(args[1]);
-      expect(args[2]).toBe("codex-account-pool-4576.service");
-      if (args[1] === "start") restarted = true;
+      expect(args[0]).toBe('--user'); expect(args[2]).toBe('codex-account-pool-4576.service');
+      if (args[1] === 'stop') { stopped = true; return ''; }
+      expect(args[1]).toBe('start'); expect(stopped).toBe(true); restarted = true; return '';
     } };
     throw new Error(`Unexpected dependency ${name}`);
   };
   vm.runInNewContext(fs.readFileSync(script, "utf8"), {
     require: mockedRequire, __dirname: path.dirname(script), Buffer, Date,
-    setTimeout, clearTimeout, process: { argv: ["node", script, "--after-thread", protectedThread] },
+    setTimeout, clearTimeout, process: { argv: ["node", script, "--after-thread", protectedThread], env: {} },
     console: { log: (line: string) => events.push(line), error: (line: string) => { throw new Error(line); } }
   });
   await vi.advanceTimersByTimeAsync(5000);
@@ -76,7 +76,7 @@ it("waits for the protected turn, restarts outside that turn, and resumes only t
   await vi.advanceTimersByTimeAsync(5000);
   await completed;
   expect(restarted).toBe(true);
-  expect(sent).toHaveLength(1);
-  expect(sent[0]).toMatchObject({ threadId: otherThread, prompt: "继续" });
+  expect(sent.filter(message => message.type === 'turn.start')).toEqual([expect.objectContaining({ threadId: otherThread, prompt: "继续" })]);
+  expect(sent.some(message => message.type === 'turn.queue.list' && message.threadId === otherThread)).toBe(true);
   expect(events.some(line => line.includes("deployment_complete"))).toBe(true);
 });

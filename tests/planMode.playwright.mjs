@@ -58,14 +58,14 @@ try {
   await page.goto(`${origin}/?project=mode-project&thread=mode-thread`);
   await page.locator(".v2PlanActiveChip").waitFor();
   assert.equal(await page.locator(".appRenderFallback").count(), 0);
-  await page.getByText(/秒后进行第 1 次重试/).waitFor();
+  await page.getByText(/等待重试 · \d+ 秒 · 第 1\/10 次/).waitFor();
   await page.reload();
   await page.locator('[data-thread-id="mode-thread"] .threadSelectButton').click();
-  await page.getByText(/秒后进行第 1 次重试/).waitFor();
+  await page.getByText(/等待重试 · \d+ 秒 · 第 1\/10 次/).waitFor();
   await page.getByText("错误详情 · model_overloaded", { exact: true }).click();
   await page.getByText("Selected model is at capacity. Please try a different model.", { exact: true }).waitFor();
   await page.getByRole("button", { name: "取消自动重试", exact: true }).click();
-  await page.getByRole("button", { name: "关闭提示", exact: true }).click();
+  await page.getByRole("button", { name: "关闭模型状态提示", exact: true }).click();
   await page.locator(".turnRecoveryNotice").waitFor({ state: "detached" });
   for (const theme of ["dark", "light"]) {
     await page.evaluate(theme => document.documentElement.dataset.theme = theme, theme);

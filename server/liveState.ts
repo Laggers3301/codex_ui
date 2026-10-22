@@ -1,4 +1,5 @@
 import type { RpcEnvelope } from "./types.js";
+import { isQuestionToolName, readLiveQuestionNotification } from "../src/questionTool.js";
 
 type LiveTurnStatus = "running" | "completed";
 
@@ -217,6 +218,32 @@ export class LiveStateStore {
       const item = asRecord(params.item);
       const eventType = typedItemEvent?.[1] ?? item.type;
       const eventPhase = typedItemEvent?.[2] ?? genericItemEvent?.[1];
+      const question = readLiveQuestionNotification(envelope);
+      if (question) {
+        const tool = this.recordToolItem({ ...params, item: {
+          ...item, type: "toolCall", tool: question.tool, input: question.input
+        } }, question.completed);
+        return tool ? { kind: "tool", item: { ...tool, input: livePreview(tool.input), output: livePreview(tool.output) }, historyItem: tool } : null;
+      }
+      if (eventType === "agentMessage" || item.type === "agentMessage") {
+        const id = stringOrNull(item.id) ?? stringOrNull(params.itemId);
+        const content = Array.isArray(item.content) ? item.content.map(value => {
+          const part = asRecord(value);
+          return ["text", "output_text"].includes(String(part.type)) && typeof part.text === "string" ? part.text : "";
+        }).join("") : undefined;
+        const fullText = typeof item.text === "string" ? item.text : content;
+        if (!id || fullText === undefined) return null;
+        const existing = this.agentMessages.get(id);
+        if (existing?.completed && eventPhase !== "completed") return null;
+        // Item completion is an authoritative snapshot, not another delta.
+        // Preserve the existing identity/order and do not append it twice.
+        let agent = existing;
+        if (!agent && fullText) agent = this.recordAgentMessageDelta({ ...params, itemId: id, delta: fullText }) ?? undefined;
+        if (!agent) return null;
+        const next = { ...agent, text: fullText || agent.text, completed: eventPhase === "completed", updatedAt: new Date().toISOString() };
+        this.agentMessages.set(id, next);
+        return { kind: "agent", item: next };
+      }
       const eventItem = {
         ...item,
         type: item.type ?? eventType,
@@ -263,6 +290,7 @@ export class LiveStateStore {
     if (!sourceItemId || !delta) {
       return null;
     }
+    if (isQuestionToolName(this.toolItems.get(sourceItemId)?.tool)) return null;
 
     const now = new Date().toISOString();
     const { threadId, turnId } = turnFields(params);
@@ -277,6 +305,7 @@ export class LiveStateStore {
     const resolvedTurnId = turnId ?? inferredTurn?.turnId ?? null;
     const activeSegmentId = this.activeAgentSegments.get(sourceItemId);
     const activeSegment = activeSegmentId ? this.agentMessages.get(activeSegmentId) : undefined;
+    if (activeSegment?.completed) return null;
     // A streamed message keeps its identity and first-seen position even when
     // an asynchronous tool completion arrives between two text deltas.
     const sequence = activeSegment?.sequence ?? ++this.nextSequence;

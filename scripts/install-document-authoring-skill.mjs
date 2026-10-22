@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 export const skillName = "latex-word-authoring";
 const appRoot = fileURLToPath(new URL("../", import.meta.url));
 
-export function installDocumentAuthoringSkill({ poolFile, source, dryRun = false }) {
+export function installDocumentAuthoringSkill({ poolFile, source, dryRun = false, name = skillName }) {
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(name)) throw new Error("Invalid skill name");
   const skillRoot = fs.realpathSync(source);
   if (!fs.statSync(path.join(skillRoot, "SKILL.md")).isFile()) throw new Error("Skill manifest missing");
   const pool = JSON.parse(fs.readFileSync(poolFile, "utf8"));
@@ -20,7 +21,7 @@ export function installDocumentAuthoringSkill({ poolFile, source, dryRun = false
     const parent = path.join(home, "skills");
     if (!fs.statSync(parent).isDirectory()) throw new Error("Runtime skills directory missing");
     const canonicalParent = fs.realpathSync(parent);
-    const destination = path.join(canonicalParent, skillName);
+    const destination = path.join(canonicalParent, name);
     if (seen.has(destination)) continue;
     seen.add(destination);
     let alreadyInstalled = false;
@@ -48,7 +49,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const args = process.argv.slice(2);
     if (args.some((arg) => arg !== "--dry-run")) throw new Error("Usage: node scripts/install-document-authoring-skill.mjs [--dry-run]");
     const targets = installDocumentAuthoringSkill({
-      poolFile: process.env.CODEX_WEB_ACCOUNT_POOL_FILE || path.join(appRoot, "account-pool.json"),
+      poolFile: path.join(appRoot, "account-pool.json"),
       source: path.join(appRoot, "skills", skillName),
       dryRun: args.includes("--dry-run")
     });

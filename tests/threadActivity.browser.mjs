@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 
 const baseUrl = process.env.THREAD_ACTIVITY_QA_URL || "http://127.0.0.1:4590";
-const chromiumPath = process.env.DOCUMENT_QA_CHROMIUM || undefined;
+const chromiumPath = process.env.DOCUMENT_QA_CHROMIUM || "/home/example/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome";
 const screenshots = await fs.mkdtemp("/tmp/codex-thread-activity-");
 const browser = await chromium.launch({ executablePath: chromiumPath, headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 let page;

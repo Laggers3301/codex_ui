@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 
 const screenshots = await fs.mkdtemp("/tmp/codex-subagent-panel-");
-const browser = await chromium.launch({ executablePath: process.env.DOCUMENT_QA_CHROMIUM || undefined, headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+const browser = await chromium.launch({ executablePath: "/home/example/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome", headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 let page;
 try {
   const context = await browser.newContext({ viewport: { width: 1200, height: 800 }, reducedMotion: "no-preference" });

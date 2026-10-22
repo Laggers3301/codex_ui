@@ -9,18 +9,20 @@ const MiB = 1024 ** 2;
 const uid = process.getuid();
 const roots = /\/(?:\.vscode-server|\.vscode-server-insiders|\.cursor-server|\.windsurf-server)\//;
 const guarded = /\/resource-guard-[\w-]+\.scope$/;
+export const manualWorkspaceRoot = path.resolve(process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? new URL('../data/users', import.meta.url).pathname);
 export async function text(file) { try { return await fs.readFile(file, 'utf8'); } catch { return ''; } }
 export function identity(p) {
   // Never persist argv: it may contain access tokens, passwords or user prompts.
+  const owner = path.relative(manualWorkspaceRoot, p.cwd).match(/^([\w-]+)(?:[\\/]|$)/)?.[1] ?? null;
   return { pid: p.pid, ppid: p.ppid, start: p.start, exe: p.exe, entry: p.entry,
-    cwd: p.cwd, cgroup: p.cgroup, owner: p.cwd.match(/\/users\/([\w-]+)(?:\/|$)/)?.[1] ?? null,
+    cwd: p.cwd, cgroup: p.cgroup, owner,
     rssMb: Math.round(p.rss / MiB), name: p.name };
 }
 export function classify(p) {
   if (/\/(?:codex-account-pool[^/]*|codex-remote|codex-ui-v2|codex-speech-tunnel|codex-pool-watchdog|codex-resource-guardian)\.service(?:\/|$)/.test(p.cgroup)) return null;
   if (roots.test(p.exe) || p.args.some(a => a.startsWith('/') && roots.test(a))) return 'editor';
   // Only manual project jobs, not shared system/desktop services or the web backends.
-  if (!/\/codex_zerotier_remote\/users\/[\w-]+\//.test(p.cwd)) return null;
+  if (!p.cwd.startsWith(manualWorkspaceRoot + path.sep) || !/^[\w-]+\//.test(path.relative(manualWorkspaceRoot, p.cwd))) return null;
   if (p.args.some(a => /(?:pool-watchdog|resource-guardian|run-account-runtime|run-backend|server\/index|backend\/dist|restart-backend)/.test(a))) return null;
   if (/^(?:python[\d.]*|node|java|cargo|rustc|gcc|g\+\+|cc1plus|cc1|clang[\w+.-]*|make|ninja|cmake|git|wget|curl|tar|gzip|zstd|ffmpeg)$/.test(path.basename(p.exe))) return 'job';
   return null;

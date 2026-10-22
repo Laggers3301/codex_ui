@@ -2,6 +2,7 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {openReadableRollout,rolloutSourcePath} from './rolloutStorage.js';
 
 const headerReadChunkBytes = 64 * 1024;
 const maximumHeaderBytes = 4 * 1024 * 1024;
@@ -58,14 +59,14 @@ export async function createCrossAccountForkSnapshot(
   sourceSessionsRoot: string
 ): Promise<{ path: string; remove: () => Promise<void> }> {
   const [realSource, realRoot] = await Promise.all([
-    fsPromises.realpath(sourcePath),
+    rolloutSourcePath(sourcePath),
     fsPromises.realpath(sourceSessionsRoot)
   ]);
   assertInside(realSource, realRoot);
   const sourceStat = await fsPromises.lstat(realSource);
   if (!sourceStat.isFile()) throw new Error("分支源会话不是普通 JSONL 文件。");
 
-  const source = await fsPromises.open(realSource, "r");
+  const source = await openReadableRollout(sourcePath);
   const temporaryRoot = await fsPromises.mkdtemp(path.join(os.tmpdir(), "codex-cross-account-fork-"));
   await fsPromises.chmod(temporaryRoot, 0o700);
   const snapshotPath = path.join(temporaryRoot, "source.jsonl");
@@ -85,7 +86,8 @@ export async function createCrossAccountForkSnapshot(
 
     if (completeEnd > firstLine.nextOffset) {
       await new Promise<void>((resolve, reject) => {
-        const input = fs.createReadStream(realSource, {
+        const input = source.createReadStream({
+          autoClose:false,
           start: firstLine.nextOffset,
           end: completeEnd - 1
         });

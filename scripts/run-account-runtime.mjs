@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { selectedRuntime } from './runtime-update-state.mjs';
+import { selectedRuntime, adoptValidatedStartupRuntime } from './runtime-update-state.mjs';
 
 const [command, ...args] = process.argv.slice(2);
 if (!command) throw new Error('Missing account runtime command');
@@ -24,6 +24,10 @@ function metadata() {
   } catch (error) { return { state: error.code === 'ENOENT' ? 'missing' : 'invalid' }; }
 }
 let previous = home ? metadata() : null;
+if(home && process.env.CODEX_WEB_RUNTIME_ADOPT_CANDIDATE==='1') {
+  const version=adoptValidatedStartupRuntime(home,command);
+  if(version)diagnostic('validated_cold_start_upgrade',{version});
+}
 const runtimeCommand = home ? selectedRuntime(home, command) : command;
 const child = spawn(runtimeCommand, args, { stdio: 'inherit', env: process.env });
 diagnostic('started', { nativePid: child.pid, binary: runtimeCommand, authState: previous?.state, lastRefresh: previous?.lastRefresh });

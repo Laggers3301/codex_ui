@@ -34,7 +34,7 @@ export class CodexSocket {
 
     this.setStatus("connecting");
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const socket = new WebSocket(`${protocol}://${window.location.host}/ws`);
+    const socket = new WebSocket(`${protocol}://${window.location.host}/ws?agent_deltas=1`);
     this.socket = socket;
     this.clearConnectionTimers();
     this.connectDeadline = window.setTimeout(() => { if (this.socket === socket && socket.readyState === WebSocket.CONNECTING) this.recover(socket); }, 10_000);

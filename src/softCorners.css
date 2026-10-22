@@ -1,0 +1,25 @@
+/* A shared shape scale, not a blanket radius on every element.
+   Do not reshape circular controls, tiny status dots, code blocks or docked panels. */
+:root {
+  --ui-radius-control: 10px;
+  --ui-radius-menu: 18px;
+  --ui-radius-card: 20px;
+  --ui-radius-dialog: 24px;
+  --ui-radius-composer: 26px;
+}
+:root .conversation > .composer { border-radius: var(--ui-radius-composer); }
+:root :is(.uiGlassPopover, .polishedSelectMenu, .groupedModelMenu, .skillPickerPopover, .v2PlusMenu, .accountPoolPopover, .quotaPopover) { border-radius: var(--ui-radius-menu); }
+:root :is(.modalDialog, .renameThreadDialog, .directoryDialog, .settingsDialog, .leaderboardDialog, .temporaryCloseDialog, .globalSearchDialog) { border-radius: var(--ui-radius-dialog); }
+:root :is(.rightWorkspaceOverviewCard, .toolQuestionCard) { border-radius: var(--ui-radius-card); }
+/* Native progressive enhancement: no SVG masks, resize JS, layout transforms or extra paints. */
+@supports (corner-shape: superellipse(1.25)) {
+  :root :is(.conversation > .composer, .uiGlassPopover, .polishedSelectMenu, .groupedModelMenu,
+    .skillPickerPopover, .v2PlusMenu, .accountPoolPopover, .quotaPopover, .modalDialog,
+    .renameThreadDialog, .directoryDialog, .settingsDialog, .leaderboardDialog,
+    .temporaryCloseDialog, .globalSearchDialog, .rightWorkspaceOverviewCard, .toolQuestionCard) {
+    corner-shape: superellipse(1.25);
+  }
+  /* The composer's backdrop is a separate layer; both edges must use the same geometry. */
+  :root .conversation > .composer::before { corner-shape: inherit; }
+}
+@media (max-width: 900px) { :root { --ui-radius-composer: 23px; --ui-radius-dialog: 22px; } }

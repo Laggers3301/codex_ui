@@ -1,4 +1,5 @@
 import type { ThreadItem } from "./types";
+import { parseQuestionToolItem } from "./questionTool";
 
 export function correlationId(item: ThreadItem): string {
   return String(item.callId ?? item.call_id ?? item.toolCallId ?? item.tool_call_id ?? "");
@@ -22,13 +23,23 @@ export function latestUserTimelineIndex(items: ThreadItem[]): number {
 /** One invocation owns its output, even if parallel calls finish out of order. */
 export function coalesceToolOutputs(items: ThreadItem[]): ThreadItem[] {
   const calls = new Map<string, ThreadItem>();
-  const copies = items.map((item) => ({ ...item }));
+  const copies = items.map((item) => {
+    const copy = { ...item };
+    const type = item.type.toLowerCase().replace(/_/g, "");
+    if (["functioncall", "customtoolcall", "dynamictoolcall", "agentmessage"].includes(type) && parseQuestionToolItem(item)) {
+      copy.type = "toolCall";
+      const nativeAsync = type === "agentmessage" && item.delivery === "async" && Array.isArray(item.questions);
+      copy.tool = nativeAsync ? "request_user_input_async" : String(item.tool ?? item.toolName ?? item.name ?? "");
+      copy.input = nativeAsync ? JSON.stringify({ questions: item.questions }) : item.input ?? item.command ?? item.arguments;
+    }
+    return copy;
+  });
   let legacyPending: ThreadItem[] = [];
   for (const item of copies) {
     if (item.type.toLowerCase() === "toolcall") {
       calls.set(correlationId(item) || item.id, item);
       if (!correlationId(item)) legacyPending.push(item);
-    } else if (item.type.toLowerCase() === "toolcalloutput") {
+    } else if (["toolcalloutput", "functioncalloutput", "customtoolcalloutput"].includes(item.type.toLowerCase().replace(/_/g, ""))) {
       const id = correlationId(item) || String(item.text ?? "");
       // Old API responses omitted callId on calls. A single outstanding serial
       // call can be associated unambiguously; never guess for parallel calls.
@@ -45,7 +56,7 @@ export function coalesceToolOutputs(items: ThreadItem[]): ThreadItem[] {
     }
   }
   return copies.filter((item) => {
-    if (item.type.toLowerCase() !== "toolcalloutput") return true;
+    if (!["toolcalloutput", "functioncalloutput", "customtoolcalloutput"].includes(item.type.toLowerCase().replace(/_/g, ""))) return true;
     const call = calls.get(correlationId(item) || String(item.text ?? ""));
     if (call) {
       call.aggregatedOutput = item.aggregatedOutput ?? String(item.output ?? "");

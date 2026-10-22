@@ -6,6 +6,7 @@ import { createInterface } from "node:readline";
 import { accountHistoryRoots } from "./sessionReadRoots.js";
 import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { AppError } from "./appErrors.js";
+import {readableRolloutPath, rolloutStat,openReadableRollout,rolloutReadStream,readRolloutText} from './rolloutStorage.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -317,10 +318,10 @@ async function buildSessionPathIndex(sessionsRoot: string): Promise<Map<string, 
       const target = path.join(directory, entry.name);
       if (entry.isDirectory()) {
         await walk(target);
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl") && isSafeCodexSessionPath(target, sessionsRoot)) {
-        const sessionId = sessionIdFromJsonlFilename(entry.name);
+      } else if (entry.isFile() && /\.jsonl(?:\.zst)?$/.test(entry.name) && isSafeCodexSessionPath(target.replace(/\.zst$/, ''), sessionsRoot)) {
+        const sessionId = sessionIdFromJsonlFilename(entry.name.replace(/\.zst$/, ''));
         if (sessionId) {
-          paths.set(sessionId, target);
+          paths.set(sessionId, target.replace(/\.zst$/, ''));
         }
       }
     }));
@@ -448,8 +449,8 @@ export async function findThreadJsonlPathById(threadId: string, sessionsRoot?: s
         if (found) {
           return found;
         }
-      } else if (entry.isFile() && entry.name.endsWith(`${cleanThreadId}.jsonl`) && isSafeCodexSessionPath(target, sessionsRoot)) {
-        return target;
+      } else if (entry.isFile() && (entry.name.endsWith(`${cleanThreadId}.jsonl`) || entry.name.endsWith(`${cleanThreadId}.jsonl.zst`)) && isSafeCodexSessionPath(target.replace(/\.zst$/, ''), sessionsRoot)) {
+        return target.replace(/\.zst$/, '');
       }
     }
     return null;
@@ -475,7 +476,7 @@ export async function threadJsonlMatchesSearch(filePath: string, query: string, 
     return true;
   }
 
-  const input = createReadStream(filePath, { encoding: "utf8" });
+  const input = await rolloutReadStream(filePath, { encoding: "utf8" });
   const lines = createInterface({ input, crlfDelay: Infinity });
   try {
     for await (const line of lines) {
@@ -510,8 +511,8 @@ export async function readThreadSummaryFromJsonl(
   if (!isSafeCodexSessionPath(filePath, sessionsRoot)) {
     throw new Error("Refusing to read a thread outside the Codex sessions directory.");
   }
-  const stat = await fs.stat(filePath);
-  const input = createReadStream(filePath, { encoding: "utf8" });
+  const stat = await rolloutStat(filePath);
+  const input = await rolloutReadStream(filePath, { encoding: "utf8" });
   const lines = createInterface({ input, crlfDelay: Infinity });
   let metadata: JsonObject | null = null;
   let preview = "";
@@ -601,7 +602,7 @@ export async function readThreadFromJsonl(
     return parseThreadFromJsonl(filePath, threadId, sessionsRoot, options);
   }
 
-  const stat = await fs.stat(filePath);
+  const stat = await rolloutStat(filePath);
   const signature = `${stat.size}:${stat.mtimeMs}`;
   const cached = cachedParsedThreads.get(filePath);
   if (cached?.signature === signature) {
@@ -640,14 +641,15 @@ async function parseThreadFromJsonl(
     throw new Error("Refusing to read a thread outside the Codex sessions directory.");
   }
 
-  const fileStat = await fs.stat(filePath);
+  const readablePath = await readableRolloutPath(filePath);
+  const fileStat = await fs.stat(readablePath);
   const tailBytes = Math.max(0, Math.floor(options.tailBytes ?? 0));
   let raw: string;
   let truncated = false;
   if (typeof options.startOffset === "number") {
     const startOffset = Math.max(0, Math.min(fileStat.size, Math.floor(options.startOffset)));
     const endOffset = Math.max(startOffset, Math.min(fileStat.size, Math.floor(options.endOffset ?? fileStat.size)));
-    const handle = await fs.open(filePath, "r");
+    const handle = await openReadableRollout(filePath);
     try {
       const headBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, fileStat.size));
       const bodyBuffer = Buffer.allocUnsafe(endOffset - startOffset);
@@ -664,7 +666,7 @@ async function parseThreadFromJsonl(
       await handle.close();
     }
   } else if (tailBytes > 0 && fileStat.size > tailBytes) {
-    const handle = await fs.open(filePath, "r");
+    const handle = await openReadableRollout(filePath);
     try {
       const headBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, fileStat.size));
       const tailStart = Math.max(0, fileStat.size - tailBytes);
@@ -677,7 +679,7 @@ async function parseThreadFromJsonl(
       const tailText = tailBuffer.toString("utf8");
       const firstCompleteLine = tailText.indexOf("\n");
       if (!firstLine || firstCompleteLine < 0) {
-        raw = await fs.readFile(filePath, "utf8");
+        raw = await readRolloutText(filePath);
       } else {
         raw = `${firstLine}\n${tailText.slice(firstCompleteLine + 1)}`;
         truncated = true;
@@ -686,7 +688,7 @@ async function parseThreadFromJsonl(
       await handle.close();
     }
   } else {
-    raw = await fs.readFile(filePath, "utf8");
+    raw = await readRolloutText(filePath);
   }
   const turns = new Map<string, FallbackTurn>();
   let metadata: JsonObject | null = null;

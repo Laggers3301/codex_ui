@@ -15,8 +15,8 @@ const tokens = (totalTokens: number) => ({
 describe("API-provider leaderboard usage", () => {
   it("shows accrued tracked quota rather than diluting it with token share", () => {
     const board = { currentCycle: { users: [{ userId: "sample-user", quotaPercent: 29.7 }, { userId: "other", quotaPercent: 10 }] } } as never;
-    const sources = [{ id: "0901", kind: "codex-account", quota: { rateLimits: { primary: { resetsAt: 1000000 } } } }] as never;
-    const ledger = { "0901": { resetAt: 1000002, userCycleQuotaPercent: 78 } } as never;
+    const sources = [{ id: "0003", kind: "codex-account", quota: { rateLimits: { primary: { resetsAt: 1000000 } } } }] as never;
+    const ledger = { "0003": { resetAt: 1000002, userCycleQuotaPercent: 78 } } as never;
     const result = applyAccruedTrackedQuota(board, sources, ledger, "sample-user");
     expect(result.currentCycle.users[0].quotaPercent).toBe(78);
     expect(result.currentCycle.users[1].quotaPercent).toBe(10);
@@ -42,11 +42,12 @@ describe("API-provider leaderboard usage", () => {
   });
 
   it("recognizes a registered user's legacy home directory without guessing arbitrary folders", () => {
-    const isKnown = (id: string) => id === "known-user";
-    const home = path.dirname(path.resolve(serverConfig.dataDir));
-    expect(userIdFromSessionCwd(path.join(home, "known-user/project"), isKnown)).toBe("known-user");
-    expect(userIdFromSessionCwd(path.join(home, "unknown/project"), isKnown)).toBeNull();
-    expect(userIdFromSessionCwd(path.join(serverConfig.dataDir, "users/qa-user/project"), isKnown)).toBe("qa-user");
+    const isKnown = (id: string) => id === "registered-user";
+    const managed = path.resolve(process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users"));
+    const legacy = path.dirname(path.dirname(managed));
+    expect(userIdFromSessionCwd(path.join(legacy,"registered-user/project"), isKnown)).toBe("registered-user");
+    expect(userIdFromSessionCwd(path.join(legacy,"unknown/project"), isKnown)).toBeNull();
+    expect(userIdFromSessionCwd(path.join(managed,"qa-user/project"), isKnown)).toBe("qa-user");
   });
 
   it("falls back to seven days when no GPT reset is available", () => {

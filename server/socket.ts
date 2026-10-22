@@ -9,10 +9,11 @@ import { z } from "zod";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
-import { serverConfig } from "./config.js";
 import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
 import { LiveStateStore } from "./liveState.js";
+import { serverConfig } from "./config.js";
 import { isUserInputRequest, validateUserInputResponse } from "./userInput.js";
+import { questionToolOutput } from "./questionAnswers.js";
 import { AppError } from "./appErrors.js";
 import { TurnRetryQueue, publicRecovery } from "./turnRetry.js";
 import { notificationIsContextCompaction, RawCompactFilter } from "./rawNotificationFilter.js";
@@ -48,6 +49,9 @@ import {
 import type { Project, RpcEnvelope, SocketClientMessage, SocketServerMessage } from "./types.js";
 import { sendUserPush } from "./webPush.js";
 import { meaningfulTurnProgressMethod, TurnWatchdog, type WatchdogProbeClaim, type WatchdogTurn } from "./turnWatchdog.js";
+import { LatestTaskQueue } from "./streamBatch.js";
+import { requestedServiceTier, requestedTurnServiceTier } from "./serviceTier.js";
+import type { LiveAgentMessage } from "./liveState.js";
 
 const commandSchema = z.array(z.string()).min(1);
 const threadStartContextConfigSchema = z.object({
@@ -72,6 +76,7 @@ function compactTimeoutMs(): number {
 
 type UserWebSocket = WebSocket & {
   codexUserId?: string;
+  agentDeltas?: boolean;
   /** Native WebSocket ping/pong detects half-open browser links without a page refresh. */
   isAlive?: boolean;
 };
@@ -113,6 +118,20 @@ function broadcast(wss: WebSocketServer, message: SocketServerMessage): void {
     if (client.readyState === client.OPEN) {
       client.send(payload);
     }
+  }
+}
+
+/** Old pages receive full snapshots; new pages opt into offset-checked deltas. */
+function sendAgentDelta(wss: WebSocketServer, owner: string, item: LiveAgentMessage, delta: string): void {
+  const {text, ...metadata}=item;
+  let compact:string|undefined,legacy:string|undefined;
+  for (const socket of wss.clients) {
+    const client=socket as UserWebSocket;
+    if (client.readyState!==client.OPEN || client.codexUserId!==owner) continue;
+    const payload=client.agentDeltas
+      ? compact??=JSON.stringify({type:"live.agent.delta",data:{...metadata,delta,textOffset:text.length-delta.length}})
+      : legacy??=JSON.stringify({type:"live.agent",data:item});
+    client.send(payload);
   }
 }
 
@@ -474,6 +493,10 @@ function runDedupedPrompt<T>(
 
 export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, store: ProjectStore, browserService?: BrowserService): WebSocketServer {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  // Canonical native rollouts retain every delta. The UI journal checkpoints
+  // snapshots at most every 200ms, plus first content and turn boundaries.
+  const streamJournal = new LatestTaskQueue(200, error => console.warn("Stream journal checkpoint failed", error));
+  wss.on("close", () => streamJournal.flush());
   const browserChanged = (event: { userId: string; threadId: string; state: BrowserState }) => {
     sendToUser(wss, event.userId, { type: "browser.state", data: { threadId: event.threadId, projectId: store.getThreadOwner(event.threadId)?.projectId, state: event.state } });
   };
@@ -682,6 +705,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
 
     const turnId = notificationTurnId(message);
+    if (turnId && ["turn/completed", "turn/started"].includes(message.method ?? "")) {
+      streamJournal.flushPrefix(JSON.stringify([owner,turnId]).slice(0,-1)+",");
+    }
     const threadIdForWatchdog = notificationThreadId(message);
     const accountId = notificationAccountId(message);
     if (message.method === "serverRequest/resolved") {
@@ -692,7 +718,12 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         pendingApprovalTurns.delete(requestId);
         if (pending) {
           const progress = turnWatchdog.progress(pending.userId, pending.accountId, pending.threadId, pending.turnId ?? "", "serverRequest/resolved");
-          if (progress) sendTurnProgress(progress.turn, "active");
+          if (progress) {
+            const waiting = bridge.getPendingServerRequests().some(request => isUserInputRequest(request.method)
+              && asRecord(request.params).threadId === pending.threadId && asRecord(request.params).isBlocking !== false);
+            if (waiting) turnWatchdog.setPhase(owner, pending.accountId, pending.threadId, pending.turnId, "waiting_user_input");
+            sendTurnProgress(progress.turn, waiting ? "waiting_user_input" : "active");
+          }
         }
       }
     }
@@ -772,7 +803,14 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       && !suppressGenericRecoveryMessage
       && !suppressInternalToolMessage
     ) {
-      store.saveTimelineItem(liveUpdate.item.threadId, liveUpdate.item.turnId, journalItem(liveUpdate));
+      const persist = () => store.saveTimelineItem(liveUpdate.item.threadId!, liveUpdate.item.turnId!, journalItem(liveUpdate));
+      if (liveUpdate.kind === "agent" && message.method === "item/agentMessage/delta") {
+        const delta=asRecord(message.params).delta;
+        streamJournal.enqueue(JSON.stringify([owner,liveUpdate.item.turnId,liveUpdate.item.itemId]),persist,typeof delta === "string" && delta.length === liveUpdate.item.text.length);
+      } else {
+        if (liveUpdate.kind === "agent") streamJournal.flush(JSON.stringify([owner,liveUpdate.item.turnId,liveUpdate.item.itemId]));
+        persist();
+      }
     }
     if (!suppressRawCompact) {
       sendToUser(wss, owner, { type: "codex.notification", data: message });
@@ -780,7 +818,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     if (liveUpdate?.kind === "tool" && !suppressInternalToolMessage) {
       sendToUser(wss, owner, { type: "live.tool", data: liveUpdate.item });
     } else if (liveUpdate?.kind === "agent" && !suppressGenericRecoveryMessage) {
-      sendToUser(wss, owner, { type: "live.agent", data: liveUpdate.item });
+      const delta=asRecord(message.params).delta;
+      if (message.method === "item/agentMessage/delta" && typeof delta === "string") sendAgentDelta(wss,owner,liveUpdate.item,delta);
+      else sendToUser(wss, owner, { type: "live.agent", data: liveUpdate.item });
     }
 
     if (
@@ -981,8 +1021,10 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
           const accountId = notificationAccountId(request as RpcEnvelope);
           pendingApprovalTurns.set(request.id, { userId: owner, accountId, threadId, turnId });
           const phase = isUserInputRequest(request.method) ? "waiting_user_input" : "waiting_approval";
-          const waiting = turnWatchdog.setPhase(owner, accountId, threadId, turnId, phase);
-          if (waiting) sendTurnProgress(waiting, phase);
+          if (!isUserInputRequest(request.method) || asRecord(request.params).isBlocking !== false) {
+            const waiting = turnWatchdog.setPhase(owner, accountId, threadId, turnId, phase);
+            if (waiting) sendTurnProgress(waiting, phase);
+          }
           if (!isUserInputRequest(request.method)) void sendUserPush(store, owner, {
             type: "approval",
             threadId,
@@ -1049,6 +1091,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     store.ensureUser(sessionUserId, sessionUserId);
     const userSocket = ws as UserWebSocket;
     userSocket.codexUserId = sessionUserId;
+    userSocket.agentDeltas = new URL(request.url ?? "/ws", "http://localhost").searchParams.get("agent_deltas") === "1";
     userSocket.isAlive = true;
     ws.on("pong", () => {
       userSocket.isAlive = true;
@@ -1070,7 +1113,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission, (requestId) => {
         const pending = pendingApprovalTurns.get(requestId);
         if (pending) processBridgeNotification({ method: "serverRequest/resolved", accountId: pending.accountId, params: { threadId: pending.threadId, requestId } } as RpcEnvelope);
-      }, browserService);
+      }, browserService, (threadId, itemId) => sendToUser(wss, sessionUserId, {
+        type: "question.answered", data: { threadId, itemId }
+      }));
     });
     ws.on("close", () => {
       for (const [processId, socket] of processSockets) {
@@ -1102,7 +1147,8 @@ async function handleClientMessage(
   startNextQueuedTurn: (owner: string, threadId: string) => Promise<void>,
   steerQueuedSubmission: (owner: string, threadId: string, expectedTurnId: string, queuedSubmissionId: string) => Promise<unknown>,
   onServerRequestResolved: (requestId: number | string) => void,
-  browserService?: BrowserService
+  browserService?: BrowserService,
+  onQuestionAnswered?: (threadId: string, itemId: string) => void
 ): Promise<void> {
   let message: SocketClientMessage;
   try {
@@ -1161,6 +1207,7 @@ async function handleClientMessage(
           async () => {
             const browserMcp = browserService ? mintBrowserMcpConfig(sessionUserId, project.id) : null;
             const startParams = {
+              ...requestedServiceTier(message.serviceTier),
               cwd: project.rootPath,
               model,
               approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
@@ -1215,6 +1262,7 @@ async function handleClientMessage(
               console.warn("Native Codex automatic thread title failed", error);
             });
             const turnParams = {
+              ...requestedTurnServiceTier(message.serviceTier),
               threadId,
               input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames, message.documentReference),
               collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
@@ -1280,7 +1328,11 @@ async function handleClientMessage(
               const contextUsage = await readThreadContextUsage(threadId, contextConfig);
               await prepareDisconnectedThreadRetry(bridge, guards.disconnectedThreads, threadId);
               await bridge.request("thread/resume", {
+                ...requestedServiceTier(message.serviceTier),
                 threadId,
+                // Re-sending an edited prompt must not hydrate a large legacy
+                // history into the shared Node heap. The UI reads bounded pages.
+                excludeTurns: true,
                 cwd: project.rootPath,
                 model,
                 approvalPolicy: executionApproval,
@@ -1296,6 +1348,7 @@ async function handleClientMessage(
               }, 30_000);
               store.setThreadExecutionSettings(threadId, sessionUserId, executionSandbox, executionApproval);
               const turnParams = {
+                ...requestedTurnServiceTier(message.serviceTier),
                 threadId,
                 input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames, message.documentReference),
                 collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
@@ -1382,7 +1435,14 @@ async function handleClientMessage(
         }
         const result = await guards.requestDeduper.run(
           { userId: sessionUserId, requestId },
-          async () => bridge.request("thread/queue/add", { threadId, input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", prompt, message.skillNames, message.documentReference), clientUserMessageId: requestId }),
+          async () => {
+            const tier = requestedServiceTier(message.serviceTier);
+            if (message.serviceTier !== undefined) {
+              // Updates subsequent turns only, never the generation in flight.
+              await bridge.request("thread/settings/update", { threadId, ...tier });
+            }
+            return bridge.request("thread/queue/add", { threadId, input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", prompt, message.skillNames, message.documentReference), clientUserMessageId: requestId });
+          },
           { serializeKey: `queue:${threadId}` }
         );
         send(ws, { type: "ack", requestId, ok: true, data: result });
@@ -1689,6 +1749,41 @@ async function handleClientMessage(
         break;
       }
 
+      case "question.respond": {
+        const threadId = pickString(message.threadId), itemId = pickString(message.itemId);
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        const project = getProjectOrThrow(store, message.projectId, sessionUserId);
+        const owner = store.getThreadOwner(threadId)!;
+        if (!itemId || owner.projectId !== project.id) throw new Error("答案与当前会话不匹配，请刷新会话。");
+        const data = await guards.requestDeduper.run({ userId: sessionUserId, requestId }, async () => {
+          const question = await questionToolOutput(store, threadId, itemId, message.answers);
+          const saved = store.getQuestionAnswer(threadId, itemId, sessionUserId);
+          if (saved !== null) {
+            if (JSON.stringify(saved) !== JSON.stringify(question.answers)) throw new Error("该问题已经回答，请刷新会话。");
+            return { alreadyAnswered: true };
+          }
+          // A native request always owns its reply, including nonblocking input.
+          if (bridge.getPendingServerRequests().some(pending => isUserInputRequest(pending.method)
+            && asRecord(pending.params).threadId === threadId && asRecord(pending.params).itemId === itemId)) {
+            throw new Error("该问题已同步为原生提问，请刷新会话后再回答。");
+          }
+          await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, threadId);
+          const execution = executionSettingsOverrides(store.getThreadExecutionSettings(threadId, sessionUserId));
+          await resumeThreadIfUnloaded(bridge, threadId, owner.rootPath, browserMcpForThread(threadId), execution);
+          const params = { threadId, input: [], toolOutput: question.toolOutput,
+            model: owner.modelOverride ?? project.defaultModel,
+            effort: owner.reasoningEffortOverride ?? project.defaultReasoningEffort };
+          const turn = await bridge.request("turn/start", params, 30_000);
+          guards.retries?.watch(sessionUserId, threadId, params);
+          rememberAcceptedTurn(guards, threadId, requestId, turn);
+          store.recordQuestionAnswer(threadId, itemId, sessionUserId, question.answers);
+          return { accepted: true };
+        }, { serializeKey: "question:" + threadId + ":" + itemId });
+        onQuestionAnswered?.(threadId, itemId);
+        send(ws, { type: "ack", requestId, ok: true, data });
+        break;
+      }
+
       case "userInput.respond":
       case "approval.respond": {
         const responseId = message.codexRequestId as number | string | undefined;
@@ -1707,6 +1802,10 @@ async function handleClientMessage(
         }
         const result = message.type === "userInput.respond" ? validateUserInputResponse(pending.params, message.result) : message.result;
         bridge.respondToServerRequest(responseId, result);
+        if (message.type === "userInput.respond") {
+          const params = asRecord(pending.params);
+          store.recordQuestionAnswer(pickString(params.threadId), pickString(params.itemId), sessionUserId, result);
+        }
         onServerRequestResolved(responseId);
         send(ws, { type: "ack", requestId, ok: true });
         break;

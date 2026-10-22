@@ -8,8 +8,12 @@ function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
+export function isQuestionToolName(value: unknown): value is string {
+  return typeof value === "string" && /(?:^|\.)request_user_input(?:_async)?$/.test(value.trim());
+}
+
 export function parseQuestionTool(toolName: string, input: unknown): ToolQuestion[] | null {
-  if (!/(?:^|\.)request_user_input(?:_async)?$/.test(toolName.trim())) return null;
+  if (!isQuestionToolName(toolName)) return null;
   let root: Record<string, unknown>;
   try {
     root = record(typeof input === "string" ? JSON.parse(input) : input);
@@ -34,10 +38,31 @@ export function parseQuestionTool(toolName: string, input: unknown): ToolQuestio
   return questions.length ? questions : null;
 }
 
+/** Native async questions are agentMessage items with explicit delivery/questions
+ * metadata. Preserve that identity before the generic text stream drops it.
+ * Never infer a question from assistant prose, JSON examples, or accepted:true. */
+export function readLiveQuestionNotification(value: unknown) {
+  const notification = record(value);
+  if (typeof notification.method !== "string" || !/^item\/(?:[^/]+\/)?(?:started|completed)$/.test(notification.method)) return null;
+  const params = record(notification.params), item = record(params.item);
+  const nativeAsync = String(item.type).replace(/_/g, "").toLowerCase() === "agentmessage"
+    && item.delivery === "async" && Array.isArray(item.questions);
+  const tool = nativeAsync ? "request_user_input_async" : [item.tool, item.toolName, item.name].find(isQuestionToolName);
+  const itemId = [item.callId, item.call_id, item.id, params.itemId].find(value => typeof value === "string" && value.trim());
+  if (!tool || typeof itemId !== "string" || typeof params.threadId !== "string" || typeof params.turnId !== "string") return null;
+  const input = nativeAsync ? JSON.stringify({ questions: item.questions }) : item.input ?? item.arguments ?? item.command ?? "";
+  return {
+    itemId, sourceItemId: typeof item.id === "string" ? item.id : itemId,
+    threadId: params.threadId, turnId: params.turnId, tool,
+    input: typeof input === "string" ? input : JSON.stringify(input),
+    completed: notification.method.endsWith("/completed"),
+  };
+}
+
 export interface UserInputRequest {
   id: string | number;
   method: string;
-  params: { threadId: string; turnId: string; itemId: string; questions: unknown[] };
+  params: { threadId: string; turnId: string; itemId: string; questions: unknown[]; isBlocking?: boolean };
   questions: ToolQuestion[];
 }
 
@@ -64,24 +89,28 @@ export function synchronousQuestionHasResult(item: { tool?: unknown; status?: un
 }
 
 /** App-server history can place function arguments in `command`, not `input`. */
-export function parseQuestionToolItem(item: { tool?: unknown; input?: unknown; command?: unknown }): ToolQuestion[] | null {
-  const toolName = typeof item.tool === "string" ? item.tool : "";
+export function parseQuestionToolItem(item: { type?: unknown; delivery?: unknown; questions?: unknown; tool?: unknown; name?: unknown; toolName?: unknown; arguments?: unknown; input?: unknown; command?: unknown }): ToolQuestion[] | null {
+  if (String(item.type).replace(/_/g, "").toLowerCase() === "agentmessage" && item.delivery === "async" && Array.isArray(item.questions)) {
+    return parseQuestionTool("request_user_input_async", { questions: item.questions });
+  }
+  // Native functionCall items use name/arguments; fallback history uses tool/command.
+  // Only explicit tool identity is accepted, never arbitrary JSON in model prose.
+  const toolName = [item.tool, item.toolName, item.name].find(value => typeof value === "string" && value.trim()) as string | undefined;
   const input = typeof item.input === "string"
-    ? item.input.trim() ? item.input : item.command
-    : item.input ?? item.command;
-  return parseQuestionTool(toolName, input);
+    ? item.input.trim() ? item.input : item.command ?? item.arguments
+    : item.input ?? item.command ?? item.arguments;
+  return parseQuestionTool(toolName ?? "", input);
 }
 
-/** A question is no longer pending once a later user message is in the transcript. */
-export function questionHasLaterUserMessage(
-  items: Array<{ id?: unknown; type?: unknown; role?: unknown }>,
+/** Only an explicitly correlated answer can resolve an asynchronous question. */
+export function questionHasAnswer(
+  items: Array<{ id?: unknown; type?: unknown; role?: unknown; output?: unknown; aggregatedOutput?: unknown }>,
   questionItemId: string
 ): boolean {
-  const questionIndex = items.findIndex((item) => item.id === questionItemId);
-  if (questionIndex < 0) return false;
-  return items.slice(questionIndex + 1).some((item) => {
-    const type = typeof item.type === "string" ? item.type.toLowerCase() : "";
-    const role = typeof item.role === "string" ? item.role.toLowerCase() : "";
-    return type === "usermessage" || type === "user" || role === "user";
-  });
+  return items.some(item => [item.output, item.aggregatedOutput].some(output => {
+    try {
+      const answer = record(typeof output === "string" ? JSON.parse(output) : output);
+      return answer.type === "codex_web_question_answer" && answer.itemId === questionItemId;
+    } catch { return false; }
+  }));
 }

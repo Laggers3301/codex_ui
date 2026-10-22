@@ -7,8 +7,13 @@ import { CodexBridge } from "./codexBridge.js";
 import { serverConfig } from "./config.js";
 import { ensureDefaultAgentLanguage } from "./agentLanguage.js";
 import { responsesCompatibleModelCatalog } from "./modelCatalogCompatibility.js";
-import { appendLegacyRollbackMarker, removeAppendedRollbackMarker, LegacyRollbackConflictError, type AppendedRollbackMarker } from "./legacyRollback.js";
-import { installedRuntimeVersion, isNewerRuntime, runtimeIsIdle, runtimeSelectionPath, writeRuntimeSelection } from "./runtimeUpgrade.js";
+import { appendLegacyRollbackMarker, removeAppendedRollbackMarker, readLegacyTailMetadata, LegacyRollbackConflictError, type AppendedRollbackMarker } from "./legacyRollback.js";
+import { installedRuntimeVersion, isNewerRuntime, runtimeIsIdle, runtimeSelectionPath, writeRuntimeSelection, RuntimeUpgradeFailure, nextRuntimeUpgradeRetry, type RuntimeBusyReason, type RuntimeUpgradeStage, type RuntimeUpgradeRetry } from "./runtimeUpgrade.js";
+import {readableRolloutPath} from './rolloutStorage.js';
+import { authFailureCodes as AUTH_FAILURE_CODES, permanentAuthCode, credentialTiming, renewalDue, renewalRetryDelay, type AuthFailureCode } from "./authRenewal.js";
+import {authDiagnostic, type AuthDiagnostic, type AuthPhase} from "./authDiagnostics.js";
+import { ProviderTurnProtocol } from "./providerProtocol.js";
+import { validateModelRequest } from "./modelRequestValidation.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -33,11 +38,6 @@ interface PersistedPoolState {
   quotaSnapshots?: Record<string, { limits: unknown; usage: unknown }>;
   authFailures?: Record<string, { code: AuthFailureCode; credentialVersion?: number; credentialFingerprint?: string | null }>;
 }
-
-type AuthFailureCode = "refresh_token_reused" | "refresh_token_invalidated" | "refresh_token_expired";
-const AUTH_FAILURE_CODES = new Set<AuthFailureCode>([
-  "refresh_token_reused", "refresh_token_invalidated", "refresh_token_expired"
-]);
 
 export interface AccountPoolRawSnapshot {
   id: string;
@@ -138,11 +138,6 @@ function authCredentialSnapshot(codexHome: string): { stamp: number; fingerprint
   } finally {
     if (descriptor !== null) fs.closeSync(descriptor);
   }
-}
-
-function permanentAuthCode(message: string): AuthFailureCode | null {
-  const code = message.match(/\b(refresh_token_reused|refresh_token_invalidated|refresh_token_expired)\b/)?.[1];
-  return code && AUTH_FAILURE_CODES.has(code as AuthFailureCode) ? code as AuthFailureCode : null;
 }
 
 function authFailureWarning(code: AuthFailureCode): string {
@@ -263,7 +258,7 @@ function accountSupportedModels(codexHome: string): Set<string> | null {
   }
 }
 
-function createAccountBridge(codexHome: string, accountId: string): CodexBridge {
+function createAccountBridge(codexHome: string, accountId: string, adoptCandidate = false): CodexBridge {
   const scope = process.env.CODEX_WEB_ISOLATE_AGENT_SCOPES === "1" ? {
     unitPrefix: `codex-agent-${accountId.replace(/[^A-Za-z0-9-]/g, "-")}`,
     slice: "codex-workers.slice",
@@ -277,9 +272,9 @@ function createAccountBridge(codexHome: string, accountId: string): CodexBridge 
     command: "/usr/bin/flock",
     args: ["--exclusive", "--nonblock", "--no-fork", "--conflict-exit-code", "75",
       path.join(codexHome, ".web-runtime.lock"), process.execPath,
-      fileURLToPath(new URL("../scripts/run-account-runtime.mjs", import.meta.url)),
+      fileURLToPath(new URL("../../scripts/run-account-runtime.mjs", import.meta.url)),
       serverConfig.codexBin, ...accountAppServerArgs(codexHome)],
-    env: { ...process.env, CODEX_HOME: codexHome },
+    env: { ...process.env, CODEX_HOME: codexHome, CODEX_WEB_RUNTIME_ADOPT_CANDIDATE: adoptCandidate ? "1" : "0" },
     scope
   });
 }
@@ -305,13 +300,198 @@ export class AccountPoolBridge extends EventEmitter {
   private readonly accountMaintenance = new Map<string, Promise<void>>();
   private runtimeUpgradeTimer: ReturnType<typeof setInterval> | undefined;
   private runtimeUpgradeChecking = false;
-  private readonly rejectedRuntimeVersions = new Set<string>();
+  private storageTimer: ReturnType<typeof setInterval> | undefined;
+  private storageInitialTimer: ReturnType<typeof setTimeout> | undefined;
+  private storageChecking = false;
+  private readonly storageScheduledAt=new Map<string,number>();
+
+  private async maintainCompressedStorage(): Promise<void> {
+    if(this.storageChecking) return;
+    const policyPath=path.join(serverConfig.dataDir,'native-storage-policy.json');
+    try {
+      const policy=JSON.parse(fs.readFileSync(policyPath,'utf8'));
+      if(policy.enabled!==true||policy.adapterRevision!==1) return;
+    } catch { return; }
+    this.storageChecking=true;
+    try {
+      for(const account of this.accounts) {
+        if(Date.now()-(this.storageScheduledAt.get(account.id)??0)<24*60*60*1000) continue;
+        if(account.activeRequests||this.accountMaintenance.has(account.id)||account.bridge.getPendingServerRequests().length) continue;
+        try {
+          if(!await runtimeIsIdle(account.bridge)) continue;
+          await this.invokeAccount(account,'rollout/compress',undefined,30_000);
+          this.storageScheduledAt.set(account.id,Date.now());
+          // This RPC acknowledges scheduling, not completion or savings.
+          console.info('storage.native_compression_scheduled',{accountId:account.id});
+        } catch { console.warn('storage.native_compression_deferred',{accountId:account.id}); }
+      }
+    } finally { this.storageChecking=false; }
+  }
+  private readonly runtimeUpgradeRetries = new Map<string, RuntimeUpgradeRetry>();
+  private readonly runtimeUpgradeBusy = new Map<string, { signature: string; at: number }>();
   private readonly pendingCredentialReloads = new Set<string>();
+  private authRenewalTimer: ReturnType<typeof setInterval> | undefined;
+  private authRenewalInitialTimer: ReturnType<typeof setTimeout> | undefined;
+  private authRenewalChecking = false;
+  private authRenewalStopped = false;
+  private authRenewalGeneration = 0;
+  private readonly authRenewalRetries = new Map<string, { fingerprint: string | null; nextAt: number; failures: number }>();
+  private readonly diagnosticLastAt = new Map<string,number>();
+
+  private diagnose(account: AccountRuntime, phase: AuthPhase, outcome: AuthDiagnostic["outcome"], error?: unknown): void {
+    const refreshedAt=credentialTiming(account.codexHome)?.refreshedAt;
+    const row=authDiagnostic(account.id,phase,outcome,error,refreshedAt ? new Date(refreshedAt).toISOString() : null);
+    const key=JSON.stringify({...row,time:null});
+    if(Date.now()-(this.diagnosticLastAt.get(key)??0)<60_000)return;
+    if(this.diagnosticLastAt.size>256)this.diagnosticLastAt.clear();
+    this.diagnosticLastAt.set(key,Date.now());this.emit("accountAuthDiagnostic",row);
+  }
+
+  authorizationTarget(accountId: string) {
+    const account=this.accountsById.get(accountId);
+    if(!account || account.kind!=="codex-account")throw new Error("Unknown managed account");
+    return {home:account.codexHome,expected:this.currentCredentialVersion(account),version:installedRuntimeVersion(account.codexHome,serverConfig.codexBin)};
+  }
+
+  createDeviceAuthorizationBridge(accountId: string, stageHome: string): CodexBridge {
+    const target=this.authorizationTarget(accountId);
+    writeRuntimeSelection(stageHome,target.version);
+    return this.bridgeFactory(stageHome,`${accountId}-device-login`);
+  }
+
+  /** Single installation entry. The staging runtime MUST be stopped first.
+   * No logout, no overwrite on conflict, and no restart of a busy account. */
+  async installAuthorizedCredentials(accountId: string, stageHome: string, expected: {stamp:number;fingerprint:string|null}): Promise<"busy"|"installed"> {
+    // Finish the current read batch before replacing its runtime or cache.
+    if(this.accountRefreshInFlight)await this.accountRefreshInFlight;
+    const account=this.accountsById.get(accountId);
+    if(!account || account.kind!=="codex-account")throw new Error("Unknown managed account");
+    if(this.authRenewalStopped || this.accountMaintenance.has(accountId))return "busy";
+    let release!:()=>void;
+    this.accountMaintenance.set(accountId,new Promise<void>(resolve=>{release=resolve;}));
+    const readAuth=(home:string):JsonRecord=>{
+      const fd=fs.openSync(path.join(home,"auth.json"),fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
+      try{const st=fs.fstatSync(fd);if(!st.isFile()||st.size>131072)throw new Error("invalid_credentials");return asRecord(JSON.parse(fs.readFileSync(fd,"utf8")));}
+      finally{fs.closeSync(fd);}
+    };
+    let stopped=false,installedOnDisk=false;
+    let phase:AuthPhase="credential_install";
+    try {
+      if(account.activeRequests || account.bridge.getPendingServerRequests().length || !await runtimeIsIdle(account.bridge))return "busy";
+      const staged=readAuth(stageHome),tokens=asRecord(staged.tokens);
+      if(staged.auth_mode!=="chatgpt" || !tokens.access_token || !tokens.refresh_token || !tokens.account_id || !credentialTiming(stageHome)?.expiresAt || credentialTiming(stageHome)!.expiresAt!<=Date.now())throw new Error("invalid_credentials");
+      const old=fs.existsSync(path.join(account.codexHome,"auth.json"))?asRecord(readAuth(account.codexHome).tokens):{};
+      if(old.account_id && old.account_id!==tokens.account_id)throw new Error("account_mismatch");
+      const before=this.currentCredentialVersion(account);
+      if(before.fingerprint!==expected.fingerprint || before.stamp!==expected.stamp)throw new Error("authorization_conflict");
+      await account.bridge.stopAndWait();stopped=true;
+      if(this.authRenewalStopped)throw new Error("authorization_conflict");
+      const final=this.currentCredentialVersion(account);
+      if(final.fingerprint!==expected.fingerprint || final.stamp!==expected.stamp)throw new Error("authorization_conflict");
+      const file=path.join(stageHome,"auth.json");fs.chmodSync(file,0o600);fs.renameSync(file,path.join(account.codexHome,"auth.json"));
+      installedOnDisk=true;
+      const installed=this.currentCredentialVersion(account);
+      account.authFileStamp=installed.stamp;account.credentialFingerprint=installed.fingerprint;
+      account.authFailureCode=null;account.authFailureFingerprint=null;account.cache=null;
+      this.pendingCredentialReloads.add(accountId);this.authRenewalRetries.delete(accountId);this.persistState();
+      this.diagnose(account,"credential_install","success");
+      phase="runtime_reload";
+      const replacement=this.bridgeFactory(account.codexHome,account.id);
+      account.bridge=replacement;this.forwardEvents(account,replacement);
+      await replacement.start();stopped=false;this.pendingCredentialReloads.delete(accountId);
+      this.diagnose(account,"runtime_reload","success");
+      this.emit("accountRuntime",{accountId,event:"credentials_reloaded"});
+      return "installed";
+    } catch(error) {
+      this.diagnose(account,phase,"failure",error);
+      if(stopped && !this.authRenewalStopped) {
+        // Restart using whichever credentials are authoritative on disk. Never
+        // restore a stale refresh-token chain after a successful installation.
+        const replacement=this.bridgeFactory(account.codexHome,account.id);
+        account.bridge=replacement;this.forwardEvents(account,replacement);
+        try{await replacement.start();}catch{account.health="degraded";}
+      }
+      if(installedOnDisk)return "installed";
+      throw error;
+    } finally {this.accountMaintenance.delete(accountId);release();}
+  }
+
+  async verifyAuthorizedAccount(accountId:string):Promise<boolean> {
+    const account=this.accountsById.get(accountId);if(!account)throw new Error("Unknown managed account");
+    try {
+      const accountInfo=asRecord(await this.invokeAccount(account,"account/read",{refreshToken:false},12_000));
+      if(!accountInfo.account)throw new Error("verification_incomplete");
+      await this.invokeAccount(account,"account/rateLimits/read",undefined,12_000);
+      this.diagnose(account,"health_verify","success");return true;
+    } catch(error){this.diagnose(account,"health_verify","deferred",error);return false;}
+  }
+
+  /** One serialized renewal through the account's existing, lease-owning
+   * native runtime. Never POST OAuth from Node or copy refresh credentials. */
+  async renewManagedCredentials(): Promise<void> {
+    if (this.authRenewalStopped || this.authRenewalChecking) return;
+    const generation = this.authRenewalGeneration;
+    this.authRenewalChecking = true;
+    try {
+      // Wait for a quota refresh rather than missing every check when its
+      // interval happens to align with this timer. No maintenance gate is held.
+      if (this.accountRefreshInFlight) await this.accountRefreshInFlight;
+      for (const account of this.accounts) {
+        if (this.authRenewalStopped || generation !== this.authRenewalGeneration) return;
+        if (account.kind !== "codex-account" || account.activeRequests || this.accountMaintenance.has(account.id)) continue;
+        const before = this.currentCredentialVersion(account);
+        this.updateCredentialVersion(account, before);
+        if (account.authFailureCode || this.pendingCredentialReloads.has(account.id)) continue;
+        const retry = this.authRenewalRetries.get(account.id);
+        if (retry?.fingerprint === before.fingerprint && Date.now() < retry.nextAt) continue;
+        const timing = credentialTiming(account.codexHome);
+        if (!renewalDue(timing)) continue;
+        let release!: () => void;
+        this.accountMaintenance.set(account.id, new Promise<void>(resolve => { release = resolve; }));
+        try {
+          // Deliberately bypass the public account/read clamp only here. All
+          // quota/browser requests remain non-rotating and wait for this gate.
+          const result = asRecord(await account.bridge.request("account/read", { refreshToken: true }, 30_000));
+          if (this.authRenewalStopped || generation !== this.authRenewalGeneration) return;
+          const after = this.currentCredentialVersion(account), updated = credentialTiming(account.codexHome);
+          if (!result.account || !updated || !after.fingerprint ||
+            (after.fingerprint === before.fingerprint && (updated.expiresAt ?? 0) <= (timing?.expiresAt ?? 0))) {
+            throw new Error("Native renewal did not advance credential metadata");
+          }
+          // The same runtime performed this rotation; restarting it would be
+          // unnecessary and could interrupt a running model turn.
+          account.authFileStamp = after.stamp; account.credentialFingerprint = after.fingerprint;
+          account.cache = null;
+          this.authRenewalRetries.set(account.id, { fingerprint: after.fingerprint, nextAt: Date.now() + 3600_000, failures: 0 });
+          this.emit("accountAuth", { accountId: account.id, code: "renewed", requiresLogin: false });
+          this.diagnose(account,"managed_refresh","success");
+        } catch (error) {
+          if (this.authRenewalStopped || generation !== this.authRenewalGeneration) return;
+          const code = permanentAuthCode(error instanceof Error ? error.message : String(error));
+          const failures = retry?.fingerprint === before.fingerprint ? retry.failures + 1 : 1;
+          this.authRenewalRetries.set(account.id, { fingerprint: before.fingerprint, nextAt: Date.now() + renewalRetryDelay(failures), failures });
+          if (code) {
+            account.authFailureCode = code; account.authFailureFingerprint = before.fingerprint;
+            account.health = "degraded"; account.lastError = authFailureWarning(code);
+            this.persistState();
+          }
+          this.emit("accountAuth", { accountId: account.id, code: code ?? "renewal_temporarily_failed", requiresLogin: Boolean(code) });
+          this.diagnose(account,"managed_refresh","failure",error);
+        } finally { this.accountMaintenance.delete(account.id); release(); }
+      }
+    } finally { this.authRenewalChecking = false; }
+  }
 
   private markReadyUnlessAuthFailure(account: AccountRuntime): void {
     if (account.authFailureCode) {
       account.health = "degraded";
       account.lastError = authFailureWarning(account.authFailureCode);
+      return;
+    }
+    const authState = asRecord(account.cache?.account);
+    if (authState.account === null && authState.requiresOpenaiAuth !== false) {
+      account.health = "degraded";
+      account.lastError = "account: 当前账号未登录，不参与新会话的正常自动分配。";
       return;
     }
     account.health = "ready";
@@ -360,7 +540,12 @@ export class AccountPoolBridge extends EventEmitter {
     if (!parsed || !Array.isArray(parsed.accounts)) {
       throw new Error("Invalid account pool file.");
     }
-    return new AccountPoolBridge(parsed, path.dirname(absolute));
+    const launchedHomes = new Set<string>();
+    return new AccountPoolBridge(parsed, path.dirname(absolute), (home, id) => {
+      const coldStart = !launchedHomes.has(home);
+      launchedHomes.add(home);
+      return createAccountBridge(home, id, coldStart && process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE === "1");
+    });
   }
 
   constructor(
@@ -428,7 +613,10 @@ export class AccountPoolBridge extends EventEmitter {
   }
 
   private forwardEvents(account: AccountRuntime, bridge: CodexBridge): void {
+    let authErrorTail = "";
+    const protocol = new ProviderTurnProtocol();
     bridge.on("notification", (message) => {
+      if(account.bridge!==bridge)return;
       if (asRecord(message).method === "serverRequest/resolved") {
         const params = asRecord(asRecord(message).params);
         const routed = [...this.serverRequestAccounts].find(([, route]) => route.bridge === bridge && route.originalId === params.requestId);
@@ -439,9 +627,12 @@ export class AccountPoolBridge extends EventEmitter {
         this.emit("notification", { ...asRecord(message), params: { ...params, requestId: routed[0] }, accountId: account.id, accountLabel: account.label });
         return;
       }
-      this.emit("notification", { ...asRecord(message), accountId: account.id, accountLabel: account.label });
+      for (const event of protocol.accept(message)) {
+        this.emit("notification", { ...event, accountId: account.id, accountLabel: account.label });
+      }
     });
     bridge.on("serverRequest", (request) => {
+      if(account.bridge!==bridge)return;
       const original = asRecord(request);
       const originalId = original.id as number | string;
       const id = `pool-${this.nextServerRequestId++}`;
@@ -449,6 +640,7 @@ export class AccountPoolBridge extends EventEmitter {
       this.emit("serverRequest", { ...original, id, accountId: account.id, accountLabel: account.label });
     });
     bridge.on("status", (status) => {
+      if(account.bridge!==bridge)return;
       const state = asRecord(status).state;
       if (state === "ready") this.markReadyUnlessAuthFailure(account);
       else if (state === "exited") account.health = "degraded";
@@ -459,6 +651,10 @@ export class AccountPoolBridge extends EventEmitter {
       }
     });
     bridge.on("stderr", (message) => {
+      if(account.bridge!==bridge)return;
+      if(/Failed to refresh token|Encountered unknown response while refreshing token/.test(String(message))){
+        this.diagnose(account,"native_refresh","failure",String(message));
+      }
       for (const line of String(message).split("\n")) {
         if (!line.startsWith("[account-runtime] ")) continue;
         try {
@@ -476,7 +672,9 @@ export class AccountPoolBridge extends EventEmitter {
           });
         } catch { /* An incomplete stderr chunk is not an auth failure. */ }
       }
-      const code = permanentAuthCode(String(message));
+      const combined = authErrorTail + String(message);
+      const code = permanentAuthCode(combined);
+      authErrorTail = code ? "" : combined.slice(combined.lastIndexOf("\n") + 1).slice(-4096);
       if (code && account.authFailureCode !== code) {
         account.authFailureCode = code;
         account.authFailureFingerprint = account.credentialFingerprint;
@@ -494,6 +692,7 @@ export class AccountPoolBridge extends EventEmitter {
       this.emit("stderr", `[${account.id}] ${String(message)}`);
     });
     bridge.on("errorEvent", (message) => {
+      if(account.bridge!==bridge)return;
       account.health = "degraded";
       account.lastError = String(message);
       this.emit("errorEvent", `[${account.id}] ${String(message)}`);
@@ -566,21 +765,58 @@ export class AccountPoolBridge extends EventEmitter {
   }
 
   async start(): Promise<void> {
+    this.authRenewalStopped = false;
     const results = await Promise.allSettled(this.accounts.map(async (account) => {
-      await account.bridge.start();
+      const file=runtimeSelectionPath(account.codexHome);
+      const previous=fs.existsSync(file)?fs.readFileSync(file,"utf8"):null;
+      const before=installedRuntimeVersion(account.codexHome,serverConfig.codexBin);
+      try { await account.bridge.start(); }
+      catch(error) {
+        const selected=installedRuntimeVersion(account.codexHome,serverConfig.codexBin);
+        if(process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE!=="1"||!isNewerRuntime(selected,before))throw error;
+        // Cold-start adoption is under the native lease. If that launch fails,
+        // restore the previous pin and use a non-adopting recovery bridge.
+        await account.bridge.stopAndWait();
+        if(previous===null)fs.rmSync(file,{force:true});else writeFileAtomically(file,previous);
+        const recovery=this.bridgeFactory(account.codexHome,account.id);
+        account.bridge=recovery;this.forwardEvents(account,recovery);
+        await recovery.start();
+        this.runtimeUpgradeRetries.set(`${account.id}:${selected}`,nextRuntimeUpgradeRetry(undefined,"replacement"));
+        console.warn("Codex cold-start upgrade restored previous runtime",{accountId:account.id,version:selected,restored:before});
+      }
       this.markReadyUnlessAuthFailure(account);
     }));
     if (results.every((result) => result.status === "rejected")) {
       throw new Error("No Codex account in the pool could start.");
     }
     await this.refreshAccountData(false);
+    if (!this.authRenewalTimer && process.env.CODEX_WEB_MANAGED_AUTH_RENEWAL !== "0") {
+      const check = () => { void this.renewManagedCredentials().catch(() => this.emit("errorEvent", "Managed credential renewal deferred by a local error.")); };
+      this.authRenewalTimer = setInterval(check, 60_000);
+      this.authRenewalTimer.unref();
+      this.authRenewalInitialTimer = setTimeout(check, 30_000);
+      this.authRenewalInitialTimer.unref();
+    }
     if (process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE === "1" && !this.runtimeUpgradeTimer) {
       this.runtimeUpgradeTimer = setInterval(() => { void this.checkRuntimeUpgrade(); }, 60_000);
       this.runtimeUpgradeTimer.unref();
     }
+    if(!this.storageTimer) {
+      this.storageTimer=setInterval(()=>{void this.maintainCompressedStorage();},15*60*1000);
+      this.storageTimer.unref();
+      this.storageInitialTimer=setTimeout(()=>{void this.maintainCompressedStorage();},60_000); this.storageInitialTimer.unref();
+    }
   }
 
   stop(): void {
+    this.authRenewalStopped = true; this.authRenewalGeneration++;
+    if (this.authRenewalTimer) clearInterval(this.authRenewalTimer);
+    if (this.authRenewalInitialTimer) clearTimeout(this.authRenewalInitialTimer);
+    this.authRenewalTimer = undefined; this.authRenewalInitialTimer = undefined;
+    if(this.storageInitialTimer) clearTimeout(this.storageInitialTimer);
+    this.storageInitialTimer=undefined;
+    if(this.storageTimer) clearInterval(this.storageTimer);
+    this.storageTimer=undefined;
     if (this.runtimeUpgradeTimer) clearInterval(this.runtimeUpgradeTimer);
     this.runtimeUpgradeTimer = undefined;
     for (const account of this.accounts) {
@@ -594,35 +830,55 @@ export class AccountPoolBridge extends EventEmitter {
     if (!account) throw new Error("Unknown account");
     const current = installedRuntimeVersion(account.codexHome, serverConfig.codexBin);
     if (!isNewerRuntime(version,current)) return "unchanged";
-    if (account.authFailureCode || this.accountMaintenance.has(account.id)) return "busy";
+    const busy = (details: RuntimeBusyReason): "busy" => {
+      const key = `${account.id}:${version}`, signature = JSON.stringify(details), previous = this.runtimeUpgradeBusy.get(key);
+      if (!previous || previous.signature !== signature || Date.now() - previous.at >= 600_000) {
+        this.runtimeUpgradeBusy.set(key, { signature, at: Date.now() });
+        console.info("Codex runtime update waiting for idle", { accountId: account.id, version, ...details });
+      }
+      writeFileAtomically(path.join(account.codexHome, ".web-runtime-upgrade-status.json"), JSON.stringify({ version, current, checkedAt: new Date().toISOString(), ...details }));
+      return "busy";
+    };
+    if (account.authFailureCode) return busy({ reason: "authorization_required" });
+    if (this.accountMaintenance.has(account.id)) return busy({ reason: "account_maintenance" });
     let release!: () => void;
     this.accountMaintenance.set(account.id,new Promise<void>(resolve => {release=resolve;}));
     const file=runtimeSelectionPath(account.codexHome);
     const previous=fs.existsSync(file)?fs.readFileSync(file,"utf8"):null;
     let stopped=false;
+    let stage: RuntimeUpgradeStage = "preflight";
     try {
-      if (account.activeRequests || account.bridge.getPendingServerRequests().length) return "busy";
-      if (!await runtimeIsIdle(account.bridge)) return "busy";
+      if (account.activeRequests) return busy({ reason: "active_requests", count: account.activeRequests });
+      if (account.bridge.getPendingServerRequests().length) return busy({ reason: "pending_approval" });
+      let reason: RuntimeBusyReason = { reason: "unknown" };
+      if (!await runtimeIsIdle(account.bridge, value => { reason = value; })) return busy(reason);
       // Incoming requests are waiting at the barrier; goals/queues/terminals
       // were checked natively, so no model turn is interrupted here.
+      stage = "replacement";
       await account.bridge.stopAndWait(); stopped=true;
       writeRuntimeSelection(account.codexHome,version);
       const replacement=this.bridgeFactory(account.codexHome,account.id);
       account.bridge=replacement;this.forwardEvents(account,replacement);
       await replacement.start(); stopped=false;
       this.markReadyUnlessAuthFailure(account);
+      this.runtimeUpgradeBusy.delete(`${account.id}:${version}`);
+      writeFileAtomically(path.join(account.codexHome, ".web-runtime-upgrade-status.json"), JSON.stringify({ version, checkedAt: new Date().toISOString(), reason: "upgraded" }));
       this.emit("accountRuntime",{accountId:account.id,event:"runtime_upgraded",version});
       return "reloaded";
     } catch(error) {
       if(stopped) {
-        await account.bridge.stopAndWait();
-        if(previous===null) fs.rmSync(file,{force:true});
-        else writeFileAtomically(file,previous);
-        const recovery=this.bridgeFactory(account.codexHome,account.id);
-        account.bridge=recovery;this.forwardEvents(account,recovery);
-        await recovery.start();
+        try {
+          await account.bridge.stopAndWait();
+          if(previous===null) fs.rmSync(file,{force:true});
+          else writeFileAtomically(file,previous);
+          const recovery=this.bridgeFactory(account.codexHome,account.id);
+          account.bridge=recovery;this.forwardEvents(account,recovery);
+          await recovery.start();
+        } catch (rollbackError) {
+          throw new RuntimeUpgradeFailure("rollback", rollbackError);
+        }
       }
-      throw error;
+      throw new RuntimeUpgradeFailure(stage, error);
     } finally {this.accountMaintenance.delete(account.id);release();}
   }
 
@@ -639,13 +895,17 @@ export class AccountPoolBridge extends EventEmitter {
       fs.accessSync(binary,fs.constants.X_OK);
       for(const account of this.accounts) {
         const key=`${account.id}:${candidate.version}`;
-        if(this.rejectedRuntimeVersions.has(key)) continue;
+        const previousRetry = this.runtimeUpgradeRetries.get(key);
+        if(previousRetry && previousRetry.retryAt > Date.now()) continue;
         try {
           const result=await this.applyRuntimeVersionIfIdle(account.id,candidate.version);
+          if(result !== "busy") this.runtimeUpgradeRetries.delete(key);
           if(result==="reloaded") console.info("Codex runtime updated",{accountId:account.id,version:candidate.version});
         } catch(error) {
-          this.rejectedRuntimeVersions.add(key);
-          console.warn("Codex runtime update deferred after failure",{accountId:account.id,version:candidate.version,error:error instanceof Error?error.message:"runtime failure"});
+          const stage = error instanceof RuntimeUpgradeFailure ? error.stage : "preflight";
+          const retry = nextRuntimeUpgradeRetry(previousRetry, stage);
+          this.runtimeUpgradeRetries.set(key, retry);
+          console.warn("Codex runtime update deferred after failure",{accountId:account.id,version:candidate.version,stage,attempts:retry.attempts,retryAt:new Date(retry.retryAt).toISOString(),error:error instanceof Error?error.message:"runtime failure"});
         }
       }
     } catch(error) { console.warn("Codex update candidate unavailable",{error:error instanceof Error?error.message:"runtime failure"}); }
@@ -762,12 +1022,16 @@ export class AccountPoolBridge extends EventEmitter {
 
   private async invokeAccount(account: AccountRuntime, method: string, params?: unknown, timeoutMs = 120_000): Promise<unknown> {
     await this.waitForMaintenance(account);
+    validateModelRequest(account.codexHome, method, params);
     account.activeRequests += 1;
     try {
       // Enforce native-owned renewal at the shared transport boundary, also
       // covering explicit thread-account readers and future host call sites.
       const requestParams = method === "account/read" ? { ...asRecord(params), refreshToken: false } : params;
       return await account.bridge.request(method, requestParams, timeoutMs);
+    } catch(error) {
+      if(["account/read","account/rateLimits/read","account/usage/read"].includes(method))this.diagnose(account,"health_verify","failure",error);
+      throw error;
     } finally {
       account.activeRequests -= 1;
     }
@@ -819,6 +1083,7 @@ export class AccountPoolBridge extends EventEmitter {
       return result;
     } catch (error) {
       if (startingProcessId) this.processAccounts.delete(startingProcessId);
+      if (error instanceof Error && "code" in error && error.code === "unsupported_model_capability") throw error;
       account.health = "degraded";
       account.lastError = error instanceof Error ? error.message : String(error);
       throw error;
@@ -881,8 +1146,22 @@ export class AccountPoolBridge extends EventEmitter {
     }
   }
 
-  /** Rewind one stopped legacy turn without changing the thread id. */
-  async rollbackLegacyLatest(threadId: string, expectedTurnId: string): Promise<unknown> {
+  /** Serialize a native history mutation against all pool requests. Calls
+   * inside the callback use the owning bridge to avoid waiting on our barrier. */
+  async withThreadMaintenance<T>(threadId: string, work: (bridge: CodexBridge) => Promise<T>): Promise<T> {
+    const account = await this.accountForRequest("thread/read", { threadId });
+    if (this.accountMaintenance.has(account.id) || account.activeRequests || account.bridge.getPendingServerRequests().length) {
+      throw new LegacyRollbackConflictError("该账号正在处理请求或审批，请稍后重试；草稿和附件仍保留。");
+    }
+    let release!: () => void;
+    this.accountMaintenance.set(account.id, new Promise<void>(resolve => { release = resolve; }));
+    try { return await work(account.bridge); }
+    finally { this.accountMaintenance.delete(account.id); release(); }
+  }
+
+  /** Rewind a stopped legacy suffix without changing the thread id. Original
+   * records stay in the log; Codex replays the rollback marker on reload. */
+  async rollbackLegacyLatest(threadId: string, expectedTurnId: string, edit?: { expectedLatestTurnId: string; allowHistoryRewrite: boolean }): Promise<unknown> {
     const account = await this.accountForRequest("thread/read", { threadId });
     if (this.accountMaintenance.has(account.id)) throw new LegacyRollbackConflictError("该账号正在处理另一项会话维护，请稍后重试。");
     let release!: () => void;
@@ -894,48 +1173,43 @@ export class AccountPoolBridge extends EventEmitter {
       if (account.activeRequests || account.bridge.getPendingServerRequests().length) {
         throw new LegacyRollbackConflictError("该账号还有正在处理的请求或审批，请稍后重试撤回。");
       }
-      const loaded = asRecord(await account.bridge.request("thread/loaded/list", {}, 30_000));
-      const loadedIds = Array.isArray(loaded.data) ? loaded.data.filter((id): id is string => typeof id === "string") : [];
-      for (const loadedId of loadedIds) {
-        const snapshot = asRecord(asRecord(await account.bridge.request("thread/read", { threadId: loadedId, includeTurns: false }, 30_000)).thread);
-        if (asRecord(snapshot.status).type !== "idle") {
-          throw new LegacyRollbackConflictError("该账号还有运行中的会话，请等这些任务结束后重试；草稿和附件仍保留。");
-        }
-        const goal = asRecord(await account.bridge.request("thread/goal/get", { threadId: loadedId }, 30_000));
-        if (asRecord(goal.goal).status === "active") {
-          throw new LegacyRollbackConflictError("该账号还有持续目标在运行，请稍后重试撤回。");
-        }
-        const queue = asRecord(await account.bridge.request("thread/queue/list", { threadId: loadedId, limit: 1 }, 30_000));
-        if (Array.isArray(queue.data) && queue.data.length) {
-          throw new LegacyRollbackConflictError("该账号还有排队消息，请稍后重试撤回。");
-        }
-      }
-      const before = asRecord(asRecord(await account.bridge.request("thread/read", { threadId, includeTurns: true }, 60_000)).thread);
-      const turns = Array.isArray(before.turns) ? before.turns.map(asRecord) : [];
-      const last = turns.at(-1);
-      if (before.historyMode !== "legacy" || !last || last.id !== expectedTurnId) {
-        throw new LegacyRollbackConflictError("只能撤回当前会话的最后一轮；请刷新后重试。");
+      if (!await runtimeIsIdle(account.bridge)) throw new LegacyRollbackConflictError("该账号还有运行中会话、排队任务或后台终端，请稍后重试；草稿和附件仍保留。");
+      // Never serialize a legacy rollout into Node: it may be larger than the
+      // shared backend heap. Read only bounded structural metadata at its tail.
+      const before = asRecord(asRecord(await account.bridge.request("thread/read", { threadId, includeTurns: false }, 30_000)).thread);
+      if (typeof before.path !== "string" || !before.path) throw new Error("Codex 未提供该会话的日志路径。");
+      let metadata = await readLegacyTailMetadata(await readableRolloutPath(before.path), edit?.allowHistoryRewrite ? expectedTurnId : undefined);
+      const last = metadata.latest;
+      if (before.historyMode !== "legacy" || !last || last.id !== (edit?.expectedLatestTurnId ?? expectedTurnId) || !metadata.target || metadata.target.id !== expectedTurnId) {
+        throw new LegacyRollbackConflictError("会话已更新或待编辑的提问已撤回，请刷新后重试；原记录未改动。");
       }
       if (!["completed", "failed", "interrupted"].includes(String(last.status))) {
         throw new LegacyRollbackConflictError("最后一轮仍在运行，请等待完成或先终止回答。");
       }
-      if (!Array.isArray(last.items) || !last.items.some((item) => asRecord(item).type === "userMessage")) {
-        throw new LegacyRollbackConflictError("最后一轮不是用户提问，不能自动撤回。");
+      if (!metadata.target.hasUserMessage) {
+        throw new LegacyRollbackConflictError("目标轮次不是用户提问，不能自动撤回。");
       }
-      if (typeof before.path !== "string" || !before.path) throw new Error("Codex 未提供该会话的日志路径。");
+      if(!fs.existsSync(before.path)) {
+        // Only native Codex may recover a writable rollout and acquire its
+        // writer locks. A read cache is never used as the edit target.
+        await account.bridge.request('thread/resume',{threadId,excludeTurns:true},30_000);
+        metadata=await readLegacyTailMetadata(before.path, edit?.allowHistoryRewrite ? expectedTurnId : undefined);
+        if(metadata.latest?.id!==(edit?.expectedLatestTurnId ?? expectedTurnId) || metadata.target?.id!==expectedTurnId) throw new LegacyRollbackConflictError('恢复后的会话已变化，未执行撤回，请刷新后重试。');
+      }
       await account.bridge.stopAndWait();
       stopped = true;
-      marker = await appendLegacyRollbackMarker(account.codexHome, before.path, threadId);
+      marker = await appendLegacyRollbackMarker(account.codexHome, before.path, threadId, metadata, metadata.rollbackTurns);
       await account.bridge.start();
       stopped = false;
-      const after = asRecord(asRecord(await account.bridge.request("thread/read", { threadId, includeTurns: true }, 60_000)).thread);
-      const remaining = Array.isArray(after.turns) ? after.turns.map(asRecord) : [];
-      if (remaining.length !== turns.length - 1 || remaining.some((turn) => turn.id === expectedTurnId)) {
+      const after = asRecord(asRecord(await account.bridge.request("thread/read", { threadId, includeTurns: false }, 30_000)).thread);
+      const remaining = await readLegacyTailMetadata(before.path);
+      if (after.id !== threadId || after.historyMode !== "legacy" || remaining.latest?.id !== metadata.retainedPrevious?.id || remaining.latest?.id === expectedTurnId) {
         throw new Error("撤回标记未被当前 Codex 正确重放，正在恢复原记录。");
       }
       marker = null;
       this.markReadyUnlessAuthFailure(account);
-      return { thread: after };
+      return { thread: { id: threadId, path: before.path, historyMode: "legacy", turns: [] },
+        rolledBackTurnId: expectedTurnId, rolledBackTurns: metadata.rollbackTurns, latestTurnId: remaining.latest?.id ?? null };
     } catch (error) {
       let recoveryError: unknown = null;
       if (marker) {

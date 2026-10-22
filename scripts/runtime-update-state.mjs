@@ -24,6 +24,18 @@ export function selectedRuntime(home, fallback, root=appRoot) {
     return binary;
   } catch { return fallback; }
 }
+// Called by the runtime wrapper only AFTER it owns the account's flock lease.
+// Explicit replacements and their recovery launches never opt into this path.
+export function adoptValidatedStartupRuntime(home, fallback, root=appRoot) {
+  try {
+    const candidate=JSON.parse(fs.readFileSync(path.join(root,'bin/runtime-candidate.json'),'utf8'));
+    const current=selectedRuntime(home,fallback,root).match(/\/codex-(\d+\.\d+\.\d+)\//)?.[1]??'0.0.0';
+    if(candidate.validated!==true||!newerVersion(candidate.version,current))return null;
+    fs.accessSync(runtimeBinary(candidate.version,root),fs.constants.X_OK);
+    writeState(selectionFile(home),{version:candidate.version,selectedAt:new Date().toISOString()});
+    return candidate.version;
+  }catch{return null;}
+}
 export function writeState(file, state) {
   const temporary=`${file}.${process.pid}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify(state,null,2)+'\n',{mode:0o600});

@@ -266,6 +266,27 @@ export class ProjectStore {
       thread_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
       sandbox_mode TEXT NOT NULL, approval_policy TEXT NOT NULL, updated_at TEXT NOT NULL
     )`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS question_answers (
+      thread_id TEXT NOT NULL, item_id TEXT NOT NULL, user_id TEXT NOT NULL,
+      answer_json TEXT NOT NULL, PRIMARY KEY(thread_id, item_id)
+    )`);
+  }
+
+  getQuestionAnswer(threadId: string, itemId: string, userId: string): unknown | null {
+    const row = this.db.prepare("SELECT answer_json FROM question_answers WHERE thread_id = ? AND item_id = ? AND user_id = ?")
+      .get(threadId, itemId, userId) as { answer_json: string } | undefined;
+    return row ? JSON.parse(row.answer_json) : null;
+  }
+
+  recordQuestionAnswer(threadId: string, itemId: string, userId: string, answer: unknown): void {
+    if (this.getThreadOwner(threadId)?.userId !== userId) throw new Error("Question does not belong to this user.");
+    this.db.prepare("INSERT INTO question_answers VALUES (?, ?, ?, ?) ON CONFLICT(thread_id, item_id) DO NOTHING")
+      .run(threadId, itemId, userId, JSON.stringify(answer));
+  }
+
+  answeredQuestionItemIds(threadId: string, userId: string): string[] {
+    return (this.db.prepare("SELECT item_id FROM question_answers WHERE thread_id = ? AND user_id = ?")
+      .all(threadId, userId) as { item_id: string }[]).map(row => row.item_id);
   }
 
   getThreadExecutionSettings(threadId: string, userId: string): { sandbox: Project["defaultSandbox"]; approvalPolicy: Project["defaultApprovalPolicy"] } | null {
@@ -732,10 +753,19 @@ export class ProjectStore {
     return new Set(rows.map(row => row.thread_id));
   }
 
-  setThreadLocallyArchived(threadId: string, userId: string, projectId: string, archived: boolean): boolean {
+  explicitThreadArchiveDecisions(userId:string,projectId:string):Map<string,{archived:boolean;at:number}> {
+    const rows=this.db.prepare('SELECT thread_id,is_archived_local,archive_decided_at FROM thread_owners WHERE user_id=? AND project_id=? AND archive_decided_at IS NOT NULL').all(userId,projectId) as Array<{thread_id:string;is_archived_local:number;archive_decided_at:string}>;
+    return new Map(rows.map(row=>[row.thread_id,{archived:row.is_archived_local===1,at:Date.parse(row.archive_decided_at)/1000}]));
+  }
+
+  unusedThreadIds(userId:string,projectId:string):string[] {
+    return (this.db.prepare('SELECT thread_id FROM unuse WHERE user_id=? AND project_id=?').all(userId,projectId) as Array<{thread_id:string}>).map(row=>row.thread_id);
+  }
+
+  setThreadLocallyArchived(threadId: string, userId: string, projectId: string, archived: boolean, explicit=true): boolean {
     const result = this.db.prepare(
-      "UPDATE thread_owners SET is_archived_local = ? WHERE thread_id = ? AND user_id = ? AND project_id = ?"
-    ).run(archived ? 1 : 0, threadId, userId, projectId);
+      "UPDATE thread_owners SET is_archived_local = ?,archive_decided_at=CASE WHEN ? THEN ? ELSE archive_decided_at END WHERE thread_id = ? AND user_id = ? AND project_id = ?"
+    ).run(archived ? 1 : 0, explicit?1:0,new Date().toISOString(),threadId, userId, projectId);
     return result.changes > 0;
   }
 
@@ -1200,6 +1230,7 @@ export class ProjectStore {
     if (!hasColumn("is_archived_local")) {
       this.db.exec("ALTER TABLE thread_owners ADD COLUMN is_archived_local INTEGER NOT NULL DEFAULT 0");
     }
+    if(!hasColumn('archive_decided_at'))this.db.exec('ALTER TABLE thread_owners ADD COLUMN archive_decided_at TEXT');
     if (!hasColumn("manual_order")) {
       this.db.exec("ALTER TABLE thread_owners ADD COLUMN manual_order INTEGER");
     }

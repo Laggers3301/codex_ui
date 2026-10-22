@@ -8,11 +8,11 @@ import { chromium, expect } from "@playwright/test";
 import WebSocket from "ws";
 
 const url = process.env.NATIVE_GOAL_QA_URL || "http://127.0.0.1:4575";
-const username = process.env.DOCUMENT_QA_USER || "qaUser";
+const username = process.env.DOCUMENT_QA_USER || "qa-user";
 if (!process.env.DOCUMENT_QA_PASSWORD) throw new Error("Set the authorized QA login password.");
-const root = await fs.mkdtemp(path.join(process.env.DOCUMENT_QA_ROOT || process.cwd(), "goal-kickoff-qa-"));
+const root = await fs.mkdtemp(`/srv/codex-ui/data/users/${username}/goal-kickoff-qa-`);
 const screenshots = await fs.mkdtemp("/tmp/codex-native-goal-");
-const browser = await chromium.launch({ executablePath: process.env.DOCUMENT_QA_CHROMIUM || undefined, headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+const browser = await chromium.launch({ executablePath: process.env.DOCUMENT_QA_CHROMIUM || "/home/example/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome", headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 let ws;
 let threadId;
 const messages = [];

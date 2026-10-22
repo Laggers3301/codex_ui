@@ -12,12 +12,12 @@ import { attachSocketServer } from "./socket.js";
 
 class StickyModeBridge extends EventEmitter {
   mode: string = "default";
-  turns: Array<{ mode: string; settings: unknown }> = [];
+  turns: Array<{ mode: string; settings: unknown; serviceTier?: string | null; serviceTierForTurn?: string }> = [];
   getPendingServerRequests() { return []; }
   async request(method: string, params: any) {
     if (method === "turn/start") {
       if (params.collaborationMode) this.mode = params.collaborationMode.mode;
-      this.turns.push({ mode: this.mode, settings: params.collaborationMode?.settings });
+      this.turns.push({ mode: this.mode, settings: params.collaborationMode?.settings, serviceTier: params.serviceTier, serviceTierForTurn: params.serviceTierForTurn });
       return { turn: { id: `turn-${this.turns.length}` } };
     }
     return {};
@@ -62,14 +62,19 @@ describe("leaving native Plan mode", () => {
           client = await connect((server.address() as { port: number }).port); sockets.push(client.socket);
         }
         const requestId = `mode-${index}`;
-        client.socket.send(JSON.stringify({ type: "turn.start", requestId, threadId: "mode-thread", projectId: project.id, collaborationMode: mode, prompt: `mode change ${index}` }));
+        client.socket.send(JSON.stringify({ type: "turn.start", requestId, threadId: "mode-thread", projectId: project.id, collaborationMode: mode, serviceTier: index === 1 ? null : "fast", prompt: `mode change ${index}` }));
         const ack = await client.wait(message => message.requestId === requestId);
         expect(ack.ok, ack.error).toBe(true);
         expect(bridge.mode).toBe(mode);
         expect(bridge.turns[index].settings).toEqual({ model: "gpt-6.1-sol", reasoning_effort: "max", developer_instructions: null });
+        expect(bridge.turns[index].serviceTier).toBe(index === 1 ? null : "fast");
+        expect(bridge.turns[index].serviceTierForTurn).toBe(index === 1 ? "default" : "priority");
         bridge.complete();
       }
       expect(bridge.turns.map(turn => turn.mode)).toEqual(["plan", "default", "plan"]);
+      // Let the completion notification's deferred queue check finish before
+      // disposing the test database.
+      await new Promise(resolve => setTimeout(resolve, 20));
     } finally {
       sockets.forEach(socket => socket.terminate());
       await new Promise<void>(resolve => wss.close(() => server.close(() => resolve())));

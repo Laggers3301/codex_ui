@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const terminalCodes = new Set(['refresh_token_reused', 'refresh_token_invalidated', 'refresh_token_expired']);
+const terminalCodes = new Set(['refresh_token_reused', 'refresh_token_invalidated', 'refresh_token_expired', 'refresh_token_unavailable']);
 
 function credentialIdentity(home) {
   let fd;

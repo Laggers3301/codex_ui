@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { serverConfig } from "./config.js";
 import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { readThreadFromJsonl } from "./threadFallback.js";
+import {rolloutLogicalStat, rolloutStat,openReadableRollout,rolloutReadStream} from './rolloutStorage.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -238,7 +239,7 @@ async function indexedRecordBoundaryMatches(filePath: string, threadId: string):
   if (row?.start_offset === undefined) return true;
   const startOffset = Number(row.start_offset);
   if (!Number.isSafeInteger(startOffset) || startOffset < 0) return false;
-  const handle = await fs.open(filePath, "r");
+  const handle = await openReadableRollout(filePath);
   try {
     if (startOffset === 0) {
       const current = Buffer.allocUnsafe(1);
@@ -254,7 +255,7 @@ async function indexedRecordBoundaryMatches(filePath: string, threadId: string):
 }
 
 async function updateThreadIndex(filePath: string, threadId: string): Promise<void> {
-  const stat = await fs.stat(filePath);
+  const stat = await rolloutStat(filePath);
   let state = fileState(threadId);
   const boundaryMatches = !state || await indexedRecordBoundaryMatches(filePath, threadId);
   const mustReset = Boolean(state && (
@@ -316,7 +317,7 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
   // Parse the JSONL before opening a transaction. File streaming is asynchronous;
   // keeping BEGIN open across `await` lets another request enter the same sqlite
   // connection and caused intermittent "transaction within a transaction" 502s.
-  for await (const chunkValue of createReadStream(filePath, { start: lineStart })) {
+  for await (const chunkValue of await rolloutReadStream(filePath, { start: lineStart })) {
     const chunk = Buffer.isBuffer(chunkValue) ? chunkValue : Buffer.from(chunkValue);
     pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
     for (;;) {
@@ -449,7 +450,13 @@ export function warmThreadIndex(filePath: string, threadId: string): Promise<voi
     // large conversation must not delay a cursor jump into an indexed file.
     const state = fileState(threadId);
     if (state) {
-      const stat = await fs.stat(filePath);
+      // Native lossless compression changes physical inode, not logical bytes.
+      // Do not inflate the entire cold corpus during background index scans.
+      if (!await fs.stat(filePath).catch(()=>null)) {
+        const logical=await rolloutLogicalStat(filePath);
+        if(state.filePath===filePath&&state.size===logical.size&&state.indexedOffset===logical.size&&state.mtimeMs===logical.mtimeMs) return;
+      }
+      const stat = await rolloutStat(filePath);
       if (state.filePath === filePath && state.inode === Number(stat.ino)
         && state.size === stat.size && state.indexedOffset === stat.size && state.mtimeMs === stat.mtimeMs) return;
     }
@@ -482,7 +489,7 @@ async function indexedCollaborationMode(filePath: string, threadId: string): Pro
   // be very large, so a tail scan is insufficient and a full read is wasteful.
   const turns = db.prepare("SELECT turn_id, start_offset FROM thread_turns WHERE thread_id = ? ORDER BY start_offset DESC LIMIT 4")
     .all(threadId) as Array<{ turn_id: string; start_offset: number }>;
-  const handle = await fs.open(filePath, "r");
+  const handle = await openReadableRollout(filePath);
   try {
     const { size } = await handle.stat();
     for (const turn of turns) {
@@ -589,7 +596,7 @@ export function locateIndexedThreadItem(threadId: string, itemId: string) {
   return row?.ordinal ? { ordinal: Number(row.ordinal), turnId: String(row.turn_id), cursor: encodeCursor(threadId, Number(row.ordinal) + 1) } : null;
 }
 
-export async function readIndexedThreadItem(filePath: string, threadId: string, itemId: string): Promise<JsonRecord | null> {
+export async function readIndexedThreadItem(filePath: string, threadId: string, itemId: string, options: { preferCall?: boolean } = {}): Promise<JsonRecord | null> {
   await warmThreadIndex(filePath, threadId);
   const row = db.prepare(`
     SELECT turn_id, start_offset, end_offset FROM thread_records
@@ -606,7 +613,9 @@ export async function readIndexedThreadItem(filePath: string, threadId: string, 
   for (const turnValue of turns) {
     const turn = turnValue as JsonRecord;
     const items = Array.isArray(turn.items) ? turn.items : [];
-    const item = items.find((value) => (value as JsonRecord).type === "toolCallOutput" && (value as JsonRecord).callId === itemId)
+    const call = options.preferCall ? items.find(value => (value as JsonRecord).type === "toolCall"
+      && (String((value as JsonRecord).id ?? "") === itemId || (value as JsonRecord).callId === itemId)) : undefined;
+    const item = call ?? items.find((value) => (value as JsonRecord).type === "toolCallOutput" && (value as JsonRecord).callId === itemId)
       ?? items.find((value) => String((value as JsonRecord).id ?? "") === itemId || (value as JsonRecord).callId === itemId);
     if (item && typeof item === "object") return item as JsonRecord;
   }

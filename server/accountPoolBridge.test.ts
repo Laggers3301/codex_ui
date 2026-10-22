@@ -667,6 +667,39 @@ describe("account-pool routing policy", () => {
       expect(await pool.applyRuntimeVersionIfIdle("a","0.159.2")).toBe("unchanged");
     }finally{pool.stop();fs.rmSync(temporary,{recursive:true,force:true});}
   });
+  it("opts into candidate adoption only on the cold launch, never on replacement or rollback bridges",()=>{
+    const root=fs.mkdtempSync(path.join(os.tmpdir(),"runtime-cold-launch-"));
+    const old=process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE;
+    process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE="1";
+    fs.writeFileSync(path.join(root,"pool.json"),JSON.stringify({accounts:[{id:"fixture",label:"fixture",codexHome:root}],stateFile:"state.json"}));
+    let pool:AccountPoolBridge|undefined;
+    try{
+      pool=AccountPoolBridge.fromFile(path.join(root,"pool.json"));
+      const internal=pool as unknown as {accounts:{bridge:{launch:{env:NodeJS.ProcessEnv}}}[];bridgeFactory:(home:string,id:string)=>{launch:{env:NodeJS.ProcessEnv}}};
+      expect(internal.accounts[0].bridge.launch.env.CODEX_WEB_RUNTIME_ADOPT_CANDIDATE).toBe("1");
+      expect(internal.bridgeFactory(root,"fixture").launch.env.CODEX_WEB_RUNTIME_ADOPT_CANDIDATE).toBe("0");
+      expect(internal.bridgeFactory(root,"fixture").launch.env.CODEX_WEB_RUNTIME_ADOPT_CANDIDATE).toBe("0");
+      expect(fs.existsSync(path.join(root,".web-runtime-version.json"))).toBe(false);
+      expect(fs.existsSync(path.join(root,"auth.json"))).toBe(false);
+    }finally{pool?.stop();if(old===undefined)delete process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE;else process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE=old;fs.rmSync(root,{recursive:true,force:true});}
+  });
+  it("restores the previous pin if a cold-start adopted runtime fails",async()=>{
+    const root=fs.mkdtempSync(path.join(os.tmpdir(),"runtime-cold-recovery-"));
+    const file=path.join(root,".web-runtime-version.json"),old=process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE;
+    process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE="1";fs.writeFileSync(file,JSON.stringify({version:"0.162.1"}));
+    class Runtime extends FakeCodexBridge {
+      constructor(readonly index:number){super();}
+      override async start(){if(this.index===0){fs.writeFileSync(file,JSON.stringify({version:"0.163.0"}));throw new Error("cold initialization failed");}await super.start();}
+    }
+    const runtimes:Runtime[]=[];
+    const pool=new AccountPoolBridge({accounts:[{id:"a",label:"a",codexHome:root}],stateFile:"pool.json"},root,()=>{const b=new Runtime(runtimes.length);runtimes.push(b);return b as unknown as CodexBridge;});
+    try{
+      await pool.start();
+      expect(runtimes).toHaveLength(2);expect(runtimes[0].stopped).toBe(true);expect(runtimes[1].stopped).toBe(false);
+      expect(JSON.parse(fs.readFileSync(file,"utf8")).version).toBe("0.162.1");
+      expect(fs.existsSync(path.join(root,"auth.json"))).toBe(false);
+    }finally{pool.stop();if(old===undefined)delete process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE;else process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE=old;fs.rmSync(root,{recursive:true,force:true});}
+  });
 
   it("never stops running accounts and restores the previous version on startup failure", async () => {
     for(const busy of [true,false]) {
@@ -690,6 +723,62 @@ describe("account-pool routing policy", () => {
         expect(JSON.parse(fs.readFileSync(path.join(temporary,".web-runtime-version.json"),"utf8")).version).toBe("0.159.2");
       }finally{pool.stop();fs.rmSync(temporary,{recursive:true,force:true});}
     }
+  });
+
+  it("classifies failed idle probes separately and can retry without stopping the old runtime", async () => {
+    const temporary=fs.mkdtempSync(path.join(os.tmpdir(),"codex-runtime-probe-retry-"));
+    fs.writeFileSync(path.join(temporary,".web-runtime-version.json"),JSON.stringify({version:"0.162.1"}));
+    let fail=true;
+    class ProbeBridge extends FakeCodexBridge {
+      override async request(method:string,params?:unknown) {
+        this.requests.push({method,params});
+        if(method==="thread/loaded/list") {
+          if(fail)throw new Error("temporary idle probe timeout");
+          return {data:[]};
+        }
+        return {};
+      }
+    }
+    const instances:ProbeBridge[]=[];
+    const pool=new AccountPoolBridge({accounts:[{id:"a",label:"a",codexHome:temporary}],stateFile:"state.json"},temporary,()=>{const b=new ProbeBridge();instances.push(b);return b as unknown as CodexBridge;});
+    try {
+      await expect(pool.applyRuntimeVersionIfIdle("a","0.163.0")).rejects.toMatchObject({stage:"preflight",message:"temporary idle probe timeout"});
+      expect(instances[0].stopped).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(temporary,".web-runtime-version.json"),"utf8")).version).toBe("0.162.1");
+      fail=false;
+      expect(await pool.applyRuntimeVersionIfIdle("a","0.163.0")).toBe("reloaded");
+      expect(instances[0].stopped).toBe(true);
+    } finally {pool.stop();fs.rmSync(temporary,{recursive:true,force:true});}
+  });
+
+  it("retries the automatic updater after cooldown and does not block a newer candidate", async () => {
+    const temporary=fs.mkdtempSync(path.join(os.tmpdir(),"codex-runtime-auto-retry-"));
+    const pool=new AccountPoolBridge({accounts:[{id:"a",label:"a",codexHome:temporary}],stateFile:"state.json"},temporary,()=>new FakeCodexBridge() as unknown as CodexBridge);
+    const exists=fs.existsSync.bind(fs),read=fs.readFileSync.bind(fs),access=fs.accessSync.bind(fs);
+    let version="0.163.0",now=0;
+    const candidate=(file:unknown)=>String(file).endsWith("/bin/runtime-candidate.json");
+    const binary=(file:unknown)=>String(file).includes("/bin/codex-")&&String(file).endsWith("/bin/codex");
+    const spies=[
+      vi.spyOn(fs,"existsSync").mockImplementation(file=>candidate(file)||exists(file)),
+      vi.spyOn(fs,"readFileSync").mockImplementation(((file:any,...args:any[])=>candidate(file)?JSON.stringify({validated:true,version}):(read as any)(file,...args)) as any),
+      vi.spyOn(fs,"accessSync").mockImplementation((file,mode)=>{if(!binary(file))access(file,mode);}),
+      vi.spyOn(Date,"now").mockImplementation(()=>now),
+      vi.spyOn(console,"warn").mockImplementation(()=>{}),
+      vi.spyOn(console,"info").mockImplementation(()=>{}),
+    ];
+    const apply=vi.spyOn(pool,"applyRuntimeVersionIfIdle")
+      .mockRejectedValueOnce(new Error("temporary preflight error"))
+      .mockResolvedValue("reloaded");
+    const check=()=> (pool as unknown as {checkRuntimeUpgrade():Promise<void>}).checkRuntimeUpgrade();
+    try {
+      await check();expect(apply).toHaveBeenCalledTimes(1);
+      now=30_000;await check();expect(apply).toHaveBeenCalledTimes(1);
+      now=60_000;await check();expect(apply).toHaveBeenCalledTimes(2);
+      apply.mockRejectedValueOnce(new Error("another temporary error"));
+      now=120_000;await check();expect(apply).toHaveBeenCalledTimes(3);
+      version="0.164.0";await check();expect(apply).toHaveBeenCalledTimes(4);
+      expect(apply).toHaveBeenLastCalledWith("a","0.164.0");
+    } finally {spies.forEach(spy=>spy.mockRestore());apply.mockRestore();pool.stop();fs.rmSync(temporary,{recursive:true,force:true});}
   });
 
   it("always gives a new thread to the healthy account with more remaining quota", () => {

@@ -7,6 +7,7 @@ import path from "node:path";
 import { serverConfig } from "./config.js";
 import type { RpcEnvelope } from "./types.js";
 import { AppError } from "./appErrors.js";
+import {authDiagnostic} from "./authDiagnostics.js";
 
 /**
  * The process used as the JSON-RPC transport for a Codex app-server.
@@ -73,6 +74,15 @@ export function classifyRpcEnvelope(message: RpcEnvelope): "response" | "serverR
   return "notification";
 }
 
+/** A reclaim/throttle watermark is not an allocation ceiling. Debounce transient
+ * tool allocations before interrupting work, without disabling the hard cap. */
+export function memoryPressureWindow(headroom: number | null, since: number | null, now: number):
+  { since: number | null; pause: boolean } {
+  if (headroom === null || headroom >= 256 * 1024 * 1024) return { since: null, pause: false };
+  const started = since ?? now;
+  return { since: started, pause: now - started >= 30_000 };
+}
+
 export class CodexBridge extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
@@ -83,6 +93,7 @@ export class CodexBridge extends EventEmitter {
   private stopped = false;
   private resourceMonitor: ReturnType<typeof setInterval> | null = null;
   private pressureReported = false;
+  private lowMemorySince: number | null = null;
 
   constructor(private readonly launch: CodexBridgeLaunchOptions = {
     command: serverConfig.codexBin,
@@ -175,7 +186,10 @@ export class CodexBridge extends EventEmitter {
       const directory = path.join("/sys/fs/cgroup", relative);
       const budgets: number[] = [];
       for (const group of [directory, path.dirname(directory)]) {
-        const limits = ["memory.high", "memory.max"].map(file => fs.readFileSync(path.join(group, file), "utf8").trim()).filter(value => value !== "max").map(Number);
+        // memory.high throttles/reclaims; it is NOT the available-memory ceiling.
+        // Counting it as a hard limit prematurely stops healthy tools while Linux
+        // is still reclaiming cache, even with a full GiB left below memory.max.
+        const limits = ["memory.max"].map(file => fs.readFileSync(path.join(group, file), "utf8").trim()).filter(value => value !== "max").map(Number);
         if (!limits.length) continue;
         const current = Number(fs.readFileSync(path.join(group, "memory.current"), "utf8").trim());
         const stats = fs.readFileSync(path.join(group, "memory.stat"), "utf8");
@@ -247,11 +261,15 @@ export class CodexBridge extends EventEmitter {
     this.emit("status", { state: "ready" });
     if (this.launch.scope) {
       this.pressureReported = false;
+      this.lowMemorySince = null;
       this.resourceMonitor = setInterval(() => {
         const headroom = this.getMemoryHeadroom();
-        if (headroom !== null && headroom < 256 * 1024 * 1024 && !this.pressureReported) {
+        const pressure = memoryPressureWindow(headroom, this.lowMemorySince, Date.now());
+        this.lowMemorySince = pressure.since;
+        if (pressure.pause && !this.pressureReported) {
           this.pressureReported = true;
-          this.emit("status", { state: "resource_pressure", message: "memory_pressure: 运行时可用内存低于 256 MiB，正在请求安全暂停当前轮次。" });
+          console.warn("[memory.pressure.pause]", JSON.stringify({ scope: this.launch.scope?.unitPrefix, headroomBytes: headroom, lowSince: this.lowMemorySince }));
+          this.emit("status", { state: "resource_pressure", message: "memory_pressure: 任务内存硬限额余量持续 30 秒低于 256 MiB，正在请求安全暂停当前轮次。" });
         } else if (headroom === null || headroom > 512 * 1024 * 1024) this.pressureReported = false;
       }, 5000);
       this.resourceMonitor.unref?.();
@@ -302,6 +320,16 @@ export class CodexBridge extends EventEmitter {
       return;
     }
 
+    // Malformed provider/native envelopes are not process-fatal and must not
+    // be interpreted as notifications or reflected into public error text.
+    if (!message || typeof message !== "object" || Array.isArray(message)
+      || (message.method !== undefined && typeof message.method !== "string")
+      || (message.id !== undefined && typeof message.id !== "number" && typeof message.id !== "string")
+      || (message.method === undefined && message.id === undefined)) {
+      this.emit("stderr", "Ignored malformed app-server envelope");
+      return;
+    }
+
     const kind = classifyRpcEnvelope(message);
 
     if (kind === "response") {
@@ -314,7 +342,13 @@ export class CodexBridge extends EventEmitter {
       clearTimeout(pending.timer);
       this.pending.delete(id);
       if (message.error) {
-        pending.reject(new Error(message.error.message));
+        const error=new Error(message.error.message);
+        if(["account/read","account/rateLimits/read","account/usage/read","account/login/start"].includes(pending.method)){
+          const safe=authDiagnostic("transport","health_verify","failure",message.error);
+          // Retain only explicitly allowed error context, not data/headers/body.
+          Object.defineProperties(error,{httpStatus:{value:safe.httpStatus},requestId:{value:safe.requestId},authCode:{value:safe.code}});
+        }
+        pending.reject(error);
       } else {
         pending.resolve(message.result);
       }

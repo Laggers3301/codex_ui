@@ -255,6 +255,7 @@ export interface DirectoryListResponse {
 
 export interface ThreadSummary {
   id: string;
+  answeredQuestionItemIds?: string[];
   sessionId: string;
   preview: string;
   name: string | null;
@@ -404,6 +405,7 @@ export interface ThreadHistoryPage {
 }
 
 export interface ThreadListResponse {
+  hiddenThreadIds?: string[];
   data: ThreadSummary[];
   nextCursor: string | null;
   backwardsCursor: string | null;

@@ -26,3 +26,13 @@ test('company ingress failures recover only their own transport',()=>{
  }
 });
 test('proxy recovery is separate, requires healthy backend and three failed checks',()=>{const p=new NetworkRecoveryPolicy(),broken={...healthy,frontendWS:false};assert.equal(p.evaluate(broken,0),null);assert.equal(p.evaluate(broken,15000),null);assert.equal(p.evaluate(broken,30000),'restart-frontend');assert.equal(p.evaluate(broken,45000),null);});
+test('unreachable diagnostics or congested LAN never tear down a forwarding session',()=>{
+ for(const extra of [
+  {cloudRelay:{ready:0,origin:0,reachable:false}},
+  {cloudRelay:{ready:200,origin:0},network:{gateway:{ok:true,ms:304}}},
+  {cloudRelay:{ready:0,origin:0},network:{gateway:{ok:false}}}
+ ]){
+  const p=new NetworkRecoveryPolicy();
+  for(let i=0;i<60;i++)assert.equal(p.evaluate({...healthy,...extra},i*15000),null);
+ }
+});

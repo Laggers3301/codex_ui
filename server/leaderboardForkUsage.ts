@@ -1,16 +1,17 @@
 import fs from "node:fs";
 import { createInterface } from "node:readline";
+import {rolloutReadStream,rolloutLogicalStat} from './rolloutStorage.js';
 
 const turnCache = new Map<string, { size: number; mtimeMs: number; ids: Set<string> }>();
 
 /** Forks copy old token_count records, sometimes with rewritten timestamps.
  * Stable turn IDs, not import timestamps, identify already-billed work. */
 export async function inheritedBillingTurnIds(filePath: string): Promise<Set<string>> {
-  const stat = fs.statSync(filePath);
+  const stat = await rolloutLogicalStat(filePath);
   const cached = turnCache.get(filePath);
   if (cached?.size === stat.size && cached.mtimeMs === stat.mtimeMs) return cached.ids;
   const ids = new Set<string>();
-  const input = fs.createReadStream(filePath, { encoding: "utf8" });
+  const input = await rolloutReadStream(filePath, { encoding: "utf8" });
   const lines = createInterface({ input, crlfDelay: Infinity });
   for await (const line of lines) {
     let row;

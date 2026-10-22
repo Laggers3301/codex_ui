@@ -6,9 +6,9 @@ import path from "node:path";
 import { unzipSync } from "fflate";
 
 const baseUrl = process.env.DOCUMENT_QA_URL || "http://127.0.0.1:4590";
-const username = process.env.DOCUMENT_QA_USER || "qaUser";
+const username = process.env.DOCUMENT_QA_USER || "qa-user";
 if (!process.env.DOCUMENT_QA_PASSWORD) throw new Error("Set DOCUMENT_QA_PASSWORD for an authorized test user.");
-const root = process.env.DOCUMENT_QA_ROOT || await fs.mkdtemp(path.join(process.env.DOCUMENT_QA_ROOT || process.cwd(), "document-workbench-qa-"));
+const root = process.env.DOCUMENT_QA_ROOT || await fs.mkdtemp(`/srv/codex-ui/data/users/${username}/document-workbench-qa-`);
 const screenshots = await fs.mkdtemp("/tmp/codex-writing-visual-");
 // Exercise native OOXML round-tripping with real document structures, not just
 // a paragraph-only fixture. This writes only inside the explicitly scoped QA root.
@@ -47,7 +47,7 @@ image.save(buffer, format="PNG")
 doc.add_picture(BytesIO(buffer.getvalue()), width=Inches(0.2))
 doc.save(root / "word-fixture.docx")
 `, root], { stdio: "inherit" });
-const browser = await chromium.launch({ executablePath: process.env.DOCUMENT_QA_CHROMIUM || undefined, headless: process.env.DOCUMENT_QA_HEADLESS !== "0", args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+const browser = await chromium.launch({ executablePath: process.env.DOCUMENT_QA_CHROMIUM || "/home/example/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome", headless: process.env.DOCUMENT_QA_HEADLESS !== "0", args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 let activePage;
 try {
   const context = await browser.newContext({ viewport: { width: 1600, height: 1000 }, deviceScaleFactor: 1 });

@@ -3,6 +3,26 @@ import { coalesceToolOutputs, collapseCodeModeWrappers, latestUserTimelineIndex,
 import type { ThreadItem } from "./types";
 
 const time = (n: number) => new Date(1_700_000_000_000 + n * 1000).toISOString();
+it("promotes native async question messages and keeps their identity over generic text snapshots", () => {
+  const native: ThreadItem = { id: "q", type: "agentMessage", delivery: "async", questions: [{ title: "请提供路径", options: null }], text: "请提供路径" };
+  const result = coalesceToolOutputs([native]);
+  expect(result[0]).toMatchObject({ id: "q", type: "toolCall", tool: "request_user_input_async" });
+  const overlaid = mergeTimelineItems([{ id: "q", type: "agentMessage", text: "旧的文本投影" }], result);
+  expect(overlaid).toHaveLength(1);
+  expect(overlaid[0]).toMatchObject({ type: "toolCall", tool: "request_user_input_async" });
+  expect(coalesceToolOutputs([{ ...native, delivery: null, questions: null }])[0].type).toBe("agentMessage");
+});
+it("normalizes native questions and attaches their accepted receipt without treating it as an answer", () => {
+  const args = JSON.stringify({ questions: [{ title: "允许独立浏览器验收吗？", options: ["允许", "暂不"] }] });
+  const result = coalesceToolOutputs([
+    { id: "native-q", type: "functionCall", name: "request_user_input_async", arguments: args, call_id: "q" },
+    { id: "receipt", type: "function_call_output", call_id: "q", output: '{"accepted":true}' },
+  ]);
+  expect(result).toHaveLength(1);
+  expect(result[0]).toMatchObject({ type: "toolCall", tool: "request_user_input_async", input: args, aggregatedOutput: '{"accepted":true}' });
+  const unrelated = { id: "other", type: "functionCall", name: "exec", arguments: args };
+  expect(coalesceToolOutputs([unrelated])).toEqual([unrelated]);
+});
 const call = (n: number): ThreadItem => ({ id: `call-${n}`, callId: `call-${n}`, type: "toolCall", tool: n === 2 ? "view_image" : "exec", timelineAt: time(n) });
 const message: ThreadItem = { id: "message", type: "agentMessage", text: "中间消息", timelineAt: time(19) };
 const live = [...Array.from({ length: 18 }, (_, i) => call(i + 1)), message, call(20), call(21)];

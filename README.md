@@ -1,6 +1,29 @@
 # Codex UI account pool
 
-## Latest source synchronization (2026-10-13)
+## Latest source synchronization (2026-10-20)
+
+This update includes the complete frontend and backend source, not only TypeScript:
+
+- Historical/latest prompt editing with attachment restoration, explicit suffix
+  withdrawal consent, recoverable pre-edit backups, stale-view protection and
+  failed-send draft retention. Editing does not undo filesystem changes.
+- Safe validated Codex runtime adoption, busy-reason reporting, startup rollback
+  and capability checks; existing account credentials remain private.
+- Batched streaming updates, Fast service-tier propagation, bounded failure
+  retries, actionable recovery notices and free-text tool questions.
+- HTML previews open rendered by default, with a formatted, bounded source editor;
+  conversation-scoped transfer state and sidebar visibility fixes.
+- Mobile table sizing, conversation/composer layout, CSS transitions and preview
+  zoom improvements. Latin-word apostrophes use narrow western glyphs in prose
+  and inline highlights, and monospace glyphs in fenced code; Chinese text and
+  copy/source characters are preserved.
+
+The runtime, build, editing and typography regression tests are included. Browser
+checks use isolated mock APIs; no production account or thread is required.
+To run optional native rollback fixtures, set `CODEX_ROLLBACK_TEST_BIN` to an
+installed compatible CLI binary. No Codex binary or model weights are bundled.
+
+### Earlier synchronization
 
 Includes recent frontend/backend updates: Feishu OAuth and confirmation workflows,
 voice dictation, pets, free-text tool questions, composer prediction, model-context
