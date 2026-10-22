@@ -12744,7 +12744,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               </aside>
             ) : null}
             <div className="conversationContent hasComposerAmbientGlow">
-              <ComposerAmbientGlow key={`ambient:${selectedUserId}`} theme={colorTheme} hasDraft={composerHasDraft} welcome={Boolean(selectedProject && !selectedThread && !openingThreadId && !openingThreadPresence.present && visiblePendingUserMessages.length === 0 && liveTimelineEntries.length === 0 && localMessages.length === 0)} />
+              <ComposerAmbientGlow key={`ambient:${selectedUserId}`} theme={colorTheme} hasDraft={composerHasDraft || Boolean(temporaryPrompt.trim())} welcome={Boolean(selectedProject && !selectedThread && !openingThreadId && !openingThreadPresence.present && visiblePendingUserMessages.length === 0 && liveTimelineEntries.length === 0 && localMessages.length === 0)} />
               {showPromptNavigator ? (
                 <nav
                   className="promptNavigator"

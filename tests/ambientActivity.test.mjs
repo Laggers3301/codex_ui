@@ -18,12 +18,13 @@ test("sending/clearing fades once and a later draft starts again", () => {
   activity.sync(true, false);
   assert.deepEqual(changes, [true, false, true]); activity.dispose();
 });
-test("empty homepage welcomes the user, selecting an existing thread hides it", () => {
+test("welcome fades after clearing a draft and returns only on a new welcome view", () => {
   const changes = [];
   const activity = createAmbientActivity(value => changes.push(value));
   activity.sync(false, true); activity.sync(true, true); activity.sync(false, true);
-  assert.deepEqual(changes, [true]);
-  activity.sync(false, false); assert.deepEqual(changes, [true, false]); activity.dispose();
+  assert.deepEqual(changes, [true, false]);
+  activity.sync(false, false); assert.deepEqual(changes, [true, false]);
+  activity.sync(false, true); assert.deepEqual(changes, [true, false, true]); activity.dispose();
 });
 test("Chinese IME composition stays active and cancels cleanly without committed text", () => {
   const changes = [];
@@ -33,28 +34,25 @@ test("Chinese IME composition stays active and cancels cleanly without committed
   activity.sync(false, false);
   assert.deepEqual(changes, [true, false, true, false]); activity.dispose();
 });
-test("a focused empty editor keeps the glow through draft sync and slow IME updates", () => {
+test("slow IME preedit stays active through unrelated empty-draft sync", () => {
   const changes = [];
   const activity = createAmbientActivity(value => changes.push(value));
   activity.sync(false, true);
-  activity.focus(true);
   activity.compositionStart();
   activity.sync(false, false);
   activity.sync(false, false);
   assert.deepEqual(changes, [true]);
   activity.compositionEnd(false);
-  assert.deepEqual(changes, [true]);
-  activity.focus(false);
   assert.deepEqual(changes, [true, false]);
   activity.dispose();
 });
-test("focus alone lights an empty editor and blur fades an empty existing conversation", () => {
+test("clearing a draft does not relight on later empty-draft updates", () => {
   const changes = [];
   const activity = createAmbientActivity(value => changes.push(value));
   activity.sync(false, false);
-  activity.focus(true); activity.sync(false, false); activity.input(false);
+  activity.input(true);
   assert.deepEqual(changes, [true]);
-  activity.focus(false);
+  activity.input(false); activity.sync(false, false); activity.input(false);
   assert.deepEqual(changes, [true, false]);
   activity.dispose();
 });

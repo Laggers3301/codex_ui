@@ -92,18 +92,23 @@ try {
   const mainInput = first.locator('.composer:not(.temporaryAskComposer) [contenteditable="true"]').first();
   const glow = first.locator('.composerAmbientGlow');
   await mainInput.focus();
-  await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "true");
+  assert.equal(await glow.getAttribute("data-active"), "false", "empty editor focus alone must not keep the glow lit");
   await mainInput.fill("真实页面中的草稿光效");
   await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "true");
   await mainInput.fill("");
-  assert.equal(await glow.getAttribute("data-active"), "true", "a focused empty editor keeps the glow after clearing text");
+  await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "false");
+  assert.ok(await mainInput.evaluate(element => document.activeElement === element), "clearing the main editor keeps focus while the glow fades");
   await mainInput.evaluate(element => element.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })));
   await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "true");
   await checkPolicyMenu(first, sideAccess);
   assert.equal(await glow.getAttribute("data-active"), "true", "a delayed preedit keeps the glow through unrelated parent renders");
   await mainInput.evaluate(element => element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "" })));
   await composer(first).fill("A 的草稿");
-  assert.equal(await glow.getAttribute("data-active"), "true", "the side composer also keeps the page glow while focused");
+  await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "true");
+  await composer(first).fill("");
+  await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "false");
+  assert.ok(await composer(first).evaluate(element => document.activeElement === element), "clearing the side editor also fades the glow without losing focus");
+  await composer(first).fill("A 的草稿");
   const draftSaved = first.waitForResponse(response => response.url().includes("/side-chat") && response.request().method() === "PATCH");
   await switchMain(first, "main-c", "这个主会话还没有侧边会话。");
   await (await draftSaved).finished();
@@ -196,7 +201,7 @@ try {
     newTabRestoresRunningSideChat: true, restoredSideKeepsStreaming: true, reloadRestoresSideChat: true, followupReusesThread: true,
     lateAcknowledgementStaysWithParent: true, backgroundCompletionDoesNotSwitchPanel: true,
     closeOnlyInterruptsMatchingSide: true, deletedSideDoesNotReturn: true, errorCanBeSelectedAndDismissed: true,
-    accessMenusFitViewport: true, draftAndPreeditKeepGlow: true, pageErrors: errors }));
+    accessMenusFitViewport: true, draftAndPreeditKeepGlow: true, clearDraftFadesWithFocus: true, pageErrors: errors }));
 } finally {
   await browser?.close();
   for (const child of children.reverse()) {
