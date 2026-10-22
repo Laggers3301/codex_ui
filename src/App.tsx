@@ -12221,9 +12221,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
         <div className="threadNoticeStack">
         {error ? (
-          <div className="errorBanner" onClick={() => setError("")}>
-            {error}
+          <div className="errorBanner" role="alert">
+            <span className="errorBannerMessage">{error}</span>
             {archiveBranchRetry&&archiveBranchRetry.threadId===selectedThread?.id?<button className="branchArchiveRetry" type="button" disabled={branchingThread} onClick={event=>{event.stopPropagation();if(archiveBranchRetry)void createBranchFromTurn({id:archiveBranchRetry.turnId},true);}}>精简较早的工具结果后分支</button>:null}
+            <button className="iconButton errorBannerDismiss" type="button" aria-label="关闭错误提示" title="关闭错误提示" onClick={() => setError("")}><X size={16} /></button>
           </div>
         ) : null}
 
