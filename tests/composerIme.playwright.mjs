@@ -16,7 +16,8 @@ for (const name of engines) {
     await page.waitForFunction(() => document.querySelector('[contenteditable="true"]')?.editor);
     const report = await page.evaluate(() => window.runComposerImeCases());
     assert.deepEqual(errors, []);
-    assert.equal(report.results.length, 11);
+    assert.equal(report.results.length, 23);
+    assert.equal(report.results.filter(result => result.scenario === "slowComposition").length, 12);
     console.log(JSON.stringify({ browser: name, ...report }));
   } finally { await browser.close(); }
 }

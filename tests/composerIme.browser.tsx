@@ -9,6 +9,7 @@ function Harness() {
   const [value, setValue] = useState("前文 `code` 后文 ");
   const [emitted, setEmitted] = useState<string[]>([]);
   const [submitted, setSubmitted] = useState(0);
+  const [parentRenders, setParentRenders] = useState(0);
   return <main style={{ maxWidth: 900, margin: "40px auto", padding: 16 }}>
     <MarkdownComposerEditor value={value} onChange={next => {
       emittedValues.push(next);
@@ -18,15 +19,17 @@ function Harness() {
     }} onSubmit={() => setSubmitted(count => count + 1)} placeholder="输入法验收" />
     <button onClick={() => setValue("外部替换后的草稿")}>替换草稿</button>
     <button onClick={() => setValue("")}>清空草稿</button>
+    <button data-testid="refresh-parent" onClick={() => setParentRenders(count => count + 1)}>刷新父组件</button>
     <output data-testid="value">{value}</output>
     <output data-testid="emitted">{JSON.stringify(emitted)}</output>
     <output data-testid="submitted">{submitted}</output>
+    <output data-testid="parent-renders">{parentRenders}</output>
   </main>;
 }
 createRoot(document.getElementById("root")!).render(<Harness />);
 
 /** Synthetic composition events exercise the document synchronization race.
- * The Windows IME itself still needs verification on the affected machine. */
+ * The actual system IME still needs verification on the affected machine. */
 async function runComposerImeCases() {
   const input = document.querySelector<HTMLElement>('[contenteditable="true"]')!;
   const editor = (input as HTMLElement & { editor: import("@tiptap/core").Editor }).editor;
@@ -43,14 +46,21 @@ async function runComposerImeCases() {
     input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "" }));
     const selection = document.getSelection()!;
     let node = selection.anchorNode!;
+    let offset = selection.anchorOffset;
     if (node.nodeType !== Node.TEXT_NODE) {
+      const container = input.contains(node) ? node : input.querySelector("p")!;
+      const next = container.childNodes[offset] ?? null;
       node = document.createTextNode("");
-      input.querySelector("p")!.insertBefore(node, input.querySelector("p")!.firstChild);
+      container.insertBefore(node, next);
+      offset = 0;
     }
-    const before = node.nodeValue!;
-    return (text: string) => {
-      node.nodeValue = before + text;
-      selection.collapse(node, node.nodeValue.length);
+    const before = node.nodeValue!.slice(0, offset);
+    const after = node.nodeValue!.slice(offset);
+    return (text: string, caretAtStart = false) => {
+      input.dispatchEvent(new CompositionEvent("compositionupdate", { bubbles: true, data: text }));
+      input.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertCompositionText", isComposing: true, data: text }));
+      node.nodeValue = before + text + after;
+      selection.collapse(node, before.length + (caretAtStart ? 0 : text.length));
       input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertCompositionText", isComposing: true, data: text }));
     };
   };
@@ -82,6 +92,78 @@ async function runComposerImeCases() {
       if (prefix.includes("https:")) check(input.querySelector("a")?.textContent === "链接", "Link must stay intact");
       editor.off("transaction", onTransaction);
       results.push({ prefix: prefix || "plain", initial, replacements, committedOnce: true, caretPreserved: true });
+    }
+  }
+  const refreshParent = document.querySelector<HTMLButtonElement>('[data-testid="refresh-parent"]')!;
+  for (const { format, markdown } of [
+    { format: "plain", markdown: "甲乙后文" },
+    { format: "code", markdown: "前文 `code` 甲乙后文" },
+    { format: "link", markdown: "前文 [链接](https://example.com) 甲乙后文" },
+  ]) {
+    for (const placement of ["middle", "end"]) {
+      for (const caretAtStart of [false, true]) {
+        const label = `${format}/${placement}/${caretAtStart ? "preedit-start" : "preedit-end"}`;
+        await prepare(markdown);
+        let insertionPosition = editor.state.doc.content.size - 1;
+        if (placement === "middle") {
+          editor.state.doc.descendants((node, position) => {
+            const offset = node.text?.indexOf("后文") ?? -1;
+            if (node.isText && offset >= 0) insertionPosition = position + offset;
+          });
+        }
+        editor.commands.setTextSelection(insertionPosition);
+        await wait(0);
+        const startEmitted = emitted().length;
+        const startRenders = Number(document.querySelector('[data-testid="parent-renders"]')!.textContent);
+        let replacements = 0;
+        const onTransaction = ({ transaction }: { transaction: import("@tiptap/pm/state").Transaction }) => {
+          if (transaction.docChanged && transaction.getMeta("preventUpdate") === true) replacements++;
+        };
+        editor.on("transaction", onTransaction);
+        const write = compose();
+        const checkPending = (caretStart: number, caretEnd = caretStart) => {
+          check(replacements === 0, "A slow composition must not replace the document: " + label);
+          check(emitted().length === startEmitted, "A slow preedit must not reach controlled props: " + label);
+          const selection = document.getSelection();
+          const domCaret = selection?.isCollapsed && selection.anchorNode && input.contains(selection.anchorNode)
+            ? editor.view.posAtDOM(selection.anchorNode, selection.anchorOffset) : -1;
+          const caret = editor.state.selection;
+          check(caret.empty && caret.from >= caretStart && caret.from <= caretEnd && domCaret >= caretStart && domCaret <= caretEnd, "A parent render must keep the pending IME caret within the composing text: " + label + JSON.stringify({ expected: [caretStart, caretEnd], model: caret.toJSON(), domCaret }));
+          check(document.activeElement === input, "A slow composition must keep editor focus: " + label);
+        };
+        // No preedit text arrives for over a second while unrelated UI updates.
+        // Programmatic clicks avoid moving focus away from the editor.
+        for (let tick = 0; tick < 4; tick++) {
+          refreshParent.click();
+          await wait(275);
+          checkPending(insertionPosition);
+        }
+        write("sh", caretAtStart);
+        refreshParent.click();
+        await wait(200);
+        // ProseMirror normalizes Chrome's preedit caret to the end. Both the
+        // model and visible caret must stay inside the active preedit span.
+        checkPending(insertionPosition + (caretAtStart ? 0 : 2), insertionPosition + 2);
+        write("中", caretAtStart);
+        refreshParent.click();
+        await wait(200);
+        checkPending(insertionPosition + (caretAtStart ? 0 : 1), insertionPosition + 1);
+        // A native IME places the committed caret after the selected candidate.
+        write("中");
+        input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "中" }));
+        const beforeSubmit = document.querySelector('[data-testid="submitted"]')!.textContent;
+        input.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter", keyCode: 13, isComposing: false }));
+        await wait(100);
+        const expected = placement === "end" ? markdown + "中" : markdown.replace("甲乙后文", "甲乙中后文");
+        check(editor.getMarkdown() === expected, "A slow commit must preserve surrounding text and formatting: " + label);
+        check(editor.state.selection.from === insertionPosition + 1, "A slow commit must keep the caret at the insertion position: " + label);
+        check(emitted().length === startEmitted + 1, "A slow commit must publish once: " + label);
+        check(document.querySelector('[data-testid="submitted"]')!.textContent === beforeSubmit, "Confirming a slow IME candidate must not submit: " + label);
+        const parentRenders = Number(document.querySelector('[data-testid="parent-renders"]')!.textContent) - startRenders;
+        check(parentRenders === 6, "The slow IME case must exercise parent renders: " + label);
+        editor.off("transaction", onTransaction);
+        results.push({ scenario: "slowComposition", format, placement, preeditCaret: caretAtStart ? "start" : "end", firstPreeditDelayMs: 1100, parentRenders, committedOnce: true, caretPreserved: true });
+      }
     }
   }
   await prepare("`code`");
