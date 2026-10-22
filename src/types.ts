@@ -284,6 +284,8 @@ export interface ThreadSearchMatch {
   ordinal: number;
 }
 
+export type { SideChat, SideChatChange, SideChatStatus } from "../shared/sideChat";
+
 export interface ThreadPresentation {
   threadId: string;
   pinned: boolean;

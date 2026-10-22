@@ -6,6 +6,7 @@ import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
 import type { CreateProjectInput, LocalSendSettings, Project, ReasoningEffort, UpdateLocalSendSettingsInput, UpdateProjectInput, UserProfile } from "./types.js";
 import type { TurnRecoveryState } from "./turnRetry.js";
+import { SideChatStore } from "./sideChats.js";
 
 export const ADMIN_USER_ID = "admin";
 export const DEFAULT_USER_ID = ADMIN_USER_ID;
@@ -237,6 +238,7 @@ function toUnusedThread(row: UnusedThreadRow): UnusedThread {
 
 export class ProjectStore {
   private readonly db: DatabaseSync;
+  readonly sideChats: SideChatStore;
 
   constructor(dbPath = path.join(serverConfig.dataDir, "codex-web.sqlite")) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -270,6 +272,7 @@ export class ProjectStore {
       thread_id TEXT NOT NULL, item_id TEXT NOT NULL, user_id TEXT NOT NULL,
       answer_json TEXT NOT NULL, PRIMARY KEY(thread_id, item_id)
     )`);
+    this.sideChats = new SideChatStore(this.db, this);
   }
 
   getQuestionAnswer(threadId: string, itemId: string, userId: string): unknown | null {
@@ -981,6 +984,7 @@ export class ProjectStore {
            deleted_at = excluded.deleted_at`
       )
       .run(cleanThreadId, userId, owner.projectId, owner.rootPath, deletedAt);
+    this.sideChats.forgetForThread(cleanThreadId);
     return this.getUnusedThread(cleanThreadId, userId);
   }
 

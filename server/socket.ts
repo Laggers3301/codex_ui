@@ -52,6 +52,7 @@ import { meaningfulTurnProgressMethod, TurnWatchdog, type WatchdogProbeClaim, ty
 import { LatestTaskQueue } from "./streamBatch.js";
 import { requestedServiceTier, requestedTurnServiceTier } from "./serviceTier.js";
 import type { LiveAgentMessage } from "./liveState.js";
+import { settleClosedSideChat, SideChatError } from "./sideChats.js";
 
 const commandSchema = z.array(z.string()).min(1);
 const threadStartContextConfigSchema = z.object({
@@ -493,6 +494,8 @@ function runDedupedPrompt<T>(
 
 export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, store: ProjectStore, browserService?: BrowserService): WebSocketServer {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const unsubscribeSideChats = store.sideChats.subscribe(change => sendToUser(wss, change.userId, { type: "side.chat", data: change }));
+  wss.on("close", unsubscribeSideChats);
   // Canonical native rollouts retain every delta. The UI journal checkpoints
   // snapshots at most every 200ms, plus first content and turn boundaries.
   const streamJournal = new LatestTaskQueue(200, error => console.warn("Stream journal checkpoint failed", error));
@@ -709,6 +712,16 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       streamJournal.flushPrefix(JSON.stringify([owner,turnId]).slice(0,-1)+",");
     }
     const threadIdForWatchdog = notificationThreadId(message);
+    if (threadIdForWatchdog && turnId && ["turn/started", "turn/completed"].includes(message.method ?? "")) {
+      const side = store.sideChats.forThread(threadIdForWatchdog);
+      if (side?.status === "closing") {
+        void settleClosedSideChat(bridge, store, side.id, side.userId, threadIdForWatchdog, message.method === "turn/started" ? turnId : null)
+          .catch(error => console.error("[side-chat.close.failed]", error instanceof Error ? error.message : String(error)));
+      } else {
+        const turn = asRecord(asRecord(message.params).turn);
+        store.sideChats.turn(threadIdForWatchdog, turnId, message.method === "turn/completed", turn.status === "failed" ? pickString(asRecord(turn.error).message, "侧边会话执行失败。") : undefined);
+      }
+    }
     const accountId = notificationAccountId(message);
     if (message.method === "serverRequest/resolved") {
       const requestId = asRecord(message.params).requestId as number | string | undefined;
@@ -1184,8 +1197,12 @@ async function handleClientMessage(
       case "thread.start": {
         await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId);
         const project = getProjectOrThrow(store, message.projectId, sessionUserId);
-        const prompt = pickString(message.prompt).trim();
-        if (!prompt) {
+        const question = pickString(message.prompt).trim();
+        const sideChatId = pickString(message.sideChatId);
+        const side = sideChatId ? store.sideChats.byId(sideChatId, sessionUserId) : null;
+        if (sideChatId && !side) throw new SideChatError("侧边会话已关闭或不可访问。", 403);
+        const prompt = side ? `请基于下面选中的文字回答问题。\n\n选中文字：\n${side.selectedText}\n\n用户问题：\n${question}` : question;
+        if (!question) {
           throw new Error("Prompt is required.");
         }
         const model = pickString(message.model, project.defaultModel).trim() || project.defaultModel;
@@ -1200,11 +1217,12 @@ async function handleClientMessage(
           guards,
           sessionUserId,
           requestId,
-          `new-thread:${project.id}`,
+          sideChatId ? `new-side-thread:${sideChatId}` : `new-thread:${project.id}`,
           prompt,
           model,
           reasoningEffort,
           async () => {
+            if (sideChatId) store.sideChats.begin(sideChatId, sessionUserId, project.id, requestId, question, null, pickString(message.sideChatModelProfileId));
             const browserMcp = browserService ? mintBrowserMcpConfig(sessionUserId, project.id) : null;
             const startParams = {
               ...requestedServiceTier(message.serviceTier),
@@ -1236,6 +1254,10 @@ async function handleClientMessage(
               model,
               reasoningEffort
             });
+            if (sideChatId && !store.sideChats.attach(sideChatId, sessionUserId, requestId, threadId)) {
+              await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, null);
+              throw new SideChatError("侧边会话已关闭，本次创建已取消。");
+            }
             store.setThreadExecutionSettings(threadId, sessionUserId,
               pickSandbox(message.sandbox, project.defaultSandbox), pickApprovalPolicy(message.approvalPolicy, project.defaultApprovalPolicy));
             if (browserMcp?.bindingId) bindBrowserMcpThread(browserMcp.bindingId, threadId, store);
@@ -1276,15 +1298,27 @@ async function handleClientMessage(
                 ...await scopedHookTrustConfig(bridge, store, sessionUserId, project, threadId)
               }
             };
+            if (sideChatId && store.sideChats.byId(sideChatId, sessionUserId)?.status === "closing") {
+              await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, null);
+              throw new SideChatError("侧边会话已关闭，本次提问已取消。");
+            }
             guards.retries?.watch(sessionUserId, threadId, turnParams);
             let turn: unknown;
             try { turn = await bridge.request("turn/start", turnParams); }
             catch (error) {
+              if (sideChatId && store.sideChats.byId(sideChatId, sessionUserId)?.status === "closing") {
+                await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, null);
+                throw error;
+              }
               guards.retries?.failed(sessionUserId, threadId, `pending:${requestId}`, error, true, false);
               if (AppError.from(error).retryable && guards.retries?.pending(threadId)) return { thread, queuedForRetry: true };
               throw error;
             }
             rememberAcceptedTurn(guards, threadId, requestId, turn);
+            if (sideChatId && !store.sideChats.accepted(sideChatId, sessionUserId, requestId, turnIdFromStartResult(turn))) {
+              await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, turnIdFromStartResult(turn));
+              throw new SideChatError("侧边会话已关闭，本次提问已停止。");
+            }
             store.touchThreadOwner(threadId);
             return { thread, turn };
           }
@@ -1307,6 +1341,9 @@ async function handleClientMessage(
         const modelDefaults = ownerProject ?? project;
         const model = owner?.modelOverride ?? modelDefaults.defaultModel;
         const reasoningEffort = owner?.reasoningEffortOverride ?? modelDefaults.defaultReasoningEffort;
+        const sideChatId = pickString(message.sideChatId);
+        const boundSide = store.sideChats.forThread(threadId);
+        if (boundSide && boundSide.id !== sideChatId) throw new SideChatError("请从主会话的侧边栏继续此会话。", 403);
         const savedExecution = store.getThreadExecutionSettings(threadId, sessionUserId);
         const executionSandbox = pickSandbox(message.sandbox, savedExecution?.sandbox ?? modelDefaults.defaultSandbox);
         const executionApproval = pickApprovalPolicy(message.approvalPolicy, savedExecution?.approvalPolicy ?? modelDefaults.defaultApprovalPolicy);
@@ -1320,6 +1357,7 @@ async function handleClientMessage(
           reasoningEffort,
           async () => {
             assertNoActiveTurn(guards, threadId);
+            if (sideChatId) store.sideChats.begin(sideChatId, sessionUserId, owner?.projectId ?? project.id, requestId, prompt, threadId, pickString(message.sideChatModelProfileId));
             guards.retries?.cancel(sessionUserId, threadId);
             guards.startingThreads.add(threadId);
             try {
@@ -1363,8 +1401,16 @@ async function handleClientMessage(
                 }
               };
               guards.retries?.watch(sessionUserId, threadId, turnParams);
+              if (sideChatId && store.sideChats.byId(sideChatId, sessionUserId)?.status === "closing") {
+                await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, null);
+                throw new SideChatError("侧边会话已关闭，本次提问已取消。");
+              }
               const turn = await bridge.request("turn/start", turnParams, 30_000);
               rememberAcceptedTurn(guards, threadId, requestId, turn);
+              if (sideChatId && !store.sideChats.accepted(sideChatId, sessionUserId, requestId, turnIdFromStartResult(turn))) {
+                await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, turnIdFromStartResult(turn));
+                throw new SideChatError("侧边会话已关闭，本次提问已停止。");
+              }
               if (!owner?.modelOverride || !owner.reasoningEffortOverride) {
                 store.setThreadModelConfig(threadId, sessionUserId, model, reasoningEffort);
               }
@@ -1815,6 +1861,12 @@ async function handleClientMessage(
         throw new Error(`Unsupported socket message type: ${message.type}`);
     }
   } catch (error) {
+    const sideChatId = pickString(message.sideChatId);
+    if (sideChatId) {
+      const side = store.sideChats.byId(sideChatId, sessionUserId);
+      if (side?.status === "closing" && !side.threadId) store.sideChats.forget(side);
+      else store.sideChats.failed(sideChatId, sessionUserId, requestId, error);
+    }
     const applicationError = AppError.from(error);
     const threadId = pickString(message.threadId);
     if (message.type === "turn.start" && threadId && store.getThreadOwner(threadId)?.userId === sessionUserId && !guards.activeTurnsByThread.has(threadId)) {
