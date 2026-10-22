@@ -88,6 +88,13 @@ export function synchronousQuestionHasResult(item: { tool?: unknown; status?: un
     && (item.completed === true || ["completed", "failed", "declined"].includes(String(item.status)) || Boolean(item.output));
 }
 
+/** An answer receipt or a finished tool cannot still be streaming a question. */
+export function questionIsGenerating(item: { tool?: unknown; status?: unknown; completed?: unknown; output?: unknown; aggregatedOutput?: unknown }): boolean {
+  return isQuestionToolName(item.tool) && item.completed !== true
+    && !["completed", "failed", "declined", "cancelled", "canceled", "interrupted"].includes(String(item.status).toLowerCase())
+    && !item.output && !item.aggregatedOutput;
+}
+
 /** App-server history can place function arguments in `command`, not `input`. */
 export function parseQuestionToolItem(item: { type?: unknown; delivery?: unknown; questions?: unknown; tool?: unknown; name?: unknown; toolName?: unknown; arguments?: unknown; input?: unknown; command?: unknown }): ToolQuestion[] | null {
   if (String(item.type).replace(/_/g, "").toLowerCase() === "agentmessage" && item.delivery === "async" && Array.isArray(item.questions)) {

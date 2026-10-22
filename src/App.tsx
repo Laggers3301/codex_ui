@@ -97,7 +97,7 @@ import { useBoundSideChats } from "./useBoundSideChats";
 import type { TemporaryAsk } from "./sideChats";
 import type { SideChatChange } from "./types";
 import {setSidebarThreadHidden,sidebarVisibilityVersion,visibleSidebarThreads,reconcileSidebarVisibility} from "./sidebarVisibility";
-import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, type UserInputRequest } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, type UserInputRequest } from "./questionTool";
 import { ToolQuestionCard, ToolQuestionMessage } from "./ToolQuestionCard";
 import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
@@ -10312,7 +10312,8 @@ export function App() {
     if (parseAgentOperation(collaborationItem)) return <article className="messageItem kind-tool subagentMessage" key={entry.id}><SubagentToolCard item={collaborationItem} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} /></article>;
     const liveQuestions = parseQuestionTool(safeText(entry.tool), entry.input);
     if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} />;
-    if (isQuestionToolName(entry.tool)) return <div className="v2ThinkingLine" role="status" key={entry.id}>正在生成问题…</div>;
+    if (isQuestionToolName(entry.tool)) return !questionIsAnswered(entry.id, entry.turnId ?? undefined) && questionIsGenerating(entry)
+      ? <div className="v2ThinkingLine" role="status" key={entry.id}>正在生成问题…</div> : null;
     return (
       <article className="messageItem kind-tool type-toolCall live" key={entry.id}>
         <div className="messageMeta">{entry.completed ? "工具输出" : "调用工具"} · {entry.tool}</div>
@@ -13028,7 +13029,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     }
                     if (kind === "tool" && isQuestionToolName(item.tool)) {
                       toolGroupIndex = flushToolGroup(toolGroupIndex, true);
-                      renderedHistoryItems.push(<div className="v2ThinkingLine" role="status" key={`${turn.id}-${item.id}-question-pending`}>正在生成问题…</div>);
+                      if (!questionIsAnswered(item.id, turn.id, items) && questionIsGenerating(item)) {
+                        renderedHistoryItems.push(<div className="v2ThinkingLine" role="status" key={`${turn.id}-${item.id}-question-pending`}>正在生成问题…</div>);
+                      }
                       continue;
                     }
                     if (kind === "tool" || kind === "reasoning") {

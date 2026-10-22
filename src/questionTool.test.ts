@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification } from "./questionTool";
 
 describe("question tool presentation", () => {
+  it("shows generation only for an unfinished question without an answer receipt", () => {
+    expect(questionIsGenerating({ tool: "request_user_input_async", completed: false })).toBe(true);
+    const receipt = JSON.stringify({ type: "codex_web_question_answer", itemId: "original-question" });
+    expect(questionIsGenerating({ tool: "request_user_input_async", completed: true, output: receipt })).toBe(false);
+    expect(questionIsGenerating({ tool: "request_user_input_async", aggregatedOutput: receipt })).toBe(false);
+    expect(questionIsGenerating({ tool: "request_user_input", status: "completed" })).toBe(false);
+    expect(questionIsGenerating({ tool: "request_user_input_async", completed: true })).toBe(false);
+    expect(questionIsGenerating({ tool: "exec", completed: false })).toBe(false);
+  });
   it("preserves the native async agentMessage metadata on started, before any history or tool receipt", () => {
     const item = { type: "agentMessage", id: "call-native-q", delivery: "async", text: "请提供路径", questions: [{ title: "请提供路径", options: null }] };
     const event = { method: "item/started", params: { threadId: "t", turnId: "r", item } };

@@ -51,6 +51,7 @@ try {
               this.emit({ type: "codex.notification", data: { method: "serverRequest/resolved", params: { threadId: "questions-thread", requestId: message.codexRequestId } } });
               this.emit({ type: "codex.notification", data: { method: "turn/completed", params: { threadId: "questions-thread", turn: { id: "questions-turn", status: "completed" } } } });
             } else this.emit({ type: "question.answered", data: { threadId: "questions-thread", itemId } });
+            this.emit({ type: "live.tool", data: { itemId: "receipt-" + itemId, threadId: "questions-thread", turnId: "questions-turn", tool: "request_user_input_async", input: "", output: JSON.stringify({ type: "codex_web_question_answer", itemId }), completed: true, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() } });
             this.emit({ type: "ack", requestId: message.requestId, ok: true });
           }, 120);
         }
@@ -63,7 +64,7 @@ try {
       const answered = await page.evaluate(() => JSON.parse(localStorage.getItem("fixture-answered") ?? "[]"));
       const thread = { id: "questions-thread", name: "并行问题验收", sessionId: "questions-thread", cwd: "/test", updatedAt: 1, createdAt: 1, status: "idle", answeredQuestionItemIds: answered, turns: [
         { id: "questions-turn", status: "completed", items: questions.map(q => ({ id: q.id, type: "toolCall", tool: "request_user_input_async", input: JSON.stringify({ questions: [{ id: q.id, title: q.title, options: q.options }] }), output: '{"accepted":true}', completed: true })) },
-        { id: "unrelated-turn", status: "completed", items: [{ id: "unrelated-user", type: "userMessage", text: "补充一条和上述问题无关的信息" }] }
+        { id: "unrelated-turn", status: "completed", items: [{ id: "unrelated-user", type: "userMessage", text: "补充一条和上述问题无关的信息" }, ...answered.map(itemId => ({ id: "receipt-" + itemId, type: "toolCall", tool: "request_user_input_async", input: "", output: JSON.stringify({ type: "codex_web_question_answer", itemId }), completed: true }))] }
       ] };
       let json = { data: [] };
       if (pathname === "/api/projects") json = { data: [project], projectRoot: "/test" };
@@ -88,6 +89,7 @@ try {
     assert.equal(await second.inputValue(), "第二题尚未提交的草稿");
     await page.getByRole("button", { name: /先测试/ }).click();
     await page.waitForFunction(() => document.querySelectorAll(".toolQuestionCard").length === 1);
+    assert.equal(await page.getByText("正在生成问题…", { exact: true }).count(), 0, "a live answer receipt is not a new question");
     assert.equal(await second.inputValue(), "第二题尚未提交的草稿");
     const firstWrites = await page.evaluate(() => window.questionWrites);
     const replies = firstWrites.filter(m => m.type === (native ? "userInput.respond" : "question.respond"));
@@ -97,12 +99,14 @@ try {
     await page.reload();
     await page.locator('[data-thread-id="questions-thread"] .threadSelectButton').click();
     await page.waitForFunction(() => document.querySelectorAll(".toolQuestionCard").length === 1);
+    assert.equal(await page.getByText("正在生成问题…", { exact: true }).count(), 0, "persisted answer receipts never show a generating placeholder");
     await second.fill("第二题的独立回答");
     await page.getByRole("button", { name: "发送自定义答案" }).click();
     await page.waitForFunction(() => document.querySelectorAll(".toolQuestionCard").length === 0);
     await page.reload();
     await page.locator('[data-thread-id="questions-thread"] .threadSelectButton').click();
     assert.equal(await page.locator(".toolQuestionCard").count(), 0);
+    assert.equal(await page.getByText("正在生成问题…", { exact: true }).count(), 0);
     assert.deepEqual(errors, []);
     results.push({ native, independentQuestions: true, failedAnswerPreserved: true, otherDraftPreserved: true, survivesTurnCompletion: true, persistsAfterReload: true, appendedUserMessages: 0 });
     await page.close();
