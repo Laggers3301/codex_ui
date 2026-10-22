@@ -29,9 +29,10 @@ class FixtureBridge extends EventEmitter {
   getPendingServerRequests() { return []; }
   async request(method: string, params: any = {}) {
     this.calls.push({ method, threadId: params.threadId });
-    if (method === "thread/start") {
+    if (method === "thread/start" || method === "thread/fork") {
       await this.creationGate;
-      const thread = { id: randomUUID(), name: "侧边聊天", cwd: root, status: "idle", createdAt: 1, updatedAt: 1, turns: [] };
+      const inherited = method === "thread/fork" ? structuredClone(threads.get(params.threadId)!.turns) : [];
+      const thread = { id: randomUUID(), name: "侧边聊天", cwd: root, status: "idle", createdAt: 1, updatedAt: 1, turns: inherited };
       threads.set(thread.id, thread); return { thread };
     }
     const thread = threads.get(params.threadId);
@@ -40,7 +41,8 @@ class FixtureBridge extends EventEmitter {
     if (method === "turn/start" && thread) {
       if (this.failNextTurn) { this.failNextTurn = false; throw new Error("用于选中复制的完整错误详情"); }
       const id = randomUUID(), userText = params.input.map((item: any) => item.text ?? "").join("\n");
-      const answer = `侧边回答 ${thread.turns.length + 1}：${userText.split("用户问题：\n").at(-1)}`;
+      const sideTurnCount = thread.turns.filter(turn => turn.items.some((item: any) => item.type === "userMessage")).length;
+      const answer = `侧边回答 ${sideTurnCount + 1}：${userText.split("用户问题：\n").at(-1)}`;
       const turn = { id, status: "running", items: [{ id: id + "-user", type: "userMessage", text: userText }, { id: id + "-answer", type: "agentMessage", text: answer }] };
       thread.turns.push(turn); thread.status = "active";
       this.emit("notification", { method: "turn/started", params: { threadId: thread.id, turn: { id, status: "running" } } });

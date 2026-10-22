@@ -18,7 +18,7 @@ class Bridge extends EventEmitter {
   getPendingServerRequests() { return []; }
   async request(method: string, params: any) {
     this.calls.push({ method, params });
-    if (method === "thread/start") { await this.threadGate; return { thread: { id: "side-child", cwd: params.cwd } }; }
+    if (method === "thread/start" || method === "thread/fork") { await this.threadGate; return { thread: { id: "side-child", cwd: params.cwd } }; }
     if (method === "turn/start") {
       const id = "turn-" + this.calls.filter(call => call.method === "turn/start").length;
       await this.turnGate;
@@ -54,7 +54,7 @@ async function fixture() {
     dispose: async () => { socket.terminate(); await new Promise<void>(resolve => wss.close(() => server.close(() => resolve()))); await new Promise(resolve => setTimeout(resolve, 30)); store.close(); fs.rmSync(root, { recursive: true, force: true }); } };
 }
 
-it("creates one bound child and continues it without starting another thread", async () => {
+it("forks the parent context once and continues the bound child without forking again", async () => {
   const f = await fixture();
   try {
     f.send({ type: "thread.start", requestId: "first", prompt: "question" });
@@ -64,9 +64,43 @@ it("creates one bound child and continues it without starting another thread", a
     await f.wait(message => message.type === "side.chat" && message.data.sideChat?.status === "complete");
     f.send({ type: "turn.start", requestId: "second", threadId: "side-child", prompt: "follow up" });
     expect((await f.wait(message => message.requestId === "second")).ok).toBe(true);
-    expect(f.bridge.calls.filter(call => call.method === "thread/start")).toHaveLength(1);
+    expect(f.bridge.calls.filter(call => call.method === "thread/start")).toHaveLength(0);
+    expect(f.bridge.calls.filter(call => call.method === "thread/fork")).toEqual([{ method: "thread/fork", params: expect.objectContaining({ threadId: "main", excludeTurns: true, deferGoalContinuation: true }) }]);
+    expect(f.bridge.calls.filter(call => call.method === "thread/goal/clear")).toEqual([{ method: "thread/goal/clear", params: { threadId: "side-child", origin: "automatic" } }]);
+    expect(f.bridge.calls.find(call => call.method === "turn/start")?.params.collaborationMode.mode).toBe("default");
     expect(f.bridge.calls.filter(call => call.method === "turn/start")).toHaveLength(2);
     expect(f.store.sideChats.get("main", "admin", f.project.id)?.parentThreadId).toBe("main");
+  } finally { await f.dispose(); }
+});
+
+it("does not silently start an empty thread when the parent fork fails", async () => {
+  const f = await fixture(), request = f.bridge.request.bind(f.bridge);
+  f.bridge.request = async (method, params) => {
+    if (method === "thread/fork") throw new Error("parent context unavailable");
+    return request(method, params);
+  };
+  try {
+    f.send({ type: "thread.start", requestId: "fork-error", prompt: "remember earlier" });
+    expect(await f.wait(message => message.requestId === "fork-error")).toMatchObject({ ok: false, error: "parent context unavailable" });
+    expect(f.bridge.calls.some(call => call.method === "thread/start" || call.method === "turn/start")).toBe(false);
+    expect(f.store.sideChats.byId(f.side.id, "admin")).toMatchObject({ status: "error", threadId: null, lastPrompt: "remember earlier" });
+    expect(f.store.userCanAccessThread("main", "admin", f.project.id)).toBe(true);
+  } finally { await f.dispose(); }
+});
+
+it("keeps the question retryable and hides a fork whose inherited goal could not be cleared", async () => {
+  const f = await fixture(), request = f.bridge.request.bind(f.bridge);
+  f.bridge.request = async (method, params) => {
+    if (method === "thread/goal/clear") throw new Error("goal clear unavailable");
+    return request(method, params);
+  };
+  try {
+    f.send({ type: "thread.start", requestId: "goal-error", prompt: "side question" });
+    expect(await f.wait(message => message.requestId === "goal-error")).toMatchObject({ ok: false, error: "goal clear unavailable" });
+    expect(f.bridge.calls.some(call => call.method === "turn/start")).toBe(false);
+    expect(f.store.sideChats.byId(f.side.id, "admin")).toMatchObject({ status: "error", threadId: null, lastPrompt: "side question" });
+    expect(f.store.userCanAccessThread("side-child", "admin", f.project.id)).toBe(false);
+    expect(f.store.userCanAccessThread("main", "admin", f.project.id)).toBe(true);
   } finally { await f.dispose(); }
 });
 

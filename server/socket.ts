@@ -1195,13 +1195,13 @@ async function handleClientMessage(
       }
 
       case "thread.start": {
-        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId);
         const project = getProjectOrThrow(store, message.projectId, sessionUserId);
         const question = pickString(message.prompt).trim();
         const sideChatId = pickString(message.sideChatId);
         const side = sideChatId ? store.sideChats.byId(sideChatId, sessionUserId) : null;
         if (sideChatId && !side) throw new SideChatError("侧边会话已关闭或不可访问。", 403);
-        const prompt = side ? `请基于下面选中的文字回答问题。\n\n选中文字：\n${side.selectedText}\n\n用户问题：\n${question}` : question;
+        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, side?.parentThreadId);
+        const prompt = side ? `请结合主会话上下文，基于下面选中的文字回答问题。\n\n选中文字：\n${side.selectedText}\n\n用户问题：\n${question}` : question;
         if (!question) {
           throw new Error("Prompt is required.");
         }
@@ -1239,9 +1239,14 @@ async function handleClientMessage(
               developerInstructions: contextPinDeveloperInstructions(requestedContextPin)
             };
             const allowedAccountId = allowedAccountForUser(sessionUserId);
-            const thread = allowedAccountId && isAccountPoolBridge(bridge)
-              ? await bridge.startThreadOnAccount(allowedAccountId, startParams)
-              : await bridge.request("thread/start", startParams);
+            // Fork on the parent's account so native history (including
+            // compacted context) is inherited without copying it into a prompt.
+            // Defer its goal until we can clear the child's copy below.
+            const thread = side
+              ? await bridge.request("thread/fork", { ...startParams, threadId: side.parentThreadId, excludeTurns: true, deferGoalContinuation: true })
+              : allowedAccountId && isAccountPoolBridge(bridge)
+                ? await bridge.startThreadOnAccount(allowedAccountId, startParams)
+                : await bridge.request("thread/start", startParams);
             const threadId = (thread as { thread?: { id?: string } }).thread?.id;
             if (!threadId) {
               throw new Error("Codex did not return a thread id.");
@@ -1254,6 +1259,17 @@ async function handleClientMessage(
               model,
               reasoningEffort
             });
+            // A side question inherits context, not the parent's autonomous
+            // task. Never resume that goal after answering the side question.
+            if (side) {
+              try { await bridge.request("thread/goal/clear", { threadId, origin: "automatic" }); }
+              catch (error) {
+                // Keep the question retryable without exposing a child that
+                // might still carry the parent's goal to a later turn/start.
+                store.softDeleteThread(threadId, sessionUserId, project.id);
+                throw error;
+              }
+            }
             if (sideChatId && !store.sideChats.attach(sideChatId, sessionUserId, requestId, threadId)) {
               await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, null);
               throw new SideChatError("侧边会话已关闭，本次创建已取消。");
@@ -1287,7 +1303,7 @@ async function handleClientMessage(
               ...requestedTurnServiceTier(message.serviceTier),
               threadId,
               input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames, message.documentReference),
-              collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
+              collaborationMode: requestedCollaborationMode(message.collaborationMode ?? (side ? "default" : undefined), model, reasoningEffort),
               cwd: project.rootPath,
               approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
               sandboxPolicy: sandboxPolicy(project, pickSandbox(message.sandbox, project.defaultSandbox)),

@@ -73,7 +73,7 @@ try {
   }, metadata.projectId);
   const openPage = async (id, quote) => {
     const page = await context.newPage(); page.on("pageerror", error => errors.push(error.message));
-    await page.goto(`${origin}/?project=${metadata.projectId}&thread=${id}`);
+    await page.goto(`${origin}/?project=${metadata.projectId}&thread=${id}`, { waitUntil: "domcontentloaded" });
     await page.locator("#conversation-messages").getByText(quote, { exact: true }).waitFor(); return page;
   };
   const state = async () => (await context.request.get(origin + "/api/__test/state")).json();
@@ -115,7 +115,7 @@ try {
   assert.equal(await panel(first).count(), 0, "a main thread without a side chat hides the panel");
   const draftPage = await openPage("main-a", quoteA);
   assert.equal(await composer(draftPage).innerText(), "A 的草稿", "an unsent draft is restored from the database in a new tab");
-  assert.equal((await state()).calls.filter(call => call.method === "thread/start").length, 0, "opening a side chat alone never starts a model");
+  assert.equal((await state()).calls.filter(call => call.method === "thread/fork").length, 0, "opening a side chat alone never starts a model");
   await draftPage.close();
   await switchMain(first, "main-a", quoteA);
   assert.equal(await composer(first).innerText(), "A 的草稿");
@@ -124,11 +124,14 @@ try {
   let snapshot = await state();
   const a = snapshot.sides.find(side => side?.parentThreadId === "main-a");
   assert.ok(a.threadId);
-  assert.equal(snapshot.calls.filter(call => call.method === "thread/start").length, 1);
+  assert.ok(snapshot.calls.some(call => call.method === "thread/fork" && call.threadId === "main-a"));
+  assert.equal(snapshot.calls.some(call => call.method === "thread/start"), false);
+  assert.equal(snapshot.calls.filter(call => call.method === "thread/fork").length, 1);
 
   const second = await openPage("main-a", quoteA);
   await panel(second).getByText("侧边回答 1：A 的草稿", { exact: true }).waitFor();
-  assert.equal((await state()).calls.filter(call => call.method === "thread/start").length, 1, "restoring a new tab never creates another native thread");
+  await panel(second).getByText(quoteA, { exact: true }).last().waitFor();
+  assert.equal((await state()).calls.filter(call => call.method === "thread/fork").length, 1, "restoring a new tab never creates another native thread");
   await context.request.post(origin + "/api/__test/append", { data: { threadId: a.threadId, delta: "\n\n恢复后仍能实时更新" } });
   await panel(second).getByText("恢复后仍能实时更新", { exact: true }).waitFor();
   await switchMain(first, "main-b", quoteB);
@@ -150,7 +153,7 @@ try {
   await composer(first).press("Enter");
   await panel(first).getByText("侧边回答 2：A 的第二个问题", { exact: true }).waitFor();
   await panel(second).getByText("侧边回答 2：A 的第二个问题", { exact: true }).waitFor();
-  assert.equal((await state()).calls.filter(call => call.method === "thread/start").length, 2);
+  assert.equal((await state()).calls.filter(call => call.method === "thread/fork").length, 2);
   await second.reload();
   await switchMain(second, "main-a", quoteA);
   await panel(second).getByText("侧边回答 2：A 的第二个问题", { exact: true }).waitFor();
@@ -176,7 +179,7 @@ try {
   assert.equal(await panel(first).count(), 0, "a late acknowledgement never opens the wrong main thread's panel");
   await switchMain(first, "main-b", quoteB);
   await panel(first).getByText("侧边回答 1：B 的延迟问题", { exact: true }).waitFor();
-  assert.equal((await state()).calls.filter(call => call.method === "thread/start").length, 3);
+  assert.equal((await state()).calls.filter(call => call.method === "thread/fork").length, 3);
   await switchMain(first, "main-a", quoteA);
   await panel(first).getByText("侧边回答 2：A 的第二个问题", { exact: true }).waitFor();
   await complete(a.threadId);
@@ -197,11 +200,20 @@ try {
   await banner.waitFor({ state: "detached" });
   assert.deepEqual(errors, []);
   console.log(JSON.stringify({ browser: "chromium", isolatedDatabase: true, realRestAndWebsocket: true, mockModelOnly: true,
-    boundToParent: true, draftRestored: true, missingSideHidden: true, switchesBetweenSideChats: true,
+    nativeForkInheritsContext: true, inheritedHistoryRestored: true, boundToParent: true, draftRestored: true, missingSideHidden: true, switchesBetweenSideChats: true,
     newTabRestoresRunningSideChat: true, restoredSideKeepsStreaming: true, reloadRestoresSideChat: true, followupReusesThread: true,
     lateAcknowledgementStaysWithParent: true, backgroundCompletionDoesNotSwitchPanel: true,
     closeOnlyInterruptsMatchingSide: true, deletedSideDoesNotReturn: true, errorCanBeSelectedAndDismissed: true,
     accessMenusFitViewport: true, draftAndPreeditKeepGlow: true, clearDraftFadesWithFocus: true, pageErrors: errors }));
+} catch (error) {
+  for (const page of browser?.contexts().flatMap(context => context.pages()) ?? []) {
+    console.error(JSON.stringify({ url: page.url(), diagnostics: await page.evaluate(() => ({
+      focused: document.hasFocus(), activeElement: document.activeElement?.outerHTML.slice(0, 400),
+      glow: document.querySelector('.composerAmbientGlow')?.outerHTML.slice(0, 400)
+    })).catch(() => null) }));
+    await page.screenshot({ path: "/tmp/lzc-bound-side-chat-failure.png" }).catch(() => {});
+  }
+  throw error;
 } finally {
   await browser?.close();
   for (const child of children.reverse()) {
