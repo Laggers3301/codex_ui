@@ -9,9 +9,12 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "bound-side-chat-browser-"));
 process.env.CODEX_WEB_DATA_DIR = path.join(root, "data");
 process.env.CODEX_THREAD_INDEX_DB = path.join(root, "index.sqlite");
 process.env.CODEX_WEB_ACCOUNT_POOL_FILE = "";
-const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, auth] = await Promise.all([
-  import("../server/db.js"), import("../server/sideChatRoutes.js"), import("../server/socket.js"), import("../server/auth.js")
-]);
+// The public repository is flat; the production host keeps frontend/backend
+// separately. Both layouts must run this isolated fixture without live APIs.
+const serverRoot = new URL(fs.existsSync(new URL('../server/db.ts', import.meta.url)) ? '../server/' : '../../backend/server/', import.meta.url);
+const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, auth] = await Promise.all(
+  ['db', 'sideChatRoutes', 'socket', 'auth'].map(name => import(new URL(name + '.js', serverRoot).href))
+);
 const store = new ProjectStore(path.join(root, "store.sqlite"));
 const project = store.createProject({ name: "侧边绑定验收", rootPath: root, defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "high" });
 type Thread = { id: string; name: string; cwd: string; status: string; turns: any[]; createdAt: number; updatedAt: number };
