@@ -7,7 +7,7 @@ export function journalItem(update: LiveStateUpdate): Item {
   const item = update.item;
   return update.kind === "tool"
     ? { id: item.itemId, callId: item.itemId, sourceItemId: update.item.sourceItemId, type: "toolCall", tool: update.item.tool, collaboration: update.item.collaboration, input: (update.historyItem ?? update.item).input, aggregatedOutput: (update.historyItem ?? update.item).output, completed: item.completed, timelineAt: item.startedAt, timelineOrder: item.sequence }
-    : { id: update.item.sourceItemId, type: "agentMessage", text: update.item.text, timelineAt: item.startedAt, timelineOrder: item.sequence };
+    : { id: update.item.sourceItemId, type: "agentMessage", text: update.item.text, completed: item.completed, streamState: update.item.streamState ?? (item.completed ? "completed" : "streaming"), timelineAt: item.startedAt, timelineOrder: item.sequence };
 }
 
 /** Enrich only the loaded history interval, not unseen pages of a long turn. */
@@ -25,7 +25,7 @@ export function overlayJournal(thread: Item, read: (turnId: string) => Item[], i
       if (item.callId) byId.set(String(item.callId), item);
       if (item.sourceItemId) byId.set(String(item.sourceItemId), item);
     }
-    const merged = items.map((item) => ({ ...item }));
+    const merged: Item[] = items.map((item) => ({ ...item, ...(item.type === "agentMessage" ? { streamState: "completed", completed: true } : {}) }));
     for (const entry of read(String(turn.id))) {
       if (isContextCompactionItem(entry)) {
         continue;
@@ -37,10 +37,18 @@ export function overlayJournal(thread: Item, read: (turnId: string) => Item[], i
       const existing = byId.get(String(entry.id)) ?? byId.get(String(entry.sourceItemId));
       if (existing && existing.type !== "toolCallOutput") {
         const index = items.indexOf(existing);
-        merged[index] = { ...entry, ...existing, timelineAt: entry.timelineAt, timelineOrder: entry.timelineOrder };
+        merged[index] = { ...entry, ...merged[index], timelineAt: entry.timelineAt, timelineOrder: entry.timelineOrder };
       } else {
         const time = Date.parse(String(entry.timelineAt));
-        if (entry.source === "turnDiff" || (time >= first && time <= last)) merged.push(entry);
+        if (entry.source === "turnDiff" || (time >= first && time <= last)) {
+          // Old journals did not store completion. A journal-only draft inside
+          // the loaded native interval, before a later committed message, is
+          // not a committed response. Keep its bytes, retire only its display.
+          const replacedDraft = entry.type === "agentMessage" && entry.completed !== true
+            && Number.isFinite(time) && items.some(item => item.type === "agentMessage"
+              && Date.parse(String(item.timelineAt ?? "")) > time);
+          merged.push(replacedDraft ? { ...entry, streamState: "superseded" } : entry);
+        }
       }
     }
     merged.sort((a, b) => Date.parse(String(a.timelineAt)) - Date.parse(String(b.timelineAt)) || Number(a.timelineOrder ?? 0) - Number(b.timelineOrder ?? 0));

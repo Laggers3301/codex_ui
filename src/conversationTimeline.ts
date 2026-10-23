@@ -21,9 +21,9 @@ export function latestUserTimelineIndex(items: ThreadItem[]): number {
 }
 
 /** One invocation owns its output, even if parallel calls finish out of order. */
-export function coalesceToolOutputs(items: ThreadItem[]): ThreadItem[] {
+export function coalesceToolOutputs(items: ThreadItem[], preserveRetired = false): ThreadItem[] {
   const calls = new Map<string, ThreadItem>();
-  const copies = items.map((item) => {
+  const copies = items.filter(item => preserveRetired || item.streamState !== "superseded").map((item) => {
     const copy = { ...item };
     const type = item.type.toLowerCase().replace(/_/g, "");
     if (["functioncall", "customtoolcall", "dynamictoolcall", "agentmessage"].includes(type) && parseQuestionToolItem(item)) {
@@ -102,7 +102,7 @@ export function collapseCodeModeWrappers(items: ThreadItem[]): ThreadItem[] {
 
 export function liveTimelineItems(entries: Array<{
   id: string; kind: "agent" | "tool"; sourceItemId?: string; startedAt: string; sequence: number;
-  text?: string; tool?: string; input?: string; output?: string; completed?: boolean; collaboration?: Record<string, unknown>;
+  text?: string; tool?: string; input?: string; output?: string; completed?: boolean; streamState?: string; collaboration?: Record<string, unknown>;
 }>): ThreadItem[] {
   const items: ThreadItem[] = [];
   const agents = new Map<string, ThreadItem>();
@@ -114,7 +114,7 @@ export function liveTimelineItems(entries: Array<{
       const existing = agents.get(id);
       if (existing) existing.text = `${existing.text ?? ""}${entry.text ?? ""}`;
       else {
-        const item: ThreadItem = { id, type: "agentMessage", text: entry.text, timelineAt: entry.startedAt, timelineOrder: entry.sequence, timelineLive: true };
+        const item: ThreadItem = { id, type: "agentMessage", text: entry.text, completed: entry.completed, streamState: entry.streamState, timelineAt: entry.startedAt, timelineOrder: entry.sequence, timelineLive: true };
         items.push(item);
         agents.set(id, item);
       }
@@ -151,10 +151,13 @@ export function mergeTimelineItems(history: ThreadItem[], updates: ThreadItem[])
         : previous.timelineAt ?? item.timelineAt;
       const merged: ThreadItem = { ...previous, ...item, id: previous.id, sourceItemId: previous.sourceItemId, timelineAt };
       if (previous.completed === true) merged.completed = true;
+      if (previous.streamState === "completed") merged.streamState = "completed";
+      if (previous.streamState === "superseded") merged.streamState = "superseded";
       for (const key of ["input", "command", "output", "aggregatedOutput", "text"] as const) {
         if (!item[key] && previous[key]) (merged as Record<string, unknown>)[key] = previous[key];
       }
-      if (item.type === "agentMessage" && typeof previous.text === "string" && previous.text.startsWith(String(item.text ?? ""))) merged.text = previous.text;
+      if (item.type === "agentMessage" && previous.streamState === "completed") merged.text = previous.text;
+      else if (item.type === "agentMessage" && item.streamState !== "completed" && item.completed !== true && typeof previous.text === "string" && previous.text.startsWith(String(item.text ?? ""))) merged.text = previous.text;
       Object.assign(previous, merged);
     }
   }

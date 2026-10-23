@@ -10,6 +10,7 @@ import { ComposerAmbientGlow } from "./ambient/ComposerAmbientGlow";
 import { resolvePromptTopAnchor } from "./promptTopAnchor";
 import { useComposerPrediction } from "./useComposerPrediction";
 import { applyLiveAgentUpdate, type AgentWireUpdate } from "./liveAgentUpdates";
+import { recoverAgentStreams } from "./agentStreamRecovery";
 import {BranchToolArchive} from "./BranchToolArchive";
 import { X as PanelClose, FileText as PanelFile, ChevronDown as PanelDown, MoreHorizontal as PanelMore, Copy as ActionCopy, Branch as ActionBranch, Trash as ActionTrash } from "./PanelIcons";
 import { RemoteFolderSidebar, fileReferenceText } from "./RemoteFolderSidebar";
@@ -34,6 +35,8 @@ import { localMessageBelongsToThread } from "./localMessageScope";
 import { isSuccessfulTransferReceipt, TRANSFER_RECEIPT_HOLD_MS } from "./transferReceipt";
 import { TransferReceipt } from "./TransferReceipt";
 import "./threadContextMenu.css";
+import { downloadBrowserFile, shareBrowserFile } from "./browserFileActions";
+import { PreviewFileTransferActions, type BrowserFileAction } from "./PreviewFileTransferActions";
 import { readTurnProgress, turnProgressText, updateTurnProgress, type TurnProgress } from "./turnProgress";
 import { exhaustedAccountSuggestion, type ExhaustedAccountSuggestion } from "./accountExhaustion";
 import "katex/dist/katex.min.css";
@@ -614,12 +617,14 @@ interface LiveDeltaEntry {
   startedAt: string;
   sequence?: number;
   sourceItemId?: string;
+  completed?: boolean;
+  streamState?: "streaming" | "completed" | "interrupted" | "superseded";
 }
 
 interface LiveToolEntry extends LiveToolItem {}
 
 type LiveTimelineEntry =
-  | { id: string; kind: "agent"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; text: string; sourceItemId?: string }
+  | { id: string; kind: "agent"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; text: string; sourceItemId?: string; completed?: boolean; streamState?: LiveDeltaEntry["streamState"] }
   | { id: string; kind: "tool"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; tool: string; input: string; output: string; completed: boolean; sourceItemId?: string; collaboration?: Record<string, unknown> };
 
 interface PendingUserMessage {
@@ -3815,12 +3820,14 @@ function LeaderboardScopeView({ title, scope, users }: { title: string; scope: C
 function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
   return (
     <div className="trackedQuotaBody">
-      <section className={`trackedQuotaSummary ${usage.todayQuotaPercent > 50 ? "warning" : usage.blocked ? "blocked" : "healthy"}`}>
+      <section className={`trackedQuotaSummary ${usage.blocked ? "blocked" : usage.todayQuotaPercent >= usage.dailyLimitPercent ? "warning" : "healthy"}`}>
         <div>
           <span>{usage.today} · {usage.timeZone}</span>
           <strong>今日估算占用 {percentText(usage.todayQuotaPercent)}%</strong>
         </div>
-        <em>{usage.todayQuotaPercent > 50 ? "今日超过 50%，仅作用量预警" : "仅统计用量，不限制使用"}</em>
+        <em>{usage.dailyLimitEnforced
+          ? usage.blocked ? `已达每日合计 ${percentText(usage.dailyLimitPercent)}% 上限，今日暂停新回答` : `每日合计上限 ${percentText(usage.dailyLimitPercent)}%，不限账号`
+          : usage.todayQuotaPercent > 50 ? "今日超过 50%，仅作用量预警" : "仅统计用量，不限制使用"}</em>
       </section>
 
       <div className="trackedQuotaAccounts">
@@ -3831,7 +3838,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
               <span>账号剩余 {account.accountRemainingPercent === null ? "--" : `${percentText(account.accountRemainingPercent)}%`}</span>
             </header>
             <div className="trackedQuotaMetrics">
-              <div><span>sample-user 今日</span><strong>{percentText(account.todayQuotaPercent)}%</strong><small>{formatNumber(account.todayTokens)} token</small></div>
+              <div><span>lzc 今日</span><strong>{percentText(account.todayQuotaPercent)}%</strong><small>{formatNumber(account.todayTokens)} token</small></div>
               <div><span>本周期累计</span><strong>{percentText(account.userCycleQuotaPercent)}%</strong><small>{formatNumber(account.userCycleTokens)} token</small></div>
             </div>
             <p>{account.cycleStartAt && account.resetAt
@@ -3849,10 +3856,12 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
             <em>{percentText(day.quotaPercent)}%</em>
             <small>{day.accounts.map((account) => `${account.accountLabel} ${percentText(account.quotaPercent)}%`).join(" · ")}</small>
           </article>
-        )) : <div className="emptyState">当前额度周期暂无 sample-user token 记录。</div>}
+        )) : <div className="emptyState">当前额度周期暂无 lzc token 记录。</div>}
       </section>
 
-      <p className="trackedQuotaFootnote">个人百分比为估算值，并非 OpenAI 提供的个人扣额；多人共用账号时无法精确拆分。此面板仅恢复用量显示与预警，不恢复账号选择或每日额度限制。</p>
+      <p className="trackedQuotaFootnote">个人百分比为估算值，并非 OpenAI 提供的个人扣额；多人共用账号时无法精确拆分。{usage.dailyLimitEnforced
+        ? `按北京时间自然日累计，各 GPT 账号合计达到 ${percentText(usage.dailyLimitPercent)}% 后暂停新回答与自动续跑；不限制账号选择，历史仍可查看。`
+        : "当前仅显示用量与预警，未启用每日额度限制。"}</p>
       <LeaderboardWarnings errors={usage.errors} />
     </div>
   );
@@ -3933,7 +3942,9 @@ function liveDeltasFromSnapshot(
           text: reconnectPreview(message.text, 32_000),
           startedAt: message.startedAt ?? message.updatedAt,
           sequence: message.sequence,
-          sourceItemId: message.sourceItemId
+          sourceItemId: message.sourceItemId,
+          completed: message.completed,
+          streamState: message.streamState
         }
       ])
   );
@@ -4639,7 +4650,7 @@ export function App() {
   const [exportSendLocal, setExportSendLocal] = useState(false);
   const [exportingThread, setExportingThread] = useState(false);
   const [sendingLocalFile, setSendingLocalFile] = useState(false);
-  const [sharingBrowserFile, setSharingBrowserFile] = useState(false);
+  const [browserFileAction, setBrowserFileAction] = useState<BrowserFileAction | null>(null);
   const [accountPool, setAccountPool] = useState<CodexAccountPool | null>(() => (
     storedJson<CodexAccountPool | null>(accountPoolSnapshotStorageKey, null)
   ));
@@ -8380,47 +8391,25 @@ export function App() {
     }
   }
 
-  async function shareOrDownloadPreviewFile() {
+  async function savePreviewFile(action: BrowserFileAction) {
     const projectId = imageGallery?.projectId ?? selectedProject?.id;
     const filePath = activeImageTarget || filePreview?.relativePath;
     const fileName = activeImageTarget ? compactFileLabel(activeImageTarget) : filePreview?.name;
     if (!projectId || !filePath || !fileName) {
       return;
     }
-    setSharingBrowserFile(true);
+    setBrowserFileAction(action);
     setError("");
     try {
       const blob = !activeImageTarget && filePreviewObjectUrl
         ? await fetch(filePreviewObjectUrl).then((response) => response.blob())
         : await fetchProjectFileBlob(projectId, filePath);
-      const file = new File([blob], fileName, { type: filePreview?.mime || blob.type || "application/octet-stream" });
-      const shareData: ShareData = { files: [file], title: fileName };
-      const canShareFile = typeof navigator.share === "function"
-        && (typeof navigator.canShare !== "function" || navigator.canShare(shareData));
-      if (canShareFile) {
-        try {
-          await navigator.share(shareData);
-          return;
-        } catch (caught) {
-          if (caught instanceof DOMException && caught.name === "AbortError") {
-            return;
-          }
-        }
-      }
-
-      const downloadUrl = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = downloadUrl;
-      anchor.download = fileName;
-      anchor.rel = "noopener";
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 30_000);
+      if (action === "share") await shareBrowserFile(blob, fileName);
+      else downloadBrowserFile(blob, fileName);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
-      setSharingBrowserFile(false);
+      setBrowserFileAction(null);
     }
   }
 
@@ -9427,7 +9416,10 @@ export function App() {
     const activeTurns = activeTurnsFromSnapshot(snapshot);
     activeTurnsByThreadRef.current = activeTurns;
     const snapshotDeltas = Object.fromEntries(Object.entries(liveDeltasFromSnapshot(snapshot, activeTurns)).filter(([id, entry]) =>
-      liveQuestionIdentitiesRef.current.get(id)?.threadId !== entry.threadId));
+      liveQuestionIdentitiesRef.current.get(id)?.threadId !== entry.threadId).map(([id, entry]) => {
+        const previous = liveAgentBasesRef.current.get(id);
+        return [id, previous?.streamState === "superseded" && previous.threadId === entry.threadId && previous.turnId === entry.turnId ? { ...entry, streamState: "superseded" as const } : entry];
+      }));
     const snapshotTools = liveToolsFromSnapshot(snapshot);
     // A completed turn is removed from the server's live snapshot before its
     // JSONL history is always readable. Preserve the temporary panel's live
@@ -9986,6 +9978,21 @@ export function App() {
         return;
       }
       const params = notification.params ?? {};
+      const recoveryChanges = recoverAgentStreams(liveAgentBasesRef.current, notification);
+      if (recoveryChanges.length) {
+        for (const [id, entry] of recoveryChanges) {
+          liveAgentBasesRef.current.set(id, entry);
+          enqueueLiveAgentSnapshot(id, entry);
+        }
+        const retired = new Set(recoveryChanges.filter(([, entry]) => entry.streamState === "superseded").map(([id]) => id));
+        if (retired.size) setSelectedThread(current => current ? { ...current, turns: current.turns.map(turn => ({ ...turn, items: turn.items.map(item => retired.has(item.id) || retired.has(String(item.sourceItemId)) ? { ...item, streamState: "superseded" } : item) })) } : current);
+      }
+      const recoveryThreadId = notificationThreadId(params), recoveryTurnId = notificationTurnId(params);
+      if (recoveryThreadId && recoveryTurnId && notification.method === "error" && params.willRetry === true) {
+        setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId: recoveryThreadId, turnId: recoveryTurnId, state: "stream_retrying", silentForMs: 0 }, activeTurnsByThreadRef.current[recoveryThreadId]));
+      } else if (recoveryThreadId && recoveryTurnId && /^(?:item\/completed|item\/agentMessage\/completed)$/.test(notification.method ?? "") && isRecord(params.item) && params.item.type === "agentMessage") {
+        setTurnProgress(current => current[`${selectedUserId}:${recoveryThreadId}`]?.state === "stream_retrying" ? updateTurnProgress(current, selectedUserId, { threadId: recoveryThreadId, turnId: recoveryTurnId, state: "active", silentForMs: 0 }) : current);
+      }
       receiveLiveQuestion(notification);
       if (notification.method === "turn/diff/updated") {
         const turnId = notificationTurnId(params);
@@ -10238,6 +10245,7 @@ export function App() {
   }
   const renderLiveTimelineEntry = (entry: LiveTimelineEntry) => {
     if (entry.kind === "agent") {
+      if (entry.streamState === "superseded") return null;
       return stripInterruptArtifacts(entry.text) ? (
         <article className="messageItem kind-agent type-agentMessage live" key={entry.id}>
           <div className="messageMeta">Codex · agentMessage</div>
@@ -11732,10 +11740,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         <div className={`modalBackdrop uiExitLayer${trackedQuotaPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={trackedQuotaPresence.closing} inert={trackedQuotaPresence.closing} onMouseDown={(event) => {
           if (event.target === event.currentTarget) setTrackedQuotaOpen(false);
         }}>
-          <section className="settingsDialog trackedQuotaDialog" role="dialog" aria-modal="true" aria-label="sample-user 额度占用">
+          <section className="settingsDialog trackedQuotaDialog" role="dialog" aria-modal="true" aria-label="lzc 额度占用">
             <div className="dialogHeader">
               <div>
-                <h2>sample-user 额度占用</h2>
+                <h2>lzc 额度占用</h2>
                 <p>各账号分别统计，并按自然日合计。</p>
               </div>
               <button className="iconButton" type="button" onClick={() => setTrackedQuotaOpen(false)} title="关闭">
@@ -11746,7 +11754,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               ? <div className="emptyState">正在核对各账号的会话记录…</div>
               : trackedQuotaUsage
                 ? <TrackedQuotaDetails usage={trackedQuotaUsage} />
-                : <div className="emptyState">暂未读取到 sample-user 用量。</div>}
+                : <div className="emptyState">暂未读取到 lzc 用量。</div>}
             <div className="dialogActions">
               <span className="trackedQuotaUpdated">{trackedQuotaUsage ? `更新于 ${new Date(trackedQuotaUsage.updatedAt).toLocaleString()}` : ""}</span>
               <button className="iconTextButton" type="button" onClick={() => setTrackedQuotaOpen(false)}>关闭</button>
@@ -12053,8 +12061,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               设置
             </button>
             <button className={`trackedQuotaButton${trackedQuotaUsage && trackedQuotaUsage.todayQuotaPercent > 50 ? " warning" : ""}`}
-              type="button" onClick={() => void refreshTrackedQuota(true)} title="查看 sample-user 今日估算用量和历史统计（仅显示，不限制使用）" aria-label="sample-user 额度占用">
-              sample-user {trackedQuotaUsage ? `${percentText(trackedQuotaUsage.todayQuotaPercent)}%` : "--"}
+              type="button" onClick={() => void refreshTrackedQuota(true)} title="查看 lzc 今日估算用量和历史统计（仅显示，不限制使用）" aria-label="lzc 额度占用">
+              lzc {trackedQuotaUsage ? `${percentText(trackedQuotaUsage.todayQuotaPercent)}%` : "--"}
             </button>
             <div
               className="quotaPopoverAnchor"
@@ -12890,7 +12898,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   const historyItems = syntheticUserItem ? [syntheticUserItem, ...(turn.items ?? [])] : turn.items ?? [];
                   const liveItems = sanitizeTurnItems(liveTimelineItems(liveTimelineByTurn.get(turn.id) ?? []));
                   // Merge identities and chronology before introducing message boundaries.
-                  const items = collapseCodeModeWrappers(coalesceToolOutputs(mergeTimelineItems(coalesceToolOutputs(historyItems), liveItems)));
+                  const items = collapseCodeModeWrappers(coalesceToolOutputs(mergeTimelineItems(coalesceToolOutputs(historyItems, true), liveItems)));
                   const hasAgentAnswerFromIndex = new Array<boolean>(items.length + 1).fill(false);
                   for (let index = items.length - 1; index >= 0; index -= 1) {
                     const item = items[index];
@@ -13479,7 +13487,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               <div className="imageViewerActionWrap">
                 <button className="imageViewerRoundButton" type="button" aria-label="图片操作" title="下载、分享或 SSH 发送" aria-expanded={imageViewerActionsOpen} onClick={() => setImageViewerActionsOpen((current) => !current)}><MoreHorizontal size={20} /></button>
                 <div className={`imageViewerActionMenu${imageViewerActionsOpen ? " open" : ""}`} aria-hidden={!imageViewerActionsOpen}>
-                  <button type="button" disabled={!imageViewerActionsOpen || sharingBrowserFile} onClick={() => { setImageViewerActionsOpen(false); void shareOrDownloadPreviewFile(); }}>{sharingBrowserFile ? "准备中…" : "下载 / 分享"}</button>
+                  <PreviewFileTransferActions enabled={imageViewerActionsOpen} busy={browserFileAction} onAction={action => { setImageViewerActionsOpen(false); void savePreviewFile(action); }} />
                   <button type="button" disabled={!imageViewerActionsOpen || sendingLocalFile} onClick={() => { setImageViewerActionsOpen(false); void sendPreviewFileToLocal(); }}>{sendingLocalFile ? "发送中…" : "SSH 发送"}</button>
                   <label className="documentAutoSendToggle"><input type="checkbox" checked={autoSendGeneratedFiles} onChange={event => updateAutoSendGeneratedFiles(event.target.checked)} />自动发送生成文件</label>
                 </div>
@@ -13544,11 +13552,11 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     ))}
                   </div>
                 ) : null}
-                {filePreview && !runnablePreview ? <div className="imageViewerActionWrap">
+                {filePreview ? <div className="imageViewerActionWrap">
                   <button className="imageViewerRoundButton" type="button" aria-label="文件操作" title="下载、分享或 SSH 发送" aria-expanded={imageViewerActionsOpen} onClick={() => setImageViewerActionsOpen(current => !current)}><PanelMore size={20} /></button>
                   <div className={`imageViewerActionMenu${imageViewerActionsOpen ? " open" : ""}`} aria-hidden={!imageViewerActionsOpen}>
                     {/\.(tex|docx)$/i.test(filePreview.name) ? <button type="button" disabled={!imageViewerActionsOpen} onClick={() => { const path = filePreview.relativePath; closeFilePreview(); openWriting(path); }}>在写作工作台中打开</button> : null}
-                    <button type="button" disabled={!imageViewerActionsOpen || sharingBrowserFile} onClick={() => { setImageViewerActionsOpen(false); void shareOrDownloadPreviewFile(); }}>{sharingBrowserFile ? "准备中…" : "下载 / 分享"}</button>
+                    <PreviewFileTransferActions enabled={imageViewerActionsOpen} busy={browserFileAction} onAction={action => { setImageViewerActionsOpen(false); void savePreviewFile(action); }} />
                     <button type="button" disabled={!imageViewerActionsOpen || sendingLocalFile} onClick={() => { setImageViewerActionsOpen(false); void sendPreviewFileToLocal(); }}>{sendingLocalFile ? "发送中…" : "SSH 发送"}</button>
                     <label className="documentAutoSendToggle"><input type="checkbox" checked={autoSendGeneratedFiles} onChange={event => updateAutoSendGeneratedFiles(event.target.checked)} />自动发送生成文件</label>
                   </div>

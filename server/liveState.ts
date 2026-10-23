@@ -17,6 +17,7 @@ export interface LiveAgentMessage {
   turnId: string | null;
   text: string;
   completed: boolean;
+  streamState?: "streaming" | "completed" | "interrupted" | "superseded";
   sequence: number;
   startedAt: string;
   updatedAt: string;
@@ -232,7 +233,7 @@ export class LiveStateStore {
         let agent = existing;
         if (!agent && fullText) agent = this.recordAgentMessageDelta({ ...params, itemId: id, delta: fullText }) ?? undefined;
         if (!agent) return null;
-        const next = { ...agent, text: fullText || agent.text, completed: eventPhase === "completed", updatedAt: new Date().toISOString() };
+        const next: LiveAgentMessage = { ...agent, text: fullText || agent.text, completed: eventPhase === "completed", streamState: eventPhase === "completed" ? "completed" : "streaming", updatedAt: new Date().toISOString() };
         this.agentMessages.set(id, next);
         return { kind: "agent", item: next };
       }
@@ -255,6 +256,29 @@ export class LiveStateStore {
       this.recordTurnCompleted(params);
     }
     return null;
+  }
+
+  /** Only retire an interrupted sampling attempt after a native message completes. */
+  recordAgentRecovery(envelope: RpcEnvelope): LiveAgentMessage[] {
+    const params = asRecord(envelope.params);
+    const { threadId, turnId } = turnFields(params);
+    if (!threadId || !turnId || !this.hasActiveTurn(params)) return [];
+    const error = envelope.method === "error";
+    const item = asRecord(params.item);
+    const finished = /^(?:item\/completed|item\/agentMessage\/completed)$/.test(envelope.method ?? "")
+      && (item.type === "agentMessage" || envelope.method === "item/agentMessage/completed")
+      && item.delivery !== "async"
+      && typeof item.id === "string" && this.agentMessages.get(item.id)?.completed;
+    if (!error && !finished) return [];
+    const changed: LiveAgentMessage[] = [];
+    for (const [id, message] of this.agentMessages) {
+      if (message.threadId !== threadId || message.turnId !== turnId || message.completed || message.streamState === "superseded") continue;
+      const state = error ? "interrupted" : message.streamState === "interrupted" && id !== item.id ? "superseded" : null;
+      if (!state || state === message.streamState) continue;
+      const next: LiveAgentMessage = { ...message, streamState: state, updatedAt: new Date().toISOString() };
+      this.agentMessages.set(id, next); changed.push(next);
+    }
+    return changed;
   }
 
   snapshot(): LiveStateSnapshot {
@@ -296,7 +320,7 @@ export class LiveStateStore {
     const resolvedTurnId = turnId ?? inferredTurn?.turnId ?? null;
     const activeSegmentId = this.activeAgentSegments.get(sourceItemId);
     const activeSegment = activeSegmentId ? this.agentMessages.get(activeSegmentId) : undefined;
-    if (activeSegment?.completed) return null;
+    if (activeSegment?.completed || activeSegment?.streamState === "superseded") return null;
     // A streamed message keeps its identity and first-seen position even when
     // an asynchronous tool completion arrives between two text deltas.
     const sequence = activeSegment?.sequence ?? ++this.nextSequence;
@@ -309,6 +333,7 @@ export class LiveStateStore {
       turnId: resolvedTurnId ?? existing?.turnId ?? null,
       text: `${existing?.text ?? ""}${delta}`,
       completed: existing?.completed ?? false,
+      streamState: existing?.streamState ?? "streaming",
       sequence,
       startedAt: existing?.startedAt ?? now,
       updatedAt: now

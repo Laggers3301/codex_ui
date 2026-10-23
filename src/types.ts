@@ -139,6 +139,7 @@ export interface TrackedQuotaUsage {
   timeZone: string;
   today: string;
   dailyLimitPercent: number;
+  dailyLimitEnforced?: boolean;
   unlimitedAccountId: string | null;
   todayQuotaPercent: number;
   blocked: boolean;
@@ -430,6 +431,7 @@ export interface LiveAgentMessage {
   turnId: string | null;
   text: string;
   completed: boolean;
+  streamState?: "streaming" | "completed" | "interrupted" | "superseded";
   sequence?: number;
   startedAt: string;
   updatedAt: string;

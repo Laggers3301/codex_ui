@@ -11,7 +11,6 @@ import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
 import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
 import { LiveStateStore } from "./liveState.js";
-import { serverConfig } from "./config.js";
 import { isUserInputRequest, validateUserInputResponse } from "./userInput.js";
 import { AppError } from "./appErrors.js";
 import { TurnRetryQueue, publicRecovery } from "./turnRetry.js";
@@ -62,7 +61,7 @@ const threadStartContextConfigSchema = z.object({
 const contextProbeBytes = 512 * 1024;
 const contextPrecompactThreshold = 0.85;
 const contextFullThreshold = 0.98;
-const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
+const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? "/home/ls/codex_zerotier_remote/users";
 const DEFAULT_COMPACT_TIMEOUT_MS = 600_000;
 
 function compactTimeoutMs(): number {
@@ -764,7 +763,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     const recordLiveState = !suppressRawCompact || notificationIsContextCompaction(message);
     const completingAgentMessages = turnId && message.method === "turn/completed"
       ? state.snapshot().agentMessages
-        .filter((item) => item.turnId === turnId)
+        .filter((item) => item.turnId === turnId && item.streamState !== "superseded")
         .sort((left, right) => left.sequence - right.sequence)
       : [];
     if (turnId && message.method === "turn/started") {
@@ -776,6 +775,13 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
 
     const liveUpdate = recordLiveState ? state.recordNotification(message) : null;
+    const agentRecoveryUpdates = recordLiveState ? state.recordAgentRecovery(message) : [];
+    for (const item of agentRecoveryUpdates) {
+      const key = JSON.stringify([owner, item.turnId, item.itemId]);
+      streamJournal.flush(key);
+      store.saveTimelineItem(item.threadId!, item.turnId!, journalItem({ kind: "agent", item }));
+      sendToUser(wss, owner, { type: "live.agent", data: item });
+    }
     if (liveUpdate?.kind === "tool" && liveUpdate.item.threadId && liveUpdate.item.turnId) {
       const label = liveUpdate.item.tool.toLowerCase();
       const phase = liveUpdate.item.completed
@@ -866,7 +872,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const needsFallbackRecovery = Boolean(completedRecovery && isGenericContextLossReply(latestAgentText));
       const completedThreadId = notificationThreadId(message);
       const completedItems = completedThreadId ? store.readTimelineItems(completedThreadId, turnId) : [];
-      const latestAgentItem = [...completedItems].reverse().find((item) => item.type === "agentMessage");
+      const latestAgentItem = [...completedItems].reverse().find((item) => item.type === "agentMessage" && item.streamState !== "superseded");
       const latestAgentOrder = Number(latestAgentItem?.timelineOrder ?? latestAgent?.sequence);
       const hasToolAfterLatestAgent = Number.isFinite(latestAgentOrder)
         ? completedItems.some((item) => item.type === "toolCall" && Number(item.timelineOrder) > latestAgentOrder)
@@ -887,7 +893,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const needsRecovery = !runtimeExited && (needsFallbackRecovery || needsPlanContinuation);
       if (completedThreadId) {
         for (const item of completedItems) {
-          if (item.completed === false) store.saveTimelineItem(completedThreadId, turnId, { ...item, completed: true });
+          if (item.type !== "agentMessage" && item.completed === false) store.saveTimelineItem(completedThreadId, turnId, { ...item, completed: true });
         }
       }
       invalidateTrackedQuotaCacheForUser(owner);

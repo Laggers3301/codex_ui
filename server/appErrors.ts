@@ -21,6 +21,7 @@ export class AppError extends Error {
     if (/usage_?limit|quota|credits|rate limit/i.test(signature)) return new AppError("quota_or_rate_limit", "服务额度或请求频率受限，请查看错误详情。", original);
     if (/unauthorized|authentication|invalid.*token|401\b/i.test(signature)) return new AppError("authentication_failed", "账号认证失败，请查看错误详情。", original);
     if (/context.*(exhaust|exceed|full)|CONTEXT_EXHAUSTED/i.test(signature)) return new AppError("context_exhausted", "会话上下文已满，请使用续接会话。", original);
+    if (/stream[_ ]disconnected|stream.*before completion|peer closed connection/i.test(signature)) return new AppError("stream_disconnected", "模型连接意外中断，正在按重试策略尝试恢复；已完成的步骤会保留。", original, true);
     return new AppError(nativeCode || "request_failed", "本轮处理失败，请查看错误详情。", original);
   }
 }

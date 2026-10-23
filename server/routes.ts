@@ -57,8 +57,8 @@ import { executionSettingsOverrides, queueScheduledPrompt, resumeThreadIfUnloade
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
 // Default Codex cwd per logged-in user. This prevents generated artifacts from
-// accumulating in /home/example while retaining historical shared-home projects.
-const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
+// accumulating in /home/ls while retaining historical shared-home projects.
+const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? "/home/ls/codex_zerotier_remote/users";
 const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
 const maxThreadHistoryPageSize = 240;
@@ -826,6 +826,7 @@ export type PublicTrackedQuotaUsage = {
   timeZone: string;
   today: string;
   dailyLimitPercent: number;
+  dailyLimitEnforced?: boolean;
   unlimitedAccountId: string | null;
   todayQuotaPercent: number;
   blocked: boolean;
@@ -932,7 +933,7 @@ function loadTrackedQuotaDiskCache(): void {
     ) {
       // Return the last complete snapshot immediately after a process restart,
       // then refresh it in the background on the first request.
-      trackedQuotaCache = { data, expiresAt: 0 };
+      trackedQuotaCache = { data: withCurrentTrackedQuotaPolicy(data), expiresAt: 0 };
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -1009,7 +1010,7 @@ export function userIdFromSessionCwd(cwd: string | null, isKnownUser?: (userId: 
     const [firstSegment] = path.relative(normalizedRoot, normalizedCwd).split(path.sep);
     return firstSegment?.trim() || null;
   }
-  // Some existing users run Codex directly in /home/example/<login> rather than
+  // Some existing users run Codex directly in /home/ls/<login> rather than
   // the managed users root. Only trust this layout for a registered login.
   const homeRoot = path.dirname(path.dirname(normalizedRoot));
   if (isKnownUser && normalizedCwd.startsWith(`${homeRoot}${path.sep}`)) {
@@ -1570,7 +1571,7 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
     id: serverConfig.leaderboardAccountLabel,
     label: serverConfig.leaderboardAccountLabel,
     kind: "codex-account",
-    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/example", ".codex"), "sessions"),
+    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/ls", ".codex"), "sessions"),
     quota: await readCachedCodexQuota(bridge, forceRefresh)
   }];
 }
@@ -1583,6 +1584,18 @@ export function allowedAccountForUser(userId: string): string | null {
   return serverConfig.trackedQuotaEnforce && serverConfig.trackedQuotaAllowedAccountId && sameTrackedUser(userId, serverConfig.trackedQuotaUser)
     ? serverConfig.trackedQuotaAllowedAccountId
     : null;
+}
+
+/** Cached accounting is retained, but a deployment must not reuse old policy flags. */
+export function withCurrentTrackedQuotaPolicy(usage: PublicTrackedQuotaUsage): PublicTrackedQuotaUsage {
+  const dailyLimitEnforced = serverConfig.trackedQuotaEnforce && !serverConfig.trackedQuotaAllowedAccountId;
+  return {
+    ...usage,
+    dailyLimitPercent: serverConfig.trackedQuotaDailyLimitPercent,
+    dailyLimitEnforced,
+    unlimitedAccountId: serverConfig.trackedQuotaAllowedAccountId || null,
+    blocked: dailyLimitEnforced && usage.todayQuotaPercent >= serverConfig.trackedQuotaDailyLimitPercent
+  };
 }
 
 async function buildTrackedQuotaUsage(
@@ -1698,6 +1711,7 @@ async function buildTrackedQuotaUsage(
     timeZone: serverConfig.trackedQuotaTimeZone,
     today,
     dailyLimitPercent: serverConfig.trackedQuotaDailyLimitPercent,
+    dailyLimitEnforced: serverConfig.trackedQuotaEnforce && !serverConfig.trackedQuotaAllowedAccountId,
     unlimitedAccountId: serverConfig.trackedQuotaAllowedAccountId || null,
     todayQuotaPercent,
     blocked: serverConfig.trackedQuotaEnforce && !serverConfig.trackedQuotaAllowedAccountId && todayQuotaPercent >= serverConfig.trackedQuotaDailyLimitPercent,
@@ -1750,7 +1764,7 @@ async function readTrackedQuotaUsageForEnforcement(
   store: ProjectStore
 ): Promise<PublicTrackedQuotaUsage> {
   loadTrackedQuotaDiskCache();
-  if (trackedQuotaCache && trackedQuotaCache.expiresAt > Date.now()) return trackedQuotaCache.data;
+  if (trackedQuotaCache && trackedQuotaCache.data.today === naturalDayKey(Math.floor(Date.now() / 1000)) && trackedQuotaCache.expiresAt > Date.now()) return trackedQuotaCache.data;
   if (trackedQuotaRefreshInFlight) return trackedQuotaRefreshInFlight;
   trackedQuotaRefreshInFlight = buildTrackedQuotaUsage(bridge, store, false)
     .then((data) => {
@@ -1789,6 +1803,9 @@ export async function assertTrackedUserQuotaAvailable(
 }
 
 export function assertTrackedDailyQuotaWithinLimit(usage: Pick<PublicTrackedQuotaUsage,"userId"|"todayQuotaPercent"|"dailyLimitPercent">): void {
+  if (!Number.isFinite(usage.todayQuotaPercent) || usage.todayQuotaPercent < 0 || !Number.isFinite(usage.dailyLimitPercent) || usage.dailyLimitPercent <= 0) {
+    throw new Error(`${usage.userId} 今日额度状态暂时无法核实，暂不能发起新回答，请稍后重试。`);
+  }
   if (usage.todayQuotaPercent >= usage.dailyLimitPercent) {
     throw new Error(
       `${usage.userId} 今日估算额度占用已达 ${usage.todayQuotaPercent.toFixed(2)}%，超过每日 ${usage.dailyLimitPercent.toFixed(2)}% 上限；今日可查看历史，但不能继续发起回答。`
@@ -2735,7 +2752,7 @@ async function filterOwnedThreadList(
       continue;
     }
     const fullThread = await readOwnedThreadForList(bridge, threadId);
-    // Ownership is the access boundary. A legacy session may retain /home/example as
+    // Ownership is the access boundary. A legacy session may retain /home/ls as
     // its historical cwd after the user's default workspace is moved.
     if (fullThread) {
       byId.set(threadId, listItemSummaryFromThread(fullThread));
@@ -2811,7 +2828,7 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
   const rootPath = ensureUserWorkspaceDirectory(userId);
 
   // List the personal workspace first: a newly opened page selects it by
-  // default. Existing projects (including historical /home/example conversations)
+  // default. Existing projects (including historical /home/ls conversations)
   // are deliberately retained below it.
   const workspace = store.getProjectByRootPath(rootPath, userId) ?? store.createProject({
     name: "我的工作区",
