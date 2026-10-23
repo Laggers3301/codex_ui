@@ -62,7 +62,7 @@ export function readLiveQuestionNotification(value: unknown) {
 export interface UserInputRequest {
   id: string | number;
   method: string;
-  params: { threadId: string; turnId: string; itemId: string; questions: unknown[] };
+  params: { threadId: string; turnId: string; itemId: string; questions: unknown[]; isBlocking?: boolean };
   questions: ToolQuestion[];
 }
 
@@ -88,6 +88,13 @@ export function synchronousQuestionHasResult(item: { tool?: unknown; status?: un
     && (item.completed === true || ["completed", "failed", "declined"].includes(String(item.status)) || Boolean(item.output));
 }
 
+/** An answer receipt or a finished tool cannot still be streaming a question. */
+export function questionIsGenerating(item: { tool?: unknown; status?: unknown; completed?: unknown; output?: unknown; aggregatedOutput?: unknown }): boolean {
+  return isQuestionToolName(item.tool) && item.completed !== true
+    && !["completed", "failed", "declined", "cancelled", "canceled", "interrupted"].includes(String(item.status).toLowerCase())
+    && !item.output && !item.aggregatedOutput;
+}
+
 /** App-server history can place function arguments in `command`, not `input`. */
 export function parseQuestionToolItem(item: { type?: unknown; delivery?: unknown; questions?: unknown; tool?: unknown; name?: unknown; toolName?: unknown; arguments?: unknown; input?: unknown; command?: unknown }): ToolQuestion[] | null {
   if (String(item.type).replace(/_/g, "").toLowerCase() === "agentmessage" && item.delivery === "async" && Array.isArray(item.questions)) {
@@ -102,16 +109,25 @@ export function parseQuestionToolItem(item: { type?: unknown; delivery?: unknown
   return parseQuestionTool(toolName ?? "", input);
 }
 
-/** A question is no longer pending once a later user message is in the transcript. */
-export function questionHasLaterUserMessage(
-  items: Array<{ id?: unknown; type?: unknown; role?: unknown }>,
+/** Only an explicitly correlated answer can resolve an asynchronous question. */
+export function questionHasAnswer(
+  items: Array<{ id?: unknown; type?: unknown; role?: unknown; output?: unknown; aggregatedOutput?: unknown }>,
   questionItemId: string
 ): boolean {
-  const questionIndex = items.findIndex((item) => item.id === questionItemId);
-  if (questionIndex < 0) return false;
-  return items.slice(questionIndex + 1).some((item) => {
-    const type = typeof item.type === "string" ? item.type.toLowerCase() : "";
-    const role = typeof item.role === "string" ? item.role.toLowerCase() : "";
-    return type === "usermessage" || type === "user" || role === "user";
+  return items.some(item => [item.output, item.aggregatedOutput].some(output => {
+    try {
+      const answer = record(typeof output === "string" ? JSON.parse(output) : output);
+      return answer.type === "codex_web_question_answer" && answer.itemId === questionItemId;
+    } catch { return false; }
+  }));
+}
+
+/** @deprecated Kept for older host-side editor bundles during rolling deploys.
+ * The current question UI uses explicit correlated answer receipts instead. */
+export function questionHasLaterUserMessage(items: Array<{id?: unknown; type?: unknown; role?: unknown}>, questionItemId: string): boolean {
+  const index = items.findIndex(item => item.id === questionItemId);
+  return index >= 0 && items.slice(index + 1).some(item => {
+    const type = String(item.type ?? '').toLowerCase(), role = String(item.role ?? '').toLowerCase();
+    return type === 'usermessage' || type === 'user' || role === 'user';
   });
 }

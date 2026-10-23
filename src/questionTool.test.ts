@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification } from "./questionTool";
 
 describe("question tool presentation", () => {
+  it("shows generation only for an unfinished question without an answer receipt", () => {
+    expect(questionIsGenerating({ tool: "request_user_input_async", completed: false })).toBe(true);
+    const receipt = JSON.stringify({ type: "codex_web_question_answer", itemId: "original-question" });
+    expect(questionIsGenerating({ tool: "request_user_input_async", completed: true, output: receipt })).toBe(false);
+    expect(questionIsGenerating({ tool: "request_user_input_async", aggregatedOutput: receipt })).toBe(false);
+    expect(questionIsGenerating({ tool: "request_user_input", status: "completed" })).toBe(false);
+    expect(questionIsGenerating({ tool: "request_user_input_async", completed: true })).toBe(false);
+    expect(questionIsGenerating({ tool: "exec", completed: false })).toBe(false);
+  });
   it("preserves the native async agentMessage metadata on started, before any history or tool receipt", () => {
     const item = { type: "agentMessage", id: "call-native-q", delivery: "async", text: "请提供路径", questions: [{ title: "请提供路径", options: null }] };
     const event = { method: "item/started", params: { threadId: "t", turnId: "r", item } };
@@ -79,26 +88,26 @@ describe("question tool presentation", () => {
     expect(parseQuestionTool("request_user_input_async", { questions: [{ title: "   " }] })).toBeNull();
   });
 
-  it("does not treat an async accepted receipt as a user answer", () => {
+  it("keeps every unanswered question open after an unrelated user message or async receipt", () => {
     const items = [
-      { id: "question", type: "toolCall" },
+      { id: "question-a", type: "toolCall" },
+      { id: "question-b", type: "toolCall" },
       { id: "receipt", type: "toolCallOutput", output: '{"accepted":true}' },
-      { id: "continuation", type: "agentMessage" }
+      { id: "reply", type: "userMessage" }
     ];
-    expect(questionHasLaterUserMessage(items, "question")).toBe(false);
-    expect(questionHasLaterUserMessage([...items, { id: "reply", type: "userMessage" }], "question")).toBe(true);
+    expect(questionHasAnswer(items, "question-a")).toBe(false);
+    expect(questionHasAnswer(items, "question-b")).toBe(false);
     expect(parseQuestionTool("request_user_input_async", { accepted: true })).toBeNull();
   });
 
-  it("stops presenting a question after a later user reply, including within the same turn", () => {
-    const items = [
-      { id: "first", type: "userMessage" },
-      { id: "question", type: "toolCall" },
-      { id: "tool-output", type: "toolCallOutput" },
-      { id: "answer", type: "userMessage" }
-    ];
-    expect(questionHasLaterUserMessage(items.slice(0, 3), "question")).toBe(false);
-    expect(questionHasLaterUserMessage(items, "question")).toBe(true);
-    expect(questionHasLaterUserMessage(items, "missing")).toBe(false);
+  it("matches a tool answer to only its original question", () => {
+    const items = [{ type: "toolCallOutput", output: JSON.stringify({
+      type: "codex_web_question_answer", itemId: "question-a", questions: [{ answer: "A" }]
+    }) }];
+    expect(questionHasAnswer(items, "question-a")).toBe(true);
+    expect(questionHasAnswer(items, "question-b")).toBe(false);
+    expect(questionHasAnswer([{ aggregatedOutput: items[0].output }], "question-a")).toBe(true);
+    expect(questionHasAnswer([{ output: "", aggregatedOutput: items[0].output }], "question-a")).toBe(true);
+    expect(questionHasAnswer([{ output: "{broken" }], "question-a")).toBe(false);
   });
 });

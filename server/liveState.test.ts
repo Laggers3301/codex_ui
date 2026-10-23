@@ -2,6 +2,21 @@ import { describe, expect, it } from "vitest";
 import { LiveStateStore } from "./liveState.js";
 
 describe("LiveStateStore reconnect bounds", () => {
+  it("preserves typed async agent questions as tools for reconnect and answer delivery", () => {
+    const state = new LiveStateStore();
+    state.recordNotification({ method: "turn/started", params: { threadId: "thread", turnId: "turn" } });
+    const item = { type: "agentMessage", id: "question", delivery: "async", text: "请选择", questions: [{ title: "请选择", options: ["A", "B"] }] };
+    const update = state.recordNotification({ method: "item/started", params: { threadId: "thread", turnId: "turn", item } });
+    expect(update?.kind).toBe("tool");
+    expect(state.snapshot().agentMessages).toEqual([]);
+    expect(state.snapshot().toolItems[0]).toMatchObject({ itemId: "question", tool: "request_user_input_async" });
+    expect(JSON.parse(state.snapshot().toolItems[0].input)).toEqual({ questions: item.questions });
+    expect(state.recordNotification({ method: "item/agentMessage/delta", params: { threadId: "thread", turnId: "turn", itemId: "question", delta: "请选择" } })).toBeNull();
+    state.recordNotification({ method: "item/completed", params: { threadId: "thread", turnId: "turn", item } });
+    expect(state.snapshot().agentMessages).toEqual([]);
+    expect(state.snapshot().toolItems[0].completed).toBe(true);
+  });
+
   it("does not split or reorder a message when a tool completes between deltas", () => {
     const state = new LiveStateStore();
     state.recordNotification({ method: "turn/started", params: { threadId: "thread", turnId: "turn" } });

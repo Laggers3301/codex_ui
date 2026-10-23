@@ -1,7 +1,9 @@
 import { chromium } from "@playwright/test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-const output = new URL("../../data/backend/ambient-glow-20261021/", import.meta.url).pathname;
+const origin = process.env.QUESTION_TEST_ORIGIN ?? "http://127.0.0.1:4187";
+const output = process.env.QUESTION_TEST_OUTPUT ?? new URL("../../data/backend/ambient-glow-20261021/", import.meta.url).pathname;
+await fs.mkdir(output, { recursive: true });
 const browser = await chromium.launch({ ...(process.env.QA_CHROMIUM_PATH ? { executablePath: process.env.QA_CHROMIUM_PATH } : {}), headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 const results = [];
 try {
@@ -11,7 +13,7 @@ try {
     const errors = [];
     page.on("pageerror", e => errors.push(e.message));
     await page.route("**/api/**", route => route.fulfill({ status: 200, contentType: "application/json", body: "{}" }));
-    await page.goto("http://127.0.0.1:4187/tests/questionTool.browser.html?native");
+    await page.goto(origin + "/tests/questionTool.browser.html?native");
     await page.evaluate(theme => { document.documentElement.dataset.theme = theme; document.body.style.minWidth = "0"; }, theme);
     await page.locator(".toolQuestionCard").waitFor();
     assert.equal(await page.getByRole("button", { name: /允许独立浏览器验收/ }).count(), 1);

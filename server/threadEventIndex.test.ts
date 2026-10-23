@@ -80,6 +80,8 @@ it("loads a deferred parallel tool result by stable call id", async () => {
     const { readIndexedThreadItem } = await import("./threadEventIndex.js");
     expect(await readIndexedThreadItem(filePath, "thread", "call-a")).toMatchObject({ id: "out-a", aggregatedOutput: "output A" });
     expect(await readIndexedThreadItem(filePath, "thread", "call-b")).toMatchObject({ id: "out-b", aggregatedOutput: "output B" });
+    expect(await readIndexedThreadItem(filePath, "thread", "call-a", { preferCall: true })).toMatchObject({ id: "response-a", tool: "exec" });
+    expect(await readIndexedThreadItem(filePath, "thread", "call-b", { preferCall: true })).toMatchObject({ id: "response-b", tool: "exec" });
   } finally {
     vi.unstubAllEnvs();
     await fs.rm(root, { recursive: true, force: true });

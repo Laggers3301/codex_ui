@@ -25,6 +25,15 @@ async function fixture(run: (o: { root: string; source: string; sourcePath: stri
 }
 
 describe("bounded exact legacy branch", () => {
+  it('can select the latest terminal turn for guarded side questions, respecting rollback',()=>fixture(async options=>{
+    const copied=await copyLargeThreadBranch(options);
+    const text=await fs.readFile(copied.path,'utf8');
+    expect(text).toContain('问题 one'); expect(text).not.toContain('问题 two');
+    expect(await fs.readFile(options.sourcePath,'utf8')).toBe(options.source);
+  },[...turn('one'),...turn('two'),event('thread_rolled_back',{num_turns:1})]));
+  it('refuses an unfinished latest turn without silently dropping it',()=>fixture(async options=>{
+    await expect(copyLargeThreadBranch(options)).rejects.toThrow(/还未结束/);
+  },[...turn('one'),event('task_started',{turn_id:'two'})]));
   it("archives only older oversized outputs, preserving two recent turns and complete original records",()=>fixture(async options=>{
     const archiveRoot=path.join(options.root,"private-archives");
     const copied=await copyLargeThreadBranch({...options,lastTurnId:"four",toolArchiveRoot:archiveRoot});

@@ -12564,9 +12564,25 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
 
 /* Errors must remain legible on both surfaces; the legacy banner colors were dark-only. */
 .errorBanner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   border-color: rgba(255, 143, 130, .38);
   background: rgba(87, 31, 30, .94);
   color: #ffe5e0;
+}
+.errorBannerMessage {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  user-select: text;
+  cursor: text;
+}
+.errorBannerDismiss {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  color: inherit;
 }
 :root[data-theme="light"] .errorBanner {
   border-color: rgba(154, 47, 40, .24);

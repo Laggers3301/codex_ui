@@ -26,6 +26,9 @@ export class BranchGate {
   }
 }
 
+// Ordinary branches and bound side questions share the same bulk-history gate.
+export const branchGate = new BranchGate();
+
 /** Byte offsets, not decoded string lengths; bounded by one record, never the rollout. */
 async function* records(file: fsp.FileHandle, size: number) {
   let chunks: Buffer[] = [];
@@ -90,7 +93,7 @@ export async function copyLargeThreadBranch(options: {
   sourcePath: string;
   sourceSessionsRoot: string;
   sourceThreadId: string;
-  lastTurnId: string;
+  lastTurnId?: string;
   targetSessionsRoot: string;
   cwd: string;
   toolArchiveRoot?: string;
@@ -113,8 +116,8 @@ export async function copyLargeThreadBranch(options: {
     let completeEnd = 0;
     let targetStart: number | null = null;
     let targetEnd: number | null = null;
-    let current: { id: string; terminal: boolean } | null = null;
-    const turns: Array<{ id: string; terminal: boolean }> = [];
+    let current: { id: string; terminal: boolean; start: number; end?: number } | null = null;
+    const turns: Array<{ id: string; terminal: boolean; start: number; end?: number }> = [];
     for await (const record of records(file, before.size)) {
       completeEnd = record.end;
       if (!metadata) {
@@ -137,12 +140,13 @@ export async function copyLargeThreadBranch(options: {
       if (row.type !== "event_msg") continue;
       const payload = row.payload ?? {};
       if (payload.type === "task_started" && typeof payload.turn_id === "string") {
+        if (current) current.end = record.start;
         if (targetStart !== null && targetEnd === null) targetEnd = record.start;
         if (payload.turn_id === options.lastTurnId) {
           if (targetStart !== null) throw new BranchConflictError("该回答有重复的轮次边界，无法安全创建分支。");
           targetStart = record.start;
         }
-        current = { id: payload.turn_id, terminal: false };
+        current = { id: payload.turn_id, terminal: false, start: record.start };
         turns.push(current);
       } else if (payload.type === "task_complete" || payload.type === "turn_aborted") {
         const id = typeof payload.turn_id === "string" ? payload.turn_id : current?.id;
@@ -155,7 +159,8 @@ export async function copyLargeThreadBranch(options: {
         current = null;
       }
     }
-    const target = turns.find((turn) => turn.id === options.lastTurnId);
+    const target = options.lastTurnId ? turns.find((turn) => turn.id === options.lastTurnId) : turns.at(-1);
+    if (!options.lastTurnId && target) { targetStart = target.start; targetEnd = target.end ?? null; }
     if (!metadata || targetStart === null || !target) throw new BranchConflictError("所选回答不存在或已经撤回，请刷新会话后重试。");
     if (!target.terminal) throw new BranchConflictError("所选回答还未结束，请先停止或等待完成后再创建分支。");
     const sourceEnd = targetEnd ?? completeEnd;
@@ -183,7 +188,7 @@ export async function copyLargeThreadBranch(options: {
     await fsp.writeFile(stagedPath, header, { mode: 0o600, flag: "wx" });
     let archiveSummary:ToolArchiveSummary|undefined;
     if(options.toolArchiveRoot){
-      const targetIndex=turns.findIndex(t=>t.id===options.lastTurnId);
+      const targetIndex=turns.findIndex(t=>t.id===target.id);
       const recentIds=turns.slice(0,targetIndex+1).slice(-2).map(t=>t.id);
       const recent=new Set(recentIds);
       archive=await createToolOutputArchive(options.toolArchiveRoot,{version:1,threadId,sourceThreadId:options.sourceThreadId,keptRecentTurnIds:recentIds,archivedRecords:0,archivedBytes:0,originalBranchBytes:header.length+sourceEnd-headerEnd,branchBytes:0,archiveBytes:0,createdAt:now.toISOString()});

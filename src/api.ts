@@ -25,6 +25,7 @@ import type {
   ThreadPresentation,
   ThreadListResponse,
   ThreadReadResponse,
+  SideChat,
   SubagentThreadSummary,
   ThreadSummary,
   ThreadSearchMatch,
@@ -571,6 +572,24 @@ export function searchThreadHits(threadId: string, projectId: string, query: str
 
 export function deleteThread(projectId: string, threadId: string): Promise<{ ok: boolean }> {
   return request(`/api/projects/${projectId}/threads/${threadId}`, { method: "DELETE" });
+}
+
+const sideChatUrl = (projectId: string, parentThreadId: string) => `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(parentThreadId)}/side-chat`;
+
+export function readSideChat(projectId: string, parentThreadId: string): Promise<{ data: SideChat | null }> {
+  return request(sideChatUrl(projectId, parentThreadId), { cache: "no-store" });
+}
+
+export function createSideChat(projectId: string, parentThreadId: string, selectedText: string, modelProfileId: string): Promise<{ data: SideChat }> {
+  return request(sideChatUrl(projectId, parentThreadId), { method: "POST", body: JSON.stringify({ selectedText, modelProfileId }) });
+}
+
+export function saveSideChatDraft(side: SideChat, draft: string, modelProfileId: string, keepalive = false): Promise<{ data: SideChat }> {
+  return request(sideChatUrl(side.projectId, side.parentThreadId), { method: "PATCH", body: JSON.stringify({ id: side.id, draft, modelProfileId, expectedRequestId: side.requestId }), keepalive });
+}
+
+export function deleteSideChat(side: SideChat): Promise<{ ok: boolean; data: SideChat | null }> {
+  return request(`${sideChatUrl(side.projectId, side.parentThreadId)}?id=${encodeURIComponent(side.id)}`, { method: "DELETE" });
 }
 
 export function branchThread(

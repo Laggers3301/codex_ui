@@ -1,0 +1,22 @@
+lzc 已应用修复的源码说明
+
+本分支已将本轮修复实际合入 server/、src/、tests/ 和相关脚本，可直接查看和使用修改后的源码。patches/ 中的 .patch 文件保留为原始变更归档，无需再应用到本分支。
+
+集成基线：远端 main 的 de13547007453a07c7b7a9ac0223fdffdbc29a40（2026-10-13 同步生产源码）。原补丁包提交 79e04e7 保留在历史中，原有提交作者不变。
+本轮补丁及源码集成作者：林子川 <1577212376@qq.com>
+远端仓库：https://github.com/lll123github/codex_ui.git
+分支：lzc
+
+主要源码入口：
+  server/socket.ts、server/userInput.ts：原生同步问答、等待状态和回答确认。
+  src/App.tsx、src/useConversationPlanMode.ts：计划模式恢复、退出与会话隔离；右键菜单通过 portal 显示在列表上层。
+  server/turnRetry.ts、server/appErrors.ts、src/TurnRecoveryNotice.tsx：明确模型过载时每 60 秒重试，最多 10 次；恢复排队状态、取消与错误详情。
+  server/codexBridge.ts：资源预算保护；server/socket.ts 同时包含服务关闭后的排队回调保护。
+
+路径适配：原补丁的 backend/server/ 对应当前 server/，frontend/src/ 对应 src/，frontend/tests/ 对应 tests/。维护脚本已适配当前仓库布局，未注册或运行部署任务，未加入取消标记检查。
+
+验证结果：88 项相关单元/集成测试、2 项维护脚本测试、完整 TypeScript 检查、隔离临时目录构建，以及原生问答和计划模式两组浏览器回归均通过。浏览器检查覆盖刷新后回答问题、发送失败后保留答案、计划模式退出与隔离、两种主题下右键菜单层级、过载错误详情与重试取消。
+
+manifest.json 的 sourceIntegration 保存当前源码路径、文件哈希和本次验证记录；其原有 files、patch、validation 字段记录最初补丁导出时的校验信息。
+
+本次仅整合分支源码并推送。没有部署到运行目录，没有重启服务，也没有启用自动部署。

@@ -7,6 +7,7 @@ import {defaultHtmlPreview,isHtmlPreviewFile} from "./htmlFilePreview";
 const HtmlSourcePreview = lazy(() => import("./HtmlSourcePreview"));
 import { VoiceInput } from "./VoiceInput";
 import { ComposerAmbientGlow } from "./ambient/ComposerAmbientGlow";
+import { selectMenuPosition } from "./selectMenuPosition";
 import { resolvePromptTopAnchor } from "./promptTopAnchor";
 import { useComposerPrediction } from "./useComposerPrediction";
 import { applyLiveAgentUpdate, type AgentWireUpdate } from "./liveAgentUpdates";
@@ -21,7 +22,7 @@ import type { WritingProject, WritingSelection } from "./writing/types";
 import { withoutDocumentContext, type ComposerDocumentReference } from "./documentReference";
 import "./writingCanvas.css";
 import { Application as IconParkApplication, Command as IconParkCommand } from "@icon-park/svg";
-import { nodeInputRule } from "@tiptap/core";
+import { nodeInputRule, type Editor } from "@tiptap/core";
 import { InlineMath, BlockMath } from "@tiptap/extension-mathematics";
 import { Markdown } from "@tiptap/markdown";
 import { Placeholder } from "@tiptap/extension-placeholder";
@@ -96,8 +97,11 @@ import { FeatureUpdateNotice } from "./FeatureUpdateNotice";
 import { collectAgents, parseAgentOperation, reconcileSubagents } from "./subagentPresentation";
 import { useSubagentDirectory } from "./subagentDirectory";
 import { useSidebarThreadLists } from "./sidebarThreadLists";
-import {setSidebarThreadHidden,sidebarVisibilityVersion,visibleSidebarThreads,reconcileSidebarVisibility} from './sidebarVisibility';
-import { parseQuestionTool, parseQuestionToolItem, questionHasLaterUserMessage, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, type UserInputRequest } from "./questionTool";
+import { useBoundSideChats } from "./useBoundSideChats";
+import type { TemporaryAsk } from "./sideChats";
+import type { SideChatChange } from "./types";
+import {setSidebarThreadHidden,sidebarVisibilityVersion,visibleSidebarThreads,reconcileSidebarVisibility} from "./sidebarVisibility";
+import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, type UserInputRequest } from "./questionTool";
 import { ToolQuestionCard, ToolQuestionMessage } from "./ToolQuestionCard";
 import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
@@ -302,22 +306,6 @@ function contextConfigShortLabel(config: ThreadContextConfig): string {
   return config.contextWindow ? "272K" : "默认";
 }
 
-interface TemporaryAsk {
-  requestId: string;
-  projectId: string;
-  threadId: string | null;
-  selectedText: string;
-  prompt: string;
-  prompts: Array<{
-    requestId: string;
-    turnId: string | null;
-    text: string;
-    createdAt: number;
-  }>;
-  turnId: string | null;
-  status: "ready" | "starting" | "running" | "complete" | "error";
-}
-
 function isTemporaryAskThread(thread: ThreadSummary): boolean {
   const text = `${thread.name ?? ""} ${thread.preview ?? ""}`;
   return text.includes("请基于下面选中的文字回答") || text.includes("选中文字：");
@@ -405,27 +393,73 @@ function PolishedSelect<T extends string>({
   const [open, setOpen] = useState(false);
   const menuPresence = useExitPresence(open);
   const selected = options.find((option) => option.value === value) ?? options[0];
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const menuId = useId();
+  const [menuPosition, setMenuPosition] = useState<ReturnType<typeof selectMenuPosition> | null>(null);
+  useLayoutEffect(() => {
+    if (!menuPresence.present) return;
+    const update = () => {
+      const trigger = triggerRef.current, menu = menuRef.current;
+      if (!trigger || !menu) return;
+      const viewport = window.visualViewport;
+      const next = selectMenuPosition(trigger.getBoundingClientRect(), className.includes("topbarPolicySelect") ? 245 : 230,
+        menu.scrollHeight + menu.offsetHeight - menu.clientHeight,
+        { width: viewport?.width ?? innerWidth, height: viewport?.height ?? innerHeight, left: viewport?.offsetLeft, top: viewport?.offsetTop });
+      setMenuPosition(current => current && current.left === next.left && current.top === next.top && current.width === next.width && current.maxHeight === next.maxHeight ? current : next);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    if (triggerRef.current) observer.observe(triggerRef.current);
+    if (menuRef.current) observer.observe(menuRef.current);
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    window.visualViewport?.addEventListener("resize", update);
+    window.visualViewport?.addEventListener("scroll", update);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+      window.visualViewport?.removeEventListener("resize", update);
+      window.visualViewport?.removeEventListener("scroll", update);
+    };
+  }, [menuPresence.present, className, options.length]);
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node) && !menuRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", dismiss, true);
+    return () => document.removeEventListener("pointerdown", dismiss, true);
+  }, [open]);
   return (
     <div
+      ref={rootRef}
       className={`polishedSelect ${className} ${open ? "open" : ""}`}
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false);
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null) && !menuRef.current?.contains(event.relatedTarget as Node | null)) setOpen(false);
       }}
+      onKeyDown={event => { if (event.key === "Escape") { setOpen(false); triggerRef.current?.focus(); } }}
     >
       <button
+        ref={triggerRef}
         className="polishedSelectTrigger"
         type="button"
         disabled={disabled}
         title={title}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
         onClick={() => setOpen((current) => !current)}
       >
         <span>{selected?.label ?? value}</span>
         <span className="polishedSelectChevron" aria-hidden="true" />
       </button>
-      {menuPresence.present ? (
-        <div className={`polishedSelectMenu${menuPresence.closing ? " uiClosing" : ""}`} role="listbox" aria-hidden={menuPresence.closing} inert={menuPresence.closing}>
+      {menuPresence.present ? createPortal((
+        <div className={`polishedSelectFloatingLayer ${className}`} style={{ position: "fixed", inset: 0, zIndex: 10050, pointerEvents: "none" }}>
+        <div ref={menuRef} id={menuId} className={`polishedSelectMenu${menuPresence.closing ? " uiClosing" : ""}`} role="listbox" aria-hidden={menuPresence.closing} inert={menuPresence.closing}
+          style={{ position: "fixed", left: menuPosition?.left ?? 0, top: menuPosition?.top ?? 0, right: "auto", bottom: "auto", width: menuPosition?.width ?? 230, maxHeight: menuPosition?.maxHeight ?? 360, visibility: menuPosition ? "visible" : "hidden", pointerEvents: "auto" }}>
           {options.map((option) => (
             <button
               className={`polishedSelectOption ${option.value === value ? "selected" : ""}`}
@@ -444,7 +478,8 @@ function PolishedSelect<T extends string>({
             </button>
           ))}
         </div>
-      ) : null}
+        </div>
+      ), document.body) : null}
     </div>
   );
 }
@@ -2289,7 +2324,7 @@ const composerExtensions = [
   ComposerBlockMath.configure({ katexOptions: { throwOnError: false } }),
 ];
 
-const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
+export const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
   value,
   onChange,
   onPaste,
@@ -2318,6 +2353,10 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
   const onSubmitRef = useRef(onSubmit);
   const onChooseSkillRef = useRef(onChooseSkill);
   const valueRef = useRef(value);
+  const composingRef = useRef(false);
+  const compositionEndFrameRef = useRef<number | null>(null);
+  const lastSynchronizedValueRef = useRef(value);
+  const pendingCompositionValueRef = useRef<string | null>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const [dismissedPrediction,setDismissedPrediction]=useState<string|null>(null);
   const [composingPrediction,setComposingPrediction]=useState(false);
@@ -2371,6 +2410,20 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
   onSubmitRef.current = onSubmit;
   onChooseSkillRef.current = onChooseSkill;
   valueRef.current = value;
+  const publishEditorValue = (current: Editor) => {
+    const next = current.getMarkdown();
+    if (next === lastSynchronizedValueRef.current) return;
+    lastSynchronizedValueRef.current = next;
+    if (next) dismissPredictionRef.current();
+    onChangeRef.current(next);
+  };
+  const beginComposition = () => {
+    if (compositionEndFrameRef.current !== null) window.cancelAnimationFrame(compositionEndFrameRef.current);
+    compositionEndFrameRef.current = null;
+    composingRef.current = true;
+    dismissPredictionRef.current();
+    setComposingPrediction(true);
+  };
   chooseSlashMatchRef.current = (index) => {
     const item = slashMatchesRef.current[index];
     if (!item) return;
@@ -2391,6 +2444,9 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
     editorProps: {
       attributes: { class: "composerRichInput", "data-placeholder": placeholder, "aria-label": placeholder, spellcheck: "false" },
       handleTextInput: (view, from, to, text) => {
+        // IMEs can insert sh/ch/zh in one event. Let ProseMirror observe the
+        // native DOM change instead of dispatching another insertion into it.
+        if (composingRef.current || view.composing || text.length !== 1) return false;
         if (from !== to || !view.state.selection.empty) return false;
         const $from = view.state.doc.resolve(from);
         const activeMarks = view.state.storedMarks ?? $from.marks();
@@ -2406,6 +2462,11 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
         return true;
       },
       handleKeyDown: (_view, event) => {
+        if (compositionEndFrameRef.current !== null && event.key === "Enter" && !_view.composing && !event.isComposing) {
+          event.preventDefault();
+          return true;
+        }
+        if (composingRef.current || _view.composing || event.isComposing || event.keyCode === 229) return false;
         if(!event.isComposing&&event.keyCode!==229&&!event.shiftKey&&!event.altKey&&!event.ctrlKey&&!event.metaKey) {
           if(event.key==="Tab"&&acceptPredictionRef.current()){event.preventDefault();return true;}
           if(event.key==="Escape"&&predictionOpen){dismissPredictionRef.current();event.preventDefault();return true;}
@@ -2432,8 +2493,46 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
     },
     onFocus: () => setSlashFocused(true),
     onBlur: () => setSlashFocused(false),
-    onUpdate: ({ editor: current }) => { const next=current.getMarkdown(); if(next) dismissPredictionRef.current(); onChangeRef.current(next); },
+    onUpdate: ({ editor: current }) => {
+      if (!composingRef.current && !current.view.composing) publishEditorValue(current);
+    },
   });
+
+  const finishComposition = () => {
+    if (compositionEndFrameRef.current !== null) window.cancelAnimationFrame(compositionEndFrameRef.current);
+    const settle = () => {
+      if (!editor || editor.isDestroyed || editor.view.composing || !composingRef.current) return;
+      composingRef.current = false;
+      setComposingPrediction(false);
+      const pending = pendingCompositionValueRef.current;
+      pendingCompositionValueRef.current = null;
+      if (pending !== null) {
+        lastSynchronizedValueRef.current = pending;
+        if (editor.getMarkdown() !== pending) editor.commands.setContent(pending, { contentType: "markdown", emitUpdate: false });
+      } else publishEditorValue(editor);
+    };
+    const afterFrame = () => {
+      compositionEndFrameRef.current = null;
+      if (editor && !editor.isDestroyed && editor.view.composing) {
+        compositionEndFrameRef.current = window.requestAnimationFrame(afterFrame);
+      } else settle();
+    };
+    const frame = window.requestAnimationFrame(afterFrame);
+    compositionEndFrameRef.current = frame;
+    // ProseMirror queues its final DOM flush during compositionend. Publish
+    // after that flush so the next send click sees the committed text, while
+    // keeping the confirmation Enter guarded until the next frame.
+    window.queueMicrotask(() => {
+      if (compositionEndFrameRef.current === frame) settle();
+    });
+  };
+
+  useEffect(() => () => {
+    if (compositionEndFrameRef.current !== null) window.cancelAnimationFrame(compositionEndFrameRef.current);
+    compositionEndFrameRef.current = null;
+    composingRef.current = false;
+    pendingCompositionValueRef.current = null;
+  }, [editor]);
 
   acceptPredictionRef.current=()=>{
     if(!predictionOpen||!prediction?.text||!editor||editor.isDestroyed||editor.view.composing||editor.state.doc.textContent.trim()||valueRef.current)return false;
@@ -2470,7 +2569,17 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
   }, [slashFocused, slashQuery, slashMatches.length]);
 
   useEffect(() => {
-    if (!editor) return;
+    if (!editor || editor.isDestroyed) return;
+    // A parent's echo is already represented by this editor transaction.
+    if (value === lastSynchronizedValueRef.current) {
+      pendingCompositionValueRef.current = null;
+      return;
+    }
+    if (composingRef.current || editor.view.composing) {
+      pendingCompositionValueRef.current = value;
+      return;
+    }
+    lastSynchronizedValueRef.current = value;
     if (editor.getMarkdown() !== value) editor.commands.setContent(value, { contentType: "markdown", emitUpdate: false });
   }, [editor, value]);
 
@@ -2514,9 +2623,12 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
   return <div
     ref={shellRef}
     className={`composerRichEditor${predictionPresence.present&&!value ? " hasPredictionGhost" : ""}${predictionAccepted?" predictionAccepted":""}`}
-    onBeforeInputCapture={()=>dismissPredictionRef.current()}
-    onCompositionStart={()=>{dismissPredictionRef.current();setComposingPrediction(true);}}
-    onCompositionEnd={()=>setComposingPrediction(false)}
+    onBeforeInputCapture={event => {
+      dismissPredictionRef.current();
+      if ((event.nativeEvent as InputEvent).isComposing && !composingRef.current) beginComposition();
+    }}
+    onCompositionStartCapture={beginComposition}
+    onCompositionEnd={finishComposition}
     style={height === undefined ? undefined : { minHeight: height, height: animatedHeight }}
     onPasteCapture={(event) => {
       if (!onPaste) return;
@@ -2556,7 +2668,7 @@ const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
       updateDelay={80}
       appendTo={() => document.body}
       options={{ placement: "top-start", offset: 8, shift: true, flip: true, onHide: () => setFormatMenuOpen(false) }}
-      shouldShow={({ editor: current, state }) => !state.selection.empty && current.isFocused}
+      shouldShow={({ editor: current, state }) => !composingRef.current && !current.view.composing && !state.selection.empty && current.isFocused}
       onMouseDown={(event) => event.preventDefault()}
       onKeyDown={(event) => { if (event.key === "Escape") setFormatMenuOpen(false); }}
     >
@@ -4771,13 +4883,23 @@ export function App() {
     timer=window.setTimeout(hide,8000);return()=>window.clearTimeout(timer);
   },[providerFailureOpen,providerFailure]);
   const [newThreadProjectPickerOpen, setNewThreadProjectPickerOpen] = useState(false);
-  const [temporaryAsk, setTemporaryAsk] = useState<TemporaryAsk | null>(null);
-  const [temporaryThread, setTemporaryThread] = useState<ThreadSummary | null>(null);
-  const [temporaryPrompt, setTemporaryPrompt] = useState("");
-  const [temporaryModelProfileId, setTemporaryModelProfileId] = useState(defaultModelProfileId);
+  const boundSideChats = useBoundSideChats(selectedUserId, selectedProjectId || undefined, selectedThread?.id, setError);
+  const sideChatController = boundSideChats.controller;
+  const temporaryAsk = boundSideChats.session?.ask ?? null;
+  const temporaryThread = boundSideChats.session?.thread ?? null;
+  const temporaryPrompt = boundSideChats.session?.draft ?? "";
+  const temporaryModelProfileId = boundSideChats.session?.modelProfileId ?? defaultModelProfileId;
+  const setTemporaryPrompt = useCallback((text: string) => {
+    if (selectedThread?.id) sideChatController.setDraft(selectedUserId, selectedThread.id, text);
+  }, [sideChatController, selectedUserId, selectedThread?.id]);
+  const setTemporaryModelProfileId = useCallback((model: string) => {
+    if (selectedThread?.id) sideChatController.setDraft(selectedUserId, selectedThread.id, sideChatController.get(selectedUserId, selectedThread.id)?.draft ?? "", model);
+  }, [sideChatController, selectedUserId, selectedThread?.id]);
   const [temporaryAskWidth, setTemporaryAskWidth] = useState(() => storedNumber("codex-web-temporary-ask-width", 390, 300, 760));
   const selectionAskActionRef = useRef<SelectionAskActionHandle>(null);
-  const [temporaryCloseConfirm, setTemporaryCloseConfirm] = useState(false);
+  const [temporaryCloseTarget, setTemporaryCloseTarget] = useState<TemporaryAsk | null>(null);
+  const temporaryCloseConfirm = Boolean(temporaryCloseTarget);
+  const setTemporaryCloseConfirm = (open: boolean) => setTemporaryCloseTarget(open ? temporaryAsk : null);
   const [temporaryCloseDontAsk, setTemporaryCloseDontAsk] = useState(() => storedBoolean("codex-web-temporary-close-dont-ask"));
   const accountMenuPresence = useExitPresence(accountMenuOpen);
   const newThreadProjectPickerPresence = useExitPresence(newThreadProjectPickerOpen, 260);
@@ -4884,6 +5006,7 @@ export function App() {
   const projectsRef = useRef<Project[]>(projects);
   const notificationLinkHandledRef = useRef(false);
   const temporaryAskRef = useRef<TemporaryAsk | null>(null);
+  temporaryAskRef.current = temporaryAsk;
   const temporaryThreadIdsRef = useRef(new Set<string>());
   const pendingUserMessagesRef = useRef<PendingUserMessage[]>(pendingUserMessages);
   const threadLiveRecoveryAtRef = useRef<Record<string, number>>({});
@@ -4935,27 +5058,20 @@ export function App() {
     }
   }
 
-  function performCloseTemporaryAsk() {
-    const current = temporaryAskRef.current;
-    temporaryAskRef.current = null;
-    setTemporaryAsk(null);
-    setTemporaryThread(null);
-    setTemporaryPrompt("");
-    selectionAskActionRef.current?.dismiss();
-    if (!current?.threadId) return;
-    setLiveDeltas((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== current.threadId)));
-    setLiveTools((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== current.threadId)));
+  function clearTemporaryThread(threadId: string) {
+    setLiveDeltas((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== threadId)));
+    setLiveTools((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== threadId)));
     setActiveTurnsByThread((items) => {
-      const next = { ...items };
-      delete next[current.threadId!];
-      return next;
+      const next = { ...items }; delete next[threadId]; return next;
     });
-    void deleteThread(current.projectId, current.threadId)
-      .then(() => {
-        temporaryThreadIdsRef.current.delete(current.threadId!);
-        return refreshThreads(current.projectId);
-      })
-      .catch((caught) => setError(`删除临时对话失败：${caught instanceof Error ? caught.message : String(caught)}`));
+  }
+
+  function performCloseTemporaryAsk(current = temporaryAskRef.current) {
+    selectionAskActionRef.current?.dismiss();
+    if (!current) return;
+    void sideChatController.close(current).then(() => {
+      if (!sideChatController.get(current.userId, current.parentThreadId) && current.threadId) clearTemporaryThread(current.threadId);
+    });
   }
 
   function closeTemporaryAsk() {
@@ -4971,53 +5087,29 @@ export function App() {
       window.localStorage.setItem("codex-web-temporary-close-dont-ask", "true");
     }
     setTemporaryCloseConfirm(false);
-    performCloseTemporaryAsk();
+    performCloseTemporaryAsk(temporaryCloseTarget);
   }
 
   function openTemporaryAsk(text: string, left: number, top: number) {
     if (!selectedProject || !text.trim()) return;
-    if (temporaryAskRef.current) {
-      selectionAskActionRef.current?.dismiss();
-      return;
-    }
-    const requestId = `temp-${requestToken()}`;
-    const next: TemporaryAsk = {
-      requestId,
-      projectId: selectedProject.id,
-      threadId: null,
-      selectedText: text.trim(),
-      prompt: "",
-      prompts: [],
-      turnId: null,
-      status: "ready",
-    };
-    temporaryAskRef.current = next;
-    setTemporaryAsk(next);
-    setTemporaryThread(null);
-    setTemporaryPrompt("");
-    setTemporaryModelProfileId(activeModelProfileId);
     selectionAskActionRef.current?.dismiss();
+    if (!selectedThread?.id) { setError("请先打开一个主会话，再使用侧边提问。"); return; }
+    void sideChatController.open(selectedUserId, selectedProject.id, selectedThread.id, text.trim(), activeModelProfileId);
   }
 
   function sendTemporaryPrompt() {
     const current = temporaryAskRef.current;
     const text = temporaryPrompt.trim();
-    if (!current || !text || current.status === "starting" || current.status === "running") return;
+    if (!current || !text || ["starting", "running", "closing"].includes(current.status)) return;
     const requestId = `temp-${requestToken()}`;
-    const next = {
-      ...current,
-      requestId,
-      prompt: text,
-      prompts: [...current.prompts, { requestId, turnId: null, text, createdAt: Date.now() }],
-      status: "starting" as const
-    };
-    temporaryAskRef.current = next;
-    setTemporaryAsk(next);
-    setTemporaryPrompt("");
+    const next = sideChatController.begin(current.userId, current.parentThreadId, requestId, text);
+    if (!next) return;
     try {
       codexSocket.send(current.threadId ? {
         type: "turn.start",
         requestId,
+        sideChatId: current.id,
+        sideChatModelProfileId: temporaryModelProfileId,
         userId: selectedUserId,
         projectId: current.projectId,
         threadId: current.threadId,
@@ -5030,9 +5122,11 @@ export function App() {
       } : {
         type: "thread.start",
         requestId,
+        sideChatId: current.id,
+        sideChatModelProfileId: temporaryModelProfileId,
         userId: selectedUserId,
         projectId: current.projectId,
-        prompt: `请基于下面选中的文字回答问题。\n\n选中文字：\n${current.selectedText}\n\n用户问题：\n${text}`,
+        prompt: text,
         model: temporaryModelProfile.model,
         reasoningEffort: temporaryModelProfile.effort,
         serviceTier: resolveServiceTier(codexFastModeEnabled),
@@ -5041,8 +5135,7 @@ export function App() {
       });
     } catch (caught) {
       const failed = { ...next, status: "error" as const };
-      temporaryAskRef.current = failed;
-      setTemporaryAsk(failed);
+      sideChatController.updateAsk(failed);
       setError(caught instanceof Error ? caught.message : String(caught));
     }
   }
@@ -5053,13 +5146,13 @@ export function App() {
       if (delay > 0) {
         await new Promise<void>((resolve) => window.setTimeout(resolve, delay));
       }
-      const current = temporaryAskRef.current;
-      if (!current || current.threadId !== threadId) return;
+      const current = sideChatController.forThread(threadId);
+      if (!current) return;
       try {
         const response = await readThread(threadId, projectId, { before: 0, limit: 128, fresh: true });
-        if (temporaryAskRef.current?.threadId !== threadId) return;
+        if (!sideChatController.forThread(threadId)) return;
         const persistedThread = sanitizeThreadForRender(response.thread);
-        setTemporaryThread((currentThread) => (
+        sideChatController.updateThread(threadId, (currentThread) => (
           currentThread?.id === persistedThread.id
             ? sanitizeThreadForRender(mergeThreadHistoryPages(currentThread, persistedThread))
             : persistedThread
@@ -6776,7 +6869,7 @@ export function App() {
       void refreshThreads(selectedProjectId, threadSearch);
     }, 260);
     return () => window.clearTimeout(timer);
-  }, [threadSearch]);
+  }, [selectedUserId, selectedProjectId, threadSearch]);
 
   useEffect(() => {
     const openSearch = () => setGlobalSearchOpen(true);
@@ -7320,15 +7413,8 @@ export function App() {
         return;
       }
       if (!Array.isArray(response?.data)) throw new Error("会话列表响应不完整，已保留当前记录，请稍后刷新重试。");
-      // While a temporary thread is starting, listThreads can observe it a few
-      // milliseconds before the websocket ACK gives the browser its id. Do not
-      // mistake that in-flight thread for an abandoned one and delete it.
-      const leakedTemporaryThreads = temporaryAskRef.current
-        ? []
-        : response.data.filter((thread) => isTemporaryAskThread(thread) && !temporaryThreadIdsRef.current.has(thread.id));
-      for (const thread of leakedTemporaryThreads) {
-        void deleteThread(projectId, thread.id);
-      }
+      // A temporary thread may still be in use in another tab. Listing threads
+      // only hides these rows; explicit close is responsible for deletion.
       const visibleThreads = dedupeThreadListById(reconcileSidebarVisibility(selectedUserId,projectId,response.data,response.hiddenThreadIds,requestedAt)
         .filter((thread) => !temporaryThreadIdsRef.current.has(thread.id) && !isTemporaryAskThread(thread))
         .map((thread) => sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, thread, modelProfiles))));
@@ -9063,15 +9149,15 @@ export function App() {
     if (!threadId) return false;
     if ([...pendingUserInputsRef.current.values()].some(request => request.params.threadId === threadId && request.params.itemId === itemId)) return false;
     if (answeredQuestionItems[`${threadId}:${itemId}`]) return true;
+    if (selectedThread.answeredQuestionItemIds?.includes(itemId)) return true;
     const liveItem = liveTools[itemId];
     if (liveItem?.threadId === threadId && synchronousQuestionHasResult(liveItem)) return true;
-    if (visibleItems && questionHasLaterUserMessage(visibleItems, itemId)) return true;
+    if (visibleItems && questionHasAnswer(visibleItems, itemId)) return true;
     const turns = selectedThread.turns;
     const turnIndex = turns.findIndex((turn) => turn.id === turnId || (turn.items ?? []).some((item) => item.id === itemId));
     if (turnIndex < 0) return false;
     if (synchronousQuestionHasResult((turns[turnIndex].items ?? []).find(item => item.id === itemId) ?? {})) return true;
-    if (questionHasLaterUserMessage(turns[turnIndex].items ?? [], itemId)) return true;
-    return turns.slice(turnIndex + 1).some((turn) => turnHasUserItem(turn) || Boolean(turnUserText(turn)));
+    return questionHasAnswer(turns.flatMap(turn => turn.items ?? []), itemId);
   }
 
   function waitForQuestionAnswerAck(requestId: string, timeoutMessage = "尚未确认答案已被接收，请刷新会话后重试。"): Promise<boolean> {
@@ -9098,7 +9184,7 @@ export function App() {
     if (!request) return;
     pendingUserInputsRef.current.set(String(request.id), request);
     const { threadId, turnId, itemId } = request.params;
-    setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "waiting_user_input", silentForMs: 0 }, activeTurnsByThreadRef.current[threadId]));
+    if (request.params.isBlocking !== false) setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "waiting_user_input", silentForMs: 0 }, activeTurnsByThreadRef.current[threadId]));
     setAnsweredQuestionItems(current => {
       const next = { ...current };
       delete next[`${threadId}:${itemId}`];
@@ -9106,7 +9192,7 @@ export function App() {
     });
     const now = new Date().toISOString();
     setLiveTools(current => ({ ...current, [itemId]: {
-      ...current[itemId], itemId, threadId, turnId, tool: "request_user_input", input: JSON.stringify({ questions: request.params.questions }),
+      ...current[itemId], itemId, threadId, turnId, tool: request.params.isBlocking === false ? "request_user_input_async" : "request_user_input", input: JSON.stringify({ questions: request.params.questions }),
       output: "", completed: false, startedAt: current[itemId]?.startedAt ?? now, updatedAt: now
     } }));
   }
@@ -9137,7 +9223,8 @@ export function App() {
     if (!request) return;
     pendingUserInputsRef.current.delete(String(requestId));
     const { threadId, turnId, itemId } = request.params;
-    setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "active", silentForMs: 0 }));
+    const stillWaiting = [...pendingUserInputsRef.current.values()].some(other => other.params.threadId === threadId && other.params.turnId === turnId && other.params.isBlocking !== false);
+    if (request.params.isBlocking !== false) setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: stillWaiting ? "waiting_user_input" : "active", silentForMs: 0 }));
     setAnsweredQuestionItems(current => ({ ...current, [`${threadId}:${itemId}`]: true }));
     setLiveTools(current => current[itemId] ? { ...current, [itemId]: { ...current[itemId], completed: true } } : current);
   }
@@ -9167,7 +9254,15 @@ export function App() {
         setError("该提问的待回答请求尚未同步，请刷新会话后再回答。");
         return false;
       }
-      const accepted = await sendPrompt(selectedActiveTurnId ? "steer" : "queue", answer);
+      const requestId = `question-answer-${requestToken()}`;
+      const acceptedPromise = waitForQuestionAnswerAck(requestId);
+      try {
+        codexSocket.send({ type: "question.respond", requestId, projectId: selectedProject.id, threadId, itemId, answers });
+      } catch (caught) {
+        finishQuestionAnswerAck(requestId, false);
+        throw caught;
+      }
+      const accepted = await acceptedPromise;
       if (accepted) setAnsweredQuestionItems((current) => ({ ...current, [key]: true }));
       return accepted;
     } catch (caught) {
@@ -9425,22 +9520,21 @@ export function App() {
     // JSONL history is always readable. Preserve the temporary panel's live
     // copy until promoteTemporaryTurn confirms the persisted replacement.
     liveAgentBasesRef.current = new Map(Object.entries(snapshotDeltas));
+    const sideThreadIds = sideChatController.threadIds();
     setLiveDeltas((current) => {
       const next = { ...snapshotDeltas };
-      const temporaryThreadId = temporaryAskRef.current?.threadId;
-      if (temporaryThreadId || selectedThreadRef.current?.id) {
+      if (sideThreadIds.size || selectedThreadRef.current?.id) {
         for (const [itemId, item] of Object.entries(current)) {
-          if ((item.threadId === temporaryThreadId || item.threadId === selectedThreadRef.current?.id) && !next[itemId]) next[itemId] = item;
+          if (((item.threadId && sideThreadIds.has(item.threadId)) || item.threadId === selectedThreadRef.current?.id) && !next[itemId]) next[itemId] = item;
         }
       }
       return next;
     });
     setLiveTools((current) => {
       const next = { ...snapshotTools };
-      const temporaryThreadId = temporaryAskRef.current?.threadId;
-      if (temporaryThreadId || selectedThreadRef.current?.id) {
+      if (sideThreadIds.size || selectedThreadRef.current?.id) {
         for (const [itemId, item] of Object.entries(current)) {
-          if ((item.threadId === temporaryThreadId || item.threadId === selectedThreadRef.current?.id) && !next[itemId]) next[itemId] = item;
+          if (((item.threadId && sideThreadIds.has(item.threadId)) || item.threadId === selectedThreadRef.current?.id) && !next[itemId]) next[itemId] = item;
         }
       }
       return next;
@@ -9499,6 +9593,19 @@ export function App() {
   }
 
   function handleSocketMessage(message: SocketMessage) {
+    if (message.type === "side.chat") {
+      const change = message.data as SideChatChange | undefined;
+      if (!change?.parentThreadId || !change.userId || !change.id) return;
+      const previous = sideChatController.get(change.userId, change.parentThreadId);
+      sideChatController.receive(change);
+      if (change.sideChat?.threadId) {
+        temporaryThreadIdsRef.current.add(change.sideChat.threadId);
+        threadProjectIdsRef.current.set(change.sideChat.threadId, change.projectId);
+      } else if (!change.sideChat && previous?.record.id === change.id && previous.ask.threadId) {
+        clearTemporaryThread(previous.ask.threadId);
+      }
+      return;
+    }
     if (message.type === "turn.recovery") {
       const state = message.data as TurnRecoveryView | undefined;
       if (state?.threadId) setTurnRecoveries(current => ({ ...current, [`${selectedUserId}:${state.threadId}`]: state }));
@@ -9535,6 +9642,9 @@ export function App() {
         .map((request) => [String(request.id), request])));
       pendingUserInputsRef.current.clear();
       for (const request of data?.pendingServerRequests ?? []) receiveUserInputRequest(request);
+      if (selectedThreadRef.current?.id && selectedProjectIdRef.current) {
+        void sideChatController.load(selectedUserId, selectedProjectIdRef.current, selectedThreadRef.current.id);
+      }
       return;
     }
 
@@ -9552,6 +9662,12 @@ export function App() {
         showRightWindow("browser");
         browserOpenFramesRef.current = [window.requestAnimationFrame(() => { browserOpenFramesRef.current.push(window.requestAnimationFrame(() => setBrowserVisible(true))); })];
       }
+      return;
+    }
+
+    if (message.type === "question.answered") {
+      const data = message.data as { threadId?: string; itemId?: string } | undefined;
+      if (data?.threadId && data.itemId) setAnsweredQuestionItems(current => ({ ...current, [`${data.threadId}:${data.itemId}`]: true }));
       return;
     }
 
@@ -9694,15 +9810,14 @@ export function App() {
         return;
       }
       if (message.requestId?.startsWith("temp-")) {
-        const temporary = temporaryAskRef.current;
+        const temporary = sideChatController.forRequest(message.requestId)?.ask;
         if (!temporary || temporary.requestId !== message.requestId) {
           return;
         }
         if (!message.ok) {
           const failed = { ...temporary, status: "error" as const };
-          temporaryAskRef.current = failed;
-          setTemporaryAsk(failed);
-          setError(`临时提问失败：${message.error ?? "Codex 未接受请求。"}`);
+          sideChatController.updateAsk(failed);
+          if (temporary.parentThreadId === selectedThreadRef.current?.id && temporary.userId === selectedUserId) setError(`侧边提问失败：${message.error ?? "Codex 未接受请求。"}`);
           return;
         }
         const data = message.data as { thread?: { thread?: ThreadSummary }; turn?: { turn?: { id?: string } } } | undefined;
@@ -9715,15 +9830,14 @@ export function App() {
           prompts: temporary.prompts.map((entry) => (
             entry.requestId === message.requestId ? { ...entry, turnId: turnId ?? null } : entry
           )),
-          status: "running" as const
+          status: temporary.status === "closing" || (temporary.turnId === turnId && ["complete", "error"].includes(temporary.status)) ? temporary.status : "running" as const
         };
-        temporaryAskRef.current = next;
-        setTemporaryAsk(next);
+        sideChatController.updateAsk(next);
         if (threadId) {
           temporaryThreadIdsRef.current.add(threadId);
           threadProjectIdsRef.current.set(threadId, temporary.projectId);
         }
-        if (turnId && threadId) {
+        if (turnId && threadId && next.status === "running") {
           turnThreadIdsRef.current.set(turnId, threadId);
           activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [threadId]: turnId };
           setActiveTurnsByThread((current) => ({ ...current, [threadId]: turnId }));
@@ -10070,9 +10184,6 @@ export function App() {
         }
       }
       if (notification.method === "turn/completed") {
-        for (const request of pendingUserInputsRef.current.values()) {
-          if (request.params.threadId === notificationThreadId(params) && request.params.turnId === notificationTurnId(params)) resolveUserInputRequest(request.id);
-        }
         const turnId = notificationTurnId(params);
         const threadId = notificationThreadId(params) ?? (turnId ? turnThreadIdsRef.current.get(turnId) ?? null : null);
         if (threadId && turnId) setTurnProgress(current => updateTurnProgress(current, selectedUserId, { threadId, turnId, state: "completed", silentForMs: 0 }));
@@ -10175,16 +10286,15 @@ export function App() {
           markThreadResult(threadId);
         }
         const threadProjectId = threadProjectIdsRef.current.get(threadId) ?? selectedProjectIdRef.current;
-        const isTemporaryThread = temporaryAskRef.current?.threadId === threadId;
+        const isTemporaryThread = Boolean(sideChatController.forThread(threadId));
         if (!wasInterrupted && completedStatus === "completed" && threadProjectId && !isTemporaryThread) {
           scheduleAutoSendGeneratedFiles(threadId, threadProjectId, turnId);
         }
         if (isTemporaryThread && !wasInterrupted) {
-          const temporary = temporaryAskRef.current;
+          const temporary = sideChatController.forThread(threadId)?.ask;
           if (temporary) {
             const completed = { ...temporary, status: "complete" as const };
-            temporaryAskRef.current = completed;
-            setTemporaryAsk(completed);
+            sideChatController.updateAsk(completed);
             void promoteTemporaryTurn(threadId, temporary.projectId, turnId);
           }
         }
@@ -10258,7 +10368,8 @@ export function App() {
     if (parseAgentOperation(collaborationItem)) return <article className="messageItem kind-tool subagentMessage" key={entry.id}><SubagentToolCard item={collaborationItem} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} /></article>;
     const liveQuestions = parseQuestionTool(safeText(entry.tool), entry.input);
     if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} />;
-    if (isQuestionToolName(entry.tool)) return <div className="v2ThinkingLine" role="status" key={entry.id}>正在生成问题…</div>;
+    if (isQuestionToolName(entry.tool)) return !questionIsAnswered(entry.id, entry.turnId ?? undefined) && questionIsGenerating(entry)
+      ? <div className="v2ThinkingLine" role="status" key={entry.id}>正在生成问题…</div> : null;
     return (
       <article className="messageItem kind-tool type-toolCall live" key={entry.id}>
         <div className="messageMeta">{entry.completed ? "工具输出" : "调用工具"} · {entry.tool}</div>
@@ -10699,16 +10810,23 @@ export function App() {
       if (kind === "user") continue;
       if (kind === "tool" || kind === "reasoning") {
         if (kind === "reasoning" && !reasoningItemDisplayText(item)) continue;
-        pendingTools.push(item);
+        const live = kind === "tool" ? liveTools[item.id] : undefined;
+        pendingTools.push(live && live.threadId === temporaryAsk?.threadId && live.turnId === turn.id
+          ? { ...item, aggregatedOutput: live.output, completed: live.completed } : item);
         continue;
       }
       flushTools();
-      const text = stripInterruptArtifacts(itemText(item));
+      const liveParts = kind === "agent" && !temporaryCompletedTurnIds.has(turn.id)
+        ? Object.entries(liveDeltas).filter(([id, entry]) => entry.threadId === temporaryAsk?.threadId && entry.turnId === turn.id && (entry.sourceItemId ?? id) === item.id)
+          .sort(([a, left], [b, right]) => (left.sequence ?? liveTimelineSequence("agent", a)) - (right.sequence ?? liveTimelineSequence("agent", b)))
+        : [];
+      const text = stripInterruptArtifacts(liveParts.length ? liveParts.map(([, entry]) => entry.text).join("\n\n") : itemText(item));
       if (!text.trim() && kind === "agent") continue;
       rendered.push(
         <article className={messageClassName(item, kind === "agent" ? "temporaryAskAgent" : "")} key={`${turn.id}-${item.id}`}>
           <div className="messageMeta">{itemLabel(item)}</div>
-          <MarkdownMessage text={text || toolItemDetails(item)} projectId={temporaryAsk?.projectId} onOpenFileLink={openFilePreview} renderMath={kind === "agent"} />
+          {liveParts.length ? <LiveAgentStreamMessage text={text} projectId={temporaryAsk?.projectId} onOpenFileLink={openFilePreview} />
+            : <MarkdownMessage text={text || toolItemDetails(item)} projectId={temporaryAsk?.projectId} onOpenFileLink={openFilePreview} renderMath={kind === "agent"} />}
           <MessageImagePreviews item={item} projectId={temporaryAsk?.projectId} onOpenFileLink={openFilePreview} />
         </article>
       );
@@ -12140,9 +12258,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
         <div className="threadNoticeStack">
         {error ? (
-          <div className="errorBanner" onClick={() => setError("")}>
-            {error}
+          <div className="errorBanner" role="alert">
+            <span className="errorBannerMessage">{error}</span>
             {archiveBranchRetry&&archiveBranchRetry.threadId===selectedThread?.id?<button className="branchArchiveRetry" type="button" disabled={branchingThread} onClick={event=>{event.stopPropagation();if(archiveBranchRetry)void createBranchFromTurn({id:archiveBranchRetry.turnId},true);}}>精简较早的工具结果后分支</button>:null}
+            <button className="iconButton errorBannerDismiss" type="button" aria-label="关闭错误提示" title="关闭错误提示" onClick={() => setError("")}><X size={16} /></button>
           </div>
         ) : null}
 
@@ -12633,7 +12752,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               </aside>
             ) : null}
             <div className="conversationContent hasComposerAmbientGlow">
-              <ComposerAmbientGlow key={`ambient:${selectedUserId}`} theme={colorTheme} hasDraft={composerHasDraft} welcome={Boolean(selectedProject && !selectedThread && !openingThreadId && !openingThreadPresence.present && visiblePendingUserMessages.length === 0 && liveTimelineEntries.length === 0 && localMessages.length === 0)} />
+              <ComposerAmbientGlow key={`ambient:${selectedUserId}`} theme={colorTheme} hasDraft={composerHasDraft || Boolean(temporaryPrompt.trim())} welcome={Boolean(selectedProject && !selectedThread && !openingThreadId && !openingThreadPresence.present && visiblePendingUserMessages.length === 0 && liveTimelineEntries.length === 0 && localMessages.length === 0)} />
               {showPromptNavigator ? (
                 <nav
                   className="promptNavigator"
@@ -12798,7 +12917,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         <div className="temporaryAskHeaderText">
                           <span className="temporaryAskHeaderTitle">侧边聊天</span>
                           <span className={`temporaryAskHeaderState ${temporaryAsk.status}`}>
-                            {temporaryAsk.status === "running"
+                            {temporaryAsk.status === "closing" ? "正在关闭" : temporaryAsk.status === "running"
                               ? "实时处理中"
                               : temporaryAsk.status === "starting"
                                 ? "启动中"
@@ -12806,10 +12925,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                                   ? "已就绪"
                                   : "等待提问"}
                           </span>
-                          <small>关闭后自动删除，不会进入历史会话</small>
+                          <small>随主会话保存，切换会话时自动恢复</small>
                         </div>
                       </div>
-                      <button className="iconButton temporaryAskHeaderButton" type="button" onClick={closeTemporaryAsk} title="关闭并删除临时对话" aria-label="关闭并删除临时对话"><X size={16} /></button>
+                      <button className="iconButton temporaryAskHeaderButton" type="button" onClick={closeTemporaryAsk} disabled={temporaryAsk.status === "closing"} title="关闭并删除临时对话" aria-label="关闭并删除临时对话"><X size={16} /></button>
                     </header>
                     <div className="temporaryAskMessages messages">
                       <article className="messageItem kind-user type-userMessage temporaryAskQuote">
@@ -12836,7 +12955,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         ))}
                       {temporaryAsk.status === "starting" ? <div className="v2ThinkingLine">正在建立临时会话</div> : null}
                       {temporaryAsk.status === "running" ? <div className="v2ThinkingLine">正在思考</div> : null}
-                      {temporaryAsk.status === "error" ? <div className="v2ThinkingLine">本轮发送失败，可以修改后重试</div> : null}
+                      {temporaryAsk.error ? <div className="v2ThinkingLine" role="alert">{temporaryAsk.error}</div> : temporaryAsk.status === "error" ? <div className="v2ThinkingLine">本轮发送失败，可以修改后重试</div> : null}
                       <div ref={temporaryMessagesEndRef} className="messagesEnd" aria-hidden="true" />
                     </div>
                     <div className="composer temporaryAskComposer">
@@ -12846,14 +12965,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           onChange={setTemporaryPrompt}
                           onSubmit={sendTemporaryPrompt}
                           placeholder="随心输入"
-                          disabled={temporaryAsk.status === "starting" || temporaryAsk.status === "running"}
+                          disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
                         />
                         <div className="composerTools temporaryAskComposerTools">
                           <span className="temporarySelectionCount"><MessageSquare size={13} />1 个已选文本片段</span>
                           <ModelGroupedSelect
                             value={temporaryModelProfileId}
                             onChange={setTemporaryModelProfileId}
-                            disabled={temporaryAsk.status === "starting" || temporaryAsk.status === "running"}
+                            disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
                             profiles={modelProfiles}
                           />
                           <PolishedSelect<SandboxMode>
@@ -12864,10 +12983,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           />
                         </div>
                       </div>
-                      <button className="iconButton sendButton primary" type="button" onClick={sendTemporaryPrompt} disabled={!temporaryPrompt.trim() || temporaryAsk.status === "starting" || temporaryAsk.status === "running"} title="发送临时提问"><Send size={16} /></button>
+                      <button className="iconButton sendButton primary" type="button" onClick={sendTemporaryPrompt} disabled={!temporaryPrompt.trim() || ["starting", "running", "closing"].includes(temporaryAsk.status)} title="发送临时提问"><Send size={16} /></button>
                     </div>
                   </aside>
-                ), document.body) : null}
+                ), document.body, temporaryAsk.id) : null}
                 {temporaryClosePresence.present ? createPortal((
                   <div className={`temporaryCloseScrim uiExitLayer${temporaryClosePresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={temporaryClosePresence.closing} inert={temporaryClosePresence.closing} onMouseDown={(event) => { if (event.target === event.currentTarget) setTemporaryCloseConfirm(false); }}>
                     <section className="temporaryCloseDialog" role="dialog" aria-modal="true" aria-labelledby="temporary-close-title">
@@ -12966,7 +13085,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     }
                     if (kind === "tool" && isQuestionToolName(item.tool)) {
                       toolGroupIndex = flushToolGroup(toolGroupIndex, true);
-                      renderedHistoryItems.push(<div className="v2ThinkingLine" role="status" key={`${turn.id}-${item.id}-question-pending`}>正在生成问题…</div>);
+                      if (!questionIsAnswered(item.id, turn.id, items) && questionIsGenerating(item)) {
+                        renderedHistoryItems.push(<div className="v2ThinkingLine" role="status" key={`${turn.id}-${item.id}-question-pending`}>正在生成问题…</div>);
+                      }
                       continue;
                     }
                     if (kind === "tool" || kind === "reasoning") {

@@ -71,13 +71,15 @@ export const ComposerAmbientGlow = memo(function ComposerAmbientGlow({ theme, ha
       activity.recording(detail.recording);
     };
     const isEditor = (target: EventTarget | null) => target instanceof Element && Boolean(target.closest(".composerRichInput, textarea"));
+    const isComposerEditor = (target: EventTarget | null) => isEditor(target) && target instanceof Element
+      && (composer.contains(target) || Boolean(target.closest(".temporaryAskComposer")));
     const hasContent = (target: EventTarget | null) => content.current.hasDraft || Boolean(target instanceof HTMLTextAreaElement ? target.value.trim() : target instanceof Element && target.textContent?.replace(/\u200b/g, "").trim());
-    const input = (event: Event) => { if (isEditor(event.target)) activity.input(hasContent(event.target)); };
-    const compositionStart = (event: Event) => { if (isEditor(event.target)) activity.compositionStart(); };
-    const compositionEnd = (event: Event) => { if (isEditor(event.target)) activity.compositionEnd(hasContent(event.target)); };
+    const input = (event: Event) => { if (isComposerEditor(event.target)) activity.input(hasContent(event.target)); };
+    const compositionStart = (event: Event) => { if (isComposerEditor(event.target)) activity.compositionStart(); };
+    const compositionEnd = (event: Event) => { if (isComposerEditor(event.target)) activity.compositionEnd(hasContent(event.target)); };
     const focusIn = (event: Event) => {
-      // Warm only the small lazy module on focus; focus never makes the glow visible.
-      if (isEditor(event.target) && !motion.matches) void loadPaper().catch(() => {});
+      if (!isComposerEditor(event.target)) return;
+      if (!motion.matches) void loadPaper().catch(() => {});
     };
     const visibility = () => {
       if (document.hidden || !visible) {
@@ -93,11 +95,11 @@ export const ComposerAmbientGlow = memo(function ComposerAmbientGlow({ theme, ha
     };
     const observer = new IntersectionObserver(([entry]) => { visible = Boolean(entry?.isIntersecting); visibility(); });
     observer.observe(element);
-    composer.addEventListener("input", input);
+    document.addEventListener("input", input);
     composer.addEventListener(VOICE_AMBIENT_EVENT, voice);
-    composer.addEventListener("compositionstart", compositionStart);
-    composer.addEventListener("compositionend", compositionEnd);
-    composer.addEventListener("focusin", focusIn);
+    document.addEventListener("compositionstart", compositionStart);
+    document.addEventListener("compositionend", compositionEnd);
+    document.addEventListener("focusin", focusIn);
     document.addEventListener("visibilitychange", visibility);
     motion.addEventListener("change", motionChange);
     return () => {
@@ -106,11 +108,11 @@ export const ComposerAmbientGlow = memo(function ComposerAmbientGlow({ theme, ha
       activityRef.current = undefined;
       clearTimeout(stopTimer);
       observer.disconnect();
-      composer.removeEventListener("input", input);
+      document.removeEventListener("input", input);
       composer.removeEventListener(VOICE_AMBIENT_EVENT, voice);
-      composer.removeEventListener("compositionstart", compositionStart);
-      composer.removeEventListener("compositionend", compositionEnd);
-      composer.removeEventListener("focusin", focusIn);
+      document.removeEventListener("compositionstart", compositionStart);
+      document.removeEventListener("compositionend", compositionEnd);
+      document.removeEventListener("focusin", focusIn);
       document.removeEventListener("visibilitychange", visibility);
       motion.removeEventListener("change", motionChange);
       renderer.current?.dispose();

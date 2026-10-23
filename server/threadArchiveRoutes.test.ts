@@ -71,3 +71,27 @@ it('excludes native archives and deleted rows from normal workspace lists withou
     expect(listed.json().data.map((x:{id:string})=>x.id)).not.toContain('deleted');
   }finally{await app.close();store.close();fs.rmSync(root,{recursive:true,force:true});}
 });
+
+it('hides bound side threads from normal lists and rejects legacy automatic deletion of a child',async()=>{
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'bound-side-visibility-')),store=new ProjectStore(path.join(root,'test.sqlite'));
+  const project=store.createProject({name:'project',rootPath:root});
+  for(const id of ['main','child'])store.registerThreadOwner({threadId:id,userId:'admin',projectId:project.id,rootPath:root});
+  const side=store.sideChats.create('main','admin',project.id,'quote','sol');
+  store.sideChats.begin(side.id,'admin',project.id,'r','question',null);
+  store.sideChats.attach(side.id,'admin','r','child');
+  store.sideChats.accepted(side.id,'admin','r','turn');
+  store.sideChats.turn('child','turn',true);
+  vi.mocked(readArchivedThreadIndex).mockResolvedValue({available:true,incomplete:false,data:[]});
+  const bridge={request:async(method:string)=>method==='thread/list'?{data:[{id:'main'},{id:'child'}],nextCursor:null}:{}} as unknown as CodexBridge;
+  const app=Fastify();registerRoutes(app,bridge,store,{backgroundIndexing:false});
+  try{
+    const result=await app.inject({method:'GET',url:`/api/projects/${project.id}/threads?fast=false`});
+    expect(result.statusCode).toBe(200);expect(result.json().data.map((x:{id:string})=>x.id)).toEqual(['main']);
+    expect(result.json().hiddenThreadIds).toContain('child');
+    const legacyDelete=await app.inject({method:'DELETE',url:`/api/projects/${project.id}/threads/child`});
+    expect(legacyDelete.statusCode).toBe(409);expect(store.userCanAccessThread('child','admin',project.id)).toBe(true);
+    const parentDelete=await app.inject({method:'DELETE',url:`/api/projects/${project.id}/threads/main`});
+    expect(parentDelete.statusCode).toBe(200);expect(store.sideChats.get('main','admin',project.id)).toBeNull();
+    expect(store.userCanAccessThread('child','admin',project.id)).toBe(false);
+  }finally{await app.close();store.close();fs.rmSync(root,{recursive:true,force:true});}
+});

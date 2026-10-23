@@ -23,6 +23,7 @@ test('language servers and terminal descendants belong to editor, unrelated SSH 
 test('telemetry never writes arguments/secrets', () => {
   const logged = identity({ ...base, args: ['--token', 'SECRET'] });
   assert.equal(logged.owner, 'sample-user');
+  assert.equal(identity({ ...base, cwd: '/outside/users/other/project' }).owner, null);
   assert.equal(JSON.stringify(logged).includes('SECRET'), false);
   assert.equal('args' in logged, false);
 });

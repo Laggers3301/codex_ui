@@ -13,8 +13,9 @@ export const manualWorkspaceRoot = path.resolve(process.env.CODEX_WEB_USER_WORKS
 export async function text(file) { try { return await fs.readFile(file, 'utf8'); } catch { return ''; } }
 export function identity(p) {
   // Never persist argv: it may contain access tokens, passwords or user prompts.
+  const owner = path.relative(manualWorkspaceRoot, p.cwd).match(/^([\w-]+)(?:[\\/]|$)/)?.[1] ?? null;
   return { pid: p.pid, ppid: p.ppid, start: p.start, exe: p.exe, entry: p.entry,
-    cwd: p.cwd, cgroup: p.cgroup, owner: p.cwd.match(/\/users\/([\w-]+)(?:\/|$)/)?.[1] ?? null,
+    cwd: p.cwd, cgroup: p.cgroup, owner,
     rssMb: Math.round(p.rss / MiB), name: p.name };
 }
 export function classify(p) {

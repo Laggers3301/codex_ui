@@ -256,6 +256,7 @@ export interface DirectoryListResponse {
 
 export interface ThreadSummary {
   id: string;
+  answeredQuestionItemIds?: string[];
   sessionId: string;
   preview: string;
   name: string | null;
@@ -283,6 +284,8 @@ export interface ThreadSearchMatch {
   cursor: string;
   ordinal: number;
 }
+
+export type { SideChat, SideChatChange, SideChatStatus } from "../shared/sideChat";
 
 export interface ThreadPresentation {
   threadId: string;

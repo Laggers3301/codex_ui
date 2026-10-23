@@ -23,9 +23,11 @@ import { registerScheduledTaskMcp } from "./scheduledTaskMcp.js";
 import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
 import { createCrossAccountForkSnapshot } from "./crossAccountFork.js";
-import { assertLargeBranchMemory, BranchConflictError, BranchGate, copyLargeThreadBranch, isLegacyRollout, largeThreadForkBytes } from "./largeThreadFork.js";
+import { assertLargeBranchMemory, BranchConflictError, branchGate, copyLargeThreadBranch, isLegacyRollout, largeThreadForkBytes } from "./largeThreadFork.js";
 import {toolArchiveRoot,toolArchivePath,readToolArchiveSummary,type ToolArchiveSummary} from "./toolOutputArchive.js";
 import { DEFAULT_USER_ID, type ProjectStore, type ThreadPresentation } from "./db.js";
+import { registerSideChatRoutes } from "./sideChatRoutes.js";
+import { closeSideChat } from "./sideChats.js";
 import { listBrowsableDirectories } from "./directoryBrowser.js";
 import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { isContextCompactionItem, isGenericContextLossReply } from "./contextRecovery.js";
@@ -63,7 +65,6 @@ const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
 const maxThreadHistoryPageSize = 240;
 const handoffInFlightUsers = new Set<string>();
-const branchGate = new BranchGate();
 type HandoffJobPhase = "connecting" | "transferring" | "extracting" | "importing" | "completed" | "failed";
 type HandoffImportResult = Awaited<ReturnType<typeof importStagedUserHandoff>>;
 interface HandoffJob {
@@ -2877,6 +2878,7 @@ function deferLargeToolOutputs(threadValue: unknown): void {
 }
 
 export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore, options: { backgroundIndexing?: boolean; browserTools?: boolean } = {}): void {
+  registerSideChatRoutes(app, bridge, store, request => userIdFromRequest(request, store));
   const predictions=isAccountPoolBridge(bridge)?new ComposerPredictions(bridge):null;
   app.post<{Params:{id:string;threadId:string}}>("/api/projects/:id/threads/:threadId/prediction",async(request,reply)=>{
     const userId=userIdFromRequest(request,store),owner=store.getThreadOwner(request.params.threadId);
@@ -3043,7 +3045,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     if (!query || query.length > 512) return reply.code(400).send({ error: "Search requires 1–512 characters." });
     const projectId = request.query.projectId;
     if (projectId && !store.getProject(projectId, userId)) return reply.code(404).send({ error: "Project not found." });
-    const owners = store.listVisibleThreadOwnersForUser(userId).filter(owner => !projectId || owner.projectId === projectId);
+    const sideThreadIds = store.sideChats.threadIds(userId);
+    const owners = store.listVisibleThreadOwnersForUser(userId).filter(owner => (!projectId || owner.projectId === projectId) && !sideThreadIds.has(owner.threadId));
     const controller = new AbortController();
     const disconnected = () => { if (!reply.raw.writableEnded) controller.abort(); };
     reply.raw.once("close", disconnected);
@@ -3751,6 +3754,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         // sessions imported into `codex1 迁移会话` must never leak into the
         // personal `我的工作区` list for the same user.
         const ownedThreadIds = store.ownedThreadIds(userId, project.id);
+        const sideThreadIds = store.sideChats.threadIds(userId, project.id);
+        for (const id of sideThreadIds) ownedThreadIds.delete(id);
         const locallyArchivedIds = store.locallyArchivedThreadIds(userId, project.id);
         // Native archive moves/metadata are also authoritative. The fast JSONL
         // summary path must not resurrect them merely because Web flags lag.
@@ -3761,11 +3766,11 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           return ownedThreadIds.has(item.id)&&!(decision&&!decision.archived&&decision.at>=Number(item.updatedAt??0));
         });
         for(const item of nativeArchives)locallyArchivedIds.add(item.id);
-        const hiddenThreadIds=[...new Set([...locallyArchivedIds,...store.unusedThreadIds(userId,project.id)])];
+        const hiddenThreadIds=[...new Set([...locallyArchivedIds,...store.unusedThreadIds(userId,project.id),...sideThreadIds])];
         reply.header('Cache-Control','no-store');
         const searchTerm = normalizeSearchTerm(request.query.search);
         if (searchTerm) {
-          const owners = store.listVisibleThreadOwnersForUser(userId).filter(owner => owner.projectId === project.id && !locallyArchivedIds.has(owner.threadId));
+          const owners = store.listVisibleThreadOwnersForUser(userId).filter(owner => owner.projectId === project.id && !locallyArchivedIds.has(owner.threadId) && !sideThreadIds.has(owner.threadId));
           const result = await searchChatThreads(owners, searchTerm, { limit: 80 });
           return {
             ...result,
@@ -4122,6 +4127,15 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       return reply.code(404).send({ error: "Project not found." });
     }
 
+    // Older tabs used the normal delete endpoint to "clean up" temporary
+    // threads. Bound side chats can only be closed through their parent.
+    const boundChild = store.sideChats.forThread(request.params.threadId);
+    if (boundChild?.userId === userId && boundChild.projectId === project.id) return reply.code(409).send({ error: "请从所属主会话的侧边栏关闭此会话。" });
+    const side = store.sideChats.get(request.params.threadId, userId, project.id);
+    if (side && side.userId === userId && side.projectId === project.id) {
+      try { await closeSideChat(bridge, store, side); }
+      catch (error) { return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) }); }
+    }
     const unusedThread = store.softDeleteThread(
       request.params.threadId,
       userId,
@@ -4614,7 +4628,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         const clientThread = asRecord(result).thread;
         deferLargeToolOutputs(clientThread);
         return {
-          thread: applyThreadPresentation(clientThread, presentation, modelPresentation),
+          thread: { ...asRecord(applyThreadPresentation(clientThread, presentation, modelPresentation)),
+            answeredQuestionItemIds: store.answeredQuestionItemIds(request.params.threadId, userId) },
           history: indexedPage.history
         };
       } else {
@@ -4628,7 +4643,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const page = paginateThreadPayload(result, input.before, input.limit);
       return {
         ...page,
-        thread: applyThreadPresentation(page.thread, presentation, modelPresentation)
+        thread: { ...asRecord(applyThreadPresentation(page.thread, presentation, modelPresentation)),
+          answeredQuestionItemIds: store.answeredQuestionItemIds(request.params.threadId, userId) }
       };
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });

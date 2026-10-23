@@ -1,4 +1,5 @@
 import type { RpcEnvelope } from "./types.js";
+import { isQuestionToolName, readLiveQuestionNotification } from "../src/questionTool.js";
 
 type LiveTurnStatus = "running" | "completed";
 
@@ -218,6 +219,13 @@ export class LiveStateStore {
       const item = asRecord(params.item);
       const eventType = typedItemEvent?.[1] ?? item.type;
       const eventPhase = typedItemEvent?.[2] ?? genericItemEvent?.[1];
+      const question = readLiveQuestionNotification(envelope);
+      if (question) {
+        const tool = this.recordToolItem({ ...params, item: {
+          ...item, type: "toolCall", tool: question.tool, input: question.input
+        } }, question.completed);
+        return tool ? { kind: "tool", item: { ...tool, input: livePreview(tool.input), output: livePreview(tool.output) }, historyItem: tool } : null;
+      }
       if (eventType === "agentMessage" || item.type === "agentMessage") {
         const id = stringOrNull(item.id) ?? stringOrNull(params.itemId);
         const content = Array.isArray(item.content) ? item.content.map(value => {
@@ -306,6 +314,7 @@ export class LiveStateStore {
     if (!sourceItemId || !delta) {
       return null;
     }
+    if (isQuestionToolName(this.toolItems.get(sourceItemId)?.tool)) return null;
 
     const now = new Date().toISOString();
     const { threadId, turnId } = turnFields(params);

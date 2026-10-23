@@ -12,6 +12,7 @@ import { authenticatedUserFromHeaders } from "./auth.js";
 import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
 import { LiveStateStore } from "./liveState.js";
 import { isUserInputRequest, validateUserInputResponse } from "./userInput.js";
+import { questionToolOutput } from "./questionAnswers.js";
 import { AppError } from "./appErrors.js";
 import { TurnRetryQueue, publicRecovery } from "./turnRetry.js";
 import { notificationIsContextCompaction, RawCompactFilter } from "./rawNotificationFilter.js";
@@ -50,6 +51,8 @@ import { meaningfulTurnProgressMethod, TurnWatchdog, type WatchdogProbeClaim, ty
 import { LatestTaskQueue } from "./streamBatch.js";
 import { requestedServiceTier, requestedTurnServiceTier } from "./serviceTier.js";
 import type { LiveAgentMessage } from "./liveState.js";
+import { reconcileSideChat, settleClosedSideChat, SideChatError } from "./sideChats.js";
+import { forkSideChatContext } from "./sideChatFork.js";
 
 const commandSchema = z.array(z.string()).min(1);
 const threadStartContextConfigSchema = z.object({
@@ -491,6 +494,8 @@ function runDedupedPrompt<T>(
 
 export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, store: ProjectStore, browserService?: BrowserService): WebSocketServer {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const unsubscribeSideChats = store.sideChats.subscribe(change => sendToUser(wss, change.userId, { type: "side.chat", data: change }));
+  wss.on("close", unsubscribeSideChats);
   // Canonical native rollouts retain every delta. The UI journal checkpoints
   // snapshots at most every 200ms, plus first content and turn boundaries.
   const streamJournal = new LatestTaskQueue(200, error => console.warn("Stream journal checkpoint failed", error));
@@ -520,6 +525,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   };
   const turnWatchdog = new TurnWatchdog();
   const resourceStops = new Map<string, AppError>();
+  let socketServerClosed = false;
   const retries = new TurnRetryQueue(store, {
     busy: threadId => guards.activeTurnsByThread.has(threadId) || guards.startingThreads.has(threadId),
     changed: state => sendToUser(wss, state.userId, { type: "turn.recovery", data: publicRecovery(state) }),
@@ -543,10 +549,10 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
   });
   guards.retries = retries;
-  wss.on("close", () => retries.close());
+  wss.on("close", () => { socketServerClosed = true; retries.close(); });
   const startingQueuedThreads = new Set<string>();
   const startNextQueuedTurn = async (owner: string, threadId: string): Promise<void> => {
-    if (retries.pending(threadId)) return;
+    if (socketServerClosed || retries.pending(threadId)) return;
     if (startingQueuedThreads.has(threadId) || guards.activeTurnsByThread.has(threadId) || guards.startingThreads.has(threadId)) return;
     startingQueuedThreads.add(threadId);
     try {
@@ -706,6 +712,16 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       streamJournal.flushPrefix(JSON.stringify([owner,turnId]).slice(0,-1)+",");
     }
     const threadIdForWatchdog = notificationThreadId(message);
+    if (threadIdForWatchdog && turnId && ["turn/started", "turn/completed"].includes(message.method ?? "")) {
+      const side = store.sideChats.forThread(threadIdForWatchdog);
+      if (side?.status === "closing") {
+        void settleClosedSideChat(bridge, store, side.id, side.userId, threadIdForWatchdog, message.method === "turn/started" ? turnId : null)
+          .catch(error => console.error("[side-chat.close.failed]", error instanceof Error ? error.message : String(error)));
+      } else {
+        const turn = asRecord(asRecord(message.params).turn);
+        store.sideChats.turn(threadIdForWatchdog, turnId, message.method === "turn/completed", turn.status === "failed" ? pickString(asRecord(turn.error).message, "侧边会话执行失败。") : undefined);
+      }
+    }
     const accountId = notificationAccountId(message);
     if (message.method === "serverRequest/resolved") {
       const requestId = asRecord(message.params).requestId as number | string | undefined;
@@ -715,7 +731,12 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         pendingApprovalTurns.delete(requestId);
         if (pending) {
           const progress = turnWatchdog.progress(pending.userId, pending.accountId, pending.threadId, pending.turnId ?? "", "serverRequest/resolved");
-          if (progress) sendTurnProgress(progress.turn, "active");
+          if (progress) {
+            const waiting = bridge.getPendingServerRequests().some(request => isUserInputRequest(request.method)
+              && asRecord(request.params).threadId === pending.threadId && asRecord(request.params).isBlocking !== false);
+            if (waiting) turnWatchdog.setPhase(owner, pending.accountId, pending.threadId, pending.turnId, "waiting_user_input");
+            sendTurnProgress(progress.turn, waiting ? "waiting_user_input" : "active");
+          }
         }
       }
     }
@@ -1020,8 +1041,10 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
           const accountId = notificationAccountId(request as RpcEnvelope);
           pendingApprovalTurns.set(request.id, { userId: owner, accountId, threadId, turnId });
           const phase = isUserInputRequest(request.method) ? "waiting_user_input" : "waiting_approval";
-          const waiting = turnWatchdog.setPhase(owner, accountId, threadId, turnId, phase);
-          if (waiting) sendTurnProgress(waiting, phase);
+          if (!isUserInputRequest(request.method) || asRecord(request.params).isBlocking !== false) {
+            const waiting = turnWatchdog.setPhase(owner, accountId, threadId, turnId, phase);
+            if (waiting) sendTurnProgress(waiting, phase);
+          }
           if (!isUserInputRequest(request.method)) void sendUserPush(store, owner, {
             type: "approval",
             threadId,
@@ -1110,7 +1133,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission, (requestId) => {
         const pending = pendingApprovalTurns.get(requestId);
         if (pending) processBridgeNotification({ method: "serverRequest/resolved", accountId: pending.accountId, params: { threadId: pending.threadId, requestId } } as RpcEnvelope);
-      }, browserService);
+      }, browserService, (threadId, itemId) => sendToUser(wss, sessionUserId, {
+        type: "question.answered", data: { threadId, itemId }
+      }));
     });
     ws.on("close", () => {
       for (const [processId, socket] of processSockets) {
@@ -1142,7 +1167,8 @@ async function handleClientMessage(
   startNextQueuedTurn: (owner: string, threadId: string) => Promise<void>,
   steerQueuedSubmission: (owner: string, threadId: string, expectedTurnId: string, queuedSubmissionId: string) => Promise<unknown>,
   onServerRequestResolved: (requestId: number | string) => void,
-  browserService?: BrowserService
+  browserService?: BrowserService,
+  onQuestionAnswered?: (threadId: string, itemId: string) => void
 ): Promise<void> {
   let message: SocketClientMessage;
   try {
@@ -1176,10 +1202,15 @@ async function handleClientMessage(
       }
 
       case "thread.start": {
-        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId);
         const project = getProjectOrThrow(store, message.projectId, sessionUserId);
-        const prompt = pickString(message.prompt).trim();
-        if (!prompt) {
+        const question = pickString(message.prompt).trim();
+        const sideChatId = pickString(message.sideChatId);
+        const storedSide = sideChatId ? store.sideChats.byId(sideChatId, sessionUserId) : null;
+        const side = storedSide ? await reconcileSideChat(bridge, store, storedSide) : null;
+        if (sideChatId && !side) throw new SideChatError("侧边会话已关闭或不可访问。", 403);
+        await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, side?.parentThreadId);
+        const prompt = side ? `请结合主会话上下文，基于下面选中的文字回答问题。\n\n选中文字：\n${side.selectedText}\n\n用户问题：\n${question}` : question;
+        if (!question) {
           throw new Error("Prompt is required.");
         }
         const model = pickString(message.model, project.defaultModel).trim() || project.defaultModel;
@@ -1194,11 +1225,12 @@ async function handleClientMessage(
           guards,
           sessionUserId,
           requestId,
-          `new-thread:${project.id}`,
+          sideChatId ? `new-side-thread:${sideChatId}` : `new-thread:${project.id}`,
           prompt,
           model,
           reasoningEffort,
           async () => {
+            if (sideChatId) store.sideChats.begin(sideChatId, sessionUserId, project.id, requestId, question, null, pickString(message.sideChatModelProfileId));
             const browserMcp = browserService ? mintBrowserMcpConfig(sessionUserId, project.id) : null;
             const startParams = {
               ...requestedServiceTier(message.serviceTier),
@@ -1215,9 +1247,14 @@ async function handleClientMessage(
               developerInstructions: contextPinDeveloperInstructions(requestedContextPin)
             };
             const allowedAccountId = allowedAccountForUser(sessionUserId);
-            const thread = allowedAccountId && isAccountPoolBridge(bridge)
-              ? await bridge.startThreadOnAccount(allowedAccountId, startParams)
-              : await bridge.request("thread/start", startParams);
+            // Fork on the parent's account so native history (including
+            // compacted context) is inherited without copying it into a prompt.
+            // Defer its goal until we can clear the child's copy below.
+            const thread = side
+              ? await forkSideChatContext(bridge, store, sessionUserId, project.id, side.parentThreadId, startParams, reasoningEffort)
+              : allowedAccountId && isAccountPoolBridge(bridge)
+                ? await bridge.startThreadOnAccount(allowedAccountId, startParams)
+                : await bridge.request("thread/start", startParams);
             const threadId = (thread as { thread?: { id?: string } }).thread?.id;
             if (!threadId) {
               throw new Error("Codex did not return a thread id.");
@@ -1230,6 +1267,21 @@ async function handleClientMessage(
               model,
               reasoningEffort
             });
+            // A side question inherits context, not the parent's autonomous
+            // task. Never resume that goal after answering the side question.
+            if (side) {
+              try { await bridge.request("thread/goal/clear", { threadId, origin: "automatic" }); }
+              catch (error) {
+                // Keep the question retryable without exposing a child that
+                // might still carry the parent's goal to a later turn/start.
+                store.softDeleteThread(threadId, sessionUserId, project.id);
+                throw error;
+              }
+            }
+            if (sideChatId && !store.sideChats.attach(sideChatId, sessionUserId, requestId, threadId)) {
+              await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, null);
+              throw new SideChatError("侧边会话已关闭，本次创建已取消。");
+            }
             store.setThreadExecutionSettings(threadId, sessionUserId,
               pickSandbox(message.sandbox, project.defaultSandbox), pickApprovalPolicy(message.approvalPolicy, project.defaultApprovalPolicy));
             if (browserMcp?.bindingId) bindBrowserMcpThread(browserMcp.bindingId, threadId, store);
@@ -1259,7 +1311,7 @@ async function handleClientMessage(
               ...requestedTurnServiceTier(message.serviceTier),
               threadId,
               input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames, message.documentReference),
-              collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
+              collaborationMode: requestedCollaborationMode(message.collaborationMode ?? (side ? "default" : undefined), model, reasoningEffort),
               cwd: project.rootPath,
               approvalPolicy: pickString(message.approvalPolicy, project.defaultApprovalPolicy),
               sandboxPolicy: sandboxPolicy(project, pickSandbox(message.sandbox, project.defaultSandbox)),
@@ -1270,15 +1322,27 @@ async function handleClientMessage(
                 ...await scopedHookTrustConfig(bridge, store, sessionUserId, project, threadId)
               }
             };
+            if (sideChatId && store.sideChats.byId(sideChatId, sessionUserId)?.status === "closing") {
+              await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, null);
+              throw new SideChatError("侧边会话已关闭，本次提问已取消。");
+            }
             guards.retries?.watch(sessionUserId, threadId, turnParams);
             let turn: unknown;
             try { turn = await bridge.request("turn/start", turnParams); }
             catch (error) {
+              if (sideChatId && store.sideChats.byId(sideChatId, sessionUserId)?.status === "closing") {
+                await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, null);
+                throw error;
+              }
               guards.retries?.failed(sessionUserId, threadId, `pending:${requestId}`, error, true, false);
               if (AppError.from(error).retryable && guards.retries?.pending(threadId)) return { thread, queuedForRetry: true };
               throw error;
             }
             rememberAcceptedTurn(guards, threadId, requestId, turn);
+            if (sideChatId && !store.sideChats.accepted(sideChatId, sessionUserId, requestId, turnIdFromStartResult(turn))) {
+              await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, turnIdFromStartResult(turn));
+              throw new SideChatError("侧边会话已关闭，本次提问已停止。");
+            }
             store.touchThreadOwner(threadId);
             return { thread, turn };
           }
@@ -1299,8 +1363,18 @@ async function handleClientMessage(
         const owner = store.getThreadOwner(threadId);
         const ownerProject = owner ? store.getProject(owner.projectId, sessionUserId) : null;
         const modelDefaults = ownerProject ?? project;
-        const model = owner?.modelOverride ?? modelDefaults.defaultModel;
-        const reasoningEffort = owner?.reasoningEffortOverride ?? modelDefaults.defaultReasoningEffort;
+        const sideChatId = pickString(message.sideChatId);
+        const boundSide = store.sideChats.forThread(threadId);
+        if (boundSide && boundSide.id !== sideChatId) throw new SideChatError("请从主会话的侧边栏继续此会话。", 403);
+        if (boundSide) await reconcileSideChat(bridge, store, boundSide);
+        const previousModel = owner?.modelOverride ?? modelDefaults.defaultModel;
+        const previousEffort = owner?.reasoningEffortOverride ?? modelDefaults.defaultReasoningEffort;
+        const model = boundSide ? pickString(message.model, previousModel).trim() || previousModel : previousModel;
+        const reasoningEffort = boundSide ? pickReasoningEffort(message.reasoningEffort, previousEffort) : previousEffort;
+        if (boundSide && isAccountPoolBridge(bridge)) {
+          await bridge.resolveThreadAccount(threadId);
+          if (!bridge.canThreadUseModel(threadId, model)) throw new SideChatError('所选模型不属于侧边会话供应商。请先在主会话创建跨供应商分支，再使用侧边提问。');
+        }
         const savedExecution = store.getThreadExecutionSettings(threadId, sessionUserId);
         const executionSandbox = pickSandbox(message.sandbox, savedExecution?.sandbox ?? modelDefaults.defaultSandbox);
         const executionApproval = pickApprovalPolicy(message.approvalPolicy, savedExecution?.approvalPolicy ?? modelDefaults.defaultApprovalPolicy);
@@ -1314,6 +1388,7 @@ async function handleClientMessage(
           reasoningEffort,
           async () => {
             assertNoActiveTurn(guards, threadId);
+            if (sideChatId) store.sideChats.begin(sideChatId, sessionUserId, owner?.projectId ?? project.id, requestId, prompt, threadId, pickString(message.sideChatModelProfileId));
             guards.retries?.cancel(sessionUserId, threadId);
             guards.startingThreads.add(threadId);
             try {
@@ -1357,9 +1432,17 @@ async function handleClientMessage(
                 }
               };
               guards.retries?.watch(sessionUserId, threadId, turnParams);
+              if (sideChatId && store.sideChats.byId(sideChatId, sessionUserId)?.status === "closing") {
+                await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, null);
+                throw new SideChatError("侧边会话已关闭，本次提问已取消。");
+              }
               const turn = await bridge.request("turn/start", turnParams, 30_000);
               rememberAcceptedTurn(guards, threadId, requestId, turn);
-              if (!owner?.modelOverride || !owner.reasoningEffortOverride) {
+              if (sideChatId && !store.sideChats.accepted(sideChatId, sessionUserId, requestId, turnIdFromStartResult(turn))) {
+                await settleClosedSideChat(bridge, store, sideChatId, sessionUserId, threadId, turnIdFromStartResult(turn));
+                throw new SideChatError("侧边会话已关闭，本次提问已停止。");
+              }
+              if (boundSide || !owner?.modelOverride || !owner.reasoningEffortOverride) {
                 store.setThreadModelConfig(threadId, sessionUserId, model, reasoningEffort);
               }
               store.touchThreadOwner(threadId);
@@ -1743,6 +1826,41 @@ async function handleClientMessage(
         break;
       }
 
+      case "question.respond": {
+        const threadId = pickString(message.threadId), itemId = pickString(message.itemId);
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        const project = getProjectOrThrow(store, message.projectId, sessionUserId);
+        const owner = store.getThreadOwner(threadId)!;
+        if (!itemId || owner.projectId !== project.id) throw new Error("答案与当前会话不匹配，请刷新会话。");
+        const data = await guards.requestDeduper.run({ userId: sessionUserId, requestId }, async () => {
+          const question = await questionToolOutput(store, threadId, itemId, message.answers);
+          const saved = store.getQuestionAnswer(threadId, itemId, sessionUserId);
+          if (saved !== null) {
+            if (JSON.stringify(saved) !== JSON.stringify(question.answers)) throw new Error("该问题已经回答，请刷新会话。");
+            return { alreadyAnswered: true };
+          }
+          // A native request always owns its reply, including nonblocking input.
+          if (bridge.getPendingServerRequests().some(pending => isUserInputRequest(pending.method)
+            && asRecord(pending.params).threadId === threadId && asRecord(pending.params).itemId === itemId)) {
+            throw new Error("该问题已同步为原生提问，请刷新会话后再回答。");
+          }
+          await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, threadId);
+          const execution = executionSettingsOverrides(store.getThreadExecutionSettings(threadId, sessionUserId));
+          await resumeThreadIfUnloaded(bridge, threadId, owner.rootPath, browserMcpForThread(threadId), execution);
+          const params = { threadId, input: [], toolOutput: question.toolOutput,
+            model: owner.modelOverride ?? project.defaultModel,
+            effort: owner.reasoningEffortOverride ?? project.defaultReasoningEffort };
+          const turn = await bridge.request("turn/start", params, 30_000);
+          guards.retries?.watch(sessionUserId, threadId, params);
+          rememberAcceptedTurn(guards, threadId, requestId, turn);
+          store.recordQuestionAnswer(threadId, itemId, sessionUserId, question.answers);
+          return { accepted: true };
+        }, { serializeKey: "question:" + threadId + ":" + itemId });
+        onQuestionAnswered?.(threadId, itemId);
+        send(ws, { type: "ack", requestId, ok: true, data });
+        break;
+      }
+
       case "userInput.respond":
       case "approval.respond": {
         const responseId = message.codexRequestId as number | string | undefined;
@@ -1761,6 +1879,10 @@ async function handleClientMessage(
         }
         const result = message.type === "userInput.respond" ? validateUserInputResponse(pending.params, message.result) : message.result;
         bridge.respondToServerRequest(responseId, result);
+        if (message.type === "userInput.respond") {
+          const params = asRecord(pending.params);
+          store.recordQuestionAnswer(pickString(params.threadId), pickString(params.itemId), sessionUserId, result);
+        }
         onServerRequestResolved(responseId);
         send(ws, { type: "ack", requestId, ok: true });
         break;
@@ -1770,6 +1892,12 @@ async function handleClientMessage(
         throw new Error(`Unsupported socket message type: ${message.type}`);
     }
   } catch (error) {
+    const sideChatId = pickString(message.sideChatId);
+    if (sideChatId) {
+      const side = store.sideChats.byId(sideChatId, sessionUserId);
+      if (side?.status === "closing" && !side.threadId) store.sideChats.forget(side);
+      else store.sideChats.failed(sideChatId, sessionUserId, requestId, error);
+    }
     const applicationError = AppError.from(error);
     const threadId = pickString(message.threadId);
     if (message.type === "turn.start" && threadId && store.getThreadOwner(threadId)?.userId === sessionUserId && !guards.activeTurnsByThread.has(threadId)) {

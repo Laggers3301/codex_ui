@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createAmbientActivity } from "../src/ambient/ambientActivity.ts";
 
-test("mount/focus alone is idle, a real draft stays active even after long pauses", t => {
+test("mount alone is idle, a real draft stays active even after long pauses", t => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const changes = [];
   const activity = createAmbientActivity(value => changes.push(value));
@@ -18,12 +18,13 @@ test("sending/clearing fades once and a later draft starts again", () => {
   activity.sync(true, false);
   assert.deepEqual(changes, [true, false, true]); activity.dispose();
 });
-test("empty homepage welcomes the user, selecting an existing thread hides it", () => {
+test("welcome fades after clearing a draft and returns only on a new welcome view", () => {
   const changes = [];
   const activity = createAmbientActivity(value => changes.push(value));
   activity.sync(false, true); activity.sync(true, true); activity.sync(false, true);
-  assert.deepEqual(changes, [true]);
-  activity.sync(false, false); assert.deepEqual(changes, [true, false]); activity.dispose();
+  assert.deepEqual(changes, [true, false]);
+  activity.sync(false, false); assert.deepEqual(changes, [true, false]);
+  activity.sync(false, true); assert.deepEqual(changes, [true, false, true]); activity.dispose();
 });
 test("Chinese IME composition stays active and cancels cleanly without committed text", () => {
   const changes = [];
@@ -32,6 +33,28 @@ test("Chinese IME composition stays active and cancels cleanly without committed
   activity.compositionStart(); activity.compositionEnd(true);
   activity.sync(false, false);
   assert.deepEqual(changes, [true, false, true, false]); activity.dispose();
+});
+test("slow IME preedit stays active through unrelated empty-draft sync", () => {
+  const changes = [];
+  const activity = createAmbientActivity(value => changes.push(value));
+  activity.sync(false, true);
+  activity.compositionStart();
+  activity.sync(false, false);
+  activity.sync(false, false);
+  assert.deepEqual(changes, [true]);
+  activity.compositionEnd(false);
+  assert.deepEqual(changes, [true, false]);
+  activity.dispose();
+});
+test("clearing a draft does not relight on later empty-draft updates", () => {
+  const changes = [];
+  const activity = createAmbientActivity(value => changes.push(value));
+  activity.sync(false, false);
+  activity.input(true);
+  assert.deepEqual(changes, [true]);
+  activity.input(false); activity.sync(false, false); activity.input(false);
+  assert.deepEqual(changes, [true, false]);
+  activity.dispose();
 });
 test("sending during composition still clears the glow", () => {
   const changes = [];

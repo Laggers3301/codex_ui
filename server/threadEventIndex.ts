@@ -596,7 +596,7 @@ export function locateIndexedThreadItem(threadId: string, itemId: string) {
   return row?.ordinal ? { ordinal: Number(row.ordinal), turnId: String(row.turn_id), cursor: encodeCursor(threadId, Number(row.ordinal) + 1) } : null;
 }
 
-export async function readIndexedThreadItem(filePath: string, threadId: string, itemId: string): Promise<JsonRecord | null> {
+export async function readIndexedThreadItem(filePath: string, threadId: string, itemId: string, options: { preferCall?: boolean } = {}): Promise<JsonRecord | null> {
   await warmThreadIndex(filePath, threadId);
   const row = db.prepare(`
     SELECT turn_id, start_offset, end_offset FROM thread_records
@@ -613,7 +613,9 @@ export async function readIndexedThreadItem(filePath: string, threadId: string, 
   for (const turnValue of turns) {
     const turn = turnValue as JsonRecord;
     const items = Array.isArray(turn.items) ? turn.items : [];
-    const item = items.find((value) => (value as JsonRecord).type === "toolCallOutput" && (value as JsonRecord).callId === itemId)
+    const call = options.preferCall ? items.find(value => (value as JsonRecord).type === "toolCall"
+      && (String((value as JsonRecord).id ?? "") === itemId || (value as JsonRecord).callId === itemId)) : undefined;
+    const item = call ?? items.find((value) => (value as JsonRecord).type === "toolCallOutput" && (value as JsonRecord).callId === itemId)
       ?? items.find((value) => String((value as JsonRecord).id ?? "") === itemId || (value as JsonRecord).callId === itemId);
     if (item && typeof item === "object") return item as JsonRecord;
   }

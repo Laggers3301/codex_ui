@@ -39,7 +39,7 @@ function Fixture() {
     return () => { input.current?.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true })); };
   }, [running]);
   return <main className="ambientPreview">
-    <header><h1>输入弥散光 · 隔离预览</h1><p>草稿还在就保持流动；发送／清空后淡出。新会话首页显示欢迎光晕。不连接生产会话。</p></header>
+    <header><h1>输入弥散光 · 隔离预览</h1><p>输入文字或中文预编辑时显示光效，清空文字或发送后淡出。不连接生产会话。</p></header>
     <nav aria-label="预览控制">
       <button onClick={() => setTheme(value => value === "dark" ? "light" : "dark")}>切换白天／黑夜</button>
       <button onClick={() => setDesktop(value => !value)}>切换手机／桌面</button>

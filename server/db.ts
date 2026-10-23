@@ -6,6 +6,7 @@ import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
 import type { CreateProjectInput, LocalSendSettings, Project, ReasoningEffort, UpdateLocalSendSettingsInput, UpdateProjectInput, UserProfile } from "./types.js";
 import type { TurnRecoveryState } from "./turnRetry.js";
+import { SideChatStore } from "./sideChats.js";
 
 export const ADMIN_USER_ID = "admin";
 export const DEFAULT_USER_ID = ADMIN_USER_ID;
@@ -237,6 +238,7 @@ function toUnusedThread(row: UnusedThreadRow): UnusedThread {
 
 export class ProjectStore {
   private readonly db: DatabaseSync;
+  readonly sideChats: SideChatStore;
 
   constructor(dbPath = path.join(serverConfig.dataDir, "codex-web.sqlite")) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -266,6 +268,28 @@ export class ProjectStore {
       thread_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
       sandbox_mode TEXT NOT NULL, approval_policy TEXT NOT NULL, updated_at TEXT NOT NULL
     )`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS question_answers (
+      thread_id TEXT NOT NULL, item_id TEXT NOT NULL, user_id TEXT NOT NULL,
+      answer_json TEXT NOT NULL, PRIMARY KEY(thread_id, item_id)
+    )`);
+    this.sideChats = new SideChatStore(this.db, this);
+  }
+
+  getQuestionAnswer(threadId: string, itemId: string, userId: string): unknown | null {
+    const row = this.db.prepare("SELECT answer_json FROM question_answers WHERE thread_id = ? AND item_id = ? AND user_id = ?")
+      .get(threadId, itemId, userId) as { answer_json: string } | undefined;
+    return row ? JSON.parse(row.answer_json) : null;
+  }
+
+  recordQuestionAnswer(threadId: string, itemId: string, userId: string, answer: unknown): void {
+    if (this.getThreadOwner(threadId)?.userId !== userId) throw new Error("Question does not belong to this user.");
+    this.db.prepare("INSERT INTO question_answers VALUES (?, ?, ?, ?) ON CONFLICT(thread_id, item_id) DO NOTHING")
+      .run(threadId, itemId, userId, JSON.stringify(answer));
+  }
+
+  answeredQuestionItemIds(threadId: string, userId: string): string[] {
+    return (this.db.prepare("SELECT item_id FROM question_answers WHERE thread_id = ? AND user_id = ?")
+      .all(threadId, userId) as { item_id: string }[]).map(row => row.item_id);
   }
 
   getThreadExecutionSettings(threadId: string, userId: string): { sandbox: Project["defaultSandbox"]; approvalPolicy: Project["defaultApprovalPolicy"] } | null {
@@ -960,6 +984,7 @@ export class ProjectStore {
            deleted_at = excluded.deleted_at`
       )
       .run(cleanThreadId, userId, owner.projectId, owner.rootPath, deletedAt);
+    this.sideChats.forgetForThread(cleanThreadId);
     return this.getUnusedThread(cleanThreadId, userId);
   }
 
