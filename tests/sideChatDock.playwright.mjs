@@ -14,7 +14,7 @@ const ready = (child, pattern) => new Promise((resolve, reject) => {
   child.stdout.on("data", chunk => { text += chunk; const result = pattern(text); if (result) { clearTimeout(timer); resolve(result); } });
   child.once("exit", code => { clearTimeout(timer); reject(new Error("fixture exit " + code)); });
 });
-const evidence = "../data/backend/side-chat-dock-20261024";
+const evidence = "./output/qa/side-chat-dock-20261024";
 await fs.mkdir(evidence, { recursive: true });
 try {
   const backend = start(["--import", "tsx/esm", "tests/boundSideChats.server.ts"]);

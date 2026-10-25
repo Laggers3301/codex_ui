@@ -6,11 +6,11 @@ const origin = process.env.QA_ORIGIN ?? "http://127.0.0.1:5216";
 let productionCookie = null;
 if (process.env.QA_ORIGIN) {
   assert.equal(origin, "http://127.0.0.1:4574", "production build QA is loopback only");
-  const secret = (await fs.readFile(new URL("../../data/auth/session-secret", import.meta.url), "utf8")).trim();
+  const secret = (await fs.readFile(new URL("../data/auth/session-secret", import.meta.url), "utf8")).trim();
   const payload = Buffer.from(JSON.stringify({ u: "qa-user", exp: Date.now() + 180000 })).toString("base64url");
   productionCookie = payload + "." + createHmac("sha256", secret).update(payload).digest("base64url");
 }
-const evidence = "../data/backend/tool-motion-app-20261024";
+const evidence = process.env.QA_EVIDENCE ?? "./output/qa/tool-motion-app-20261024";
 await fs.mkdir(evidence, { recursive: true });
 const project = { id: "motion-project", name: "工具动效验收", rootPath: "/test", userId: "sample-user", defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "medium", defaultSandbox: "danger-full-access", defaultApprovalPolicy: "never" };
 const thread = { id: "motion-thread", name: "完整会话工具动效", cwd: "/test", updatedAt: 1, createdAt: 1, status: "active", turns: [{ id: "motion-turn", status: "running", items: [{ id: "user", type: "userMessage", text: "验证延迟到达的工具调用和数字基线" }] }] };
@@ -22,6 +22,8 @@ for (const [engine, type] of [["chromium", chromium], ["webkit", webkit]]) {
   catch (error) { if (engine === "webkit" && /Executable doesn't exist|libavif\.so\.13/.test(error.message)) { results.push({ engine, unavailable: true, reason: "Local WebKit runtime missing its executable or libavif.so.13; not tested on iOS Safari" }); continue; } throw error; }
   try {
     for (const theme of ["dark", "light"]) for (const mobile of [true, false]) {
+      if(process.env.QA_DEVICE && process.env.QA_DEVICE!==(mobile?'mobile':'desktop'))continue;
+      if(process.env.QA_THEME && process.env.QA_THEME!==theme)continue;
       const page = await browser.newPage({ viewport: mobile ? { width: 393, height: 852 } : { width: 1280, height: 900 } });
       if (productionCookie) await page.context().addCookies([{ name: "codex_remote_session_4575", value: productionCookie, url: origin, httpOnly: true, sameSite: "Lax" }]);
       page.on("pageerror", error => errors.push(error.message));
@@ -194,6 +196,8 @@ for (const [engine, type] of [["chromium", chromium], ["webkit", webkit]]) {
         return { editorRight: a.right, bodyRight: c.right, editorBottom: a.bottom, actionsTop: b.top, actionsBottom: b.bottom, toolsBottom: d.bottom, actionsParentIsBody: actions.closest('.composerBody') === body && actions.parentElement === tools.parentElement && actions.parentElement.classList.contains('composerControlRow') };
       });
       assert.ok(composerLayout.actionsParentIsBody);
+      const plusPosition = await page.evaluate(() => { const tools=document.querySelector('.composerControlRow .composerTools').getBoundingClientRect(),plus=document.querySelector('.composerControlRow .v2ComposerPlus').getBoundingClientRect();return {toolsLeft:tools.left,plusLeft:plus.left}; });
+      assert.ok(Math.abs(plusPosition.toolsLeft-plusPosition.plusLeft)<2,'plus stays at the left edge regardless of right-aligned controls');
       assert.ok(Math.abs(composerLayout.editorRight - composerLayout.bodyRight) < 2, "editor uses the space above mic/send");
       assert.ok(composerLayout.editorBottom <= composerLayout.actionsTop + 2, "editor cannot overlap controls");
       assert.ok(Math.abs(composerLayout.actionsBottom - composerLayout.toolsBottom) < 2, "all bottom controls align");
@@ -239,6 +243,52 @@ for (const [engine, type] of [["chromium", chromium], ["webkit", webkit]]) {
       await page.evaluate(()=>document.querySelectorAll('.qaComposerHeader,.qaComposerAttachment').forEach(node=>node.remove()));
       await page.screenshot({path:`${evidence}/composer-long-${engine}-${theme}-${mobile?'mobile':'desktop'}.png`});
       await editor.fill('恢复短草稿');
+      await page.waitForTimeout(500);
+      const glassMaterial=await page.evaluate(()=>{
+        const root=document.querySelector('.conversation > .composer'),layer=root.querySelector('.composerOriginalLayer'),warp=layer?.querySelector('.glass__warp');
+        return {enabled:root.classList.contains('composerLiquidGlass'),quality:root.dataset.glassOptics,
+          decorations:root.querySelectorAll('.composerOriginalLayer').length,rimPointerEvents:getComputedStyle(layer).pointerEvents,
+          engine:root.dataset.glassEngine,nativeFilter:getComputedStyle(root,'::before').backdropFilter,
+          contentFilter:getComputedStyle(root.querySelector('.composerRichInput')).filter,
+          controlColor:getComputedStyle(root.querySelector('.groupedModelPicker > button')).color,
+          controlBackground:getComputedStyle(root.querySelector('.groupedModelPicker > button')).backgroundColor,
+          controlBorder:getComputedStyle(root.querySelector('.groupedModelPicker > button')).borderTopWidth,
+          nativeFilterWidth:layer.querySelector('filter')?.getAttribute('width'),
+          buttonBackdrops:[...root.querySelectorAll('.composerControlRow button')].filter(node=>node.getBoundingClientRect().width).map(node=>getComputedStyle(node).backdropFilter)};
+      });
+      assert.ok(glassMaterial.enabled&&glassMaterial.decorations===1&&glassMaterial.rimPointerEvents==='none','one non-interactive glass skin');
+      assert.equal(glassMaterial.contentFilter,'none','editor glyphs are never refracted or blurred');
+      assert.ok(glassMaterial.buttonBackdrops.every(value=>value==='none'),'no independent per-button backdrop renderers');
+      assert.equal(glassMaterial.quality,'original','Chromium uses the original effect on desktop and small screens without an FPS downgrade');
+      assert.equal(glassMaterial.engine,'liquid-glass-react@1.1.1');
+      assert.equal(glassMaterial.nativeFilterWidth,'170%','production retains the original full optical filter, not the crop experiment');
+      assert.equal(glassMaterial.controlBorder,'0px','no thick static control border');
+      if(theme==='light') {
+        assert.equal(glassMaterial.controlColor,'rgb(59, 66, 57)','light controls use the same text colour as the topbar');
+        assert.equal(glassMaterial.controlBackground,'rgb(238, 240, 236)','light controls use the same pale background as the topbar');
+      }
+      assert.ok(glassMaterial.nativeFilter.includes('url(')&&glassMaterial.nativeFilter.includes('blur(12px)'),'actual backdrop samples are refracted AND blurred');
+      const bounds=await page.locator('.conversation > .composer').boundingBox();
+      const originalTransform=await page.locator('.composerOriginalPane').evaluate(node=>getComputedStyle(node).transform);
+      await page.mouse.move(bounds.x+bounds.width*.3,bounds.y+10);
+      await page.waitForTimeout(200);
+      assert.equal(originalTransform,'none');
+      assert.equal(await page.locator('.composerOriginalPane').evaluate(node=>getComputedStyle(node).transform),'none','hover does not stretch or detach the glass');
+      const glassPerformance=await page.evaluate(async()=>{
+        const root=document.querySelector('.conversation > .composer'),layer=root.querySelector('.composerOriginalLayer');
+        const frames=()=>new Promise(resolve=>{
+          let start=0,last=0;const times=[];
+          const timer=setInterval(()=>{root.querySelector('.composerRichInput').dispatchEvent(new InputEvent('input',{bubbles:true}));},50);
+          const loop=now=>{start||=now;if(last)times.push(now-last);last=now;if(now-start<1200){requestAnimationFrame(loop);return;}clearInterval(timer);times.sort((a,b)=>a-b);resolve({fps:times.length*1000/(now-start),p95Ms:times[Math.floor(times.length*.95)]});};
+          requestAnimationFrame(loop);
+        });
+        root.classList.remove('composerLiquidGlass');layer.style.visibility='hidden';
+        const baseline=await frames();
+        root.classList.add('composerLiquidGlass');layer.style.visibility='';
+        const material=await frames();
+        return {baseline,material,quality:root.dataset.glassOptics};
+      });
+      console.log(JSON.stringify({glassCheck:{engine,theme,mobile,glassMaterial,glassPerformance}}));
       await page.locator(".quotaButton").click();
       await page.locator('[data-account-id="provider:ark"]').click();
       await page.getByRole("tabpanel", { name: "Ark quota" }).waitFor();
@@ -267,7 +317,7 @@ for (const [engine, type] of [["chromium", chromium], ["webkit", webkit]]) {
       assert.ok((await banner.innerText()).includes("fixture-429"), "safe error details remain available");
       await page.screenshot({ path: `${evidence}/error-banner-${engine}-${theme}-${mobile ? "mobile" : "desktop"}.png` });
       await banner.getByRole("button", { name: "关闭模型错误提示" }).click();
-      await page.waitForFunction(() => document.querySelector(".providerErrorBanner")?.classList.contains("uiClosing"));
+      await page.waitForFunction(() => {const node=document.querySelector(".providerErrorBanner");return !node||node.classList.contains("uiClosing");});
       await banner.waitFor({ state: "detached" });
       await page.evaluate(() => window.motionSocket.emit({ type: "turn.recovery", data: { threadId: "motion-thread", error: { code: "rate_limited", message: "上游暂时限频", originalMessage: "RateLimitExceeded.EndpointTPMExceeded", retryable: true, at: new Date().toISOString() }, job: { status: "waiting", attempts: 0, maxAttempts: 5, nextRetryAt: Date.now() + 20000 } } }));
       const recoveryBanner = page.getByRole("alert", { name: "本轮模型状态" });
@@ -281,6 +331,7 @@ for (const [engine, type] of [["chromium", chromium], ["webkit", webkit]]) {
       await recoveryBanner.getByRole("button", { name: "关闭模型状态提示" }).click();
       await recoveryBanner.waitFor({ state: "detached" });
       await page.emulateMedia({ reducedMotion: "reduce" });
+      await page.waitForFunction(()=>document.querySelector('.conversation > .composer')?.dataset.glassOptics==='reduced-motion');
       assert.equal(await counter.evaluate(element => element.getAnimations().length), 0);
       assert.equal(await counter.locator(".toolCountGlyph").last().evaluate(element => getComputedStyle(element).backgroundImage), "none");
       fixtureCompleted=true;
@@ -297,6 +348,13 @@ for (const [engine, type] of [["chromium", chromium], ["webkit", webkit]]) {
       assert.ok(await modelMenu.evaluate(node=>{const r=node.getBoundingClientRect();return node.contains(document.elementFromPoint(r.left+r.width/2,r.top+Math.min(20,r.height/2)));}),'model popover is not clipped by the new footer layout');
       await modelTrigger.click();
       await modelMenu.waitFor({state:'detached'});
+      const plusTrigger=page.locator('.conversation > .composer .v2ComposerPlus');
+      await plusTrigger.click();
+      const plusMenu=page.locator('#v2PlusMenu');
+      await plusMenu.waitFor({state:'visible'});
+      assert.ok(await plusMenu.evaluate(node=>getComputedStyle(node).backdropFilter.includes('blur(20px)')),'plus actions retain their own blurred glass backing');
+      await plusTrigger.click();
+      await plusMenu.waitFor({state:'hidden'});
       fixtureCompleted=false;
       includeReasoningHistory = true;
       await page.reload();
@@ -309,7 +367,7 @@ for (const [engine, type] of [["chromium", chromium], ["webkit", webkit]]) {
       });
       assert.equal(await page.locator(".reasoningSummaryPreview").count(), 1, "native history and reconnect snapshot are one reasoning item after full page reload");
       assert.ok(await page.locator(".reasoningSummaryPreview").evaluate(node => Boolean(node.compareDocumentPosition(document.querySelector(".kind-agent")) & Node.DOCUMENT_POSITION_FOLLOWING)), "reasoning stays before its following answer");
-      results.push({ engine, theme, mobile, alignment, reasoningBeforeToolAndHistory: true, reasoningReconnectDeduplicated: true, reasoningCompletionDeduplicated: true, reasoningPageReloadDeduplicated: true, providerErrorAsHeaderBanner: true, retryStatusAsHeaderBanner: true, errorLayout, completedDelayedToolFadesIn: true, actualCountRollAnimation: true, sharedSweepCoordinateError: shimmerBefore.coordinateError, noIndependentDigitShimmer: true, shimmerAndFlipCoexist: true, shimmerPhasePreserved: true, shimmerStopsWithCluster: true, reducedMotion: true, toolTextSelectionPreserved: true, equalQuotaWidths: widths, composerLayout, longComposerLayout, crowdedComposerLayouts });
+      results.push({ engine, theme, mobile, alignment, reasoningBeforeToolAndHistory: true, reasoningReconnectDeduplicated: true, reasoningCompletionDeduplicated: true, reasoningPageReloadDeduplicated: true, providerErrorAsHeaderBanner: true, retryStatusAsHeaderBanner: true, errorLayout, completedDelayedToolFadesIn: true, actualCountRollAnimation: true, sharedSweepCoordinateError: shimmerBefore.coordinateError, noIndependentDigitShimmer: true, shimmerAndFlipCoexist: true, shimmerPhasePreserved: true, shimmerStopsWithCluster: true, reducedMotion: true, toolTextSelectionPreserved: true, equalQuotaWidths: widths, composerLayout, longComposerLayout, crowdedComposerLayouts, glassMaterial, glassPerformance });
       await page.close();
     }
   } finally { await browser.close(); }

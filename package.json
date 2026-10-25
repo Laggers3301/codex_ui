@@ -40,6 +40,7 @@
     "fastify": "^5.4.0",
     "fflate": "^0.8.3",
     "katex": "0.16.22",
+    "liquid-glass-react": "1.1.1",
     "lucide-react": "^0.468.0",
     "mermaid": "^11.17.2",
     "pdfjs-dist": "5.7.284",
@@ -62,6 +63,7 @@
     "@paper-design/shaders": "0.0.81"
   },
   "devDependencies": {
+    "@napi-rs/canvas": "0.1.100",
     "@playwright/test": "^1.63.0",
     "@types/node": "^24.0.0",
     "@types/react": "^19.0.0",

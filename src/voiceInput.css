@@ -9,6 +9,9 @@
 .conversation > .composer .composerControlRow > .composerSendActions { flex:0 0 auto; }
 .conversation > .composer .composerTools { gap:6px!important; padding-right:0!important; }
 .conversation > .composer .composerTools:not(:has(.selectedSkillChip)) { justify-content:flex-end; }
+/* Keep the injected plus at the start even when the remaining controls are
+   right-aligned. Auto margin absorbs space, not an absolute hit target. */
+.conversation > .composer .composerControlRow .composerTools > .v2ComposerPlus { margin-inline-start:0!important; margin-inline-end:auto!important; flex:0 0 25px!important; }
 .conversation > .composer .composerTools { min-height:var(--composer-control-row-size); }
 .conversation > .composer .composerTools :is(.v2FastModeButton,.polishedSelectTrigger) { height:var(--composer-control-size)!important; min-height:var(--composer-control-size)!important; box-sizing:border-box; }
 .composerSendActions { display:flex; gap:6px; height:var(--composer-control-row-size,34px); align-items:center; align-self:end; }

@@ -1,0 +1,109 @@
+/* Upstream liquid-glass-react supplies the actual optical/highlight/elastic
+   effect. Only the material tint, typography and edge emphasis are adapted. */
+.conversation > .composer.composerLiquidGlass {
+  --composer-material-fill:linear-gradient(150deg,rgba(47,51,47,.63),rgba(29,33,30,.78));
+  --composer-control-fill:linear-gradient(155deg,rgba(255,255,255,.085),rgba(255,255,255,.035));
+  --composer-control-color:#c4cbc6;
+  --composer-menu-fill:linear-gradient(145deg,rgba(49,52,49,.94),rgba(30,33,31,.97));
+  border-radius:26px;
+  box-shadow:0 10px 32px rgba(0,0,0,.18) !important;
+}
+.composerGlassAnchor { display:none; }
+.composerOriginalLayer > svg.composerFastDefs,
+.topbar .controls button.topbarGlassControl .topbarOriginalLayer > svg.topbarFastDefs {
+  position:absolute; inset:0; display:block!important; width:100%!important; height:100%!important;
+  margin:0!important; pointer-events:none;
+}
+.composerOriginalLayer {
+  position:absolute; inset:0; z-index:-1; pointer-events:none;
+  border-radius:inherit; corner-shape:inherit; overflow:hidden;
+}
+.conversation > .composer.composerLiquidGlass:has(.composerOriginalLayer[data-ready="true"])::before {
+  /* Readability does not depend on SVG/backdrop compositing support. This
+     independent, unfiltered backing samples the actual transcript behind it. */
+  background:var(--composer-material-fill) !important;
+  -webkit-backdrop-filter:var(--composer-backdrop-optics,blur(12px) saturate(1.12)) !important;
+  backdrop-filter:var(--composer-backdrop-optics,blur(12px) saturate(1.12)) !important;
+}
+.composerOriginalLayer > :is(div,span) {
+  /* Upstream snapshots glassSize and transitions all properties. Both are
+     inappropriate for a multiline composer whose height changes while typing. */
+  position:absolute !important; inset:0 !important;
+  width:100% !important; height:100% !important;
+  border-radius:inherit !important; box-sizing:border-box;
+  transform:none !important; transition:opacity 180ms ease !important;
+}
+.composerOriginalPane { pointer-events:none; }
+.composerOriginalPane > svg { width:100% !important; height:100% !important; }
+.composerOriginalPane .glass__warp {
+  /* The actual optical pass now lives on the stable ::before backing. */
+  filter:none !important; -webkit-backdrop-filter:none !important; backdrop-filter:none !important;
+}
+.composerOriginalPane .glass {
+  width:100% !important; height:100% !important; padding:0 !important;
+  border-radius:inherit; corner-shape:inherit;
+  box-shadow:0 9px 30px rgba(0,0,0,.15) !important;
+  transition:none !important;
+}
+.composerOriginalPane .glass::after { content:none; }
+.composerOriginalPane .glass > div { font:inherit !important; text-shadow:none !important; }
+.composerGlassFiller { display:none; }
+/* Upstream's moving specular layers are retained, but their intense 1.5px
+   edge is toned down. No extra static perimeter stroke is painted. */
+.composerOriginalLayer > span { opacity:.10 !important; }
+.composerOriginalLayer > span:last-of-type { opacity:.16 !important; }
+.composerOriginalLayer > div:not(.composerOriginalPane) { pointer-events:none; opacity:0 !important; }
+.conversation > .composer.composerLiquidGlass .composerControlRow :is(.v2FastModeButton,.polishedSelectTrigger,.voiceButton,.sendButton) {
+  border:0 !important; border-radius:999px !important;
+  background:var(--composer-control-fill) !important;
+  color:var(--composer-control-color) !important;
+  box-shadow:inset 0 .45px 0 rgba(255,255,255,.055) !important;
+  -webkit-backdrop-filter:none !important; backdrop-filter:none !important;
+  transition:background-color 180ms ease,box-shadow 220ms ease,color 180ms ease,transform 260ms cubic-bezier(.16,1,.3,1),opacity 180ms ease;
+}
+.conversation > .composer.composerLiquidGlass .composerControlRow :is(.v2FastModeButton,.polishedSelectTrigger,.voiceButton,.sendButton):enabled:hover {
+  background-color:rgba(255,255,255,.045) !important;
+  box-shadow:inset 0 .5px 0 rgba(255,255,255,.1),0 2px 6px rgba(0,0,0,.06) !important;
+}
+.conversation > .composer.composerLiquidGlass .composerControlRow button:enabled:active { transform:scale(.965); }
+/* The plus remains the familiar unglazed icon, not another glass disc. */
+.conversation > .composer.composerLiquidGlass .composerControlRow .v2ComposerPlus {
+  border:0 !important; border-radius:50% !important; background:transparent !important;
+  box-shadow:none !important; backdrop-filter:none !important; -webkit-backdrop-filter:none !important;
+  color:var(--composer-control-color) !important;
+  transition:color 180ms ease,background-color 180ms ease,transform 260ms cubic-bezier(.16,1,.3,1);
+}
+.conversation > .composer.composerLiquidGlass .composerControlRow .v2ComposerPlus:hover { background:rgba(127,138,130,.10) !important; }
+.conversation > .composer.composerLiquidGlass .composerControlRow .sendButton.primary { background:var(--ui-action-primary-bg,#e6e8e2) !important; color:var(--ui-action-primary-text,#242724) !important; }
+.conversation > .composer.composerLiquidGlass .composerControlRow .sendButton.stopMode { background:var(--ui-contrast) !important; color:var(--ui-surface) !important; }
+.conversation > .composer.composerLiquidGlass .composerControlRow .voiceButton.recording { color:#ed7771 !important; }
+.conversation > .composer.composerLiquidGlass .composerControlRow .v2FastModeButtonActive { background:var(--ui-control-glass-active) !important; color:var(--ui-content) !important; }
+.conversation > .composer.composerLiquidGlass .composerControlRow button:focus-visible { outline:2px solid var(--ui-content-muted); outline-offset:3px; }
+:is(.composerLiquidGlass .groupedModelMenu,.composerLiquidGlass .groupedModelCascade,.composerSlashMenu,#v2PlusMenu,.contextDialog,.composerLiquidGlass .composerFormatToolbar,.composerLiquidGlass .composerFormatTypeMenu,.composerLiquidGlass .voiceNotice) {
+  border:0 !important;
+  background:var(--composer-menu-fill,var(--ui-glass-background)) !important;
+  box-shadow:inset 0 .5px 0 rgba(255,255,255,.06),var(--ui-glass-shadow) !important;
+  -webkit-backdrop-filter:blur(20px) saturate(1.12) !important;
+  backdrop-filter:blur(20px) saturate(1.12) !important;
+}
+:root[data-theme="light"] .conversation > .composer.composerLiquidGlass {
+  --composer-material-fill:linear-gradient(145deg,rgba(255,255,255,.78),rgba(235,242,237,.86));
+  --composer-control-fill:#eef0ec;
+  --composer-control-color:#3b4239;
+  --composer-menu-fill:linear-gradient(145deg,rgba(255,255,255,.96),rgba(240,245,241,.98));
+  box-shadow:0 10px 32px rgba(42,54,43,.10) !important;
+}
+:root[data-theme="light"] .conversation > .composer.composerLiquidGlass .composerControlRow :is(.v2FastModeButton,.polishedSelectTrigger,.voiceButton) {
+  background:var(--composer-control-fill) !important;
+  color:var(--composer-control-color) !important;
+  border:0 !important;
+  box-shadow:inset 0 .45px 0 rgba(255,255,255,.15) !important;
+}
+:root[data-theme="light"] .conversation > .composer.composerLiquidGlass .composerControlRow :is(.v2FastModeButton,.polishedSelectTrigger,.voiceButton):enabled:hover { background-color:rgba(106,131,115,.11) !important; }
+:root[data-theme="light"] .conversation > .composer.composerLiquidGlass .composerControlRow .v2FastModeButtonActive { background:rgba(121,166,135,.42) !important; color:#254832 !important; }
+:root[data-theme="light"] .conversation > .composer.composerLiquidGlass .composerControlRow .v2ComposerPlus { color:#44584a !important; }
+@media(prefers-reduced-motion:reduce) {
+  .composerOriginalLayer > *, .composerOriginalPane .glass { transition:none !important; }
+  .conversation > .composer.composerLiquidGlass .composerControlRow button { transition:none !important; }
+  .conversation > .composer.composerLiquidGlass .composerControlRow button:active { transform:none; }
+}

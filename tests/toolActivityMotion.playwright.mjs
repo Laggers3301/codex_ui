@@ -2,7 +2,7 @@ import { chromium } from "@playwright/test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 const origin = process.env.MOTION_TEST_ORIGIN ?? "http://127.0.0.1:5216";
-const evidence = process.env.MOTION_TEST_EVIDENCE ?? "../data/backend/tool-motion-20261024";
+const evidence = process.env.MOTION_TEST_EVIDENCE ?? "./output/qa/tool-motion-20261024";
 await fs.mkdir(evidence, { recursive: true });
 const browser = await chromium.launch({ headless: true });
 const errors = [], results = [];

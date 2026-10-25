@@ -6,6 +6,8 @@ import { SourceTextPreview } from "./SourceTextPreview";
 import {defaultHtmlPreview,isHtmlPreviewFile} from "./htmlFilePreview";
 const HtmlSourcePreview = lazy(() => import("./HtmlSourcePreview"));
 import { VoiceInput } from "./VoiceInput";
+import { ComposerGlassMaterial } from "./ComposerGlassMaterial";
+import "./topbarLiquidGlass.css";
 import { ComposerAmbientGlow } from "./ambient/ComposerAmbientGlow";
 import { selectMenuPosition } from "./selectMenuPosition";
 import { resolvePromptTopAnchor } from "./promptTopAnchor";
@@ -387,6 +389,7 @@ function PolishedSelect<T extends string>({
   onChange,
   disabled = false,
   className = "",
+  glass = false,
   title
 }: {
   value: T;
@@ -394,6 +397,7 @@ function PolishedSelect<T extends string>({
   onChange: (value: T) => void;
   disabled?: boolean;
   className?: string;
+  glass?: boolean;
   title?: string;
 }) {
   const [open, setOpen] = useState(false);
@@ -450,7 +454,7 @@ function PolishedSelect<T extends string>({
     >
       <button
         ref={triggerRef}
-        className="polishedSelectTrigger"
+        className={`polishedSelectTrigger${glass ? " topbarGlassControl" : ""}`}
         type="button"
         disabled={disabled}
         title={title}
@@ -461,6 +465,7 @@ function PolishedSelect<T extends string>({
       >
         <span>{selected?.label ?? value}</span>
         <span className="polishedSelectChevron" aria-hidden="true" />
+        {glass ? <ComposerGlassMaterial variant="topbar" /> : null}
       </button>
       {menuPresence.present ? createPortal((
         <div className={`polishedSelectFloatingLayer ${className}`} style={{ position: "fixed", inset: 0, zIndex: 10050, pointerEvents: "none" }}>
@@ -12272,9 +12277,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               <Settings2 size={17} />
               设置
             </button>
-            <button className={`trackedQuotaButton${trackedQuotaUsage && trackedQuotaUsage.todayQuotaPercent > 50 ? " warning" : ""}`}
+            <button className={`trackedQuotaButton topbarGlassControl${trackedQuotaUsage && trackedQuotaUsage.todayQuotaPercent > 50 ? " warning" : ""}`}
               type="button" onClick={() => void refreshTrackedQuota(true)} title="查看 sample-user 今日估算用量和历史统计（仅显示，不限制使用）" aria-label="sample-user 额度占用">
               sample-user {trackedQuotaUsage ? `${percentText(trackedQuotaUsage.todayQuotaPercent)}%` : "--"}
+              <ComposerGlassMaterial variant="topbar" />
             </button>
             <div
               className="quotaPopoverAnchor"
@@ -12291,7 +12297,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               }}
             >
               <button
-                className="quotaButton v2QuotaTopButton"
+                className="quotaButton v2QuotaTopButton topbarGlassControl"
                 type="button"
                 onMouseEnter={() => {
                   cancelQuotaHoverClose();
@@ -12311,6 +12317,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 title="悬停查看；点击可固定或收起额度详情"
               >
                 {quotaLoading ? "额度..." : quotaSummaryLabel(quota, accountPool)}
+                <ComposerGlassMaterial variant="topbar" />
               </button>
               {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} /> : null}
             </div>
@@ -12328,6 +12335,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             </button>
             <PolishedSelect<SandboxMode>
               className="topbarPolicySelect"
+              glass
               value={sandbox}
               onChange={value => updateExecutionSettings(value, approvalPolicy)}
               options={[
@@ -12338,6 +12346,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             />
             <PolishedSelect<ApprovalPolicy>
               className="topbarPolicySelect approvalSelect"
+              glass
               value={approvalPolicy}
               onChange={value => updateExecutionSettings(sandbox, value)}
               options={[
@@ -12346,7 +12355,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 { value: "untrusted", label: "不可信命令询问", detail: "仅危险操作需要确认" }
               ]}
             />
-            <button className="rightWorkspaceToggle" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} title={rightWorkspaceOpen ? "隐藏右栏（Ctrl+Shift+B）" : "显示右栏（Ctrl+Shift+B）"} aria-expanded={rightWorkspaceOpen} onClick={() => setRightWorkspaceOpen(open => !open)}><WorkspaceIcon name="panel" /></button>
+            <button className="rightWorkspaceToggle topbarGlassControl" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} title={rightWorkspaceOpen ? "隐藏右栏（Ctrl+Shift+B）" : "显示右栏（Ctrl+Shift+B）"} aria-expanded={rightWorkspaceOpen} onClick={() => setRightWorkspaceOpen(open => !open)}><WorkspaceIcon name="panel" /><ComposerGlassMaterial variant="topbar" /></button>
           </div>
         </header>
 
@@ -13351,7 +13360,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             ) : null}
             <div
               ref={bindComposerElement}
-              className={`composer ${draggingUpload ? "draggingUpload" : ""}`}
+              className={`composer composerLiquidGlass ${draggingUpload ? "draggingUpload" : ""}`}
               data-has-thread={Boolean(selectedThread)}
               data-plan-mode={planMode}
               onDragOver={handleUploadDragOver}
@@ -13359,6 +13368,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               onDragLeave={handleUploadDragLeave}
               onDrop={handleUploadDrop}
             >
+              <ComposerGlassMaterial />
               {selectedThread && statusPopoverThreadId === selectedThread.id ? (
                 <aside className={`threadStatusPopover uiGlassSurface uiGlassPopover${statusPopoverVisible ? " open" : ""}`} style={{ left: statusPopoverLeft }} role="dialog" aria-label="当前会话状态" aria-hidden={!statusPopoverVisible}>
                   <header><strong>会话状态</strong><button type="button" aria-label="关闭会话状态" tabIndex={statusPopoverVisible ? 0 : -1} onClick={closeStatusPopover}><X size={15} /></button></header>

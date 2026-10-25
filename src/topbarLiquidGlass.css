@@ -1,0 +1,53 @@
+/* The composer and the visible header controls share one optical renderer.
+   Only each control's backing is filtered; labels, hit targets and popovers
+   keep their original layout, typography and keyboard behaviour. */
+.topbar .controls button.topbarGlassControl {
+  --topbar-control-fill:linear-gradient(150deg,rgba(63,68,63,.60),rgba(39,43,39,.78));
+  z-index:0;
+  border:0!important;
+  -webkit-backdrop-filter:none!important; backdrop-filter:none!important;
+  transform:none!important;
+  transition:color 180ms ease,box-shadow 220ms ease;
+}
+.topbar .controls button.topbarGlassControl:not(.rightWorkspaceToggle),
+.rightWorkspaceToggle.topbarGlassControl { position:relative; }
+.topbar .controls button.topbarGlassControl:not(.warning):not(.blocked) {
+  background:transparent!important;
+  box-shadow:none!important;
+}
+.topbar .controls button.topbarGlassControl::after {
+  content:""; position:absolute; inset:0; border-radius:inherit; corner-shape:inherit;
+  pointer-events:none; background:rgba(255,255,255,.035); opacity:0;
+  transition:opacity 180ms ease;
+}
+.topbar .controls button.topbarGlassControl:enabled:hover::after { opacity:1; }
+:root[data-theme="light"] .topbar .controls button.topbarGlassControl::after { background:rgba(39,49,38,.025); }
+.topbar .controls button.topbarGlassControl::before {
+  content:""; position:absolute; inset:0; z-index:-1; pointer-events:none;
+  border-radius:inherit; corner-shape:inherit;
+  background:var(--topbar-control-fill);
+  -webkit-backdrop-filter:var(--topbar-backdrop-optics,blur(8px) saturate(1.12));
+  backdrop-filter:var(--topbar-backdrop-optics,blur(8px) saturate(1.12));
+}
+.topbarOriginalLayer { position:absolute; inset:0; z-index:-1; pointer-events:none; overflow:hidden; border-radius:inherit; corner-shape:inherit; }
+.topbarOriginalLayer > :is(div,span) {
+  position:absolute!important; inset:0!important; width:100%!important; height:100%!important;
+  border-radius:inherit!important; box-sizing:border-box;
+  pointer-events:none!important; transform:none!important; transition:opacity 180ms ease!important;
+}
+.topbarOriginalPane > svg { display:block!important; width:100%!important; height:100%!important; margin:0!important; pointer-events:none; }
+.topbarOriginalPane .glass { width:100%!important; height:100%!important; padding:0!important; border-radius:inherit; corner-shape:inherit; box-shadow:none!important; transition:none!important; }
+.topbarOriginalPane .glass__warp { filter:none!important; -webkit-backdrop-filter:none!important; backdrop-filter:none!important; }
+/* No perimeter strokes/specular rings: header controls should not compete
+   with the transcript. Keep their actual optical backdrop and quiet tint. */
+.topbarOriginalLayer > span { display:none!important; }
+.topbarOriginalLayer > div:not(.topbarOriginalPane) { opacity:0!important; }
+.topbar .controls button.topbarGlassControl:is(.warning,.blocked) { --topbar-control-fill:transparent; }
+.topbar .controls button.topbarGlassControl:focus-visible { outline:2px solid var(--ui-content-muted); outline-offset:2px; }
+:root[data-theme="light"] .topbar .controls button.topbarGlassControl {
+  --topbar-control-fill:linear-gradient(145deg,rgba(238,240,236,.94),rgba(238,240,236,.82));
+}
+:root[data-theme="light"] .topbar .controls button.topbarGlassControl:is(.warning,.blocked) { --topbar-control-fill:transparent; }
+@media(prefers-reduced-motion:reduce) {
+  .topbar .controls button.topbarGlassControl,.topbar .controls button.topbarGlassControl::after,.topbarOriginalLayer > * { transition:none!important; }
+}
