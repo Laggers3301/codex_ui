@@ -3,6 +3,15 @@ import { coalesceToolOutputs, collapseCodeModeWrappers, latestUserTimelineIndex,
 import type { ThreadItem } from "./types";
 
 const time = (n: number) => new Date(1_700_000_000_000 + n * 1000).toISOString();
+it("merges streaming reasoning with native history by ID, without moving or regressing the summary", () => {
+  const live = liveTimelineItems([{ id: "reason", kind: "reasoning", text: "完整摘要", startedAt: time(1), sequence: 1, completed: true }]);
+  const history: ThreadItem[] = [{ id: "reason", type: "reasoning", summary: [], timelineAt: time(1) }, { id: "answer", type: "agentMessage", text: "正文", timelineAt: time(3) }];
+  const merged = mergeTimelineItems(history, live);
+  expect(merged.map(item => item.id)).toEqual(["reason", "answer"]);
+  expect(merged[0]).toMatchObject({ type: "reasoning", summary: ["完整摘要"], completed: true });
+  const replay = liveTimelineItems([{ id: "reason", kind: "reasoning", text: "完整", startedAt: time(2), sequence: 5, completed: false }]);
+  expect(mergeTimelineItems(merged, replay)[0]).toMatchObject({ summary: ["完整摘要"], timelineAt: time(1), completed: true });
+});
 it("promotes native async question messages and keeps their identity over generic text snapshots", () => {
   const native: ThreadItem = { id: "q", type: "agentMessage", delivery: "async", questions: [{ title: "请提供路径", options: null }], text: "请提供路径" };
   const result = coalesceToolOutputs([native]);

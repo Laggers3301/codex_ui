@@ -6,7 +6,7 @@ import { createInterface } from "node:readline";
 import { accountHistoryRoots } from "./sessionReadRoots.js";
 import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { AppError } from "./appErrors.js";
-import {readableRolloutPath, rolloutStat,openReadableRollout,rolloutReadStream,readRolloutText} from './rolloutStorage.js';
+import {readableRolloutPath, rolloutStat,openReadableRollout,rolloutReadStream,readRolloutText,rolloutLines,MAX_FULL_HISTORY_BYTES,HistoryMemoryLimitError} from './rolloutStorage.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -476,8 +476,7 @@ export async function threadJsonlMatchesSearch(filePath: string, query: string, 
     return true;
   }
 
-  const input = await rolloutReadStream(filePath, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
+  const lines = rolloutLines(filePath);
   try {
     for await (const line of lines) {
       if (!line.trim()) {
@@ -486,8 +485,6 @@ export async function threadJsonlMatchesSearch(filePath: string, query: string, 
       try {
         const record = JSON.parse(line) as JsonlRecord;
         if (textMatchesSearch(searchTextFromPayload(record), query)) {
-          lines.close();
-          input.destroy();
           return true;
         }
       } catch {
@@ -495,8 +492,7 @@ export async function threadJsonlMatchesSearch(filePath: string, query: string, 
       }
     }
   } finally {
-    lines.close();
-    input.destroy();
+    await lines.return(undefined);
   }
   return false;
 }
@@ -512,8 +508,7 @@ export async function readThreadSummaryFromJsonl(
     throw new Error("Refusing to read a thread outside the Codex sessions directory.");
   }
   const stat = await rolloutStat(filePath);
-  const input = await rolloutReadStream(filePath, { encoding: "utf8" });
-  const lines = createInterface({ input, crlfDelay: Infinity });
+  const lines = rolloutLines(filePath);
   let metadata: JsonObject | null = null;
   let preview = "";
 
@@ -539,8 +534,6 @@ export async function readThreadSummaryFromJsonl(
           preview = textFromContent(payload.content).trim();
         }
         if (metadata && preview) {
-          lines.close();
-          input.destroy();
           break;
         }
       } catch {
@@ -548,8 +541,7 @@ export async function readThreadSummaryFromJsonl(
       }
     }
   } finally {
-    lines.close();
-    input.destroy();
+    await lines.return(undefined);
   }
 
   if (!metadata) {
@@ -581,7 +573,21 @@ type ThreadJsonlReadOptions = {
   syntheticTurnId?: string;
 };
 
-const parsedThreadCacheLimit = 24;
+// At most 8 * 512KiB of source may be retained (not 24 giant object graphs).
+const parsedThreadCacheLimit = 8;
+const parsedThreadCacheMaxSourceBytes = 512 * 1024;
+let historyParseQueue: Promise<void> = Promise.resolve();
+let pendingHistoryParses = 0;
+async function boundedParse(filePath: string, threadId: string, sessionsRoot?: string, options: ThreadJsonlReadOptions = {}) {
+  if (pendingHistoryParses >= 32) throw new HistoryMemoryLimitError('历史读取繁忙，请稍后重试；原文未修改。');
+  pendingHistoryParses++;
+  const previous = historyParseQueue;
+  let release!: () => void;
+  historyParseQueue = new Promise<void>(resolve => { release = resolve; });
+  await previous;
+  try { return await parseThreadFromJsonl(filePath, threadId, sessionsRoot, options); }
+  finally { pendingHistoryParses--; release(); }
+}
 const cachedParsedThreads = new Map<string, {
   filePath: string;
   signature: string;
@@ -599,10 +605,15 @@ export async function readThreadFromJsonl(
   }
 
   if (options.tailBytes || options.startOffset !== undefined || options.endOffset !== undefined) {
-    return parseThreadFromJsonl(filePath, threadId, sessionsRoot, options);
+    return boundedParse(filePath, threadId, sessionsRoot, options);
   }
 
   const stat = await rolloutStat(filePath);
+  if (stat.size > MAX_FULL_HISTORY_BYTES) throw new HistoryMemoryLimitError();
+  if (stat.size > parsedThreadCacheMaxSourceBytes) {
+    cachedParsedThreads.delete(filePath);
+    return boundedParse(filePath, threadId, sessionsRoot);
+  }
   const signature = `${stat.size}:${stat.mtimeMs}`;
   const cached = cachedParsedThreads.get(filePath);
   if (cached?.signature === signature) {
@@ -612,7 +623,7 @@ export async function readThreadFromJsonl(
     return cached.value;
   }
 
-  const value = parseThreadFromJsonl(filePath, threadId, sessionsRoot);
+  const value = boundedParse(filePath, threadId, sessionsRoot);
   cachedParsedThreads.set(filePath, { filePath, signature, value });
   while (cachedParsedThreads.size > parsedThreadCacheLimit) {
     const oldestPath = cachedParsedThreads.keys().next().value;
@@ -649,6 +660,7 @@ async function parseThreadFromJsonl(
   if (typeof options.startOffset === "number") {
     const startOffset = Math.max(0, Math.min(fileStat.size, Math.floor(options.startOffset)));
     const endOffset = Math.max(startOffset, Math.min(fileStat.size, Math.floor(options.endOffset ?? fileStat.size)));
+    if (endOffset - startOffset > 32 * 1024 * 1024) throw new HistoryMemoryLimitError();
     const handle = await openReadableRollout(filePath);
     try {
       const headBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, fileStat.size));
@@ -666,6 +678,7 @@ async function parseThreadFromJsonl(
       await handle.close();
     }
   } else if (tailBytes > 0 && fileStat.size > tailBytes) {
+    if (tailBytes > MAX_FULL_HISTORY_BYTES) throw new HistoryMemoryLimitError();
     const handle = await openReadableRollout(filePath);
     try {
       const headBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, fileStat.size));
@@ -679,7 +692,7 @@ async function parseThreadFromJsonl(
       const tailText = tailBuffer.toString("utf8");
       const firstCompleteLine = tailText.indexOf("\n");
       if (!firstLine || firstCompleteLine < 0) {
-        raw = await readRolloutText(filePath);
+        throw new HistoryMemoryLimitError('所选历史片段没有完整记录，请使用分页读取；原文未修改。');
       } else {
         raw = `${firstLine}\n${tailText.slice(firstCompleteLine + 1)}`;
         truncated = true;

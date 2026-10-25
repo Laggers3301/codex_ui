@@ -7,15 +7,17 @@ import { fileURLToPath } from "node:url";
 import { afterEach, expect, it, vi } from "vitest";
 
 afterEach(() => vi.useRealTimers());
-it("waits for the protected turn, restarts outside that turn, and resumes only the other conversation", async () => {
+it.each([[false, false], [true, false], [true, true]])("waits for all-idle=%s and final-check race=%s without interrupting a busy conversation", async (allIdle, lateRace) => {
   vi.useFakeTimers();
   const script = fileURLToPath(new URL("../scripts/restart-account-pool.cjs", import.meta.url));
-  const protectedThread = "00000000-0000-4000-8000-000000000001";
-  const otherThread = "00000000-0000-4000-8000-000000000002";
+  const protectedThread = "00000000-0000-4000-8000-d9925a7bb9f4";
+  const otherThread = "00000000-0000-4000-8000-b3e8d582babf";
   let protectedBusy = true, restarted = false, stopped = false;
+  let otherBusy = true;
   const sent: Array<{ type: string; threadId: string; prompt?: string }> = [];
   const writes: string[] = [];
   const events: string[] = [];
+  let failure = "";
   let complete!: () => void;
   const completed = new Promise<void>(resolve => { complete = resolve; });
   class FakeSocket extends EventEmitter {
@@ -25,7 +27,7 @@ it("waits for the protected turn, restarts outside that turn, and resumes only t
       const payload = options.headers.cookie.split("=")[1].split(".")[0];
       this.user = JSON.parse(Buffer.from(payload, "base64url").toString()).u;
       queueMicrotask(() => this.emit("message", JSON.stringify({ type: "hello", data: { liveState: { activeTurns:
-        this.user === "qa-user" ? (protectedBusy ? [{ threadId: protectedThread }] : []) : (restarted ? [] : [{ threadId: otherThread }])
+        this.user === "qa-user" ? (protectedBusy ? [{ threadId: protectedThread }] : []) : (restarted || !otherBusy ? [] : [{ threadId: otherThread }])
       } } })));
     }
     close() {}
@@ -45,7 +47,11 @@ it("waits for the protected turn, restarts outside that turn, and resumes only t
     close() { complete(); }
   }
   const mockedRequire = (name: string) => {
-    if (name === "node:fs") return { readFileSync: (file: string) => file.endsWith('account-pool.json') ? '{"accounts":[]}' : file.endsWith('account-pool-state.json') ? '{}' : "fixture-session-secret", writeFileSync: (_file: string, text: string) => writes.push(text) };
+    if (name === "node:fs") return { readFileSync: (file: string) => {
+      if (file.endsWith('account-pool.json')) return '{"accounts":[]}';
+      if (file.endsWith('account-pool-state.json')) { if (lateRace) otherBusy = true; return '{}'; }
+      return "fixture-session-secret";
+    }, writeFileSync: (_file: string, text: string) => writes.push(text) };
     if (name === "node:path") return path;
     if (name === "node:crypto") return crypto;
     if (name === "node:net") return { connect: () => { throw new Error("Unexpected authorization connection in restart fixture"); } };
@@ -67,16 +73,31 @@ it("waits for the protected turn, restarts outside that turn, and resumes only t
   };
   vm.runInNewContext(fs.readFileSync(script, "utf8"), {
     require: mockedRequire, __dirname: path.dirname(script), Buffer, Date,
-    setTimeout, clearTimeout, process: { argv: ["node", script, "--after-thread", protectedThread], env: {} },
-    console: { log: (line: string) => events.push(line), error: (line: string) => { throw new Error(line); } }
+    setTimeout, clearTimeout, process: { argv: ["node", script, "--after-thread", protectedThread, ...(allIdle ? ["--all-idle"] : [])], env: {} },
+    console: { log: (line: string) => events.push(line), error: (line: string) => { if (lateRace) failure = line; else throw new Error(line); } }
   });
   await vi.advanceTimersByTimeAsync(5000);
   expect(restarted).toBe(false); expect(sent).toEqual([]); expect(writes).toEqual([]);
   protectedBusy = false;
   await vi.advanceTimersByTimeAsync(5000);
+  if (allIdle) {
+    expect(restarted).toBe(false); expect(stopped).toBe(false); expect(writes).toEqual([]);
+    // Waiting beyond the former 30-minute deadline must not abandon the job.
+    vi.setSystemTime(Date.now() + 31 * 60_000);
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(restarted).toBe(false); expect(stopped).toBe(false);
+    otherBusy = false;
+    await vi.advanceTimersByTimeAsync(10000);
+  }
   await completed;
+  if (lateRace) {
+    expect(failure).toContain("new active conversation");
+    expect(restarted).toBe(false); expect(stopped).toBe(false);
+    expect(sent.filter(message => message.type === "turn.start")).toEqual([]);
+    return;
+  }
   expect(restarted).toBe(true);
-  expect(sent.filter(message => message.type === 'turn.start')).toEqual([expect.objectContaining({ threadId: otherThread, prompt: "继续" })]);
-  expect(sent.some(message => message.type === 'turn.queue.list' && message.threadId === otherThread)).toBe(true);
+  expect(sent.filter(message => message.type === 'turn.start')).toEqual(allIdle ? [] : [expect.objectContaining({ threadId: otherThread, prompt: "继续" })]);
+  expect(sent.some(message => message.type === 'turn.queue.list' && message.threadId === otherThread)).toBe(!allIdle);
   expect(events.some(line => line.includes("deployment_complete"))).toBe(true);
 });

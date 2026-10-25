@@ -5,11 +5,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { selectedRuntime, adoptValidatedStartupRuntime } from './runtime-update-state.mjs';
+import { normalizeLegacyAccountWatermark } from './account-runtime-memory.mjs';
+import { ensureDelegationPolicy } from './agent-delegation-policy.mjs';
 
 const [command, ...args] = process.argv.slice(2);
 if (!command) throw new Error('Missing account runtime command');
 const home = process.env.CODEX_HOME;
 const diagnostic = (event, fields = {}) => process.stderr.write(`[account-runtime] ${JSON.stringify({ event, runtimePid: process.pid, ...fields })}\n`);
+const memoryPolicy = normalizeLegacyAccountWatermark();
+if (memoryPolicy !== 'not_owned' && memoryPolicy !== 'unchanged') diagnostic('memory_policy', { state: memoryPolicy });
+if (home) {
+  try { ensureDelegationPolicy(home); }
+  catch { diagnostic('delegation_policy_unavailable'); }
+}
 function metadata() {
   try {
     const file = path.join(home, 'auth.json');

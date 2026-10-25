@@ -16,6 +16,37 @@ function pin(file:string) {readers.set(file,(readers.get(file)??0)+1);return ()=
 let queue: Promise<unknown> = Promise.resolve();
 const maxFileBytes = 2 * 1024 ** 3;
 const maxCacheBytes = 4 * 1024 ** 3;
+export const MAX_FULL_HISTORY_BYTES = 8 * 1024 * 1024;
+export const MAX_HISTORY_RECORD_BYTES = 16 * 1024 * 1024;
+export class HistoryMemoryLimitError extends Error {
+  readonly statusCode = 413;
+  readonly code = 'HISTORY_MEMORY_LIMIT';
+  constructor(message = '历史超过安全内存读取上限，请分页查看或下载完整原始记录；原文未修改。') { super(message); }
+}
+
+// One JSONL record at a time, with a bound checked before decoding/parsing.
+// Never silently skip an oversized record and pretend search was complete.
+export async function* rolloutLines(filePath: string) {
+  const input = await rolloutReadStream(filePath, {}, 0);
+  let chunks: Buffer[] = [], bytes = 0;
+  try {
+    for await (const chunk of input) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      let start = 0;
+      while (start < buffer.length) {
+        const newline = buffer.indexOf(10, start);
+        const end = newline < 0 ? buffer.length : newline;
+        bytes += end - start;
+        if (bytes > MAX_HISTORY_RECORD_BYTES) throw new HistoryMemoryLimitError('单条历史超过安全解析上限，已停止本次读取；完整原文仍可下载。');
+        chunks.push(buffer.subarray(start, end));
+        if (newline < 0) break;
+        yield Buffer.concat(chunks, bytes).toString('utf8').replace(/\r$/, '');
+        chunks = []; bytes = 0; start = newline + 1;
+      }
+    }
+    if (bytes) yield Buffer.concat(chunks, bytes).toString('utf8').replace(/\r$/, '');
+  } finally { input.destroy(); }
+}
 
 export async function rolloutSourcePath(filePath: string): Promise<string> {
   try { return await fs.realpath(filePath); }
@@ -89,14 +120,43 @@ export async function openReadableRollout(filePath:string) {
   } catch(error) {release();throw error;}
 }
 
-export async function rolloutReadStream(filePath:string,options:Parameters<typeof createReadStream>[1]={}) {
+export async function rolloutReadStream(filePath:string,options:Parameters<typeof createReadStream>[1]={},maxRecordBytes=MAX_HISTORY_RECORD_BYTES) {
   const file=await readableRolloutPath(filePath),release=pin(file);
-  const stream=createReadStream(file,options);stream.once('close',release);return stream;
+  if(!maxRecordBytes){const stream=createReadStream(file,options);stream.once('close',release);return stream;}
+  // Check bytes while still buffered as small chunks. Applies to index scans
+  // too, before their pending buffer can grow to an unbounded single line.
+  const input=createReadStream(file,{...(typeof options==='object'?options:{}),encoding:undefined});
+  let lineBytes=0;
+  const bound=new Transform({transform(chunk:Buffer,_encoding,callback){
+    let start=0;
+    while(start<chunk.length){
+      const newline=chunk.indexOf(10,start),end=newline<0?chunk.length:newline;
+      lineBytes+=end-start;
+      if(lineBytes>maxRecordBytes){callback(new HistoryMemoryLimitError('单条历史超过安全解析上限；原文未修改。'));return;}
+      if(newline<0)break;
+      lineBytes=0;start=newline+1;
+    }
+    callback(null,chunk);
+  }});
+  if(typeof options==='object'&&options?.encoding)bound.setEncoding(options.encoding);
+  input.once('close',release);
+  input.once('error',error=>bound.destroy(error));
+  bound.once('close',()=>input.destroy());
+  input.pipe(bound);
+  return bound;
 }
 
 export async function readRolloutText(filePath:string) {
   const file=await openReadableRollout(filePath);
-  try{return await file.readFile('utf8');}finally{await file.close();}
+  try{
+    if((await file.stat()).size>MAX_FULL_HISTORY_BYTES)throw new HistoryMemoryLimitError();
+    // Fixed buffer also bounds a file that is growing after the stat check.
+    const buffer=Buffer.allocUnsafe(MAX_FULL_HISTORY_BYTES+1);
+    let used=0;
+    while(used<buffer.length){const {bytesRead}=await file.read(buffer,used,buffer.length-used,used);if(!bytesRead)break;used+=bytesRead;}
+    if(used>MAX_FULL_HISTORY_BYTES)throw new HistoryMemoryLimitError();
+    return buffer.subarray(0,used).toString('utf8');
+  }finally{await file.close();}
 }
 
 /** Preserve the uncompressed size/mtime used by billing caches, without

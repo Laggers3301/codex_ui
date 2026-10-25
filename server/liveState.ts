@@ -24,6 +24,17 @@ export interface LiveAgentMessage {
   updatedAt: string;
 }
 
+export interface LiveReasoningMessage {
+  itemId: string;
+  threadId: string | null;
+  turnId: string | null;
+  text: string;
+  completed: boolean;
+  sequence: number;
+  startedAt: string;
+  updatedAt: string;
+}
+
 export interface LiveToolItem {
   collaboration?: Record<string, unknown>;
   internal?: boolean;
@@ -49,6 +60,7 @@ export interface LiveTurnState {
 }
 
 export interface LiveStateSnapshot {
+  reasoningMessages?: LiveReasoningMessage[];
   agentMessages: LiveAgentMessage[];
   toolItems: LiveToolItem[];
   activeTurns: LiveTurnState[];
@@ -56,6 +68,7 @@ export interface LiveStateSnapshot {
 }
 
 export type LiveStateUpdate =
+  | { kind: "reasoning"; item: LiveReasoningMessage }
   | { kind: "agent"; item: LiveAgentMessage }
   | { kind: "tool"; item: LiveToolItem; historyItem?: LiveToolItem };
 
@@ -168,6 +181,8 @@ function matchesTurn(message: { threadId: string | null; turnId: string | null }
 }
 
 export class LiveStateStore {
+  private readonly reasoningMessages = new Map<string, LiveReasoningMessage>();
+  private readonly reasoningParts = new Map<string, Map<number, string>>();
   private readonly agentMessages = new Map<string, LiveAgentMessage>();
   private readonly activeAgentSegments = new Map<string, string>();
   private readonly toolItems = new Map<string, LiveToolItem>();
@@ -207,6 +222,8 @@ export class LiveStateStore {
   recordNotification(envelope: RpcEnvelope): LiveStateUpdate | null {
     const params = asRecord(envelope.params);
     const method = envelope.method ?? "";
+    const reasoning = this.recordReasoning(method, params);
+    if (reasoning) return { kind: "reasoning", item: reasoning };
     if (method === "item/agentMessage/delta") {
       if (!this.hasActiveTurn(params)) return null;
       const agent = this.recordAgentMessageDelta(params);
@@ -291,6 +308,7 @@ export class LiveStateStore {
 
   snapshot(): LiveStateSnapshot {
     return {
+      reasoningMessages: Array.from(this.reasoningMessages.values()).map(item => ({ ...item })),
       agentMessages: Array.from(this.agentMessages.values()).map((message) => ({ ...message })),
       toolItems: Array.from(this.toolItems.values()).map((item) => ({ ...item })),
       activeTurns: Array.from(this.activeTurns.values()).map((turn) => ({ ...turn })),
@@ -299,12 +317,61 @@ export class LiveStateStore {
   }
 
   clear(): void {
+    this.reasoningMessages.clear();
+    this.reasoningParts.clear();
     this.agentMessages.clear();
     this.activeAgentSegments.clear();
     this.toolItems.clear();
     this.activeTurns.clear();
     this.nextSequence = 0;
     this.updatedAt = null;
+  }
+
+  /** Public summaries only. Never inspect encrypted reasoning or raw content. */
+  private recordReasoning(method: string, params: Record<string, unknown>): LiveReasoningMessage | null {
+    const item = asRecord(params.item);
+    const summaryDelta = method === "item/reasoning/summaryTextDelta";
+    const summaryPart = method === "item/reasoning/summaryPartAdded";
+    const lifecycle = /^(?:item\/(?:reasoning\/)?)(?:started|completed)$/.test(method)
+      && (normalizedToken(item.type) === "reasoning" || method.startsWith("item/reasoning/"));
+    if ((!summaryDelta && !summaryPart && !lifecycle) || !this.hasActiveTurn(params)) return null;
+    const { threadId, turnId } = turnFields(params);
+    const active = threadId ? this.activeTurns.get(threadId) : turnId ? Array.from(this.activeTurns.values()).find(t => t.turnId === turnId) : this.activeTurns.size === 1 ? this.activeTurns.values().next().value : undefined;
+    if (turnId && active?.turnId !== turnId) return null;
+    const id = stringOrNull(params.itemId) ?? stringOrNull(item.id);
+    if (!id) return null;
+    const previous = this.reasoningMessages.get(id);
+    if (previous?.completed) return null;
+    const parts = this.reasoningParts.get(id) ?? new Map<number, string>();
+    const index = typeof params.summaryIndex === "number" && Number.isInteger(params.summaryIndex) ? params.summaryIndex : 0;
+    if (index < 0 || index >= 128) return null;
+    if (summaryDelta && typeof params.delta === "string") {
+      const remaining = Math.max(0, 64_000 - Array.from(parts.values()).reduce((n, text) => n + text.length, 0));
+      parts.set(index, (parts.get(index) ?? "") + params.delta.slice(0, remaining));
+    }
+    const complete = lifecycle && method.endsWith("completed");
+    // A completed native item is a snapshot, not another delta to append.
+    if (lifecycle && Array.isArray(item.summary)) {
+      const texts = item.summary.slice(0, 128).map(p => typeof p === "string" ? p : typeof asRecord(p).text === "string" ? asRecord(p).text as string : "");
+      if (texts.some(Boolean) && (complete || !previous?.text || texts.join("\n\n").length >= previous.text.length)) {
+        parts.clear();
+        let budget = 64_000;
+        texts.forEach((text, i) => { parts.set(i, text.slice(0, budget)); budget = Math.max(0, budget - text.length); });
+      }
+    }
+    const now = new Date().toISOString();
+    const next: LiveReasoningMessage = { itemId: id, threadId: previous?.threadId ?? threadId ?? active?.threadId ?? null,
+      turnId: previous?.turnId ?? turnId ?? active?.turnId ?? null,
+      text: Array.from(parts).sort(([a], [b]) => a - b).map(([, text]) => text).join("\n\n").slice(0, 64_000),
+      completed: complete, sequence: previous?.sequence ?? ++this.nextSequence, startedAt: previous?.startedAt ?? now, updatedAt: now };
+    this.reasoningParts.set(id, parts);
+    this.reasoningMessages.set(id, next);
+    while (this.reasoningMessages.size > 32) {
+      const oldest = this.reasoningMessages.keys().next().value!;
+      this.reasoningMessages.delete(oldest); this.reasoningParts.delete(oldest);
+    }
+    this.updatedAt = now;
+    return next;
   }
 
   private recordAgentMessageDelta(params: Record<string, unknown>): LiveAgentMessage | null {
@@ -423,6 +490,12 @@ export class LiveStateStore {
       return;
     }
     const now = new Date().toISOString();
+
+    for (const [id, message] of this.reasoningMessages) {
+      if (turnId ? message.turnId === turnId : message.threadId === threadId) {
+        this.reasoningMessages.delete(id); this.reasoningParts.delete(id);
+      }
+    }
 
     for (const [key, turn] of this.activeTurns.entries()) {
       if ((turnId && turn.turnId === turnId) || (threadId && turn.threadId === threadId)) {

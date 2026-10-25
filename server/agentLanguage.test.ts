@@ -61,4 +61,12 @@ describe("native default response language", () => {
     expect(() => ensureDefaultAgentLanguage(root)).toThrow("regular file");
     expect(fs.readFileSync(source, "utf8")).toBe("# Shared rules");
   });
+
+  it("bounds delegated context without silently overriding an explicit full-history request", () => {
+    expect(defaultAgentLanguageInstructions).toContain('fork_turns="none"');
+    expect(defaultAgentLanguageInstructions).toContain('不得直接用 fork_turns="all"');
+    expect(defaultAgentLanguageInstructions).toContain("用户明确要求完整继承");
+    expect(defaultAgentLanguageInstructions).toContain("不代表运行时已硬性阻止");
+    expect(defaultAgentLanguageInstructions).toContain("不要因创建子代理长时间未返回而重复创建");
+  });
 });

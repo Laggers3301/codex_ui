@@ -6,6 +6,7 @@ import type { IncomingHttpHeaders } from "node:http";
 import type { Server as HttpServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
+import { serverConfig } from "./config.js";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
@@ -64,7 +65,7 @@ const threadStartContextConfigSchema = z.object({
 const contextProbeBytes = 512 * 1024;
 const contextPrecompactThreshold = 0.85;
 const contextFullThreshold = 0.98;
-const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? "/home/ls/codex_zerotier_remote/users";
+const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 const DEFAULT_COMPACT_TIMEOUT_MS = 600_000;
 
 function compactTimeoutMs(): number {
@@ -824,18 +825,20 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       && !suppressInternalToolMessage
     ) {
       const persist = () => store.saveTimelineItem(liveUpdate.item.threadId!, liveUpdate.item.turnId!, journalItem(liveUpdate));
-      if (liveUpdate.kind === "agent" && message.method === "item/agentMessage/delta") {
+      if ((liveUpdate.kind === "agent" && message.method === "item/agentMessage/delta") || (liveUpdate.kind === "reasoning" && message.method === "item/reasoning/summaryTextDelta")) {
         const delta=asRecord(message.params).delta;
         streamJournal.enqueue(JSON.stringify([owner,liveUpdate.item.turnId,liveUpdate.item.itemId]),persist,typeof delta === "string" && delta.length === liveUpdate.item.text.length);
       } else {
-        if (liveUpdate.kind === "agent") streamJournal.flush(JSON.stringify([owner,liveUpdate.item.turnId,liveUpdate.item.itemId]));
+        if (liveUpdate.kind === "agent" || liveUpdate.kind === "reasoning") streamJournal.flush(JSON.stringify([owner,liveUpdate.item.turnId,liveUpdate.item.itemId]));
         persist();
       }
     }
     if (!suppressRawCompact) {
       sendToUser(wss, owner, { type: "codex.notification", data: message });
     }
-    if (liveUpdate?.kind === "tool" && !suppressInternalToolMessage) {
+    if (liveUpdate?.kind === "reasoning") {
+      sendToUser(wss, owner, { type: "live.reasoning", data: liveUpdate.item });
+    } else if (liveUpdate?.kind === "tool" && !suppressInternalToolMessage) {
       sendToUser(wss, owner, { type: "live.tool", data: liveUpdate.item });
     } else if (liveUpdate?.kind === "agent" && !suppressGenericRecoveryMessage) {
       const delta=asRecord(message.params).delta;

@@ -14,6 +14,7 @@ export function readTurnProgress(value: unknown): TurnProgress | null {
 
 export function turnProgressText(progress: TurnProgress | undefined): string {
   if (!progress) return "";
+  if (progress.state === "stream_retrying") return "模型连接中断，正在自动重试；已完成的工具操作会保留。";
   if (progress.state === "waiting_approval") return "正在等待操作批准。";
   if (progress.state === "waiting_user_input") return "正在等待你回答问题，回答后会继续。";
   if (progress.state === "waiting_subagents") return "正在等待子代理状态更新，可在右栏查看各任务进展。";

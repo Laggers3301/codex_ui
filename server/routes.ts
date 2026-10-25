@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { ProviderUsageTracker } from "./providerUsage.js";
+import { registerProviderQuotaRoutes } from "./providerQuota.js";
 import { overlayJournal } from "./timelineJournal.js";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import path from "node:path";
@@ -15,7 +16,7 @@ import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { ComposerPredictions } from "./composerPredictions.js";
 import { LegacyRollbackConflictError } from "./legacyRollback.js";
-import {readableRolloutPath, rolloutLogicalStat, rolloutReadStream} from './rolloutStorage.js';
+import {readableRolloutPath, rolloutLogicalStat, rolloutReadStream, MAX_FULL_HISTORY_BYTES, HistoryMemoryLimitError} from './rolloutStorage.js';
 import { inheritedBillingTurnIds } from "./leaderboardForkUsage.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
 import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
@@ -59,8 +60,8 @@ import { executionSettingsOverrides, queueScheduledPrompt, resumeThreadIfUnloade
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
 // Default Codex cwd per logged-in user. This prevents generated artifacts from
-// accumulating in /home/ls while retaining historical shared-home projects.
-const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? "/home/ls/codex_zerotier_remote/users";
+// accumulating in /home/example while retaining historical shared-home projects.
+const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
 const maxThreadHistoryPageSize = 240;
@@ -1011,7 +1012,7 @@ export function userIdFromSessionCwd(cwd: string | null, isKnownUser?: (userId: 
     const [firstSegment] = path.relative(normalizedRoot, normalizedCwd).split(path.sep);
     return firstSegment?.trim() || null;
   }
-  // Some existing users run Codex directly in /home/ls/<login> rather than
+  // Some existing users run Codex directly in /home/example/<login> rather than
   // the managed users root. Only trust this layout for a registered login.
   const homeRoot = path.dirname(path.dirname(normalizedRoot));
   if (isKnownUser && normalizedCwd.startsWith(`${homeRoot}${path.sep}`)) {
@@ -1572,7 +1573,7 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
     id: serverConfig.leaderboardAccountLabel,
     label: serverConfig.leaderboardAccountLabel,
     kind: "codex-account",
-    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/ls", ".codex"), "sessions"),
+    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/example", ".codex"), "sessions"),
     quota: await readCachedCodexQuota(bridge, forceRefresh)
   }];
 }
@@ -2340,6 +2341,7 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 }
 
 function errorStatus(error: unknown): number {
+  if (error instanceof HistoryMemoryLimitError) return 413;
   if (error instanceof LegacyRollbackConflictError || error instanceof ScheduleConflictError || error instanceof BranchConflictError) return 409;
   if (error instanceof PathPolicyError || error instanceof z.ZodError || error instanceof ThreadContextConfigError) {
     if (error instanceof PathPolicyError && error.message === "File does not exist.") {
@@ -2650,10 +2652,10 @@ async function readOwnedThreadForList(bridge: CodexBridge, threadId: string): Pr
   // global list recovery for an old thread.
   const fallbackPath = await findThreadJsonlPathById(threadId);
   if (fallbackPath) {
-    return asRecord(await readThreadFromJsonl(fallbackPath, threadId)).thread ?? null;
+    return await readThreadSummaryFromJsonl(fallbackPath, threadId);
   }
   try {
-    const result = await bridge.request("thread/read", { threadId, includeTurns: true }, 30_000);
+    const result = await bridge.request("thread/read", { threadId, includeTurns: false }, 30_000);
     return asRecord(result).thread ?? null;
   } catch {
     return null;
@@ -2753,7 +2755,7 @@ async function filterOwnedThreadList(
       continue;
     }
     const fullThread = await readOwnedThreadForList(bridge, threadId);
-    // Ownership is the access boundary. A legacy session may retain /home/ls as
+    // Ownership is the access boundary. A legacy session may retain /home/example as
     // its historical cwd after the user's default workspace is moved.
     if (fullThread) {
       byId.set(threadId, listItemSummaryFromThread(fullThread));
@@ -2829,7 +2831,7 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
   const rootPath = ensureUserWorkspaceDirectory(userId);
 
   // List the personal workspace first: a newly opened page selects it by
-  // default. Existing projects (including historical /home/ls conversations)
+  // default. Existing projects (including historical /home/example conversations)
   // are deliberately retained below it.
   const workspace = store.getProjectByRootPath(rootPath, userId) ?? store.createProject({
     name: "我的工作区",
@@ -2878,6 +2880,7 @@ function deferLargeToolOutputs(threadValue: unknown): void {
 }
 
 export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore, options: { backgroundIndexing?: boolean; browserTools?: boolean } = {}): void {
+  registerProviderQuotaRoutes(app, request => userIdFromRequest(request, store));
   registerSideChatRoutes(app, bridge, store, request => userIdFromRequest(request, store));
   const predictions=isAccountPoolBridge(bridge)?new ComposerPredictions(bridge):null;
   app.post<{Params:{id:string;threadId:string}}>("/api/projects/:id/threads/:threadId/prediction",async(request,reply)=>{
@@ -3631,9 +3634,15 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       }
 
       const kind = fileKind(target.filePath);
-      const content = kind === "markdown" || kind === "text"
-        ? fs.readFileSync(target.filePath).subarray(0, maxPreviewBytes).toString("utf8")
-        : undefined;
+      let content: string | undefined;
+      if (kind === "markdown" || kind === "text") {
+        const handle = fs.openSync(target.filePath, "r");
+        try {
+          const buffer = Buffer.allocUnsafe(Math.min(maxPreviewBytes, stat.size));
+          const bytes = fs.readSync(handle, buffer, 0, buffer.length, 0);
+          content = buffer.subarray(0, bytes).toString("utf8");
+        } finally { fs.closeSync(handle); }
+      }
       return {
         data: {
           name: path.basename(target.filePath),
@@ -4516,6 +4525,25 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     }
   });
 
+  // Complete native bytes, streamed after the same ownership checks as export.
+  // No JSON parsing, no tool truncation and no intermediate full-history string.
+  app.get<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/history-source", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      const source = await findThreadJsonlPathById(request.params.threadId);
+      if (!source) return reply.code(404).send({ error: "历史尚未持久化，请稍后重试。" });
+      const size = (await rolloutLogicalStat(source)).size;
+      reply.header("Cache-Control", "private, no-store").header("X-Content-Type-Options", "nosniff");
+      reply.type("application/x-ndjson").header("Content-Disposition", `attachment; filename="history-${request.params.threadId.replace(/[^a-zA-Z0-9-]/g, "_")}.jsonl"`);
+      reply.header("Content-Length", String(size));
+      if (!size) return reply.send("");
+      return reply.send(await rolloutReadStream(source, { start: 0, end: size - 1 }, 0));
+    } catch (error) { return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
+  });
+
   app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/export", async (request, reply) => {
     try {
       const userId = userIdFromRequest(request, store);
@@ -4532,20 +4560,14 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       }
 
       const input = threadExportSchema.parse(request.body ?? {});
-      let result: unknown;
-      try {
-        result = await bridge.request("thread/read", {
-          threadId: request.params.threadId,
-          includeTurns: true
-        });
-        result = await readThreadPreferJsonlFallback(request.params.threadId, result);
-      } catch (readError) {
-        const fallbackPath = threadJsonlPathFromError(readError) ?? await findThreadJsonlPathById(request.params.threadId);
-        if (!fallbackPath) {
-          throw readError;
-        }
-        result = sanitizeThreadPayloadForClient(await readThreadFromJsonl(fallbackPath, request.params.threadId));
+      const fallbackPath = await findThreadJsonlPathById(request.params.threadId);
+      if (!fallbackPath) return reply.code(409).send({ error: "历史尚未持久化，请稍后导出；不会请求运行时加载完整会话。" });
+      if ((await rolloutLogicalStat(fallbackPath)).size > MAX_FULL_HISTORY_BYTES) {
+        const nativeHistoryUrl = `/api/projects/${encodeURIComponent(project.id)}/threads/${encodeURIComponent(request.params.threadId)}/history-source`;
+        return reply.code(413).send({ code: "HISTORY_MEMORY_LIMIT", nativeHistoryUrl,
+          error: `此会话过大，已安全停止 Markdown/JSON 全量渲染。完整原始记录可流式下载：${nativeHistoryUrl}；原文未修改。` });
       }
+      let result: unknown = await readThreadFromJsonl(fallbackPath, request.params.threadId);
       result = sanitizeThreadPayloadForClient(result);
 
       const thread = asRecord(asRecord(result).thread);
@@ -4633,11 +4655,9 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           history: indexedPage.history
         };
       } else {
-        result = await bridge.request("thread/read", {
-          threadId: request.params.threadId,
-          includeTurns: true
-        });
-        result = await readThreadPreferJsonlFallback(request.params.threadId, result);
+        // Unknown native response size is not a safe fallback for a missing
+        // local rollout. Wait for persistence instead of hydrating all turns.
+        return reply.code(503).send({ code: "HISTORY_NOT_READY", error: "历史文件尚未同步，请稍后重试；为保护正在运行的会话，不会加载未知大小的完整历史。" });
       }
       result = sanitizeThreadPayloadForClient(result);
       const page = paginateThreadPayload(result, input.before, input.limit);

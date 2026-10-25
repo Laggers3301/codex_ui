@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { delegationContextInstructions } from "../scripts/agent-delegation-policy.mjs";
 
 const startMarker = "<!-- codex-web:response-language:start -->";
 const endMarker = "<!-- codex-web:response-language:end -->";
@@ -11,7 +12,9 @@ export const defaultAgentLanguageInstructions = [
   "- 主代理及所有层级的子代理默认以简体中文撰写用户可见的说明、进度、结论、任务汇报和协作消息；不因模型、子任务描述或参考资料使用英文而切换回复语言。",
   "- 创建子代理或交接任务时，应携带此语言约定，包括不继承父会话历史的子代理。",
   "- 用户明确指定其他语言时按用户要求；代码、命令、路径、标识符、模型名、必要英文术语、原文引用和原始工具日志保留原样，不为统一语言改写它们。",
-  "- This applies to the root agent and every subagent, including fresh/no-history forks: use Simplified Chinese for explanations, progress, summaries and collaboration messages by default. An English task description is not a request for an English reply. Honor an explicit user language request and preserve code, identifiers, essential terms and raw logs."
+  "- This applies to the root agent and every subagent, including fresh/no-history forks: use Simplified Chinese for explanations, progress, summaries and collaboration messages by default. An English task description is not a request for an English reply. Honor an explicit user language request and preserve code, identifiers, essential terms and raw logs.",
+  "",
+  delegationContextInstructions
 ].join("\n");
 
 /** Use Codex's native global instructions, not a visible user-message prelude.

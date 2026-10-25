@@ -440,6 +440,17 @@ export interface LiveAgentMessage {
   updatedAt: string;
 }
 
+export interface LiveReasoningMessage {
+  itemId: string;
+  threadId: string | null;
+  turnId: string | null;
+  text: string;
+  completed: boolean;
+  sequence: number;
+  startedAt: string;
+  updatedAt: string;
+}
+
 export interface LiveTurnState {
   threadId: string | null;
   turnId: string | null;
@@ -464,6 +475,7 @@ export interface LiveToolItem {
 }
 
 export interface LiveStateSnapshot {
+  reasoningMessages?: LiveReasoningMessage[];
   agentMessages: LiveAgentMessage[];
   toolItems: LiveToolItem[];
   activeTurns: LiveTurnState[];

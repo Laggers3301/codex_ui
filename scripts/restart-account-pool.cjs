@@ -70,7 +70,9 @@ async function run() {
     if (process.argv.includes('--check')) {
       log('deployment_check', { protectedThread, waitingForCurrentTurn: await busy() }); return;
     }
-    const deadline = Date.now() + 30 * 60_000;
+    // An explicitly requested all-idle deployment must not silently expire
+    // while long-running user conversations are still making progress.
+    const deadline = allIdle ? Number.POSITIVE_INFINITY : Date.now() + 30 * 60_000;
     const immediate = process.argv.includes('--now');
     log(immediate ? 'authorized_immediate_deployment' : 'waiting_for_current_conversation', { protectedThread });
     let active;
@@ -113,6 +115,13 @@ async function run() {
     // Validate state before stopping anything; it is re-read only after the old
     // process can no longer overwrite it.
     JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    if (allIdle) {
+      // Recheck after preparing state, not just before the (possibly slow)
+      // journal read. A newly started conversation cancels this attempt.
+      for (const { id: user } of db.prepare('SELECT id FROM users').all()) {
+        if ((await connect(user)).length) throw new Error('Deployment deferred: new active conversation detected; no restart performed');
+      }
+    }
     log('restarting_backend', { interruptedConversations: active.length });
     execFileSync('systemctl', ['--user', 'stop', 'codex-account-pool-4576.service']);
     let authMigrationFailure = false;

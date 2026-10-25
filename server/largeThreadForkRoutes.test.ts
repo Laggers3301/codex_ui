@@ -11,6 +11,7 @@ import { registerRoutes } from "./routes.js";
 import * as fallback from "./threadFallback.js";
 import {serverConfig} from "./config.js";
 import {createSessionCookie} from "./auth.js";
+import {guardCommand,guardMatcher} from "../scripts/install-subagent-history-guard.mjs";
 
 vi.mock("./largeThreadFork.js", async () => ({ ...await vi.importActual<typeof import("./largeThreadFork.js")>("./largeThreadFork.js"), largeThreadForkBytes: 1 }));
 vi.mock("./threadFallback.js", async () => ({ ...await vi.importActual<typeof import("./threadFallback.js")>("./threadFallback.js"), findThreadJsonlPathById: vi.fn(), threadJsonlSessionsRoot: vi.fn() }));
@@ -35,6 +36,7 @@ describe("large legacy branch route", () => {
       async request(method: string, value: unknown) {
         const params = value as Record<string, unknown>;
         calls.push({ account: this.account, method, params });
+        if (method === "hooks/list") return {data:[{hooks:[{key:"fixture-guard",currentHash:"fixture-hash",sourcePath:path.join((params.cwds as string[])[0],"hooks.json"),eventName:"preToolUse",matcher:guardMatcher,command:guardCommand}]}]};
         if (method === "thread/read") return { thread: { id: "source", name: "fixture", path: sourcePath } };
         if (method === "thread/resume") return { thread: { id: params.threadId, path: params.path, turns: [], status: { type: "idle" } } };
         return {};

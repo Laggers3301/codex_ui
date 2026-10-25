@@ -8,7 +8,9 @@ import {archivedOutputPreview,createToolOutputArchive,type ToolArchiveSummary} f
 import {openReadableRollout,rolloutSourcePath} from './rolloutStorage.js';
 
 export const largeThreadForkBytes = 128 * 1024 * 1024;
-const maxRecordBytes = 64 * 1024 * 1024;
+// Parsing/archive preview may hold several UTF-16 copies of this record.
+// Keep it safe under the web backend's 384MiB heap; never rewrite the source.
+const maxRecordBytes = 16 * 1024 * 1024;
 type Row = { type?: string; timestamp?: string; payload?: Record<string, unknown> };
 
 export class BranchConflictError extends Error {

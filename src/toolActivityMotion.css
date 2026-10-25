@@ -1,0 +1,67 @@
+.toolRollingCount {
+  display: inline-grid;
+  position: relative;
+  overflow: clip;
+  vertical-align: baseline;
+  line-height: inherit;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  color: var(--ui-content-muted);
+  perspective: 120px;
+}
+.messageItem.toolBundle.toolBundleArrival { animation: toolBundleArrive 320ms cubic-bezier(.16,1,.3,1) both; }
+@keyframes toolBundleArrive { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+.toolRollingCountSizer { visibility: hidden; grid-area: 1 / 1; }
+.toolRollingCountLayers { grid-area: 1 / 1; position: relative; }
+.toolRollingCountOld, .toolRollingCountNew { position: absolute; inset: 0; text-align: center; }
+/* One shared sweep for the complete title. Digits sample the same gradient at
+   their actual horizontal offset, rather than starting a second tiny sweep. */
+@property --tool-shimmer-phase {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 2;
+}
+@keyframes toolTitleShimmer {
+  from { --tool-shimmer-phase: 2; }
+  to { --tool-shimmer-phase: 0; }
+}
+:root .toolBundle.toolBundleShimmering .messageMeta .toolBundleTitleLabel {
+  animation: toolTitleShimmer 2.35s linear infinite !important;
+  background-position: calc(-1 * var(--tool-shimmer-width, 160px) * var(--tool-shimmer-phase)) 50% !important;
+}
+.toolBundleShimmering .toolCountGlyph {
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  background-image: var(--ui-work-shimmer-gradient);
+  background-size: calc(2 * var(--tool-shimmer-width, 160px)) 100%;
+  background-position: calc(-1 * var(--tool-shimmer-width, 160px) * var(--tool-shimmer-phase) - var(--tool-shimmer-offset, 0px)) 50%;
+  background-repeat: repeat-x;
+  background-clip: text;
+  -webkit-background-clip: text;
+}
+.toolRollingCountLayers[data-moving="true"] .toolRollingCountOld {
+  transform-origin: center bottom;
+  animation: toolCountOut 150ms cubic-bezier(.4,0,.7,1) both;
+}
+.toolRollingCountLayers[data-moving="true"] .toolRollingCountNew {
+  transform-origin: center top;
+  animation: toolCountIn 180ms cubic-bezier(.16,1,.3,1) both;
+}
+@keyframes toolCountOut {
+  to { opacity: 0; transform: translateY(-80%) rotateX(22deg); }
+}
+@keyframes toolCountIn {
+  from { opacity: 0; transform: translateY(80%) rotateX(-22deg); }
+  to { opacity: 1; transform: translateY(0) rotateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  :root .toolBundle.toolBundleShimmering .messageMeta .toolBundleTitleLabel { animation: none !important; }
+  .toolBundleShimmering .toolCountGlyph {
+    color: var(--ui-content-muted);
+    -webkit-text-fill-color: currentColor;
+    background: none;
+  }
+  .messageItem.toolBundle.toolBundleArrival { animation: none; }
+  .toolRollingCountLayers[data-moving="true"] .toolRollingCountOld { display: none; }
+  .toolRollingCountLayers[data-moving="true"] .toolRollingCountNew { animation: none; }
+}

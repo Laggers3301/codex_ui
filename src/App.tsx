@@ -36,6 +36,7 @@ import { localMessageBelongsToThread } from "./localMessageScope";
 import { isSuccessfulTransferReceipt, TRANSFER_RECEIPT_HOLD_MS } from "./transferReceipt";
 import { TransferReceipt } from "./TransferReceipt";
 import "./threadContextMenu.css";
+import "./sideChatDock.css";
 import { downloadBrowserFile, shareBrowserFile } from "./browserFileActions";
 import { PreviewFileTransferActions, type BrowserFileAction } from "./PreviewFileTransferActions";
 import { readTurnProgress, turnProgressText, updateTurnProgress, type TurnProgress } from "./turnProgress";
@@ -77,6 +78,10 @@ import {
 import ReactMarkdown, { type Components } from "react-markdown";
 import { coalesceToolOutputs, collapseCodeModeWrappers, latestUserTimelineIndex, liveTimelineItems, mergeTimelineItems } from "./conversationTimeline";
 import { ToolReveal } from "./ToolReveal";
+import { RollingToolCount, ToolArrivalList } from "./ToolActivityMotion";
+import { useProviderQuotas, providerRemaining, ProviderQuotaDetails } from "./providerQuota";
+import { isToolSummaryClick, recordToolDisclosurePointerDown } from "./toolDisclosure";
+import { ToolArrivalRegistry } from "./toolArrivalRegistry";
 import { skillReadSummary } from "./skillReadSummary";
 import { localizedSkill, skillSection } from "./skillLocalization";
 import { GoalProgress } from "./GoalProgress";
@@ -187,6 +192,7 @@ import type {
   DirectoryListResponse,
   LiveStateSnapshot,
   LiveAgentMessage,
+  LiveReasoningMessage,
   LiveToolItem,
   LocalSendSettings,
   ModelProfile,
@@ -659,6 +665,7 @@ interface LiveDeltaEntry {
 interface LiveToolEntry extends LiveToolItem {}
 
 type LiveTimelineEntry =
+  | { id: string; kind: "reasoning"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; text: string; completed: boolean }
   | { id: string; kind: "agent"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; text: string; sourceItemId?: string; completed?: boolean; streamState?: LiveDeltaEntry["streamState"] }
   | { id: string; kind: "tool"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; tool: string; input: string; output: string; completed: boolean; sourceItemId?: string; collaboration?: Record<string, unknown> };
 
@@ -2358,6 +2365,7 @@ export const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
   const lastSynchronizedValueRef = useRef(value);
   const pendingCompositionValueRef = useRef<string | null>(null);
   const shellRef = useRef<HTMLDivElement>(null);
+  const [draftBelow, setDraftBelow] = useState(false);
   const [dismissedPrediction,setDismissedPrediction]=useState<string|null>(null);
   const [composingPrediction,setComposingPrediction]=useState(false);
   const [predictionAccepted,setPredictionAccepted]=useState(false);
@@ -2605,8 +2613,8 @@ export const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
     const input = editor.view.dom;
     const updateHeight = () => {
       const maxHeight = Number.parseFloat(window.getComputedStyle(shell).maxHeight) || 300;
-      const minimumHeight = window.matchMedia("(max-width: 720px)").matches
-        ? Math.max(30, Math.min(38, height * .65)) : height;
+      const minimumHeight = Math.min(maxHeight, window.matchMedia("(max-width: 720px)").matches
+        ? Math.max(30, Math.min(38, height * .65)) : height);
       const nextHeight = Math.min(maxHeight, Math.max(minimumHeight, input.scrollHeight));
       setAnimatedHeight((current) => current === nextHeight ? current : nextHeight);
     };
@@ -2620,16 +2628,38 @@ export const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
     };
   }, [editor, height]);
 
+  useLayoutEffect(() => {
+    const shell = shellRef.current;
+    if (!editor || !shell) return;
+    const updateFade = () => {
+      setDraftBelow(shell.scrollHeight - shell.clientHeight - shell.scrollTop > 2);
+    };
+    const observer = new ResizeObserver(updateFade);
+    observer.observe(shell);
+    observer.observe(editor.view.dom);
+    shell.addEventListener("scroll", updateFade, { passive: true });
+    editor.on("update", updateFade);
+    updateFade();
+    return () => {
+      observer.disconnect();
+      shell.removeEventListener("scroll", updateFade);
+      editor.off("update", updateFade);
+    };
+  }, [editor]);
+
   return <div
     ref={shellRef}
-    className={`composerRichEditor${predictionPresence.present&&!value ? " hasPredictionGhost" : ""}${predictionAccepted?" predictionAccepted":""}`}
+    className={`composerRichEditor${draftBelow ? " hasDraftBelow" : ""}${predictionPresence.present&&!value ? " hasPredictionGhost" : ""}${predictionAccepted?" predictionAccepted":""}`}
     onBeforeInputCapture={event => {
       dismissPredictionRef.current();
       if ((event.nativeEvent as InputEvent).isComposing && !composingRef.current) beginComposition();
     }}
     onCompositionStartCapture={beginComposition}
     onCompositionEnd={finishComposition}
-    style={height === undefined ? undefined : { minHeight: height, height: animatedHeight }}
+    // A stored resize preference can exceed today's viewport/CSS maximum.
+    // min-height would win over max-height and push the grid controls outside
+    // the glass. Height may animate; CSS alone owns the hard minimum/maximum.
+    style={height === undefined ? undefined : { height: animatedHeight }}
     onPasteCapture={(event) => {
       if (!onPaste) return;
       const hasFiles = Array.from(event.clipboardData.items).some((item) => item.kind === "file");
@@ -3639,11 +3669,11 @@ function cleanLimitName(raw: string | null | undefined): string {
   return next || "模型额度";
 }
 
-function rateWindowText(window: CodexRateLimitWindow | null | undefined): string {
+function rateWindowText(window: CodexRateLimitWindow | null | undefined, labelOverride?: string): string {
   if (!window) {
     return "-";
   }
-  const windowLabel = rateWindowLabel(window);
+  const windowLabel = labelOverride ?? rateWindowLabel(window);
   const remaining = remainingQuotaPercent(window.usedPercent);
   const used = window.usedPercent ?? null;
   return `剩余 ${percentText(remaining)}% / ${windowLabel}，已用 ${percentText(used)}%，重置 ${formatResetTime(window.resetsAt)}`;
@@ -3655,7 +3685,7 @@ function rateLimitSnapshotText(snapshot: CodexRateLimitSnapshot | null | undefin
   }
   const parts = [snapshot.primary, snapshot.secondary]
     .filter((window): window is CodexRateLimitWindow => Boolean(window))
-    .map(rateWindowText);
+    .map(window => rateWindowText(window));
   const individual = snapshot.individualLimit;
   if (individual?.resetsAt && individual.resetsAt !== snapshot.primary?.resetsAt) {
     const remaining = individual.remainingPercent === null ? "" : `剩余 ${percentText(individual.remainingPercent)}%`;
@@ -3763,10 +3793,12 @@ function accountRemainingLabel(account: CodexAccountPoolAccount): string {
   return remaining === null ? "--" : `${percentText(remaining)}%`;
 }
 
-function QuotaPopover({ quota, pool, loading, closing }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean }) {
+function QuotaPopover({ quota, pool, loading, closing, userId }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean; userId: string }) {
+  const providerQuotas = useProviderQuotas(userId);
   const quotaAccounts = pool?.accounts.filter((entry) => entry.kind !== "api-provider") ?? [];
   const defaultAccount = quotaAccounts.find((entry) => entry.selectedForNewThreads) ?? quotaAccounts[0] ?? null;
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(defaultAccount?.id ?? null);
+  const selectedProvider = providerQuotas.find(item => `provider:${item.id}` === selectedAccountId);
   const selectedAccount = quotaAccounts.find((entry) => entry.id === selectedAccountId) ?? defaultAccount;
   const currentThreadAccount = quotaAccounts.find((entry) => entry.id === pool?.currentThreadAccountId) ?? null;
   const selectedQuota = selectedAccount?.quota ?? quota;
@@ -3790,9 +3822,13 @@ function QuotaPopover({ quota, pool, loading, closing }: { quota: CodexQuota | n
                 <strong>{accountRemainingLabel(account)}</strong>
               </button>
             ))}
+            {providerQuotas.map(item => <button type="button" role="tab" key={`provider:${item.id}`} data-account-id={`provider:${item.id}`}
+              aria-selected={item === selectedProvider} title={`${item.name} · ${item.stale ? "缓存用量" : "套餐用量"}`}
+              className={`accountPoolTab ${item === selectedProvider ? "active" : ""} ${item.status !== "ready" ? "degraded" : ""}`}
+              onClick={() => setSelectedAccountId(`provider:${item.id}`)}><span>{item.name}</span><strong>{providerRemaining(item)}</strong></button>)}
           </div>
-          {selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
-          {selectedAccount ? (
+          {selectedProvider ? <ProviderQuotaDetails key={selectedProvider.id} item={selectedProvider} formatPeriod={period => rateWindowText({ usedPercent: period.usedPercent, windowDurationMins: null, resetsAt: period.resetsAt ? Date.parse(period.resetsAt) / 1000 : null }, ({ session: "5小时", weekly: "7天", monthly: "月度" } as Record<string, string>)[period.label] ?? period.label)} /> : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
+          {!selectedProvider && selectedAccount ? (
             <div className="accountPoolSelectedMeta">
               {currentThreadAccount ? (
                 <>
@@ -3950,7 +3986,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
               <span>账号剩余 {account.accountRemainingPercent === null ? "--" : `${percentText(account.accountRemainingPercent)}%`}</span>
             </header>
             <div className="trackedQuotaMetrics">
-              <div><span>lzc 今日</span><strong>{percentText(account.todayQuotaPercent)}%</strong><small>{formatNumber(account.todayTokens)} token</small></div>
+              <div><span>sample-user 今日</span><strong>{percentText(account.todayQuotaPercent)}%</strong><small>{formatNumber(account.todayTokens)} token</small></div>
               <div><span>本周期累计</span><strong>{percentText(account.userCycleQuotaPercent)}%</strong><small>{formatNumber(account.userCycleTokens)} token</small></div>
             </div>
             <p>{account.cycleStartAt && account.resetAt
@@ -3968,7 +4004,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
             <em>{percentText(day.quotaPercent)}%</em>
             <small>{day.accounts.map((account) => `${account.accountLabel} ${percentText(account.quotaPercent)}%`).join(" · ")}</small>
           </article>
-        )) : <div className="emptyState">当前额度周期暂无 lzc token 记录。</div>}
+        )) : <div className="emptyState">当前额度周期暂无 sample-user token 记录。</div>}
       </section>
 
       <p className="trackedQuotaFootnote">个人百分比为估算值，并非 OpenAI 提供的个人扣额；多人共用账号时无法精确拆分。{usage.dailyLimitEnforced
@@ -4696,6 +4732,9 @@ export function App() {
   const [liveDeltas, setLiveDeltas] = useState<Record<string, LiveDeltaEntry>>({});
   const liveDeltaGapRecoveryAtRef = useRef(0);
   const [liveTools, setLiveTools] = useState<Record<string, LiveToolEntry>>({});
+  const [liveReasoning, setLiveReasoning] = useState<Record<string, LiveReasoningMessage>>({});
+  useEffect(() => { setLiveReasoning({}); }, [selectedUserId]);
+  const toolArrivals = useRef(new ToolArrivalRegistry());
   const [turnProgress, setTurnProgress] = useState<Record<string, TurnProgress>>({});
   const [turnRecoveries, setTurnRecoveries] = useState<Record<string, TurnRecoveryView>>({});
   const [answeredQuestionItems, setAnsweredQuestionItems] = useState<Record<string, true>>({});
@@ -4877,7 +4916,7 @@ export function App() {
     if(!providerFailureOpen)return;
     let timer:number;
     const hide=()=>{
-      if(document.querySelector('.providerFailureNotice details[open]')){timer=window.setTimeout(hide,1500);return;}
+      if(document.querySelector('.providerErrorBanner details[open]')){timer=window.setTimeout(hide,1500);return;}
       setProviderFailureOpen(false);
     };
     timer=window.setTimeout(hide,8000);return()=>window.clearTimeout(timer);
@@ -4895,7 +4934,10 @@ export function App() {
   const setTemporaryModelProfileId = useCallback((model: string) => {
     if (selectedThread?.id) sideChatController.setDraft(selectedUserId, selectedThread.id, sideChatController.get(selectedUserId, selectedThread.id)?.draft ?? "", model);
   }, [sideChatController, selectedUserId, selectedThread?.id]);
-  const [temporaryAskWidth, setTemporaryAskWidth] = useState(() => storedNumber("codex-web-temporary-ask-width", 390, 300, 760));
+  const [temporaryPanelMount, setTemporaryPanelMount] = useState<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (temporaryAsk?.id) showRightWindow("side-chat");
+  }, [temporaryAsk?.id, showRightWindow]);
   const selectionAskActionRef = useRef<SelectionAskActionHandle>(null);
   const [temporaryCloseTarget, setTemporaryCloseTarget] = useState<TemporaryAsk | null>(null);
   const temporaryCloseConfirm = Boolean(temporaryCloseTarget);
@@ -5017,7 +5059,7 @@ export function App() {
     }
   }
 
-  function liveTimelineSequence(kind: "agent" | "tool", itemId: string, moveToTail = false): number {
+  function liveTimelineSequence(kind: "agent" | "tool" | "reasoning", itemId: string, moveToTail = false): number {
     const key = `${kind}:${itemId}`;
     const existing = liveTimelineOrderRef.current.get(key);
     if (existing !== undefined && (!moveToTail || existing === liveTimelineSequenceRef.current)) {
@@ -5059,6 +5101,7 @@ export function App() {
   }
 
   function clearTemporaryThread(threadId: string) {
+    setLiveReasoning(items => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== threadId)));
     setLiveDeltas((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== threadId)));
     setLiveTools((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== threadId)));
     setActiveTurnsByThread((items) => {
@@ -5158,6 +5201,7 @@ export function App() {
             : persistedThread
         ));
         if (!turnId || hasPersistedCompletedTurn(persistedThread, turnId)) {
+          setLiveReasoning(items => Object.fromEntries(Object.entries(items).filter(([, item]) => item.threadId !== threadId || (turnId !== null && item.turnId !== turnId))));
           setLiveDeltas((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => (
             item.threadId !== threadId || (turnId !== null && item.turnId !== turnId)
           ))));
@@ -9493,10 +9537,22 @@ export function App() {
     });
   }
 
-  function hydrateLiveState(snapshot: LiveStateSnapshot | undefined) {
+  function hydrateLiveState(snapshot: LiveStateSnapshot | undefined, animateNewTools = false) {
     if (!snapshot) {
       return;
     }
+    const reasoning = recentLiveSnapshotItems(snapshot.reasoningMessages, 32);
+    for (const item of reasoning) {
+      liveTimelineOrderRef.current.set(`reasoning:${item.itemId}`, item.sequence);
+      liveTimelineSequenceRef.current = Math.max(liveTimelineSequenceRef.current, item.sequence);
+    }
+    setLiveReasoning(current => {
+      const next = Object.fromEntries(reasoning.map(item => [item.itemId, item]));
+      for (const [id, item] of Object.entries(current)) {
+        if ((item.threadId === selectedThreadRef.current?.id || (item.threadId && sideChatController.threadIds().has(item.threadId))) && !next[id]) next[id] = item;
+      }
+      return next;
+    });
     [
       ...recentLiveSnapshotItems(snapshot.agentMessages, LIVE_RECONNECT_AGENT_LIMIT).filter((item) => item.itemId).map((item) => ({ kind: "agent" as const, id: item.itemId, startedAt: item.startedAt ?? item.updatedAt ?? "" })),
       ...recentLiveSnapshotItems(snapshot.toolItems, LIVE_RECONNECT_TOOL_LIMIT).filter((item) => item.itemId).map((item) => ({ kind: "tool" as const, id: item.itemId, startedAt: item.startedAt ?? "" }))
@@ -9516,6 +9572,14 @@ export function App() {
         return [id, previous?.streamState === "superseded" && previous.threadId === entry.threadId && previous.turnId === entry.turnId ? { ...entry, streamState: "superseded" as const } : entry];
       }));
     const snapshotTools = liveToolsFromSnapshot(snapshot);
+    const persistedIds = new Set((selectedThreadRef.current?.turns ?? []).flatMap(turn => (turn.items ?? []).map(item => item.id)));
+    for (const [id, tool] of Object.entries(snapshotTools)) {
+      // The first hello is a baseline, not an arrival. Later snapshots can
+      // contain genuinely new tools missed between individual events.
+      if (animateNewTools && tool.threadId === selectedThreadRef.current?.id && !persistedIds.has(id)) {
+        toolArrivals.current.receive(id, threadViewTokenRef.current);
+      } else toolArrivals.current.snapshot([id]);
+    }
     // A completed turn is removed from the server's live snapshot before its
     // JSONL history is always readable. Preserve the temporary panel's live
     // copy until promoteTemporaryTurn confirms the persisted replacement.
@@ -9683,14 +9747,31 @@ export function App() {
     }
 
     if (message.type === "live.state") {
-      hydrateLiveState(message.data as LiveStateSnapshot | undefined);
+      hydrateLiveState(message.data as LiveStateSnapshot | undefined, true);
       refreshSelectedThreadFromLiveState(message.data as LiveStateSnapshot | undefined);
+      return;
+    }
+
+    if (message.type === "live.reasoning") {
+      const item = message.data as LiveReasoningMessage | undefined;
+      if (item?.itemId) {
+        toolArrivals.current.receive(item.itemId, item.threadId === selectedThreadRef.current?.id ? threadViewTokenRef.current : null);
+        markLiveEvent(item.threadId);
+        liveTimelineOrderRef.current.set(`reasoning:${item.itemId}`, item.sequence);
+        liveTimelineSequenceRef.current = Math.max(liveTimelineSequenceRef.current, item.sequence);
+        setLiveReasoning(current => {
+          const previous = current[item.itemId];
+          if (previous?.completed && !item.completed) return current;
+          return Object.fromEntries(Object.entries({ ...current, [item.itemId]: { ...item, startedAt: previous?.startedAt ?? item.startedAt, sequence: previous?.sequence ?? item.sequence } }).slice(-128));
+        });
+      }
       return;
     }
 
     if (message.type === "live.tool") {
       const item = message.data as LiveToolEntry | undefined;
       if (item?.itemId) {
+        toolArrivals.current.receive(item.itemId, item.threadId === selectedThreadRef.current?.id ? threadViewTokenRef.current : null);
         liveTimelineSequence("tool", item.itemId);
         markLiveEvent(item.threadId);
         setLiveTools((current) => {
@@ -10240,6 +10321,7 @@ export function App() {
         }
         setActiveTurnsByThread((current) => finishActiveTurn(current, threadId, turnId));
         const clearCompletedLiveItems = () => {
+          setLiveReasoning(current => Object.fromEntries(Object.entries(current).filter(([, entry]) => entry.threadId !== threadId && (!turnId || entry.turnId !== turnId))));
           setLiveDeltas((current) => Object.fromEntries(
             Object.entries(current).filter(([, entry]) => entry.threadId !== threadId && (!turnId || entry.turnId !== turnId))
           ));
@@ -10335,6 +10417,7 @@ export function App() {
   }
 
   const liveTimelineEntries: LiveTimelineEntry[] = [
+    ...Object.values(liveReasoning).map(entry => ({ id: entry.itemId, kind: "reasoning" as const, ...entry })),
     ...Object.entries(liveDeltas).map(([id, entry]) => ({ id, kind: "agent" as const, sequence: liveTimelineSequence("agent", id), ...entry })),
     ...Object.values(liveTools).map((entry) => ({ id: entry.itemId, kind: "tool" as const, sequence: liveTimelineSequence("tool", entry.itemId), ...entry }))
   ]
@@ -10354,6 +10437,7 @@ export function App() {
     liveTimelineByTurn.set(turnId, entries);
   }
   const renderLiveTimelineEntry = (entry: LiveTimelineEntry) => {
+    if (entry.kind === "reasoning") return entry.text.trim() ? <article className={`messageItem kind-reasoning type-reasoning${entry.completed ? "" : " live"}`} key={entry.id}><ReasoningMessage text={entry.text} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /></article> : null;
     if (entry.kind === "agent") {
       if (entry.streamState === "superseded") return null;
       return stripInterruptArtifacts(entry.text) ? (
@@ -10503,7 +10587,7 @@ export function App() {
     if (entries.length === 1 && itemKind(entries[0]) === "reasoning") {
       const reasoningText = reasoningItemDisplayText(entries[0]);
       return (
-        <div className="toolBundleReasoningEntry" key={entryKey} onClick={(event) => event.stopPropagation()}>
+        <div className="toolBundleReasoningEntry" key={entryKey} data-tool-entry-key={entries[0].id} onClick={(event) => event.stopPropagation()}>
           <ReasoningMessage text={reasoningText} projectId={contextProjectId} onOpenFileLink={openFilePreview} />
         </div>
       );
@@ -10538,9 +10622,12 @@ export function App() {
       <article
         className={`messageItem kind-tool type-toolCall toolBundleEntry${expanded ? " toolExpanded" : ""}${running ? " live" : ""}`}
         key={entryKey}
+        data-tool-entry-key={entries[0].id}
         aria-expanded={expanded}
+        onPointerDownCapture={event => recordToolDisclosurePointerDown(event.currentTarget, event)}
         onClick={(event) => {
           event.stopPropagation();
+          if (!isToolSummaryClick(event.target, event.currentTarget, event)) return;
           if (!expanded && !historyContext?.readOnly) revealExpandedTool(event.currentTarget);
           setExpandedToolEntries((current) => {
             if (current[entryKey]) {
@@ -10568,7 +10655,7 @@ export function App() {
     return coalesceToolOutputs(bundleItems).map((item) => [item]);
   };
 
-  const summarizeToolBundleTitle = (bundleItems: ThreadItem[], complete = true): string => {
+  const summarizeToolBundleTitle = (bundleItems: ThreadItem[], arrive = false): ReactNode => {
     const toolCallItems = bundleItems.filter((item) => safeText(item.type).toLowerCase() === "toolcall");
     const callToolNames = Array.from(new Set(
       bundleItems
@@ -10582,7 +10669,7 @@ export function App() {
       : callToolNames.length > 1
         ? "工具"
         : "tool";
-    return `调用工具 · ${toolLabel} × ${Math.max(1, displayedCount)}`;
+    return <>调用工具 · {toolLabel} × <RollingToolCount count={Math.max(1, displayedCount)} arrive={arrive} /></>;
   };
 
   const renderPersistedToolBundle = (
@@ -10602,13 +10689,17 @@ export function App() {
     const running = hasRunningTool;
     const expanded = Boolean(expandedToolBundles[bundleId]);
     const bundleGroups = getToolBundleGroups(bundleItems);
+    const arrive = toolArrivals.current.belongsToLiveView(bundleItems[0]?.id ?? "", threadViewTokenRef.current);
     return (
       <article
-        className={`messageItem kind-tool type-toolCall toolBundle${expanded ? " toolExpanded" : ""}${shimmering ? " live toolBundleShimmering" : ""}${running ? " toolBundleRunning" : ""}`}
+        className={`messageItem kind-tool type-toolCall toolBundle${arrive ? " toolBundleArrival" : ""}${expanded ? " toolExpanded" : ""}${shimmering ? " live toolBundleShimmering" : ""}${running ? " toolBundleRunning" : ""}`}
         key={bundleId}
         data-message-key={bundleId}
         aria-expanded={expanded}
+        onPointerDownCapture={event => recordToolDisclosurePointerDown(event.currentTarget, event)}
         onClick={(event) => {
+          event.stopPropagation();
+          if (!isToolSummaryClick(event.target, event.currentTarget, event)) return;
           event.preventDefault();
           if (!expanded && !historyContext?.readOnly) revealExpandedTool(event.currentTarget);
           setExpandedToolBundles((current) => {
@@ -10625,14 +10716,14 @@ export function App() {
         }}
       >
         <div className={`messageMeta toolBundleTitle${shimmering ? " live" : ""}`}>
-          <span className="toolBundleTitleLabel">{summarizeToolBundleTitle(bundleItems, !running)}</span>
+          <span className="toolBundleTitleLabel">{summarizeToolBundleTitle(bundleItems, arrive)}</span>
         </div>
         <ToolReveal open={expanded}>
-          {() => <div className="toolBundleEntries" onClick={historyContext?.readOnly ? (event) => event.stopPropagation() : undefined}>
+          {() => <ToolArrivalList itemKeys={bundleGroups.map(group => group[0].id)} arrive={arrive} onClick={historyContext?.readOnly ? (event) => event.stopPropagation() : undefined}>
             {bundleGroups.map((bundleGroup, groupIndex) => (
               historyContext ? historyContext.renderEntry(bundleGroup, groupIndex) : renderToolBundleGroup(bundleId, bundleGroup, groupIndex, contextThreadId, contextProjectId, contextTurnId)
             ))}
-          </div>}
+          </ToolArrivalList>}
         </ToolReveal>
       </article>
     );
@@ -10752,6 +10843,7 @@ export function App() {
     .flatMap((turn) => turn.items ?? [])
     .map((item) => item.id));
   const temporaryLiveTimeline = temporaryAsk?.threadId ? [
+    ...Object.values(liveReasoning).filter(item => item.threadId === temporaryAsk.threadId).map(item => ({ id: item.itemId, kind: "reasoning" as const, ...item })),
     ...Object.entries(liveDeltas)
       .filter(([, item]) => item.threadId === temporaryAsk.threadId)
       .map(([id, item]) => ({ id, kind: "agent" as const, sequence: liveTimelineSequence("agent", id), ...item })),
@@ -11299,6 +11391,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       { id: "schedule-new", title: "新建定时任务", icon: "plus", disabled: !selectedThread, onOpen: () => { setScheduleEditor(current => ({ id: null, key: current.key + 1 })); showRightWindow("schedules"); } }
     ], more: threadSchedules.schedules.length > 4 ? { label: "查看全部定时任务", onOpen: () => showRightWindow("schedules") } : undefined },
     { title: "工作窗口", entries: [
+      ...(temporaryAsk ? [{ id: "side-chat", title: "侧边聊天", icon: "chat" as const, onOpen: () => showRightWindow("side-chat") }] : []),
       { id: "remote", title: "远程文件", icon: "remote", onOpen: () => showRightWindow("remote") },
       { id: "browser", title: "浏览器", icon: "browser", onOpen: () => launchWorkspaceAction("browser"), disabled: !selectedProject },
       { id: "terminal", title: "交互终端", icon: "terminal", onOpen: () => launchWorkspaceAction("terminal"), disabled: !selectedProject },
@@ -11312,6 +11405,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     { title: "来源", entries: workspaceSources.slice(0, 4).map(source => ({ id: source.url, title: source.title, detail: new URL(source.url).hostname, icon: "sources", onOpen: () => openSourceWindow(source.url) })), more: workspaceSources.length > 4 ? { label: "查看全部来源", onOpen: () => showRightWindow("sources") } : undefined }
   ];
   const rightTabs: WorkspaceTab[] = [];
+  if (temporaryAsk) rightTabs.push({ id: "side-chat", title: "侧边聊天", icon: "chat", onClose: closeTemporaryAsk,
+    content: <div className="temporaryAskDockMount" ref={setTemporaryPanelMount} /> });
   if (diffReview) rightTabs.push({ id: "diff", title: "文件变更", icon: "diff", onClose: closeDiffReview, closing: !diffPanelVisible, content: <section className={`rightPaneDiff${diffPanelVisible ? " open" : ""}`}><header className="diffReviewPanelHeader">
     <div><h2>{diffReview.focusPath || diffReview.title}</h2><small>{diffReview.reviewTurnId ? "Codex 原生审查" : diffReview.focusPath ? "当前文件" : `${diffReview.changes.length} 个文件`}</small></div>
     {!diffReview.reviewTurnId && nativeFeaturesReady ? <button className="nativeReviewStartButton" type="button" disabled={startingNativeReview || !selectedThread || Boolean(selectedActiveTurnId)} title="用 Codex 原生审查当前工作区的未提交改动" onClick={() => void startNativeReview()}>{startingNativeReview ? "审查中…" : "代码审查"}</button> : null}
@@ -11354,12 +11449,11 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     <RunnablePreviewContext.Provider value={preview => { setRunnablePreview(preview); setPreviewDocked(true); showRightWindow("preview"); }}>
     <FeatureUpdateNotice key={`notice:${selectedUserId}`} userId={selectedUserId} />
     <main
-      className={`appShell${temporaryAsk ? " temporaryPanelOpen" : ""}`}
+      className="appShell"
       style={{
         gridTemplateColumns: sidebarCollapsed
           ? `0px 0px minmax(${temporaryAsk ? "0px" : "620px"}, 1fr)`
           : `${sidebarWidth}px 8px minmax(${temporaryAsk ? "0px" : "620px"}, 1fr)`,
-        paddingRight: temporaryAsk ? `${temporaryAskWidth}px` : undefined,
         "--v2-sidebar-width": `${threadListWidth}px`
       } as CSSProperties}
     >
@@ -11858,10 +11952,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         <div className={`modalBackdrop uiExitLayer${trackedQuotaPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={trackedQuotaPresence.closing} inert={trackedQuotaPresence.closing} onMouseDown={(event) => {
           if (event.target === event.currentTarget) setTrackedQuotaOpen(false);
         }}>
-          <section className="settingsDialog trackedQuotaDialog" role="dialog" aria-modal="true" aria-label="lzc 额度占用">
+          <section className="settingsDialog trackedQuotaDialog" role="dialog" aria-modal="true" aria-label="sample-user 额度占用">
             <div className="dialogHeader">
               <div>
-                <h2>lzc 额度占用</h2>
+                <h2>sample-user 额度占用</h2>
                 <p>各账号分别统计，并按自然日合计。</p>
               </div>
               <button className="iconButton" type="button" onClick={() => setTrackedQuotaOpen(false)} title="关闭">
@@ -11872,7 +11966,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               ? <div className="emptyState">正在核对各账号的会话记录…</div>
               : trackedQuotaUsage
                 ? <TrackedQuotaDetails usage={trackedQuotaUsage} />
-                : <div className="emptyState">暂未读取到 lzc 用量。</div>}
+                : <div className="emptyState">暂未读取到 sample-user 用量。</div>}
             <div className="dialogActions">
               <span className="trackedQuotaUpdated">{trackedQuotaUsage ? `更新于 ${new Date(trackedQuotaUsage.updatedAt).toLocaleString()}` : ""}</span>
               <button className="iconTextButton" type="button" onClick={() => setTrackedQuotaOpen(false)}>关闭</button>
@@ -12179,8 +12273,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               设置
             </button>
             <button className={`trackedQuotaButton${trackedQuotaUsage && trackedQuotaUsage.todayQuotaPercent > 50 ? " warning" : ""}`}
-              type="button" onClick={() => void refreshTrackedQuota(true)} title="查看 lzc 今日估算用量和历史统计（仅显示，不限制使用）" aria-label="lzc 额度占用">
-              lzc {trackedQuotaUsage ? `${percentText(trackedQuotaUsage.todayQuotaPercent)}%` : "--"}
+              type="button" onClick={() => void refreshTrackedQuota(true)} title="查看 sample-user 今日估算用量和历史统计（仅显示，不限制使用）" aria-label="sample-user 额度占用">
+              sample-user {trackedQuotaUsage ? `${percentText(trackedQuotaUsage.todayQuotaPercent)}%` : "--"}
             </button>
             <div
               className="quotaPopoverAnchor"
@@ -12218,7 +12312,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               >
                 {quotaLoading ? "额度..." : quotaSummaryLabel(quota, accountPool)}
               </button>
-              {quotaPopoverPresence.present ? <QuotaPopover quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} /> : null}
+              {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} /> : null}
             </div>
             <button
               className="leaderboardButton"
@@ -12265,24 +12359,22 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </div>
         ) : null}
 
-        <BranchToolArchive key={`${selectedUserId}:${selectedThread?.id}`} userId={selectedUserId} projectId={selectedProject?.id} threadId={selectedThread?.id}/>
-        </div>
-
         {providerFailurePresence.present && providerFailure && !isFreshRecoveryNotice(selectedThread?turnRecoveries[`${selectedUserId}:${selectedThread.id}`]:undefined) ? (
-          <div className={`providerFailureNotice${providerFailurePresence.closing ? " uiClosing" : ""}`}
-            role="alertdialog" aria-label="模型请求失败" aria-hidden={providerFailurePresence.closing} inert={providerFailurePresence.closing}>
-            <strong>{providerFailureCopy(providerFailure).title}</strong>
-            <p>{providerFailureCopy(providerFailure).message}</p>
-            {providerFailure.detail ? <details><summary>错误详情{providerFailure.httpStatusCode ? ` · HTTP ${providerFailure.httpStatusCode}` : ""}</summary><pre>{providerFailure.detail}</pre></details> : null}
-            <div className="providerFailureActions">
-              <button type="button" onClick={() => {
+          <div className={`errorBanner providerErrorBanner${providerFailurePresence.closing ? " uiClosing" : ""}`}
+            role="alert" aria-label="模型请求失败" aria-hidden={providerFailurePresence.closing} inert={providerFailurePresence.closing}>
+            <div className="errorBannerMessage">
+              <span>{providerFailureCopy(providerFailure).title}：{providerFailureCopy(providerFailure).message}</span>
+              {providerFailure.detail ? <details><summary>错误详情{providerFailure.httpStatusCode ? ` · HTTP ${providerFailure.httpStatusCode}` : ""}</summary><pre>{providerFailure.detail}</pre></details> : null}
+            </div>
+              <button className="providerErrorModel" type="button" onClick={() => {
                 setProviderFailureOpen(false);
                 window.setTimeout(() => document.querySelector<HTMLButtonElement>(".composerTools .groupedModelPicker .polishedSelectTrigger")?.click(), 100);
-              }}>选择其他模型</button>
-              <button type="button" onClick={() => setProviderFailureOpen(false)}>关闭</button>
-            </div>
+              }}>切换模型</button>
+              <button className="iconButton errorBannerDismiss" type="button" aria-label="关闭模型错误提示" onClick={() => setProviderFailureOpen(false)}><X size={16} /></button>
           </div>
         ) : null}
+        <BranchToolArchive key={`${selectedUserId}:${selectedThread?.id}`} userId={selectedUserId} projectId={selectedProject?.id} threadId={selectedThread?.id}/>
+        </div>
 
 
         <div className={`workspace${rightWorkspaceOpen ? " diffPanelOpen" : ""}${diffPanelResizing ? " diffPanelResizing" : ""}`} style={{ gridTemplateColumns: `${threadListCollapsed ? 56 : threadListWidth}px 0px minmax(0, 1fr) auto` }}>
@@ -12821,6 +12913,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 className="messages"
                 id="conversation-messages"
                 onPointerDownCapture={(event) => {
+                  const card = (event.target as Element).closest<HTMLElement>(".messageItem.kind-tool");
+                  if (card && event.currentTarget.contains(card)) recordToolDisclosurePointerDown(card, event);
                   const bounds = event.currentTarget.getBoundingClientRect();
                   if (event.clientX >= bounds.right - 18) {
                     messageScrollDirectionRef.current = null;
@@ -12882,6 +12976,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   if (!toolCard || !event.currentTarget.contains(toolCard)) {
                     return;
                   }
+                  if (!isToolSummaryClick(event.target, toolCard, event)) return;
                   const expanded = toolCard.classList.toggle("toolExpanded");
                   toolCard.setAttribute("aria-expanded", String(expanded));
                   const output = toolCard.querySelector<DeferredToolOutputElement>("[data-deferred-tool-output]");
@@ -12902,15 +12997,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     )}
                   </div>
                 ) : null}
-                {temporaryAsk ? createPortal((
-                  <aside className="temporaryAskPanel" style={{ width: temporaryAskWidth }} aria-label="临时侧边对话">
-                    <div
-                      className="temporaryAskResizeHandle"
-                      role="separator"
-                      aria-orientation="vertical"
-                      title="拖动调整临时对话宽度"
-                      onMouseDown={(event) => beginRightPanelResize(event, temporaryAskWidth, setTemporaryAskWidth, "codex-web-temporary-ask-width", 340, Math.min(900, window.innerWidth - 420))}
-                    />
+                {temporaryAsk && temporaryPanelMount ? createPortal((
+                  <aside className="temporaryAskPanel temporaryAskDocked" aria-label="临时侧边对话">
                     <header className="temporaryAskHeader">
                       <div className="temporaryAskHeaderLeft">
                         <span className="temporaryAskHeaderBadge" aria-hidden="true"><MessageSquare size={15} /></span>
@@ -12939,7 +13027,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       {temporaryAsk.prompts
                         .filter((entry) => !entry.turnId || !temporaryPersistedTurnIds.has(entry.turnId))
                         .map((entry) => renderTemporaryPrompt(entry.text, `temporary-prompt:${entry.requestId}`))}
-                      {temporaryLiveTimeline.map((entry) => entry.kind === "agent"
+                      {temporaryLiveTimeline.map((entry) => entry.kind === "reasoning"
+                        ? (entry.text.trim() ? <article className="messageItem kind-reasoning type-reasoning live" key={`temporary-live:${entry.id}`}><ReasoningMessage text={entry.text} projectId={temporaryAsk.projectId} onOpenFileLink={openFilePreview} /></article> : null)
+                        : entry.kind === "agent"
                         ? (stripInterruptArtifacts(entry.text) ? (
                           <article className="messageItem kind-agent type-agentMessage live temporaryAskAgent" key={`temporary-live:${entry.id}`}>
                             <div className="messageMeta">Codex · agentMessage</div>
@@ -12967,26 +13057,26 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           placeholder="随心输入"
                           disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
                         />
+                        <div className="temporarySelectionRow"><span className="temporarySelectionCount"><MessageSquare size={13} />1 个已选文本片段</span></div>
                         <div className="composerTools temporaryAskComposerTools">
-                          <span className="temporarySelectionCount"><MessageSquare size={13} />1 个已选文本片段</span>
-                          <ModelGroupedSelect
-                            value={temporaryModelProfileId}
-                            onChange={setTemporaryModelProfileId}
-                            disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
-                            profiles={modelProfiles}
-                          />
                           <PolishedSelect<SandboxMode>
                             className="temporaryPolicySelect"
                             value={sandbox}
                             onChange={setSandbox}
                             options={[{ value: "danger-full-access", label: "完全访问" }, { value: "workspace-write", label: "项目可写" }, { value: "read-only", label: "只读" }]}
                           />
+                          <ModelGroupedSelect
+                            value={temporaryModelProfileId}
+                            onChange={setTemporaryModelProfileId}
+                            disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
+                            profiles={modelProfiles}
+                          />
+                          <button className="iconButton sendButton primary" type="button" onClick={sendTemporaryPrompt} disabled={!temporaryPrompt.trim() || ["starting", "running", "closing"].includes(temporaryAsk.status)} title="发送临时提问"><Send size={16} /></button>
                         </div>
                       </div>
-                      <button className="iconButton sendButton primary" type="button" onClick={sendTemporaryPrompt} disabled={!temporaryPrompt.trim() || ["starting", "running", "closing"].includes(temporaryAsk.status)} title="发送临时提问"><Send size={16} /></button>
                     </div>
                   </aside>
-                ), document.body, temporaryAsk.id) : null}
+                ), temporaryPanelMount, temporaryAsk.id) : null}
                 {temporaryClosePresence.present ? createPortal((
                   <div className={`temporaryCloseScrim uiExitLayer${temporaryClosePresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={temporaryClosePresence.closing} inert={temporaryClosePresence.closing} onMouseDown={(event) => { if (event.target === event.currentTarget) setTemporaryCloseConfirm(false); }}>
                     <section className="temporaryCloseDialog" role="dialog" aria-modal="true" aria-labelledby="temporary-close-title">
@@ -13044,7 +13134,11 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     if (pendingToolGroup.length === 0) {
                       return indexBase;
                     }
-                    const bundleId = `${turn.id}-toolbundle-${pendingToolGroup[0].id}`;
+                    // A late public reasoning summary may precede the calls.
+                    // Keep the bundle anchored to its first actual tool so it
+                    // does not remount or forget expansion when that fills in.
+                    const bundleAnchor = pendingToolGroup.find(item => itemKind(item) === "tool") ?? pendingToolGroup[0];
+                    const bundleId = `${turn.id}-toolbundle-${bundleAnchor.id}`;
                     const isLiveRunningTurn = Boolean(selectedActiveTurnId && turn.id === selectedActiveTurnId);
                     const keepShimmering = isLiveRunningTurn && !answerAlreadyStarting;
                     const isBundleComplete = !isLiveRunningTurn || pendingToolGroup.every((toolItem) => safeText(toolItem.type).toLowerCase() !== "toolcall" || toolItem.completed !== false);
@@ -13077,6 +13171,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   let toolGroupIndex = 0;
                   for (const [itemIndex, item] of items.entries()) {
                     const kind = itemKind(item);
+                    // Item-start reserves chronology even when the provider
+                    // sends no public summary. An invisible reservation must
+                    // never flush/split the visible activity group.
+                    if (kind === "reasoning" && !reasoningItemDisplayText(item).trim()) continue;
                     const inlineQuestions = kind === "tool" ? parseQuestionToolItem(item) : null;
                     if (inlineQuestions) {
                       toolGroupIndex = flushToolGroup(toolGroupIndex, true);
@@ -13382,6 +13480,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <SubagentActivity key={`agents:${selectedUserId}:${selectedThread?.id ?? "new"}`} agents={composerAgents} directoryPage={subagentDirectory.page} parentRunning={Boolean(selectedActiveTurnId)} taskKey={selectedActiveTurnId ?? "idle"} onOpen={openSubagentReview} onOpenHistory={() => openSubagentReview(undefined, "history")} />
                   <ToolReveal open={Boolean(documentReference && documentReference.projectId === selectedProject?.id)}><div className="composerDocumentReference"><FileText size={14} /><span title={documentReference?.text}><strong>{documentReference?.path}</strong> · {documentReference?.text.slice(0, 120)}</span><button type="button" aria-label="移除文档引用" onClick={() => setDocumentReference(null)}><X size={14} /></button></div></ToolReveal>
                 </div>
+                <div className="composerControlRow">
                 <div className="composerTools">
                   {planMode ? <button className="v2PlanActiveChip" type="button" onClick={() => setPlanMode(false)} title="关闭计划模式，下次发送可执行改动"><Lightbulb size={14} />计划<AccountUpdateIndicator key={`plan:${selectedUserId}`} userId={selectedUserId} menuOpen={false} target="plan" dismissOnRefresh /></button> : null}
                   {selectedSkills.map((skill) => (
@@ -13501,6 +13600,20 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     </span>
                   ) : null}
                 </div>
+                <div className="composerSendActions">
+                  <VoiceInput key={`${selectedUserId}:${selectedThread?.id ?? selectedProject?.id ?? "new"}`} onText={text => setPrompt(current => `${current}${current && !/\s$/.test(current) ? "\n" : ""}${text}`)} />
+                  <button className={`iconButton sendButton ${composerShowsStop ? "stopMode" : "primary"}`} type="button"
+                    onClick={() => {
+                      if (composerShowsStop && requestInterruptSelectedConversation()) return;
+                      void sendPrompt("queue",undefined,mobilePredictedPrompt??undefined);
+                    }}
+                    disabled={composerShowsStop ? composerStopBusy : uploadingFiles || editingLastPrompt || !selectedProject || (!composerHasDraft&&!mobilePredictedPrompt)}
+                    aria-label={composerShowsStop ? "终止当前对话" : "发送"}
+                    title={composerShowsStop ? (composerStopBusy ? "正在终止当前对话" : "终止当前对话（Esc）") : "发送"}>
+                    {composerShowsStop ? <Square size={16} fill="currentColor" /> : <Send size={18} />}
+                  </button>
+                </div>
+                </div>
                 {uploadedFiles.length || exitingUploads.length ? (
                   <div className="uploadedFileList">
                     {[...uploadedFiles, ...exitingUploads].map((file) => {
@@ -13559,24 +13672,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   onChooseSkill={(name) => setSelectedSkillNames((current) => current.includes(name) ? current : [...current, name])}
                   placeholder={planMode ? "描述你的任务，先生成可审阅的方案…" : "随心输入"}
                 />
-              </div>
-              <div className="composerSendActions">
-              <VoiceInput key={`${selectedUserId}:${selectedThread?.id ?? selectedProject?.id ?? "new"}`} onText={text => setPrompt(current => `${current}${current && !/\s$/.test(current) ? "\n" : ""}${text}`)} />
-              <button
-                className={`iconButton sendButton ${composerShowsStop ? "stopMode" : "primary"}`}
-                type="button"
-                onClick={() => {
-                  if (composerShowsStop && requestInterruptSelectedConversation()) {
-                    return;
-                  }
-                  void sendPrompt("queue",undefined,mobilePredictedPrompt??undefined);
-                }}
-                disabled={composerShowsStop ? composerStopBusy : uploadingFiles || editingLastPrompt || !selectedProject || (!composerHasDraft&&!mobilePredictedPrompt)}
-                aria-label={composerShowsStop ? "终止当前对话" : "发送"}
-                title={composerShowsStop ? (composerStopBusy ? "正在终止当前对话" : "终止当前对话（Esc）") : "发送"}
-              >
-                {composerShowsStop ? <Square size={16} fill="currentColor" /> : <Send size={18} />}
-              </button>
               </div>
             </div>
           </section>

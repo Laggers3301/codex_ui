@@ -4107,6 +4107,12 @@ pre,
 }
 
 .composerRichEditor.hasPredictionGhost .composerRichInput .is-empty:first-child::before { content: none; }
+/* Mask the scrolling text viewport, not the glass, footer or popovers. At
+   the end of the draft remove the mask so the final line stays readable. */
+.composerRichEditor.hasDraftBelow {
+  -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 max(0px, calc(100% - 28px)), rgba(0,0,0,.6) calc(100% - 14px), transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 0%, #000 max(0px, calc(100% - 28px)), rgba(0,0,0,.6) calc(100% - 14px), transparent 100%);
+}
 .composerPredictionGhost {
   pointer-events: none;
   position: absolute;
@@ -11645,7 +11651,6 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
    a completed child after the bundle's next assistant answer has appeared. */
 :root[data-theme="light"] :is(
   .toolBundleShimmering > .messageMeta,
-  .toolBundleShimmering .toolBundleTitleLabel,
   .toolBundleShimmering .toolBundleEntry > .messageMeta,
   .toolBundleShimmering .toolBundleEntryLabel,
   .toolBundleShimmering .toolBundleEntrySummary,
@@ -11663,7 +11668,6 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
 @media (prefers-reduced-motion: reduce) {
   :root[data-theme="light"] :is(
     .toolBundleShimmering > .messageMeta,
-    .toolBundleShimmering .toolBundleTitleLabel,
     .toolBundleShimmering .toolBundleEntry > .messageMeta,
     .toolBundleShimmering .toolBundleEntryLabel,
     .toolBundleShimmering .toolBundleEntrySummary,
@@ -12650,23 +12654,26 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
   height: auto !important;
   padding: 13px 0 3px !important;
 }
-.newThreadProjectPicker { width: min(360px, 100%); }
-.newThreadProjectPicker .workspaceFeatureBody { padding-top: 2px; }
-.newThreadProjectList { display: grid; gap: 3px; max-height: min(390px, 52dvh); overflow-x: hidden; overflow-y: auto; }
+.newThreadProjectPicker { width: min(344px, 100%); font: inherit; font-size: 14px; }
+.newThreadProjectPicker header { padding: 12px 14px 8px; }
+.newThreadProjectPicker header strong { font-size: 14px; font-weight: 600; line-height: 1.5; }
+.newThreadProjectPicker .workspaceFeatureBody { padding: 0 10px 10px; font-size: 14px; }
+.newThreadProjectList { display: grid; gap: 1px; max-height: min(390px, 52dvh); overflow-x: hidden; overflow-y: auto; }
 .newThreadProjectList button,
 .newThreadCreateProject {
   display: flex;
   align-items: center;
   gap: 9px;
   width: 100%;
-  min-height: 36px;
-  padding: 6px 9px;
+  min-height: 34px;
+  padding: 5px 8px;
   border: 0;
   border-radius: 9px;
   background: transparent;
   color: var(--ui-content);
   font: inherit;
-  font-size: 12px;
+  font-size: 14px;
+  line-height: 24px;
   text-align: left;
   cursor: pointer;
   transition: background .18s ease;
@@ -12675,7 +12682,7 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
 .newThreadCreateProject:hover { background: var(--ui-selected); }
 .newThreadProjectList button span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .newThreadProjectList button svg:last-child { color: var(--ui-content-muted); }
-.newThreadCreateProject { margin-top: 8px; color: var(--ui-content-muted); }
+.newThreadCreateProject { margin-top: 4px; color: var(--ui-content-muted); }
 .directoryPickerScrim {
   z-index: 12000;
   background: rgba(8, 9, 8, .42);
@@ -12843,6 +12850,25 @@ body:has(.directoryPickerScrim) :is(.threadList, .v2ProjectDock, .v2AccountDock)
   backdrop-filter: blur(22px) saturate(1.12);
   box-shadow: var(--ui-glass-shadow);
   animation: providerFailureIn .38s cubic-bezier(.16,1,.3,1) both;
+}
+.providerErrorBanner { font: inherit; font-size: 13px; line-height: 1.5; animation: providerErrorBannerIn .28s cubic-bezier(.16,1,.3,1) both; }
+.providerErrorBanner.uiClosing { pointer-events: none; animation: providerErrorBannerOut .24s cubic-bezier(.4,0,.7,1) both; }
+.providerErrorBanner details { margin-top: 4px; font: inherit; color: inherit; }
+.providerErrorBanner summary { cursor: pointer; opacity: .85; }
+.providerErrorBanner pre { max-height: 160px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; margin: 6px 0 0; color: inherit; }
+.providerErrorModel { flex: 0 0 auto; padding: 3px 6px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; text-decoration: underline; cursor: pointer; transition: background .2s ease; }
+.providerErrorModel:hover { background: rgba(150,60,55,.12); }
+.turnRecoveryBanner .turnRecoveryActions { display: flex; flex: 0 1 auto; flex-wrap: wrap; align-items: flex-start; justify-content: flex-end; gap: 4px; margin: 0; }
+.turnRecoveryBanner .turnRecoveryActions button { min-height: 24px; border: 0; padding: 2px 5px; background: transparent; color: inherit; font: inherit; text-decoration: underline; white-space: nowrap; }
+@keyframes providerErrorBannerIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+@keyframes providerErrorBannerOut { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(-6px); } }
+@media (prefers-reduced-motion: reduce) { .providerErrorBanner, .providerErrorBanner.uiClosing { animation-duration: .01ms; } }
+@media (max-width: 720px) { .providerErrorBanner { gap: 5px; } .providerErrorModel { font-size: 12px; padding-inline: 2px; } }
+@media (max-width: 720px) {
+  .turnRecoveryBanner { display: grid; grid-template-columns: minmax(0, 1fr) 24px; gap: 5px 8px; }
+  .turnRecoveryBanner > .errorBannerMessage { grid-column: 1; grid-row: 1; }
+  .turnRecoveryBanner > .errorBannerDismiss { grid-column: 2; grid-row: 1; }
+  .turnRecoveryBanner > .turnRecoveryActions { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; }
 }
 .providerFailureNotice.uiClosing { pointer-events: none; animation: providerFailureOut .24s cubic-bezier(.4,0,.7,1) both; }
 .providerFailureNotice strong { display: block; font-size: 13px; font-weight: 600; line-height: 1.45; }

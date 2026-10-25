@@ -1,5 +1,12 @@
 .voiceInput { position:relative; align-self:end; flex:0 0 auto; }
-.conversation > .composer { --composer-control-size:30px; --composer-control-row-size:34px; grid-template-columns:minmax(0,1fr) auto!important; column-gap:6px!important; }
+.conversation > .composer { --composer-control-size:30px; --composer-control-row-size:34px; display:flex!important; flex-direction:column; }
+.conversation > .composer > :not(.composerBody) { flex-shrink:0; }
+.conversation > .composer .composerBody { display:flex; flex-direction:column; flex:1 1 auto; min-height:0; min-width:0; }
+.conversation > .composer .composerBody > * { flex:0 0 auto; }
+.conversation > .composer .composerBody > .composerRichEditor { flex:1 1 auto; min-height:38px; }
+.conversation > .composer .composerControlRow { display:flex; align-items:center; gap:6px; min-width:0; width:100%; flex:0 0 auto; order:30!important; }
+.conversation > .composer .composerControlRow > .composerTools { flex:1 1 auto; min-width:0; }
+.conversation > .composer .composerControlRow > .composerSendActions { flex:0 0 auto; }
 .conversation > .composer .composerTools { gap:6px!important; padding-right:0!important; }
 .conversation > .composer .composerTools:not(:has(.selectedSkillChip)) { justify-content:flex-end; }
 .conversation > .composer .composerTools { min-height:var(--composer-control-row-size); }

@@ -1,5 +1,11 @@
 import {it,expect} from 'vitest';
 import {isFreshRecoveryNotice,historicalRecovery,recoveryViewportBounds,type TurnRecoveryView} from './TurnRecoveryNotice';
+it('renders nested native failures and old object-coercion errors as readable HTTP errors',()=>{
+ const state=historicalRecovery('thread',{status:'failed',error:{code:'[object Object]',message:'本轮处理失败',originalMessage:'exceeded retry limit, last status: 429 Too Many Requests'}});
+ expect(state?.error?.code).toBe('http_429');
+ expect(state?.error?.originalMessage).toContain('429');
+ expect(historicalRecovery('thread',{status:'failed',error:{message:{error:{message:'HTTP 429',code:'AccountQuotaExceeded'}}}})?.error?.code).toBe('AccountQuotaExceeded');
+});
 it('centers in the whole viewport regardless of sidebar and right-pane widths',()=>{
  expect(recoveryViewportBounds(1280,850)).toEqual({left:0,top:0,width:1280,height:850});
 });

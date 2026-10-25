@@ -5,6 +5,7 @@ type Item = Record<string, unknown>;
 
 export function journalItem(update: LiveStateUpdate): Item {
   const item = update.item;
+  if (update.kind === "reasoning") return { id: update.item.itemId, type: "reasoning", text: update.item.text, summary: [update.item.text], completed: item.completed, timelineAt: item.startedAt, timelineOrder: item.sequence };
   return update.kind === "tool"
     ? { id: item.itemId, callId: item.itemId, sourceItemId: update.item.sourceItemId, type: "toolCall", tool: update.item.tool, collaboration: update.item.collaboration, input: (update.historyItem ?? update.item).input, aggregatedOutput: (update.historyItem ?? update.item).output, completed: item.completed, timelineAt: item.startedAt, timelineOrder: item.sequence }
     : { id: update.item.sourceItemId, type: "agentMessage", text: update.item.text, completed: item.completed, streamState: update.item.streamState ?? (item.completed ? "completed" : "streaming"), timelineAt: item.startedAt, timelineOrder: item.sequence };
@@ -38,6 +39,12 @@ export function overlayJournal(thread: Item, read: (turnId: string) => Item[], i
       if (existing && existing.type !== "toolCallOutput") {
         const index = items.indexOf(existing);
         merged[index] = { ...entry, ...merged[index], timelineAt: entry.timelineAt, timelineOrder: entry.timelineOrder };
+        if (entry.type === "reasoning" && typeof entry.text === "string" && entry.text.trim()) {
+          // Native history can still contain the empty item-start snapshot.
+          const native = items[index];
+          const summary = Array.isArray(native.summary) ? native.summary.map(p => typeof p === "string" ? p : String((p as Item)?.text ?? "")).join("\n\n") : String(native.text ?? "");
+          if (entry.completed || entry.text.length > summary.length) merged[index] = { ...merged[index], text: entry.text, summary: [entry.text], completed: entry.completed };
+        }
       } else {
         const time = Date.parse(String(entry.timelineAt));
         if (entry.source === "turnDiff" || (time >= first && time <= last)) {

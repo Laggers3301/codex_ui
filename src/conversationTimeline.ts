@@ -101,13 +101,15 @@ export function collapseCodeModeWrappers(items: ThreadItem[]): ThreadItem[] {
 }
 
 export function liveTimelineItems(entries: Array<{
-  id: string; kind: "agent" | "tool"; sourceItemId?: string; startedAt: string; sequence: number;
+  id: string; kind: "agent" | "tool" | "reasoning"; sourceItemId?: string; startedAt: string; sequence: number;
   text?: string; tool?: string; input?: string; output?: string; completed?: boolean; streamState?: string; collaboration?: Record<string, unknown>;
 }>): ThreadItem[] {
   const items: ThreadItem[] = [];
   const agents = new Map<string, ThreadItem>();
   for (const entry of entries) {
-    if (entry.kind === "tool") {
+    if (entry.kind === "reasoning") {
+      items.push({ id: entry.id, type: "reasoning", text: entry.text, summary: [entry.text ?? ""], completed: entry.completed, timelineAt: entry.startedAt, timelineOrder: entry.sequence, timelineLive: true });
+    } else if (entry.kind === "tool") {
       items.push({ id: entry.id, callId: entry.id, sourceItemId: entry.sourceItemId, type: "toolCall", tool: entry.tool, input: entry.input, aggregatedOutput: entry.output, completed: entry.completed, collaboration: entry.collaboration, timelineAt: entry.startedAt, timelineOrder: entry.sequence });
     } else {
       const id = entry.sourceItemId ?? entry.id;
@@ -150,6 +152,14 @@ export function mergeTimelineItems(history: ThreadItem[], updates: ThreadItem[])
         ? (previousTime <= incomingTime ? previous.timelineAt : item.timelineAt)
         : previous.timelineAt ?? item.timelineAt;
       const merged: ThreadItem = { ...previous, ...item, id: previous.id, sourceItemId: previous.sourceItemId, timelineAt };
+      if (item.type === "reasoning") {
+        const text = (value: ThreadItem) => Array.isArray(value.summary)
+          ? value.summary.map(p => typeof p === "string" ? p : String((p as Record<string, unknown>)?.text ?? "")).join("\n\n") : String(value.text ?? "");
+        const oldText = text(previous), newText = text(item);
+        if (!newText || (previous.completed === true && item.completed !== true) || (item.completed !== true && oldText.startsWith(newText))) {
+          merged.text = oldText; merged.summary = [oldText];
+        }
+      }
       if (previous.completed === true) merged.completed = true;
       if (previous.streamState === "completed") merged.streamState = "completed";
       if (previous.streamState === "superseded") merged.streamState = "superseded";

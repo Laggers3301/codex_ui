@@ -468,7 +468,7 @@
     "scope": "本轮补丁署名与补丁包交付提交作者；原有历史提交作者不变。"
   },
   "remoteConfiguration": {
-    "worktree": "/home/ls/codex_zerotier_remote/users/lzc/codex-ui-lzc",
+    "worktree": "/srv/codex-ui/data/users/sample-user/codex-ui",
     "remote": "origin",
     "fetchUrl": "https://github.com/lll123github/codex_ui.git",
     "pushUrl": "https://github.com/lll123github/codex_ui.git",

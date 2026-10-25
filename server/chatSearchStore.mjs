@@ -5,12 +5,13 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
 // unigram/bigram index handles short substrings; every candidate is verified
 // against the original (lowercased) message, so tokenization cannot add hits.
 export function shortTokens(text) {
-  const chars = Array.from(text.toLowerCase());
   const tokens = new Set();
-  for (let i = 0; i < chars.length; i++) {
-    const first = chars[i].codePointAt(0).toString(16);
+  let previous;
+  for (const character of text.toLowerCase()) {
+    const first = character.codePointAt(0).toString(16);
     tokens.add(`u${first}`);
-    if (i + 1 < chars.length) tokens.add(`b${first}x${chars[i + 1].codePointAt(0).toString(16)}`);
+    if (previous !== undefined) tokens.add(`b${previous}x${first}`);
+    previous = first;
   }
   return [...tokens].join(' ');
 }
@@ -63,8 +64,8 @@ export class ChatSearchStore {
     if (this.syncing) return;
     this.syncing = true;
     try {
-      const files = this.source.prepare('SELECT * FROM thread_files ORDER BY updated_at DESC').all();
-      const present = new Set(files.map(row => row.thread_id));
+      const files = this.source.prepare('SELECT * FROM thread_files ORDER BY updated_at DESC').iterate();
+      const present = new Set(this.source.prepare('SELECT thread_id FROM thread_files').all().map(row => row.thread_id));
       for (const row of this.db.prepare('SELECT thread_id FROM threads').all()) {
         if (!present.has(row.thread_id)) this.clearThread(row.thread_id);
       }
@@ -90,11 +91,12 @@ export class ChatSearchStore {
         try { metadata = JSON.parse(file.metadata_line ?? '{}').payload ?? {}; } catch { /* legacy metadata */ }
         for (;;) {
           const rows = this.source.prepare(`SELECT ordinal, record_id, turn_id, kind, search_text FROM thread_records
-            WHERE thread_id=? AND ordinal>? AND kind IN ('user','agent') ORDER BY ordinal LIMIT 64`).all(file.thread_id, ordinal);
-          if (!rows.length) break;
+            WHERE thread_id=? AND ordinal>? AND kind IN ('user','agent') ORDER BY ordinal LIMIT 64`).iterate(file.thread_id, ordinal);
+          let rowCount = 0;
           this.db.exec('BEGIN');
           try {
             for (const row of rows) {
+              rowCount++;
               if (!preview && row.kind === 'user') preview = row.search_text.slice(0, 512);
               const folded = row.search_text.toLowerCase();
               const inserted = this.db.prepare(`INSERT OR IGNORE INTO documents(thread_id, ordinal, record_id, turn_id, text, folded)
@@ -108,6 +110,7 @@ export class ChatSearchStore {
             }
             this.db.exec('COMMIT');
           } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+          if (!rowCount) break;
           await yieldTurn();
         }
         this.db.prepare(`INSERT INTO threads(thread_id,inode,file_path,source_size,source_updated,last_ordinal,last_record_id,preview,created_at,updated_at,source_generation)
@@ -145,7 +148,9 @@ export class ChatSearchStore {
         COUNT(*) OVER(PARTITION BY d.thread_id) AS hit_count
       FROM ${table} f JOIN documents d ON d.id=f.rowid
       WHERE ${table} MATCH ? AND d.thread_id IN (SELECT value FROM json_each(?)) AND instr(d.folded,?)>0
-    ) SELECT d.*, h.hit_count FROM hits h JOIN documents d ON d.id=h.id WHERE h.rank<=3`).all(expression, ids, query);
+    ) SELECT d.thread_id, d.turn_id, d.record_id, d.ordinal,
+      substr(d.text,max(1,instr(d.folded,?)-50),length(?)+160) AS snippet,h.hit_count
+      FROM hits h JOIN documents d ON d.id=h.id WHERE h.rank<=3`).all(expression, ids, query, query, query);
     const byThread = new Map();
     for (const row of rows) {
       if (!byThread.has(row.thread_id)) byThread.set(row.thread_id, []);
@@ -161,9 +166,8 @@ export class ChatSearchStore {
       const hits = byThread.get(owner.threadId) ?? [];
       if (!titleMatch && !hits.length) continue;
       const matches = hits.map(row => {
-        const at = row.folded.indexOf(query);
         return { threadId: owner.threadId, turnId: row.turn_id, itemId: row.record_id, ordinal: row.ordinal,
-          query, snippet: row.text.slice(Math.max(0, at - 50), at + query.length + 110).replace(/\s+/g, ' '),
+          query, snippet: row.snippet.replace(/\s+/g, ' '),
           cursor: Buffer.from(JSON.stringify({ v: 1, t: owner.threadId, o: row.ordinal + 1 })).toString('base64url') };
       });
       results.push({ id: owner.threadId, sessionId: owner.threadId, projectId: owner.projectId, name, preview,
@@ -189,14 +193,14 @@ export class ChatSearchStore {
       ? `u${chars[0].codePointAt(0).toString(16)}`
       : `b${chars[0].codePointAt(0).toString(16)}x${chars[1].codePointAt(0).toString(16)}`)
       : `"${query.replaceAll('"', '""')}"`;
-    const rows = this.db.prepare(`SELECT d.record_id, d.turn_id, d.ordinal, d.text, d.folded,
+    const rows = this.db.prepare(`SELECT d.record_id, d.turn_id, d.ordinal,
+      substr(d.text,max(1,instr(d.folded,?)-50),length(?)+160) AS snippet,
       COUNT(*) OVER() AS hit_count FROM ${table} f JOIN documents d ON d.id=f.rowid
       WHERE ${table} MATCH ? AND d.thread_id=? AND instr(d.folded,?)>0
-      ORDER BY d.ordinal ASC LIMIT ?`).all(expression, threadId, query, Math.min(2000, Math.max(1, limit)));
+      ORDER BY d.ordinal ASC LIMIT ?`).all(query, query, expression, threadId, query, Math.min(2000, Math.max(1, limit)));
     return { data: rows.map(row => {
-      const at = row.folded.indexOf(query);
       return { threadId, turnId: row.turn_id, itemId: row.record_id, ordinal: row.ordinal,
-        query, snippet: row.text.slice(Math.max(0, at - 50), at + query.length + 110).replace(/\s+/g, ' '),
+        query, snippet: row.snippet.replace(/\s+/g, ' '),
         cursor: Buffer.from(JSON.stringify({ v: 1, t: threadId, o: row.ordinal + 1 })).toString('base64url') };
     }), total: rows[0]?.hit_count ?? 0, indexing: !this.ready };
   }

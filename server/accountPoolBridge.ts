@@ -6,7 +6,11 @@ import { fileURLToPath } from "node:url";
 import { CodexBridge } from "./codexBridge.js";
 import { serverConfig } from "./config.js";
 import { ensureDefaultAgentLanguage } from "./agentLanguage.js";
+import { installSubagentHistoryGuard } from "../scripts/install-subagent-history-guard.mjs";
+import { withSubagentHistoryGuard } from "./subagentHistoryGuard.js";
 import { responsesCompatibleModelCatalog } from "./modelCatalogCompatibility.js";
+import { applyPoolContextDefaults } from "./modelContextDefaults.js";
+import { prepareVerifiedProviderCatalog } from "./verifiedProviderCapabilities.js";
 import { appendLegacyRollbackMarker, removeAppendedRollbackMarker, readLegacyTailMetadata, LegacyRollbackConflictError, type AppendedRollbackMarker } from "./legacyRollback.js";
 import { installedRuntimeVersion, isNewerRuntime, runtimeIsIdle, runtimeSelectionPath, writeRuntimeSelection, RuntimeUpgradeFailure, nextRuntimeUpgradeRetry, type RuntimeBusyReason, type RuntimeUpgradeStage, type RuntimeUpgradeRetry } from "./runtimeUpgrade.js";
 import {readableRolloutPath} from './rolloutStorage.js';
@@ -234,6 +238,7 @@ function processIdFromParams(params: unknown): string | null {
 
 export function accountAppServerArgs(codexHome: string): string[] {
   ensureDefaultAgentLanguage(codexHome);
+  installSubagentHistoryGuard(codexHome);
   const modelCatalogPath = path.join(codexHome, MODEL_CATALOG_FILENAME);
   const args = ["app-server", "--listen", "stdio://"];
   if (fs.existsSync(modelCatalogPath)) {
@@ -259,10 +264,16 @@ function accountSupportedModels(codexHome: string): Set<string> | null {
 }
 
 function createAccountBridge(codexHome: string, accountId: string, adoptCandidate = false): CodexBridge {
+  prepareVerifiedProviderCatalog(codexHome, accountId);
   const scope = process.env.CODEX_WEB_ISOLATE_AGENT_SCOPES === "1" ? {
     unitPrefix: `codex-agent-${accountId.replace(/[^A-Za-z0-9-]/g, "-")}`,
     slice: "codex-workers.slice",
-    memoryHigh: "3G",
+    // A 3 GiB high watermark below the 4 GiB allocation cap caused sustained
+    // direct reclaim during native history forks, then systemd-oomd killed the
+    // account despite available host memory. Keep the hard cap, but do not
+    // create a separate per-account reclaim stall below it. The worker slice
+    // retains its aggregate pressure and allocation limits.
+    memoryHigh: "4G",
     memoryMax: "4G",
     memorySwapMax: "256M"
   } : undefined;
@@ -272,7 +283,7 @@ function createAccountBridge(codexHome: string, accountId: string, adoptCandidat
     command: "/usr/bin/flock",
     args: ["--exclusive", "--nonblock", "--no-fork", "--conflict-exit-code", "75",
       path.join(codexHome, ".web-runtime.lock"), process.execPath,
-      fileURLToPath(new URL("../../scripts/run-account-runtime.mjs", import.meta.url)),
+      fileURLToPath(new URL("../scripts/run-account-runtime.mjs", import.meta.url)),
       serverConfig.codexBin, ...accountAppServerArgs(codexHome)],
     env: { ...process.env, CODEX_HOME: codexHome, CODEX_WEB_RUNTIME_ADOPT_CANDIDATE: adoptCandidate ? "1" : "0" },
     scope
@@ -586,6 +597,29 @@ export class AccountPoolBridge extends EventEmitter {
         if (error instanceof Error && error.message === "Multiple pool accounts cannot share one OAuth refresh session.") throw error;
         // Native auth handling reports a missing/malformed credential file.
       }
+      // A backend cold start is already outside the old runtime's active work.
+      // Reapply authorized defaults before constructing immutable launch args,
+      // including when the upstream refresh returns 304. Do not touch providers
+      // or thread-specific overrides, and retain the source on validation error.
+      if (entry.kind !== "api-provider") {
+        const catalogPath = path.join(codexHome, MODEL_CATALOG_FILENAME);
+        if (fs.existsSync(catalogPath)) {
+          try {
+            const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+            const previous = JSON.stringify(catalog);
+            applyPoolContextDefaults(catalog);
+            if (JSON.stringify(catalog) !== previous) {
+              writeFileAtomically(catalogPath, `${JSON.stringify(catalog, null, 2)}\n`);
+            }
+          } catch {
+            console.warn("Account context defaults unavailable; retaining catalog", { accountId: id });
+          }
+        }
+      }
+      // Install before *any* transport factory starts. Tests, remote adapters
+      // and recovery bridges must not depend on the default argv builder to
+      // discover this mandatory account-global guard.
+      installSubagentHistoryGuard(codexHome);
       const bridge = this.bridgeFactory(codexHome, id);
       const credential = authCredentialSnapshot(codexHome);
       const runtime: AccountRuntime = {
@@ -1027,7 +1061,10 @@ export class AccountPoolBridge extends EventEmitter {
     try {
       // Enforce native-owned renewal at the shared transport boundary, also
       // covering explicit thread-account readers and future host call sites.
-      const requestParams = method === "account/read" ? { ...asRecord(params), refreshToken: false } : params;
+      const requestParams = method === "account/read" ? { ...asRecord(params), refreshToken: false }
+        : method === "thread/start" || method === "thread/resume" || method === "thread/fork"
+          ? await withSubagentHistoryGuard(account.bridge, account.codexHome, params)
+          : params;
       return await account.bridge.request(method, requestParams, timeoutMs);
     } catch(error) {
       if(["account/read","account/rateLimits/read","account/usage/read"].includes(method))this.diagnose(account,"health_verify","failure",error);

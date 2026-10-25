@@ -3,6 +3,42 @@ import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
 
+it("bounds pages by source bytes and preserves every older tool record and full output", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-index-bytes-"));
+  vi.stubEnv("CODEX_THREAD_INDEX_DB", path.join(root, "index.sqlite"));
+  vi.stubEnv("CODEX_WEB_CODEX_SESSION_ROOTS", root); vi.resetModules();
+  try {
+    const file = path.join(root, "rollout-thread.jsonl");
+    const rows: unknown[] = [
+      { type: "session_meta", payload: { id: "thread" } },
+      { type: "turn_context", payload: { turn_id: "turn" } }
+    ];
+    for (let i = 0; i < 6; i++) rows.push(
+      { type: "response_item", payload: { type: "custom_tool_call", id: `call-${i}`, call_id: `call-${i}`, name: "exec", input: "run" } },
+      { type: "response_item", payload: { type: "custom_tool_call_output", call_id: `call-${i}`, output: `${i}:` + "x".repeat(2 * 1024 * 1024) } }
+    );
+    await fs.writeFile(file, rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+    const before = await fs.stat(file);
+    const { readIndexedThreadPage, readIndexedThreadItem } = await import("./threadEventIndex.js");
+    let page = await readIndexedThreadPage(file, "thread", { limit: 128 });
+    expect(page.history.returnedItems).toBeLessThan(6);
+    expect(page.history.hasOlder).toBe(true);
+    const ids: string[] = [];
+    for (let count = 0; count < 10; count++) {
+      const thread = page.thread as { turns: Array<{ items: Array<{ type: string; id: string }> }> };
+      ids.push(...thread.turns.flatMap(turn => turn.items.filter(item => item.type === "toolCall").map(item => item.id)));
+      if (!page.history.hasOlder) break;
+      page = await readIndexedThreadPage(file, "thread", { limit: 128, cursor: page.history.nextCursor! });
+    }
+    expect([...new Set(ids)].sort()).toEqual(Array.from({ length: 6 }, (_, i) => `call-${i}`));
+    const full = await readIndexedThreadItem(file, "thread", "call-0");
+    expect(String(full?.aggregatedOutput).length).toBe(2 * 1024 * 1024 + 2);
+    const empty = await readIndexedThreadPage(file, "thread", { limit: 128, before: 99999 });
+    expect(empty.thread.turns).toEqual([]);
+    expect((await fs.stat(file)).size).toBe(before.size);
+  } finally { vi.unstubAllEnvs(); await fs.rm(root, { recursive: true, force: true }); }
+}, 30000);
+
 it("restores the latest native collaboration mode when a page omits turn_context or displays older history", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-index-mode-"));
   vi.stubEnv("CODEX_THREAD_INDEX_DB", path.join(root, "index.sqlite"));

@@ -25,7 +25,17 @@ const pending = new Map<number, { resolve: (value: any) => void; reject: (error:
 
 export function startChatSearch(): Worker {
   if (worker) return worker;
-  const instance = new Worker(new URL("./chatSearchWorker.mjs", import.meta.url), { workerData: {
+  // The parent's --max-old-space-size overrides worker resourceLimits unless
+  // removed from inherited execArgv. Keep loaders, but isolate search's heap.
+  const execArgv: string[] = [];
+  for (let i = 0; i < process.execArgv.length; i++) {
+    const arg = process.execArgv[i];
+    if (/^--max[-_]old[-_]space[-_]size(?:=|$)/.test(arg)) { if (!arg.includes("=")) i++; continue; }
+    execArgv.push(arg);
+  }
+  const instance = new Worker(new URL("./chatSearchWorker.mjs", import.meta.url), { execArgv, resourceLimits: {
+    maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 16, stackSizeMb: 4
+  }, workerData: {
     sourcePath: process.env.CODEX_THREAD_INDEX_DB ?? path.join(serverConfig.dataDir, "thread-events.sqlite"),
     searchPath: process.env.CODEX_CHAT_SEARCH_DB ?? path.join(serverConfig.dataDir, "chat-search.sqlite")
   } });

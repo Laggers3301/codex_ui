@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CodexBridge } from "./codexBridge.js";
 import { accountAppServerArgs, selectAccountCandidate, type AccountRoutingCandidate } from "./accountPoolBridge.js";
 import { AccountPoolBridge } from "./accountPoolBridge.js";
+import { guardCommand, guardMatcher } from "../scripts/install-subagent-history-guard.mjs";
+const guardConfig = {"features.hooks":true,"hooks.state":{"fixture-guard":{trusted_hash:"fixture-hash",enabled:true}}};
 
 class FakeCodexBridge extends EventEmitter {
   readonly requests: Array<{ method: string; params: unknown }> = [];
@@ -23,6 +25,10 @@ class FakeCodexBridge extends EventEmitter {
   async request(method: string, params?: unknown): Promise<unknown> {
     this.requests.push({ method, params });
     if (this.failingMethods.has(method)) throw new Error(`forced ${method} failure`);
+    if (method === "hooks/list") {
+      const home = (params as {cwds: string[]}).cwds[0];
+      return {data:[{hooks:[{key:"fixture-guard",currentHash:"fixture-hash",sourcePath:path.join(home,"hooks.json"),eventName:"preToolUse",matcher:guardMatcher,command:guardCommand}]}]};
+    }
     if (method === "thread/start") return { thread: { id: "new-thread" } };
     if (method === "thread/fork") return { thread: { id: "forked-thread" } };
     return method === "thread/unsubscribe" ? { status: "unsubscribed" } : {};
@@ -551,7 +557,7 @@ describe("account-pool routing policy", () => {
       }, temporary, () => bridges[nextBridge++] as unknown as CodexBridge);
       await pool.startThreadOnAccount("100003", { model: "gpt-6-sol" });
       expect(bridges[0].requests).toHaveLength(0);
-      expect(bridges[1].requests).toContainEqual({ method: "thread/start", params: { model: "gpt-6-sol" } });
+      expect(bridges[1].requests).toContainEqual({ method: "thread/start", params: { model: "gpt-6-sol", config: guardConfig } });
       expect(pool.getKnownThreadAccount("new-thread")?.id).toBe("100003");
       pool.stop();
     } finally {
@@ -578,6 +584,43 @@ describe("account-pool routing policy", () => {
     }
   });
 
+  it.each(["codex-account", "api-provider"] as const)("applies supported startup defaults only to GPT accounts, not %s providers", kind => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-startup-context-"));
+    const catalogPath = path.join(temporary, "model-catalog-gpt-5.6-sol-long-context.json");
+    const original = { models: [
+      { slug: "gpt-6-astra", context_window: 272000, max_context_window: 872000, effective_context_window_percent: 95 },
+      { slug: "gpt-6.1-sol", context_window: 500000, max_context_window: 872000 }
+    ] };
+    fs.writeFileSync(catalogPath, JSON.stringify(original));
+    let windowAtConstruction = 0;
+    const bridge = new FakeCodexBridge();
+    const pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary, kind }], stateFile: "state.json" }, temporary, () => {
+      windowAtConstruction = JSON.parse(fs.readFileSync(catalogPath, "utf8")).models[0].context_window;
+      return bridge as unknown as CodexBridge;
+    });
+    try {
+      expect(windowAtConstruction).toBe(kind === "codex-account" ? 500000 : 272000);
+      const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+      expect(catalog.models[0].max_context_window).toBe(872000);
+      expect(bridge.requests).toEqual([]);
+      expect(bridge.stopped).toBe(false);
+    } finally { pool.stop(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
+  it("retains an unsupported catalog unchanged instead of failing the whole backend startup", () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-startup-unsupported-context-"));
+    const catalogPath = path.join(temporary, "model-catalog-gpt-5.6-sol-long-context.json");
+    const original = JSON.stringify({ models: [{ slug: "gpt-6-astra", context_window: 128000, max_context_window: 128000 }] });
+    fs.writeFileSync(catalogPath, original);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let pool: AccountPoolBridge | undefined;
+    try {
+      pool = new AccountPoolBridge({ accounts: [{ id: "a", label: "a", codexHome: temporary }], stateFile: "state.json" }, temporary, () => new FakeCodexBridge() as unknown as CodexBridge);
+      expect(fs.readFileSync(catalogPath, "utf8")).toBe(original);
+      expect(warn).toHaveBeenCalled();
+    } finally { pool?.stop(); warn.mockRestore(); fs.rmSync(temporary, { recursive: true, force: true }); }
+  });
+
   it("atomically applies a refreshed catalog only after the account is idle", async () => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-model-refresh-"));
     const catalogPath = path.join(temporary, "model-catalog-gpt-5.6-sol-long-context.json");
@@ -589,6 +632,7 @@ describe("account-pool routing policy", () => {
     fs.writeFileSync(catalogPath, previous);
     class IdleBridge extends FakeCodexBridge {
       override async request(method: string, params?: unknown): Promise<unknown> {
+        if (method === "hooks/list") return super.request(method, params);
         this.requests.push({ method, params });
         if (method === "thread/loaded/list") return { data: [] };
         if (method === "thread/start") return { thread: { id: "new-thread" } };
@@ -612,7 +656,7 @@ describe("account-pool routing policy", () => {
       expect(bridges).toHaveLength(2);
       expect(bridges[0].stopped).toBe(true);
       await pool.startThreadOnAccount("account-a", { model: "gpt-6-luna" });
-      expect(bridges[1].requests).toContainEqual({ method: "thread/start", params: { model: "gpt-6-luna" } });
+      expect(bridges[1].requests).toContainEqual({ method: "thread/start", params: { model: "gpt-6-luna", config: guardConfig } });
     } finally {
       pool.stop();
       fs.rmSync(temporary, { recursive: true, force: true });
@@ -818,7 +862,7 @@ describe("account-pool routing policy", () => {
       await pool.request("thread/start", { model: "gpt-6-sol" });
 
       expect(bridges[0].requests).toHaveLength(0);
-      expect(bridges[1].requests).toContainEqual({ method: "thread/start", params: { model: "gpt-6-sol" } });
+      expect(bridges[1].requests).toContainEqual({ method: "thread/start", params: { model: "gpt-6-sol", config: guardConfig } });
       pool.stop();
     } finally {
       fs.rmSync(temporary, { recursive: true, force: true });
@@ -1004,7 +1048,7 @@ describe("account-pool routing policy", () => {
 
       expect(bridges[0].requests).toContainEqual({
         method: "thread/fork",
-        params: { threadId: "source-thread", lastTurnId: "turn-1" }
+        params: { threadId: "source-thread", lastTurnId: "turn-1", config: guardConfig }
       });
       expect(bridges[0].requests).toContainEqual({ method: "turn/start", params: { threadId: "forked-thread" } });
       pool.stop();
@@ -1050,7 +1094,8 @@ describe("account-pool routing policy", () => {
         params: {
           threadId: "source-thread",
           path: "/private/source-snapshot.jsonl",
-          lastTurnId: "turn-1"
+          lastTurnId: "turn-1",
+          config: guardConfig
         }
       });
       expect(bridges[1].requests).toContainEqual({ method: "turn/start", params: { threadId: "forked-thread" } });
