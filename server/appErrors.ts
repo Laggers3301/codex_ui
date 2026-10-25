@@ -1,4 +1,4 @@
-import { modelErrorDetails, redactModelError } from "../shared/modelError.js";
+import { modelErrorDetails, modelErrorSummary, redactModelError } from "../shared/modelError.js";
 export interface PublicAppError { code: string; message: string; originalMessage: string; retryable: boolean; at: string }
 
 function safeMessage(value: unknown): string {
@@ -7,7 +7,11 @@ function safeMessage(value: unknown): string {
 
 export class AppError extends Error {
   constructor(public code: string, message: string, public originalMessage = message, public retryable = false) { super(message); this.name = "AppError"; }
-  toPublic(): PublicAppError { return { code: this.code, message: this.message, originalMessage: safeMessage(this.originalMessage), retryable: this.retryable, at: new Date().toISOString() }; }
+  toPublic(): PublicAppError {
+    const detail = modelErrorSummary(this.originalMessage);
+    const message = detail && detail !== this.message && detail !== "未知错误" ? `${this.message} 具体原因：${detail}` : this.message;
+    return { code: this.code, message, originalMessage: safeMessage(this.originalMessage), retryable: this.retryable, at: new Date().toISOString() };
+  }
   static from(value: unknown): AppError {
     if (value instanceof AppError) return value;
     const { message: original, code: nativeCode, signature, status } = modelErrorDetails(value);

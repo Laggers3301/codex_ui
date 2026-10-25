@@ -1,4 +1,4 @@
-import { modelErrorDetails } from "../shared/modelError";
+import { modelErrorDetails, modelErrorSummary } from "../shared/modelError";
 export type ProviderFailureNotice = {
   kind: "capacity" | "unavailable" | "auth" | "limit" | "stream" | "request";
   model: string;
@@ -23,7 +23,7 @@ export function classifyProviderFailure(model: string, rawError: unknown): Provi
     ...(message ? { detail: message.slice(0, 2000) } : {}) };
 }
 
-export function providerFailureCopy(notice: ProviderFailureNotice): { title: string; message: string } {
+function fallbackProviderFailureCopy(notice: ProviderFailureNotice): { title: string; message: string } {
   const model = notice.model;
   switch (notice.kind) {
     case "capacity": return { title: "模型繁忙，暂时无法接单", message: `${model} 返回 model at capacity。请切换其他模型，或稍后重试。` };
@@ -36,4 +36,13 @@ export function providerFailureCopy(notice: ProviderFailureNotice): { title: str
     case "stream": return { title: "回答连接中断，本轮未完成", message: `${model} 的响应流在完成前断开。可能是上游故障或连接问题，请稍后重试；持续失败时可选择其他模型。` };
     default: return { title: "本轮请求失败", message: `${model} 未能完成回答，具体原因请查看错误详情。可以稍后重试；持续失败时可选择其他模型。` };
   }
+}
+
+export function providerFailureCopy(notice: ProviderFailureNotice): { title: string; message: string } {
+  const copy = fallbackProviderFailureCopy(notice);
+  if (!notice.detail) return copy;
+  const detail = modelErrorSummary(notice.detail);
+  if (/每周额度已耗尽/.test(detail)) return { title: "每周额度已耗尽", message: `${notice.model}：${detail}` };
+  if (detail && !/^HTTP \d{3}$|^未知错误$/.test(detail)) return { ...copy, message: `${copy.message} 原因：${detail}` };
+  return copy;
 }

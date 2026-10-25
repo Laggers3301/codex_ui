@@ -20,6 +20,34 @@ export function latestUserTimelineIndex(items: ThreadItem[]): number {
   return -1;
 }
 
+export interface SteerTimelineBoundary {
+  id: string;
+  text: string;
+  timelineAt: string;
+  beforeItemIds: string[];
+}
+
+/** A steer belongs to the running turn, not a detached conversation tail.
+ * Previously visible items retain their positions even if their output finishes
+ * later. New live identities go after the steer, without trusting clock skew. */
+export function mergeSteerTimelineItems(items: ThreadItem[], boundaries: SteerTimelineBoundary[], matches = (item: ThreadItem, boundary: SteerTimelineBoundary) => String(item.text ?? "").trim() === boundary.text.trim()): ThreadItem[] {
+  let result = items;
+  for (const boundary of boundaries) {
+    const old = new Set(boundary.beforeItemIds);
+    const known = (item: ThreadItem) => old.has(item.id) || old.has(String(item.sourceItemId ?? "")) || Boolean(correlationId(item) && old.has(correlationId(item)));
+    const native = result.find(item => !known(item) && ["usermessage", "user"].includes(item.type.toLowerCase()) && matches(item, boundary));
+    const user = native ?? {id:boundary.id,type:"userMessage",role:"user",text:boundary.text,timelineAt:boundary.timelineAt};
+    const before: ThreadItem[] = [], after: ThreadItem[] = [];
+    for (const item of result) {
+      if (item === native || item.id === boundary.id) continue;
+      const follows = !known(item) && (item.timelineLive === true || timelineTime(item) > Date.parse(boundary.timelineAt));
+      (follows ? after : before).push(item);
+    }
+    result = [...before, user, ...after];
+  }
+  return result;
+}
+
 /** One invocation owns its output, even if parallel calls finish out of order. */
 export function coalesceToolOutputs(items: ThreadItem[], preserveRetired = false): ThreadItem[] {
   const calls = new Map<string, ThreadItem>();
@@ -110,7 +138,7 @@ export function liveTimelineItems(entries: Array<{
     if (entry.kind === "reasoning") {
       items.push({ id: entry.id, type: "reasoning", text: entry.text, summary: [entry.text ?? ""], completed: entry.completed, timelineAt: entry.startedAt, timelineOrder: entry.sequence, timelineLive: true });
     } else if (entry.kind === "tool") {
-      items.push({ id: entry.id, callId: entry.id, sourceItemId: entry.sourceItemId, type: "toolCall", tool: entry.tool, input: entry.input, aggregatedOutput: entry.output, completed: entry.completed, collaboration: entry.collaboration, timelineAt: entry.startedAt, timelineOrder: entry.sequence });
+      items.push({ id: entry.id, callId: entry.id, sourceItemId: entry.sourceItemId, type: "toolCall", tool: entry.tool, input: entry.input, aggregatedOutput: entry.output, completed: entry.completed, collaboration: entry.collaboration, timelineAt: entry.startedAt, timelineOrder: entry.sequence, timelineLive: true });
     } else {
       const id = entry.sourceItemId ?? entry.id;
       const existing = agents.get(id);

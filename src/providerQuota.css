@@ -1,4 +1,9 @@
-.providerQuotaDetails { animation: providerQuotaEnter .24s cubic-bezier(.16,1,.3,1) both; }
-.providerQuotaDetails .providerQuotaUpdated { padding-top: 8px; font-size: 12px !important; }
+.accountPoolPopover .providerQuotaDetails { contain: inline-size; min-width: 0; max-width: 100%; }
+.providerQuotaDetails { animation: providerQuotaEnter .24s cubic-bezier(.16,1,.3,1) both; overflow-wrap: anywhere; }
+.quotaPopover .providerQuotaDetails .providerQuotaRestriction { color: #e9988f; font: inherit; margin: 7px 0 0; line-height: 20px; }
+:root[data-theme="light"] .quotaPopover .providerQuotaDetails .providerQuotaRestriction { color: #a13d35 !important; }
+.providerQuotaDetails .providerQuotaBalance { display: flex; flex-wrap: wrap; gap: 0 12px; color: inherit; }
+:root[data-theme] .providerQuotaDetails .quotaPopoverRows strong span { color: inherit !important; }
+.providerQuotaDetails .providerQuotaReset { display: block; }
 @keyframes providerQuotaEnter { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
 @media (prefers-reduced-motion: reduce) { .providerQuotaDetails { animation: none; } }

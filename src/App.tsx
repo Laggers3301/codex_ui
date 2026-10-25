@@ -32,7 +32,7 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import { BubbleMenu } from "@tiptap/react/menus";
 import StarterKit from "@tiptap/starter-kit";
 import { toggleComposerList } from "./composerList";
-import { classifyProviderFailure, providerFailureCopy, type ProviderFailureNotice } from "./providerFailure";
+import { classifyProviderFailure, type ProviderFailureNotice } from "./providerFailure";
 import { finishActiveTurn, pendingTurnStart, rememberTerminalTurn } from "./turnLifecycle";
 import { localMessageBelongsToThread } from "./localMessageScope";
 import { isSuccessfulTransferReceipt, TRANSFER_RECEIPT_HOLD_MS } from "./transferReceipt";
@@ -78,10 +78,10 @@ import {
   X
 } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
-import { coalesceToolOutputs, collapseCodeModeWrappers, latestUserTimelineIndex, liveTimelineItems, mergeTimelineItems } from "./conversationTimeline";
+import { coalesceToolOutputs, collapseCodeModeWrappers, latestUserTimelineIndex, liveTimelineItems, mergeTimelineItems, mergeSteerTimelineItems, type SteerTimelineBoundary } from "./conversationTimeline";
 import { ToolReveal } from "./ToolReveal";
 import { RollingToolCount, ToolArrivalList } from "./ToolActivityMotion";
-import { useProviderQuotas, providerRemaining, ProviderQuotaDetails } from "./providerQuota";
+import { useProviderQuotas, providerRemaining, ProviderQuotaDetails, ProviderFailureSummary } from "./providerQuota";
 import { isToolSummaryClick, recordToolDisclosurePointerDown } from "./toolDisclosure";
 import { ToolArrivalRegistry } from "./toolArrivalRegistry";
 import { skillReadSummary } from "./skillReadSummary";
@@ -683,6 +683,7 @@ interface PendingUserMessage {
   text: string;
   keepAtBottomUntil: number;
   attachments?: ComposerUpload[];
+  steerBoundary?: SteerTimelineBoundary;
 }
 
 interface ComposerUpload extends ProjectFile {
@@ -1656,6 +1657,12 @@ function threadHasUserText(thread: ThreadSummary, text: string): boolean {
     });
     return matchesUserItem || (!turnHasUserItem(turn) && userTextsMatch(turnUserText(turn), text));
   });
+}
+
+function threadHasPendingUserText(thread: ThreadSummary, entry: PendingUserMessage): boolean {
+  if (!entry.steerBoundary) return threadHasUserText(thread, entry.text);
+  const old = new Set(entry.steerBoundary.beforeItemIds);
+  return (thread.turns.find(turn => turn.id === entry.turnId)?.items ?? []).some(item => itemKind(item) === "user" && !old.has(item.id) && userTextsMatch(itemText(item), entry.text));
 }
 
 function threadItemKey(item: ThreadItem, fallbackIndex: number): string {
@@ -7638,7 +7645,7 @@ export function App() {
         }
         const attachedToLoadedTurn = Boolean(entry.turnId && nextThreadWithStoredModel.turns.some((turn) => turn.id === entry.turnId));
         return (!attachedToLoadedTurn && entry.keepAtBottomUntil > now)
-          || !threadHasUserText(nextThreadWithStoredModel, entry.text)
+          || !threadHasPendingUserText(nextThreadWithStoredModel, entry)
           || !threadHasPendingAttachments(nextThreadWithStoredModel, entry);
       }));
       return nextThreadWithStoredModel;
@@ -8913,6 +8920,16 @@ export function App() {
     return skillReferencesInPrompt(withoutDocumentContext(entry.input.filter((part) => part.type === "text").map((part) => part.text ?? "").join(" ").trim())).body;
   }
 
+  function captureSteerBoundary(id: string, text: string, turnId: string): SteerTimelineBoundary {
+    const persisted = selectedThreadRef.current?.turns.find(turn => turn.id === turnId)?.items ?? [];
+    const live = liveTimelineEntries.filter(item => item.turnId === turnId || !item.turnId);
+    return {id,text,timelineAt:new Date().toISOString(),beforeItemIds:[...new Set([
+      ...persisted.flatMap(item => [item.id, String(item.sourceItemId ?? ""), String(item.callId ?? "")]),
+      ...live.flatMap(item => [item.id, item.kind === "agent" || item.kind === "tool" ? item.sourceItemId ?? "" : ""]),
+      ...pendingUserMessagesRef.current.filter(item => item.turnId === turnId).map(item => item.id)
+    ].filter(Boolean))]};
+  }
+
   function steerQueuedSubmission(entry: QueuedSubmission) {
     if (!selectedThread?.id || !selectedActiveTurnId) return;
     const requestId = `queue-steer-${requestToken()}`;
@@ -8935,6 +8952,8 @@ export function App() {
         id: `user-${requestId}`,
         requestId,
         threadId,
+        turnId: selectedActiveTurnId,
+        steerBoundary: captureSteerBoundary(`user-${requestId}`, queuedSubmissionText(entry), selectedActiveTurnId),
           viewToken: threadViewTokenRef.current,
           text: queuedSubmissionText(entry),
         keepAtBottomUntil: 0
@@ -9082,7 +9101,7 @@ export function App() {
     }
     const requestId = `thread-${requestToken()}`;
     const requestViewToken = threadViewTokenRef.current;
-    const keepAtBottomUntil = selectedActiveTurnId ? Date.now() + sentPromptBottomHoldMs : 0;
+    const keepAtBottomUntil = selectedActiveTurnId && mode !== "steer" ? Date.now() + sentPromptBottomHoldMs : 0;
     newThreadDraftModeRef.current = false;
     promptRequestContextsRef.current.set(requestId, {
       viewToken: requestViewToken,
@@ -9162,6 +9181,7 @@ export function App() {
           threadId: selectedThread?.id ?? null,
           viewToken: requestViewToken,
           text: visibleText,
+          ...(payload.type === "turn.steer" ? {turnId: payload.expectedTurnId, steerBoundary: captureSteerBoundary(`user-${requestId}`, visibleText, payload.expectedTurnId!)} : {}),
           keepAtBottomUntil,
           attachments: promptUploads
         }
@@ -9522,7 +9542,7 @@ export function App() {
         if (entry.requestId !== requestId) {
           return [entry];
         }
-        if (entry.threadId && currentThread?.id === entry.threadId && threadHasUserText(currentThread, entry.text) && threadHasPendingAttachments(currentThread, entry)) {
+        if (entry.threadId && currentThread?.id === entry.threadId && threadHasPendingUserText(currentThread, entry) && threadHasPendingAttachments(currentThread, entry)) {
           return [];
         }
         return [{ ...entry, keepAtBottomUntil: 0 }];
@@ -10983,7 +11003,7 @@ export function App() {
   const pendingUserMessagesByTurn = useMemo(() => {
     const byTurn = new Map<string, PendingUserMessage[]>();
     for (const entry of visiblePendingUserMessages) {
-      if (!entry.turnId || !displayedTurnIds.has(entry.turnId) || persistedUserTurnIds.has(entry.turnId)) {
+      if (entry.steerBoundary || !entry.turnId || !displayedTurnIds.has(entry.turnId) || persistedUserTurnIds.has(entry.turnId)) {
         continue;
       }
       const entries = byTurn.get(entry.turnId) ?? [];
@@ -12372,7 +12392,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           <div className={`errorBanner providerErrorBanner${providerFailurePresence.closing ? " uiClosing" : ""}`}
             role="alert" aria-label="模型请求失败" aria-hidden={providerFailurePresence.closing} inert={providerFailurePresence.closing}>
             <div className="errorBannerMessage">
-              <span>{providerFailureCopy(providerFailure).title}：{providerFailureCopy(providerFailure).message}</span>
+              <ProviderFailureSummary notice={providerFailure} userId={selectedUserId} />
               {providerFailure.detail ? <details><summary>错误详情{providerFailure.httpStatusCode ? ` · HTTP ${providerFailure.httpStatusCode}` : ""}</summary><pre>{providerFailure.detail}</pre></details> : null}
             </div>
               <button className="providerErrorModel" type="button" onClick={() => {
@@ -13116,7 +13136,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   const historyItems = syntheticUserItem ? [syntheticUserItem, ...(turn.items ?? [])] : turn.items ?? [];
                   const liveItems = sanitizeTurnItems(liveTimelineItems(liveTimelineByTurn.get(turn.id) ?? []));
                   // Merge identities and chronology before introducing message boundaries.
-                  const items = collapseCodeModeWrappers(coalesceToolOutputs(mergeTimelineItems(coalesceToolOutputs(historyItems, true), liveItems)));
+                  const pendingSteers = visiblePendingUserMessages.filter(entry => entry.turnId === turn.id && entry.steerBoundary);
+                  const mergedItems = mergeTimelineItems(coalesceToolOutputs(historyItems, true), liveItems);
+                  const items = collapseCodeModeWrappers(coalesceToolOutputs(mergeSteerTimelineItems(mergedItems, pendingSteers.map(entry => entry.steerBoundary!), (item, boundary) => userTextsMatch(itemText(item), boundary.text))));
                   const hasAgentAnswerFromIndex = new Array<boolean>(items.length + 1).fill(false);
                   for (let index = items.length - 1; index >= 0; index -= 1) {
                     const item = items[index];
@@ -13234,7 +13256,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     if (navigationKey && heldPersistedPromptNavigationKeys.has(navigationKey)) {
                       continue;
                     }
-                    const renderedItem = renderPersistedThreadItem(item, turn, navigationKey, messageRefKey);
+                    const pendingSteer = pendingSteers.find(entry => entry.id === item.id);
+                    const renderedItem = pendingSteer ? renderPendingUserMessage(pendingSteer) : renderPersistedThreadItem(item, turn, navigationKey, messageRefKey);
                     renderedHistoryItems.push(renderedItem);
                     if (thinkingNode && !thinkingInserted && itemIndex === latestUserItemIndex) {
                       renderedHistoryItems.push(thinkingNode);

@@ -32,3 +32,11 @@ it("handles cyclic errors and recovers old persisted object-coercion failures", 
   expect(modelErrorDetails(error)).toMatchObject({ code: "ServiceUnavailable", status: 503 });
   expect(modelErrorDetails({ code: "[object Object]", message: "本轮处理失败", originalMessage: "exceeded retry limit, last status: 429 Too Many Requests" })).toMatchObject({ code: "http_429", status: 429 });
 });
+it("includes a specific redacted reason in the public message, including weekly reset", () => {
+  const result=AppError.from({error:{code:"AccountQuotaExceeded",message:"You have exceeded the weekly usage quota. It will reset at 2026-10-26 00:00:00 +0800 CST."}}).toPublic();
+  expect(result.message).toContain("每周额度已耗尽");
+  expect(result.message).toContain("2026-10-26 00:00:00 +0800");
+  const other=AppError.from({message:"Unsupported image format; Bearer secret123 https://example.test/?token=private123"}).toPublic();
+  expect(other.message).toContain("Unsupported image format");
+  expect(JSON.stringify(other)).not.toMatch(/secret123|private123/);
+});
