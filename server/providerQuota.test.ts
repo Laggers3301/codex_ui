@@ -3,7 +3,7 @@ import Fastify from "fastify";
 import { mkdtemp, readFile, stat, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { parseArkQuota, ProviderQuotaCache, registerProviderQuotaRoutes } from "./providerQuota.js";
+import { parseArkQuota, ProviderQuotaCache, providerQuotaFailure, registerProviderQuotaRoutes } from "./providerQuota.js";
 const payload = { viewer: { secret: "never-public", user_name: "private" }, items: [{ product: "coding-plan", subscribed: true, periods: [{ label: "session", percent: 17.88, reset_at: "2026-10-24T13:01:14+08:00" }, { label: "weekly", percent: 80.79 }] }] };
 it("restores a bounded private success cache across restart and retains it after query failure", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "provider-quota-test-"));
@@ -20,9 +20,9 @@ it("restores a bounded private success cache across restart and retains it after
     await vi.waitFor(() => expect(restored.snapshot().loading).toBe(false));
     expect(restored.snapshot().items[0].periods).toHaveLength(2);
     await writeFile(file, "invalid");
-    // These invalid-cache probes must not launch a successful background write
-    // racing the next fixture file. No live provider request is needed here.
-    const unavailable = async () => { throw new Error("fixture offline"); };
+    // These assertions inspect restored state, not successful refreshes. A
+    // successful background query would race the next fixture write/rename.
+    const unavailable = async () => { throw new Error("fixture unavailable"); };
     expect(new ProviderQuotaCache(unavailable, () => now, file).snapshot().items[0].periods).toEqual([]);
     await writeFile(file, JSON.stringify(parseArkQuota(payload, "2026-09-01T00:00:00Z")));
     expect(new ProviderQuotaCache(unavailable, () => now, file).snapshot().items[0].periods).toEqual([]);
@@ -74,4 +74,40 @@ it("checks the logged-in user before starting a control-plane query", async () =
     expect(result.json().data.items[1]).toMatchObject({ name: "MiMo", status: "auth_required", periods: [] });
     expect(query).toHaveBeenCalledOnce();
   } finally { await app.close(); }
+});
+
+it("runs native quota maintenance without viewers, with one in-flight request and clean shutdown", async () => {
+  vi.useFakeTimers();
+  let finish!: (value:unknown)=>void;
+  const query=vi.fn(()=>new Promise(resolve=>{finish=resolve}));
+  const cache=new ProviderQuotaCache(query);
+  try {
+    cache.start();cache.start();expect(query).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(180_000);expect(query).toHaveBeenCalledOnce();
+    finish(payload);await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(60_000);expect(query).toHaveBeenCalledTimes(2);
+    finish(payload);await vi.advanceTimersByTimeAsync(0);
+    cache.stop();await vi.advanceTimersByTimeAsync(180_000);expect(query).toHaveBeenCalledTimes(2);
+  } finally {cache.stop();vi.useRealTimers();}
+});
+
+it("distinguishes native reauthorization from network failures without exposing raw CLI output",()=>{
+  expect(providerQuotaFailure({stderr:'{"error":{"message":"not logged in, SSO token expired"}}'})).toMatchObject({status:"auth_required",code:"sso_reauthorization_required"});
+  expect(providerQuotaFailure({stderr:'invalid_grant Bearer do-not-print'})).toMatchObject({status:"auth_required",code:"sso_invalid_grant"});
+  expect(JSON.stringify(providerQuotaFailure({stderr:'invalid_grant Bearer do-not-print'}))).not.toContain('do-not-print');
+  expect(providerQuotaFailure({stderr:'ECONNRESET'})).toMatchObject({status:"unavailable",code:"query_network_error"});
+  expect(providerQuotaFailure({killed:true})).toMatchObject({status:"unavailable",code:"query_timeout"});
+});
+
+it("preserves last successful quota on auth failure and reports recovery once, not renewal success",async()=>{
+  let now=Date.parse('2026-10-26T00:00:00Z');const report=vi.fn();
+  const query=vi.fn(async()=>payload);const cache=new ProviderQuotaCache(query,()=>now,undefined,report);
+  cache.snapshot();await vi.waitFor(()=>expect(cache.snapshot().loading).toBe(false));
+  query.mockRejectedValue(Object.assign(new Error('native failure'),{stderr:'not logged in, SSO token expired secret=hidden'}));
+  now+=60000;cache.snapshot();await vi.waitFor(()=>expect(cache.snapshot().loading).toBe(false));
+  expect(cache.snapshot().items[0]).toMatchObject({status:'auth_required',stale:true});expect(cache.snapshot().items[0].periods).toHaveLength(2);
+  now+=60000;cache.snapshot();await vi.waitFor(()=>expect(cache.snapshot().loading).toBe(false));expect(report).toHaveBeenCalledOnce();
+  query.mockResolvedValue(payload);now+=60000;cache.snapshot();await vi.waitFor(()=>expect(cache.snapshot().loading).toBe(false));
+  expect(report).toHaveBeenCalledTimes(2);expect(report.mock.calls[1][0].event).toBe('quota_query_recovered');
+  expect(JSON.stringify(report.mock.calls)).not.toMatch(/hidden|token|renewed/);
 });

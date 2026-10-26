@@ -9,6 +9,19 @@ import type { FastifyInstance } from "fastify";
 import type { ProviderQuotaPeriod, ProviderQuotaView } from "../shared/providerQuota.js";
 const exec = promisify(execFile);
 
+/** Classify the native CLI's bounded error text; never expose its argv, raw
+ * response, headers or credentials to a browser/log. */
+export function providerQuotaFailure(error: unknown): { status: "auth_required" | "unavailable"; code: string; message: string } {
+  const row = error && typeof error === "object" ? error as Record<string, unknown> : {};
+  const text = [row.stderr, row.stdout, error instanceof Error ? error.message : ""].filter(v => typeof v === "string").map(v => String(v).slice(0, 16_384)).join("\n");
+  if (/invalid_grant|refresh[_ -]?token.{0,60}(?:expired|revoked|invalid)|SSO token expired|not logged in/i.test(text)) {
+    return {status:"auth_required",code:/invalid_grant/i.test(text)?"sso_invalid_grant":"sso_reauthorization_required",message:"Ark 官方 CLI 的 SSO 授权已失效，原生自动续签未成功；需要重新授权。保留上次额度，模型 API Key 未被修改。"};
+  }
+  if (row.killed === true || /ETIMEDOUT|timed?\s*out|timeout/i.test(text)) return {status:"unavailable",code:"query_timeout",message:"Ark 官方额度查询超时，正在后台重试；暂时显示缓存。"};
+  if (/ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|TLS handshake|network is unreachable/i.test(text)) return {status:"unavailable",code:"query_network_error",message:"Ark 官方额度查询连接失败，正在后台重试；不代表账号授权失效。"};
+  return {status:"unavailable",code:"query_failed",message:"Ark 官方额度查询暂不可用，正在后台重试；保留上次成功值。"};
+}
+
 export function parseArkQuota(raw: unknown, now = new Date().toISOString()): ProviderQuotaView {
   const rows = (raw as { items?: unknown[] })?.items;
   const row = rows?.find(value => (value as { product?: string }).product === "coding-plan") as { subscribed?: boolean; periods?: unknown[] } | undefined;
@@ -28,13 +41,29 @@ export class ProviderQuotaCache {
   private ark: ProviderQuotaView = { id: "ark", name: "Ark", status: "loading", periods: [], updatedAt: null, stale: false, message: null };
   private pending: Promise<void> | null = null;
   private nextAttempt = 0;
-  constructor(private query: () => Promise<unknown>, private clock = Date.now, private cacheFile?: string) {
+  private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  private lastFailureCode: string | null = null;
+  constructor(private query: () => Promise<unknown>, private clock = Date.now, private cacheFile?: string,
+    private report: (event: {provider:string;event:string;code?:string;at:string}) => void = () => {}) {
     if (cacheFile) try {
       if (statSync(cacheFile).size <= 16_384) {
         const cached = cachedProviderQuota(JSON.parse(readFileSync(cacheFile, "utf8")), this.clock());
         if (cached) this.ark = cached;
       }
     } catch { /* Missing or invalid cache never blocks provider health. */ }
+  }
+  /** Keep the native CLI active even when nobody opens the quota popover.
+   * Native CLI alone owns OAuth, locking, rotation and invalid-grant cooldown.
+   * Query dates prove quota retrieval, NOT that an OAuth renewal succeeded. */
+  start() {
+    if (this.maintenanceTimer) return;
+    this.snapshot();
+    this.maintenanceTimer = setInterval(() => { this.snapshot(); }, 60_000);
+    this.maintenanceTimer.unref();
+  }
+  stop() {
+    if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
+    this.maintenanceTimer = null;
   }
   private async persist() {
     if (!this.cacheFile) return;
@@ -51,8 +80,16 @@ export class ProviderQuotaCache {
       let queryResult: Promise<unknown>;
       try { queryResult = Promise.resolve(this.query()); }
       catch (error) { queryResult = Promise.reject(error); }
-      this.pending = queryResult.then(async raw => { this.ark = parseArkQuota(raw, new Date(this.clock()).toISOString()); await this.persist(); }).catch(() => {
-        this.ark = { ...this.ark, status: "unavailable", stale: this.ark.periods.length > 0, message: "额度读取暂不可用，请检查官方 CLI 授权或稍后重试。" };
+      this.pending = queryResult.then(async raw => {
+        this.ark = parseArkQuota(raw, new Date(this.clock()).toISOString());
+        if (this.lastFailureCode) this.report({provider:"ark",event:"quota_query_recovered",at:new Date(this.clock()).toISOString()});
+        this.lastFailureCode = null;
+        await this.persist();
+      }).catch(error => {
+        const failure = providerQuotaFailure(error);
+        this.ark = { ...this.ark, status: failure.status, stale: this.ark.periods.length > 0, message: failure.message };
+        if (failure.code !== this.lastFailureCode) this.report({provider:"ark",event:"quota_query_failed",code:failure.code,at:new Date(this.clock()).toISOString()});
+        this.lastFailureCode = failure.code;
       }).finally(() => { this.pending = null; });
     }
     return { items: [this.ark, { id: "mimo", name: "MiMo", status: "auth_required", periods: [], updatedAt: null, stale: false,
@@ -65,7 +102,11 @@ export function registerProviderQuotaRoutes(app: FastifyInstance, authorize: (re
   const quota = cache ?? new ProviderQuotaCache(async () => {
     const { stdout } = await exec(cli, ["usage", "plan", "--product", "coding-plan", "--format", "json"], { timeout: 30_000, maxBuffer: 1024 * 1024, windowsHide: true });
     return JSON.parse(stdout);
-  }, Date.now, path.join(serverConfig.dataDir, "provider-quota-cache.json"));
+  }, Date.now, path.join(serverConfig.dataDir, "provider-quota-cache.json"), event => app.log.warn(event, "Provider quota maintenance"));
+  if (!cache) {
+    app.addHook("onReady", async () => { quota.start(); });
+    app.addHook("onClose", async () => { quota.stop(); });
+  }
   app.get("/api/codex/provider-quotas", async (request, reply) => {
     authorize(request);
     reply.header("Cache-Control", "no-store");

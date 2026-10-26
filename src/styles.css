@@ -7453,7 +7453,8 @@ body:has(.globalSearchScrim) .v2AccountDock {
 }
 
 /* A bundle participates in the same 4px vertical rhythm as its child tool rows. */
-.messageItem:has(+ .toolBundle) {
+.messageItem:has(+ .toolBundle),
+.messageItem:is(.kind-agent, .kind-system):has(+ .messageItem.kind-reasoning) {
   margin-bottom: 4px !important;
 }
 
