@@ -17,15 +17,16 @@ const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, aut
 );
 const store = new ProjectStore(path.join(root, "store.sqlite"));
 const project = store.createProject({ name: "侧边绑定验收", rootPath: root, defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "high" });
-type Thread = { id: string; name: string; cwd: string; status: string; turns: any[]; createdAt: number; updatedAt: number };
+type Thread = { id: string; name: string; cwd: string; status: string; historyMode: string; turns: any[]; createdAt: number; updatedAt: number };
 const threads = new Map<string, Thread>();
 for (const [id, name, quote] of [["main-a", "主会话 A", "第一段正文用于主会话 A 的侧边提问。"], ["main-b", "主会话 B", "第二段正文用于主会话 B 的侧边提问。"], ["main-c", "主会话 C", "这个主会话还没有侧边会话。"]]) {
   store.registerThreadOwner({ threadId: id, userId: "admin", projectId: project.id, rootPath: root });
-  threads.set(id, { id, name, cwd: root, status: "idle", createdAt: 1, updatedAt: 1, turns: [{ id: id + "-turn", status: "completed", items: [{ id: id + "-answer", type: "agentMessage", text: quote }] }] });
+  threads.set(id, { id, name, cwd: root, status: "idle", historyMode: "paginated", createdAt: 1, updatedAt: 1, turns: [{ id: id + "-turn", status: "completed", items: [{ id: id + "-answer", type: "agentMessage", text: quote }] }] });
 }
 
 class FixtureBridge extends EventEmitter {
   calls: Array<{ method: string; threadId?: string }> = [];
+  starts: Array<{ threadId: string; text: string }> = [];
   creationGate: Promise<void> | null = null;
   releaseCreation: (() => void) | null = null;
   failNextTurn = false;
@@ -35,15 +36,19 @@ class FixtureBridge extends EventEmitter {
     if (method === "thread/start" || method === "thread/fork") {
       await this.creationGate;
       const inherited = method === "thread/fork" ? structuredClone(threads.get(params.threadId)!.turns) : [];
-      const thread = { id: randomUUID(), name: "侧边聊天", cwd: root, status: "idle", createdAt: 1, updatedAt: 1, turns: inherited };
+      const thread = { id: randomUUID(), name: "侧边聊天", cwd: root, status: "idle", historyMode: "paginated", createdAt: 1, updatedAt: 1, turns: inherited };
       threads.set(thread.id, thread); return { thread };
     }
     const thread = threads.get(params.threadId);
     if (method === "thread/name/set" && thread) thread.name = params.name;
-    if (method === "thread/read" || method === "thread/resume") return { thread };
+    if (method === "thread/read") return { thread: params.includeTurns === false && thread ? { ...thread, turns: [] } : thread };
+    if (method === "thread/resume") return { thread };
+    if (method === "thread/queue/list") return { data: [] };
+    if (method === "thread/turns/list") return { data: thread?.turns.slice(-1).map(({id,status}) => ({id,status})) ?? [] };
     if (method === "turn/start" && thread) {
       if (this.failNextTurn) { this.failNextTurn = false; throw new Error("用于选中复制的完整错误详情"); }
       const id = randomUUID(), userText = params.input.map((item: any) => item.text ?? "").join("\n");
+      this.starts.push({threadId:thread.id,text:userText});
       const sideTurnCount = thread.turns.filter(turn => turn.items.some((item: any) => item.type === "userMessage")).length;
       const answer = `侧边回答 ${sideTurnCount + 1}：${userText.split("用户问题：\n").at(-1)}`;
       const turn = { id, status: "running", items: [{ id: id + "-user", type: "userMessage", text: userText }, { id: id + "-answer", type: "agentMessage", text: answer }] };
@@ -78,6 +83,17 @@ app.post<{ Body: { threadId: string; delta: string } }>("/api/__test/append", as
 app.post<{ Body: { threadId: string } }>("/api/__test/start-main", async request => bridge.request("turn/start", {
   threadId: request.body.threadId, input: [{ type: "text", text: "模拟主会话持续运行" }]
 }));
+app.post<{ Body: { threadId: string } }>("/api/__test/runtime-exit", async request => {
+  const thread=threads.get(request.body.threadId)!;
+  thread.turns.at(-1).status='interrupted';thread.status='idle';
+  bridge.emit('status',{state:'exited',code:null,signal:'SIGABRT'});return {ok:true};
+});
+app.post<{ Body: { threadId: string } }>("/api/__test/interrupt-main", async request => { bridge.complete(request.body.threadId,'interrupted');return {ok:true}; });
+app.post<{ Body: { threadId: string } }>("/api/__test/open-tool", async request => {
+  const thread=threads.get(request.body.threadId)!,turn=thread.turns.at(-1);
+  const item={id:'unfinished-operation',type:'commandExecution',command:'模拟已提交但结果未返回的操作',cwd:root,status:'inProgress'};
+  turn.items.push(item);bridge.emit('notification',{method:'item/started',params:{threadId:thread.id,turnId:turn.id,item}});return {ok:true};
+});
 app.post<{ Body: { threadId: string } }>("/api/__test/main-tool", async request => {
   const threadId = request.body.threadId, turnId = threads.get(threadId)!.turns.at(-1)!.id;
   const item = { id: "main-scroll-tool", type: "commandExecution", command: "echo MAIN_TOOL_SCROLL_UPDATE", cwd: root, status: "inProgress" };
@@ -93,7 +109,7 @@ app.post<{ Body: { pause: boolean } }>("/api/__test/hold-create", async request 
 });
 app.post("/api/__test/fail-next", async () => { bridge.failNextTurn = true; return { ok: true }; });
 app.get("/api/__test/state", async () => ({ fixture: "bound-side-chats", projectId: project.id,
-  calls: bridge.calls, sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
+  calls: bridge.calls, starts:bridge.starts, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
 app.get("/api/projects", async () => ({ data: [project], projectRoot: root }));
 app.get("/api/users", async () => ({ data: [{ id: "admin", name: "admin" }], defaultUserId: "admin" }));
 app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }] }));

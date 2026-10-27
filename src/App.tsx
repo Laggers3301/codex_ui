@@ -98,7 +98,7 @@ import { SelectionAskAction, type SelectionAskActionHandle } from "./SelectionAs
 import { PetBuddy } from "./PetBuddy";
 import { AccountUpdateIndicator } from "./AccountUpdateIndicator";
 import { useConversationPlanMode } from "./useConversationPlanMode";
-import { TurnRecoveryNotice, historicalRecovery,isFreshRecoveryNotice, type TurnRecoveryView } from "./TurnRecoveryNotice";
+import { TurnRecoveryNotice, historicalRecovery, hasRecoveryNotice, type TurnRecoveryView } from "./TurnRecoveryNotice";
 import { FeishuOffice } from "./FeishuOffice";
 import { useFeishuAttention, needsFeishuAuthorization } from "./useFeishuAttention";
 import { FeatureUpdateNotice } from "./FeatureUpdateNotice";
@@ -12387,7 +12387,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </div>
         ) : null}
 
-        {providerFailurePresence.present && providerFailure && !isFreshRecoveryNotice(selectedThread?turnRecoveries[`${selectedUserId}:${selectedThread.id}`]:undefined) ? (
+        {providerFailurePresence.present && providerFailure && !hasRecoveryNotice(selectedThread ? turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1)) : undefined) ? (
           <div className={`errorBanner providerErrorBanner${providerFailurePresence.closing ? " uiClosing" : ""}`}
             role="alert" aria-label="模型请求失败" aria-hidden={providerFailurePresence.closing} inert={providerFailurePresence.closing}>
             <div className="errorBannerMessage">
@@ -13502,9 +13502,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               <EditingPromptNotice draft={editingPromptDraft} busy={editingLastPrompt} confirmed={editingHistoryConfirmed} onConfirm={setEditingHistoryConfirmed} onCancel={cancelEditingPrompt}/>
               <div className="composerBody">
                 <div className="composerThreadActivity">
-                  <TurnRecoveryNotice key={`recovery:${selectedUserId}:${selectedThread?.id}`} state={selectedThread ? turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1)) : undefined} userId={selectedUserId} turnId={selectedThread?.turns.at(-1)?.id} onSelectModel={()=>document.querySelector<HTMLButtonElement>('.composerTools .groupedModelPicker .polishedSelectTrigger')?.click()} onAction={action => {
+                  <TurnRecoveryNotice key={`recovery:${selectedUserId}:${selectedThread?.id}`} state={selectedThread ? turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1)) : undefined} userId={selectedUserId} turnId={selectedThread?.turns.at(-1)?.id} onSelectModel={()=>document.querySelector<HTMLButtonElement>('.composerTools .groupedModelPicker .polishedSelectTrigger')?.click()} onCopy={copyTextToClipboard} onAction={(action, toolsReviewed) => {
                     if (!selectedThread) return;
-                    codexSocket.send({ type: action === "dismiss" ? "turn.error.dismiss" : action === "now" ? "turn.retry.now" : "turn.retry.cancel", threadId: selectedThread.id, requestId: `recovery-${requestToken()}` });
+                    const recovery = turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1));
+                    const types = { dismiss: "turn.error.dismiss", now: "turn.retry.now", cancel: "turn.retry.cancel", check: "turn.recovery.check", continue: "turn.recovery.continue" };
+                    codexSocket.send({ type: types[action], threadId: selectedThread.id, turnId: recovery?.interruption?.turnId ?? selectedThread.turns.at(-1)?.id,
+                      errorAt: recovery?.error?.at, historicalError: turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ? undefined : recovery?.error,
+                      toolsReviewed, requestId: `recovery-${requestToken()}` });
                   }} />
                   <ToolReveal key={`progress:${selectedUserId}:${selectedThread?.id ?? "new"}`} open={Boolean(selectedThread?.id && turnProgress[`${selectedUserId}:${selectedThread.id}`]?.turnId === selectedActiveTurnId)}><div className="composerRunNotice" role="status">{turnProgressText(selectedThread?.id ? turnProgress[`${selectedUserId}:${selectedThread.id}`] : undefined)}</div></ToolReveal>
                   <GoalProgress key={`goal:${selectedUserId}:${selectedThread?.id ?? "new"}`} controller={threadGoal} running={conversationRunState === "running"} />

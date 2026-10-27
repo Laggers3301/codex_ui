@@ -16,6 +16,7 @@ import { isUserInputRequest, validateUserInputResponse } from "./userInput.js";
 import { questionToolOutput } from "./questionAnswers.js";
 import { AppError } from "./appErrors.js";
 import { TurnRetryQueue, publicRecovery } from "./turnRetry.js";
+import { runTurnRecovery } from "./turnRecovery.js";
 import { notificationIsContextCompaction, RawCompactFilter } from "./rawNotificationFilter.js";
 import { journalItem } from "./timelineJournal.js";
 import { RequestDeduper } from "./requestDeduper.js";
@@ -95,6 +96,7 @@ type SocketRequestGuards = {
   /** Turns created for a real user task, as opposed to maintenance compaction. */
   recoverableTurnIds: Set<string>;
   disconnectedThreads: Set<string>;
+  completedTurnsByThread: Map<string, string>;
   retries?: TurnRetryQueue;
 };
 
@@ -471,8 +473,9 @@ function rememberAcceptedTurn(guards: SocketRequestGuards, threadId: string, req
   // Keeping a placeholder closes the race where a second prompt lands after
   // the RPC response but before the notification reaches this server.
   const turnId = turnIdFromStartResult(result);
+  if (turnId && guards.completedTurnsByThread.get(threadId) === turnId) return;
   guards.activeTurnsByThread.set(threadId, turnId ?? `pending:${requestId}`);
-  if (turnId) guards.recoverableTurnIds.add(turnId);
+  if (turnId) { guards.recoverableTurnIds.add(turnId); guards.retries?.started(threadId, turnId); }
 }
 
 function runDedupedPrompt<T>(
@@ -522,7 +525,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     activeTurnsByThread: new Map(),
     startingThreads: new Set(),
     recoverableTurnIds: new Set(),
-    disconnectedThreads: new Set()
+    disconnectedThreads: new Set(),
+    completedTurnsByThread: new Map()
   };
   const turnWatchdog = new TurnWatchdog();
   const resourceStops = new Map<string, AppError>();
@@ -805,6 +809,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       sendToUser(wss, owner, { type: "live.agent", data: item });
     }
     if (liveUpdate?.kind === "tool" && liveUpdate.item.threadId && liveUpdate.item.turnId) {
+      if (!liveUpdate.item.internal && (message.method === "item/started" || message.method === "item/completed")) {
+        retries.toolProgress(liveUpdate.item.threadId, liveUpdate.item.turnId, liveUpdate.item.itemId, liveUpdate.item.completed);
+      }
       const label = liveUpdate.item.tool.toLowerCase();
       const phase = liveUpdate.item.completed
         ? "running"
@@ -895,6 +902,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const latestAgentText = latestAgent?.text ?? "";
       const needsFallbackRecovery = Boolean(completedRecovery && isGenericContextLossReply(latestAgentText));
       const completedThreadId = notificationThreadId(message);
+      if (completedThreadId) guards.completedTurnsByThread.set(completedThreadId, turnId);
       const completedItems = completedThreadId ? store.readTimelineItems(completedThreadId, turnId) : [];
       const latestAgentItem = [...completedItems].reverse().find((item) => item.type === "agentMessage" && item.streamState !== "superseded");
       const latestAgentOrder = Number(latestAgentItem?.timelineOrder ?? latestAgent?.sequence);
@@ -910,10 +918,12 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const runtimeExited = asRecord(message.params).runtimeExited === true;
       const nativeError = resourceStops.get(turnId) ?? asRecord(asRecord(message.params).turn).error;
       resourceStops.delete(turnId);
-      if (completedThreadId && nativeError) retries.failed(owner, completedThreadId, turnId, nativeError,
+      if (completedThreadId && turnStatus === "interrupted") retries.interrupted(owner, completedThreadId, turnId, nativeError);
+      else if (completedThreadId && nativeError) retries.failed(owner, completedThreadId, turnId, nativeError,
         guards.recoverableTurnIds.has(turnId) || retries.pending(completedThreadId));
       else if (completedThreadId && turnStatus === "completed") retries.completed(completedThreadId, turnId);
-      else if (completedThreadId && turnStatus === "interrupted") retries.cancel(owner, completedThreadId);
+      else if (completedThreadId && turnStatus === "failed") retries.failed(owner, completedThreadId, turnId,
+        new AppError("request_failed", "本轮处理失败，运行时未提供具体错误原因。"), false);
       const needsRecovery = !runtimeExited && (needsFallbackRecovery || needsPlanContinuation);
       if (completedThreadId) {
         for (const item of completedItems) {
@@ -1184,13 +1194,27 @@ async function handleClientMessage(
   const requestId = message.requestId ?? randomUUID();
   try {
     switch (message.type) {
+      case "turn.recovery.check":
+      case "turn.recovery.continue": {
+        const threadId = pickString(message.threadId);
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        if (!guards.retries) throw new AppError("recovery_unavailable", "恢复服务尚未就绪。");
+        const data = await runTurnRecovery({ bridge, store, retries: guards.retries, guards, userId: sessionUserId,
+          threadId, turnId: pickString(message.turnId), errorAt: typeof message.errorAt === "string" ? message.errorAt : undefined,
+          historicalError: message.historicalError,
+          requestId, action: message.type === "turn.recovery.check" ? "check" : "continue", toolsReviewed: message.toolsReviewed === true,
+          beforeContinue: () => assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, threadId),
+          accepted: value => rememberAcceptedTurn(guards, threadId, requestId, value) });
+        send(ws, { type: "ack", requestId, ok: true, data });
+        break;
+      }
       case "turn.retry.cancel":
       case "turn.retry.now":
       case "turn.error.dismiss": {
         const threadId = pickString(message.threadId);
         assertThreadOwnedBy(store, threadId, sessionUserId);
         if (message.type === "turn.retry.now") guards.retries?.retryNow(sessionUserId, threadId);
-        else guards.retries?.cancel(sessionUserId, threadId, message.type === "turn.error.dismiss");
+        else guards.retries?.cancel(sessionUserId, threadId, message.type === "turn.error.dismiss", pickString(message.turnId) || undefined);
         send(ws, { type: "ack", requestId, ok: true });
         if (message.type === "turn.retry.cancel") setTimeout(() => void startNextQueuedTurn(sessionUserId, threadId), 0);
         break;
@@ -1610,6 +1634,7 @@ async function handleClientMessage(
               // Goal support is optional. A goal lookup failure must never stop
               // the user from interrupting the currently running turn.
             }
+            guards.retries?.requestStop(sessionUserId, threadId, turnId);
             const interrupt = await bridge.request("turn/interrupt", { threadId, turnId });
             return { interrupt, goalPaused };
           },
@@ -1631,6 +1656,7 @@ async function handleClientMessage(
             const activeTurnId = guards.activeTurnsByThread.get(threadId);
             if (activeTurnId && !activeTurnId.startsWith("pending:")) {
               try {
+                guards.retries?.requestStop(sessionUserId, threadId, activeTurnId);
                 await bridge.request("turn/interrupt", { threadId, turnId: activeTurnId });
               } catch {
                 // Clearing the goal is the safety-critical action. Continue if

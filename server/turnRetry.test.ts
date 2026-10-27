@@ -65,6 +65,43 @@ describe("persistent overload retries", () => {
     queue.watch("admin", "thread", { model: "gpt-6.1-sol" }); queue.failed("admin", "thread", "new", overloaded, true);
     queue.started("thread", "new-user-turn"); clock.mockReturnValue(240_000); await queue.drain(); expect(start).toHaveBeenCalledOnce();
   });
+  it("preserves an unfinished turn across backend restart without replaying tools or guessing the crash cause", async () => {
+    const {store,queue,start}=fixture();
+    queue.started('thread','unfinished');queue.toolProgress('thread','unfinished','write-file',false);queue.close();
+    const restarted=new TurnRetryQueue(store,{start,busy:()=>false,changed:()=>{},tickMs:1_000_000});
+    try {
+      const state=restarted.snapshot('admin')[0];
+      expect(state.error).toMatchObject({code:'backend_restarted',source:'backend',retryable:false});
+      expect(state.interruption).toMatchObject({turnId:'unfinished',unresolvedTools:['write-file']});
+      expect(JSON.stringify(state)).not.toContain('private prompt');
+      expect(state.error?.originalMessage).not.toContain('out of memory');
+      await restarted.drain();expect(start).not.toHaveBeenCalled();
+      const at=state.error!.at;restarted.close();
+      const again=new TurnRetryQueue(store,{start,busy:()=>false,changed:()=>{},tickMs:1_000_000});
+      try {expect(again.snapshot('admin')[0].error?.at).toBe(at);}finally{again.close();}
+    } finally {restarted.close();}
+  });
+  it('distinguishes a recorded stop request, an unexplained interruption, and a runtime exit',()=>{
+    const {queue}=fixture();queue.started('thread','stop');queue.requestStop('admin','thread','stop');queue.interrupted('admin','thread','stop');
+    expect(queue.snapshot('admin')[0].error?.source).toBe('user');
+    queue.watch('admin','thread',{});queue.started('thread','unknown');queue.interrupted('admin','thread','unknown');
+    expect(queue.snapshot('admin')[0].error?.source).toBe('unknown');
+    queue.watch('admin','thread',{});queue.started('thread','exit');queue.interrupted('admin','thread','exit',{code:'runtime_terminated',message:'Codex app-server exited (SIGABRT)'});
+    expect(queue.snapshot('admin')[0].error).toMatchObject({source:'runtime',code:'runtime_terminated'});
+  });
+  it('persists explicit dismissal and clears it when a new user turn starts',()=>{
+    const {queue,store}=fixture();queue.started('thread','turn');queue.interrupted('admin','thread','turn');
+    queue.cancel('admin','thread',true,'turn');
+    expect(queue.snapshot('admin')[0]).toMatchObject({error:null,dismissedTurnId:'turn'});
+    expect(store.getTurnRecoveryState('thread')?.interruption).toBeUndefined();
+    queue.watch('admin','thread',{});queue.started('thread','next');
+    expect(queue.snapshot('admin')).toEqual([]);
+  });
+  it('does not overwrite a newer active turn with a delayed interruption from an older turn',()=>{
+    const {queue,store}=fixture();queue.started('thread','newer');queue.interrupted('admin','thread','older');
+    expect(store.getTurnRecoveryState('thread')?.activeTurn?.id).toBe('newer');
+    expect(queue.snapshot('admin')).toEqual([]);
+  });
 });
 
 it("keeps error codes and readable causes while redacting credentials", () => {

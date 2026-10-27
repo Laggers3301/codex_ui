@@ -1,16 +1,17 @@
 import { modelErrorDetails, modelErrorSummary, redactModelError } from "../shared/modelError.js";
-export interface PublicAppError { code: string; message: string; originalMessage: string; retryable: boolean; at: string }
+import { errorSource, type ErrorSource, type PublicAppError } from "../shared/turnRecovery.js";
+export type { PublicAppError } from "../shared/turnRecovery.js";
 
 function safeMessage(value: unknown): string {
   return redactModelError(typeof value === "string" ? value : modelErrorDetails(value).message);
 }
 
 export class AppError extends Error {
-  constructor(public code: string, message: string, public originalMessage = message, public retryable = false) { super(message); this.name = "AppError"; }
+  constructor(public code: string, message: string, public originalMessage = message, public retryable = false, public source: ErrorSource = errorSource(code)) { super(message); this.name = "AppError"; }
   toPublic(): PublicAppError {
     const detail = modelErrorSummary(this.originalMessage);
     const message = detail && detail !== this.message && detail !== "未知错误" ? `${this.message} 具体原因：${detail}` : this.message;
-    return { code: this.code, message, originalMessage: safeMessage(this.originalMessage), retryable: this.retryable, at: new Date().toISOString() };
+    return { code: this.code, message, originalMessage: safeMessage(this.originalMessage), retryable: this.retryable, at: new Date().toISOString(), source: this.source };
   }
   static from(value: unknown): AppError {
     if (value instanceof AppError) return value;
