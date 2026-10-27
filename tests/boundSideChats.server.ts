@@ -75,6 +75,17 @@ const wss = attachSocketServer(app.server, bridge as any, store);
 app.post("/api/auth/login", async (_request, reply) => { reply.header("Set-Cookie", auth.createSessionCookie("admin")); return { ok: true }; });
 app.post<{ Body: { threadId: string } }>("/api/__test/complete", async request => { bridge.complete(request.body.threadId); return { ok: true }; });
 app.post<{ Body: { threadId: string; delta: string } }>("/api/__test/append", async request => { bridge.append(request.body.threadId, request.body.delta); return { ok: true }; });
+app.post<{ Body: { threadId: string } }>("/api/__test/start-main", async request => bridge.request("turn/start", {
+  threadId: request.body.threadId, input: [{ type: "text", text: "模拟主会话持续运行" }]
+}));
+app.post<{ Body: { threadId: string } }>("/api/__test/main-tool", async request => {
+  const threadId = request.body.threadId, turnId = threads.get(threadId)!.turns.at(-1)!.id;
+  const item = { id: "main-scroll-tool", type: "commandExecution", command: "echo MAIN_TOOL_SCROLL_UPDATE", cwd: root, status: "inProgress" };
+  bridge.emit("notification", { method: "item/started", params: { threadId, turnId, item } });
+  bridge.emit("notification", { method: "item/commandExecution/outputDelta", params: { threadId, turnId, itemId: item.id, delta: "MAIN_TOOL_SCROLL_UPDATE" } });
+  bridge.emit("notification", { method: "item/completed", params: { threadId, turnId, item: { ...item, status: "completed", aggregatedOutput: "MAIN_TOOL_SCROLL_UPDATE", exitCode: 0 } } });
+  return { ok: true };
+});
 app.post<{ Body: { pause: boolean } }>("/api/__test/hold-create", async request => {
   if (request.body.pause) bridge.creationGate = new Promise(resolve => { bridge.releaseCreation = resolve; });
   else { bridge.releaseCreation?.(); bridge.creationGate = null; bridge.releaseCreation = null; }

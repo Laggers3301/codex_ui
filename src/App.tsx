@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { lazy, Suspense } from "react";
 import { PreviewZoom } from "./PreviewZoom";
 import { SourceTextPreview } from "./SourceTextPreview";
+import { SideChatMessages } from "./SideChatMessages";
 import {defaultHtmlPreview,isHtmlPreviewFile} from "./htmlFilePreview";
 const HtmlSourcePreview = lazy(() => import("./HtmlSourcePreview"));
 import { VoiceInput } from "./VoiceInput";
@@ -4411,7 +4412,6 @@ export function App() {
   const conversationVirtualRef = useRef<VirtualConversationHandle | null>(null);
   const toolRevealCleanupRef = useRef<(() => void) | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  const temporaryMessagesEndRef = useRef<HTMLDivElement | null>(null);
   const promptNavigationFrameRef = useRef<number | null>(null);
   const promptPreviewSwitchTimerRef = useRef<number | null>(null);
   const lastPromptPreviewRef = useRef<{ item: PromptNavigationItem; index: number; threadId: string | null; userId: string } | null>(null);
@@ -11276,14 +11276,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
   );
 
   useEffect(() => {
-    if (!temporaryAsk) return;
-    const frame = window.requestAnimationFrame(() => {
-      temporaryMessagesEndRef.current?.scrollIntoView({ block: "end", inline: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [temporaryAsk, temporaryThread, temporaryLiveTimeline.length, liveDeltas, liveTools]);
-
-  useEffect(() => {
     if (promptNavigationItems.length === 0) {
       setActivePromptNavigationKey(null);
       setHoveredPromptNavigationKey(null);
@@ -13054,7 +13046,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       </div>
                       <button className="iconButton temporaryAskHeaderButton" type="button" onClick={closeTemporaryAsk} disabled={temporaryAsk.status === "closing"} title="关闭并删除临时对话" aria-label="关闭并删除临时对话"><X size={16} /></button>
                     </header>
-                    <div className="temporaryAskMessages messages">
+                    <SideChatMessages conversationId={temporaryAsk.id} requestId={temporaryAsk.requestId}>
                       <article className="messageItem kind-user type-userMessage temporaryAskQuote">
                         <div className="messageMeta">已选文本片段</div>
                         <CollapsibleUserMessage text={temporaryAsk.selectedText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
@@ -13082,8 +13074,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       {temporaryAsk.status === "starting" ? <div className="v2ThinkingLine">正在建立临时会话</div> : null}
                       {temporaryAsk.status === "running" ? <div className="v2ThinkingLine">正在思考</div> : null}
                       {temporaryAsk.error ? <div className="v2ThinkingLine" role="alert">{temporaryAsk.error}</div> : temporaryAsk.status === "error" ? <div className="v2ThinkingLine">本轮发送失败，可以修改后重试</div> : null}
-                      <div ref={temporaryMessagesEndRef} className="messagesEnd" aria-hidden="true" />
-                    </div>
+                      <div className="messagesEnd" aria-hidden="true" />
+                    </SideChatMessages>
                     <div className="composer temporaryAskComposer">
                       <div className="composerBody">
                         <MarkdownComposerEditor
