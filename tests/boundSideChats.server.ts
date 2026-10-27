@@ -30,7 +30,19 @@ class FixtureBridge extends EventEmitter {
   creationGate: Promise<void> | null = null;
   releaseCreation: (() => void) | null = null;
   failNextTurn = false;
-  getPendingServerRequests() { return []; }
+  failNextApproval = false;
+  pending: Array<{ id: number; method: string; params: Record<string, unknown>; receivedAt: string }> = [];
+  approvalResponses: Array<{ id: number | string; result: unknown }> = [];
+  flags = new Map<string, string[]>();
+  nextApprovalId = 1;
+  getPendingServerRequests() { return this.pending; }
+  respondToServerRequest(id: number | string, result: unknown) {
+    if (this.failNextApproval) { this.failNextApproval = false; throw new Error("模拟批准提交失败，请重试"); }
+    const request = this.pending.find(request => request.id === id)!;
+    this.approvalResponses.push({ id, result }); this.pending = this.pending.filter(request => request.id !== id);
+    const threadId = String(request.params.threadId);
+    this.flags.set(threadId, this.pending.some(request => request.params.threadId === threadId) ? ["waitingOnApproval"] : []);
+  }
   async request(method: string, params: any = {}) {
     this.calls.push({ method, threadId: params.threadId });
     if (method === "thread/start" || method === "thread/fork") {
@@ -41,7 +53,7 @@ class FixtureBridge extends EventEmitter {
     }
     const thread = threads.get(params.threadId);
     if (method === "thread/name/set" && thread) thread.name = params.name;
-    if (method === "thread/read") return { thread: params.includeTurns === false && thread ? { ...thread, turns: [] } : thread };
+    if (method === "thread/read") return { thread: thread ? { ...thread, status: { type: thread.status, activeFlags: this.flags.get(thread.id) ?? [] }, turns: params.includeTurns === false ? [] : thread.turns } : thread };
     if (method === "thread/resume") return { thread };
     if (method === "thread/queue/list") return { data: [] };
     if (method === "thread/turns/list") return { data: thread?.turns.slice(-1).map(({id,status}) => ({id,status})) ?? [] };
@@ -108,8 +120,30 @@ app.post<{ Body: { pause: boolean } }>("/api/__test/hold-create", async request 
   return { ok: true };
 });
 app.post("/api/__test/fail-next", async () => { bridge.failNextTurn = true; return { ok: true }; });
+app.post("/api/__test/fail-next-approval", async () => { bridge.failNextApproval = true; return { ok: true }; });
+app.post<{ Body: { threadId: string; kind: string; emit?: boolean } }>("/api/__test/approval", async request => {
+  const { threadId, kind, emit = true } = request.body, id = bridge.nextApprovalId++;
+  const pending = { id, method: `item/${kind}/requestApproval`, receivedAt: new Date().toISOString(), params: {
+    threadId, turnId: threads.get(threadId)!.turns.at(-1).id, itemId: `approval-${id}`,
+    reason: "核对 lzc 分支的最新代码", cwd: root,
+    ...(kind === "commandExecution" ? { command: "git fetch origin lzc" } : kind === "permissions"
+      ? { permissions: { network: { enabled: true }, fileSystem: { read: ["/tmp/approval-fixture"], write: null } } }
+      : kind === "fileChange" ? { grantRoot: "/tmp/approval-fixture" } : {})
+  } };
+  bridge.pending.push(pending); bridge.flags.set(threadId, ["waitingOnApproval"]);
+  if (emit) bridge.emit("serverRequest", pending);
+  bridge.emit("notification", { method: "thread/status/changed", params: { threadId, status: { type: "active", activeFlags: ["waitingOnApproval"] } } });
+  return { id };
+});
+app.post<{ Body: { threadId: string; waiting: boolean; clearRequests?: boolean } }>("/api/__test/approval-state", async request => {
+  const { threadId, waiting, clearRequests } = request.body;
+  if (clearRequests) bridge.pending = bridge.pending.filter(request => request.params.threadId !== threadId);
+  const activeFlags = waiting ? ["waitingOnApproval"] : []; bridge.flags.set(threadId, activeFlags);
+  bridge.emit("notification", { method: "thread/status/changed", params: { threadId, status: { type: "active", activeFlags } } });
+  return { ok: true };
+});
 app.get("/api/__test/state", async () => ({ fixture: "bound-side-chats", projectId: project.id,
-  calls: bridge.calls, starts:bridge.starts, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
+  calls: bridge.calls, starts:bridge.starts, pendingApprovals: bridge.pending, approvalResponses: bridge.approvalResponses, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
 app.get("/api/projects", async () => ({ data: [project], projectRoot: root }));
 app.get("/api/users", async () => ({ data: [{ id: "admin", name: "admin" }], defaultUserId: "admin" }));
 app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }] }));

@@ -11703,8 +11703,13 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
   animation: codexApprovalEnter .32s cubic-bezier(.22, 1, .36, 1) both;
 }
 .codexApprovalCard strong { font-size: 13px; }
+.codexApprovalRequests { min-width: 0; max-height: min(50vh, 420px); overflow: auto; margin-bottom: 10px; padding: 2px; color: var(--ui-content); font-size: 12px; overflow-wrap: anywhere; }
+.codexApprovalRequests p { margin: 4px 0; }
+.codexApprovalCard pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow: auto; margin: 0; font-size: 12px; }
+.codexApprovalRefresh { border: 0; border-radius: 8px; padding: 6px 12px; background: var(--ui-control-hover); color: var(--ui-content); cursor: pointer; }
+.codexApprovalRequests button:disabled { opacity: .55; cursor: default; }
 .codexApprovalCard code { overflow-wrap: anywhere; max-height: 90px; overflow: auto; font-size: 12px; color: var(--ui-content-muted); }
-.codexApprovalCard > div { display: flex; justify-content: flex-end; gap: 8px; }
+.codexApprovalActions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
 .codexApprovalCard button { border: 0; border-radius: 8px; padding: 6px 12px; background: var(--ui-control-hover); color: var(--ui-content); cursor: pointer; }
 .codexApprovalCard button:last-child { background: var(--ui-contrast); color: var(--ui-surface); }
 :root[data-theme="light"] .codexApprovalCard button:last-child { color: #fff; }

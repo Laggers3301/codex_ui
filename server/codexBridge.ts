@@ -160,8 +160,8 @@ export class CodexBridge extends EventEmitter {
     if (!this.serverRequests.has(id)) {
       throw new Error(`Unknown Codex server request: ${id}`);
     }
-    this.serverRequests.delete(id);
     this.write({ id, result });
+    this.serverRequests.delete(id);
   }
 
   rejectServerRequest(id: number | string, message: string): void {

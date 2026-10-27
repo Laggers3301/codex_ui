@@ -43,6 +43,8 @@ import "./sideChatDock.css";
 import { downloadBrowserFile, shareBrowserFile } from "./browserFileActions";
 import { PreviewFileTransferActions, type BrowserFileAction } from "./PreviewFileTransferActions";
 import { readTurnProgress, turnProgressText, updateTurnProgress, type TurnProgress } from "./turnProgress";
+import { isApprovalRequest, type ApprovalDecision, type ApprovalRequest } from "../shared/approvals";
+import { ApprovalRequests } from "./ApprovalRequests";
 import { exhaustedAccountSuggestion, type ExhaustedAccountSuggestion } from "./accountExhaustion";
 import "katex/dist/katex.min.css";
 import {
@@ -4805,8 +4807,11 @@ export function App() {
   const [pushEnabled, setPushEnabled] = useState(() => storedBooleanWithDefault(`codex-web-push:${getApiUserId()}`, false));
   const [pushSaving, setPushSaving] = useState(false);
   const [nativeFeaturesReady, setNativeFeaturesReady] = useState(false);
-  const [pendingApprovals, setPendingApprovals] = useState<Record<string, { id: string | number; method: string; params: Record<string, unknown> }>>({});
-  const approvalResponseRequestsRef = useRef(new Map<string, { id: string | number; method: string; params: Record<string, unknown> }>());
+  const [pendingApprovals, setPendingApprovals] = useState<Record<string, ApprovalRequest>>({});
+  const approvalResponseRequestsRef = useRef(new Map<string, ApprovalRequest>());
+  const [answeringApprovals, setAnsweringApprovals] = useState<Record<string, boolean>>({});
+  const [approvalChecks, setApprovalChecks] = useState<Record<string, { checking: boolean; message?: string }>>({});
+  const approvalSyncRequestsRef = useRef(new Map<string, { threadId: string; turnId?: string }>());
   const [localSendSettings, setLocalSendSettings] = useState<LocalSendSettings>(defaultLocalSendSettings);
   const localSendSettingsRef = useRef<LocalSendSettings>(defaultLocalSendSettings);
   const [detectedClientHost, setDetectedClientHost] = useState("");
@@ -8382,20 +8387,50 @@ export function App() {
     window.location.assign("/logout");
   }
 
-  function answerApproval(id: string | number, decision: "accept" | "decline") {
+  function answerApproval(id: string | number, decision: ApprovalDecision) {
     try {
       const requestId = `approval-${requestToken()}`;
       const pending = pendingApprovals[String(id)];
-      if (pending) approvalResponseRequestsRef.current.set(requestId, pending);
-      codexSocket.send({ type: "approval.respond", requestId, codexRequestId: id, result: { decision } });
-      setPendingApprovals((current) => {
-        const next = { ...current };
-        delete next[String(id)];
-        return next;
-      });
+      if (!pending || answeringApprovals[String(id)]) return;
+      approvalResponseRequestsRef.current.set(requestId, pending);
+      codexSocket.send({ type: "approval.respond", requestId, codexRequestId: id, threadId: pending.params.threadId, result: { decision } });
+      setAnsweringApprovals(current => ({ ...current, [String(id)]: true }));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }
+  }
+
+  function refreshApprovalRequests(threadId: string) {
+    const requestId = `approval-sync-${requestToken()}`;
+    try {
+      const turnId = activeTurnsByThreadRef.current[threadId];
+      approvalSyncRequestsRef.current.set(requestId, { threadId, turnId });
+      codexSocket.send({ type: "approval.sync", requestId, threadId, turnId });
+      setApprovalChecks(current => ({ ...current, [threadId]: { checking: true } }));
+    } catch (caught) {
+      approvalSyncRequestsRef.current.delete(requestId);
+      setApprovalChecks(current => ({ ...current, [threadId]: { checking: false, message: caught instanceof Error ? caught.message : String(caught) } }));
+    }
+  }
+
+  function renderApprovalRequests(threadId: string | null | undefined) {
+    if (!threadId) return null;
+    const progress = turnProgress[`${selectedUserId}:${threadId}`];
+    return <ApprovalRequests requests={Object.values(pendingApprovals).filter(request => request.params.threadId === threadId)}
+      waiting={progress?.state === "waiting_approval" && progress.turnId === activeTurnsByThread[threadId]}
+      checking={approvalChecks[threadId]?.checking ?? false} message={approvalChecks[threadId]?.message}
+      answering={answeringApprovals} onRefresh={() => refreshApprovalRequests(threadId)}
+      operation={request => {
+        if (typeof request.params.command === "string") return request.params.command;
+        const itemId = String(request.params.itemId ?? "");
+        const live = liveTools[itemId];
+        if (live?.threadId === threadId && live.input) return live.input;
+        const thread = selectedThread?.id === threadId ? selectedThread : temporaryThread?.id === threadId ? temporaryThread : null;
+        const item = thread?.turns.flatMap(turn => turn.items).find(item => item.id === itemId);
+        const detail = item?.command ?? item?.input ?? item?.changes;
+        return typeof detail === "string" ? detail : detail ? JSON.stringify(detail, null, 2) : "";
+      }}
+      onAnswer={(request, decision) => { answerApproval(request.id, decision); if (decision === "accept" || decision === "acceptForSession") window.dispatchEvent(new CustomEvent("codex:pet-action", { detail: "approved" })); }} />;
   }
 
   function updateLocalSendSetting<K extends keyof LocalSendSettings>(key: K, value: LocalSendSettings[K]) {
@@ -9734,8 +9769,12 @@ export function App() {
         return next;
       });
       setPendingApprovals(Object.fromEntries((data?.pendingServerRequests ?? [])
-        .filter((request) => request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")
+        .filter((request) => isApprovalRequest(request.method))
         .map((request) => [String(request.id), request])));
+      setAnsweringApprovals({});
+      setApprovalChecks({});
+      approvalResponseRequestsRef.current.clear();
+      approvalSyncRequestsRef.current.clear();
       pendingUserInputsRef.current.clear();
       for (const request of data?.pendingServerRequests ?? []) receiveUserInputRequest(request);
       if (selectedThreadRef.current?.id && selectedProjectIdRef.current) {
@@ -9769,7 +9808,7 @@ export function App() {
 
     if (message.type === "codex.serverRequest") {
       const request = message.data as { id?: string | number; method?: string; params?: Record<string, unknown> } | undefined;
-      if (request?.id !== undefined && (request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")) {
+      if (request?.id !== undefined && isApprovalRequest(request.method)) {
         setPendingApprovals((current) => ({ ...current, [String(request.id!)]: {
           id: request.id!, method: request.method!, params: request.params ?? {}
         } }));
@@ -9858,11 +9897,28 @@ export function App() {
       if (message.requestId?.startsWith("term-")) return;
       // The thread-scoped Goal controller owns its confirmation and errors.
       if (message.requestId?.startsWith("goal-")) return;
+      if (message.requestId?.startsWith("approval-sync-")) {
+        const check = approvalSyncRequestsRef.current.get(message.requestId);
+        approvalSyncRequestsRef.current.delete(message.requestId);
+        if (!check) return;
+        const data = message.data as { threadId?: string; turnId?: string; pendingServerRequests?: ApprovalRequest[]; message?: string } | undefined;
+        setApprovalChecks(current => ({ ...current, [check.threadId]: { checking: false, message: message.ok ? data?.message : `核对失败：${message.error ?? "请重试"}` } }));
+        if (!message.ok || data?.threadId !== check.threadId || (check.turnId && activeTurnsByThreadRef.current[check.threadId] !== check.turnId)) return;
+        setPendingApprovals(current => ({
+          ...Object.fromEntries(Object.entries(current).filter(([, pending]) => pending.params.threadId !== check.threadId)),
+          ...Object.fromEntries((data.pendingServerRequests ?? []).filter(request => isApprovalRequest(request.method) && request.params.threadId === check.threadId).map(request => [String(request.id), request]))
+        }));
+        for (const request of data.pendingServerRequests ?? []) receiveUserInputRequest(request);
+        return;
+      }
       if (message.requestId?.startsWith("approval-")) {
         const pending = approvalResponseRequestsRef.current.get(message.requestId);
         approvalResponseRequestsRef.current.delete(message.requestId);
+        if (pending) {
+          setAnsweringApprovals(current => { const next = { ...current }; delete next[String(pending.id)]; return next; });
+          if (message.ok) setPendingApprovals(current => { const next = { ...current }; delete next[String(pending.id)]; return next; });
+        }
         if (!message.ok) {
-          if (pending) setPendingApprovals((current) => ({ ...current, [String(pending.id)]: pending }));
           setError(`批准操作失败：${message.error ?? "请重试"}`);
         }
         return;
@@ -13077,6 +13133,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       <div className="messagesEnd" aria-hidden="true" />
                     </SideChatMessages>
                     <div className="composer temporaryAskComposer">
+                      {renderApprovalRequests(temporaryAsk.threadId)}
                       <div className="composerBody">
                         <MarkdownComposerEditor
                           value={temporaryPrompt}
@@ -13433,16 +13490,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   </div> : null}
                 </div>
               ) : null}
-              {Object.values(pendingApprovals).filter((request) => request.params.threadId === selectedThread?.id).map((request) => (
-                <div className="codexApprovalCard" role="alert" key={String(request.id)}>
-                  <strong>Codex 等待批准{request.method.includes("fileChange") ? "文件修改" : "命令执行"}</strong>
-                  <code>{String(request.params.command ?? request.params.reason ?? "请确认此操作")}</code>
-                  <div>
-                    <button type="button" onClick={() => answerApproval(request.id, "decline")}>拒绝</button>
-                    <button type="button" onClick={() => { answerApproval(request.id, "accept"); window.dispatchEvent(new CustomEvent("codex:pet-action", { detail: "approved" })); }}>仅批准这次</button>
-                  </div>
-                </div>
-              ))}
+              {renderApprovalRequests(selectedThread?.id)}
               {skillsPickerPresence.present ? createPortal(
                 <div className={`skillPickerScrim uiExitLayer${skillsPickerPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={skillsPickerPresence.closing} inert={skillsPickerPresence.closing} onMouseDown={(event) => {
                   if (event.target === event.currentTarget) setSkillsPickerOpen(false);

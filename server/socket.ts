@@ -13,6 +13,7 @@ import { authenticatedUserFromHeaders } from "./auth.js";
 import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
 import { LiveStateStore } from "./liveState.js";
 import { isUserInputRequest, validateUserInputResponse } from "./userInput.js";
+import { approvalResponse, isApprovalRequest, type ApprovalRequest } from "../shared/approvals.js";
 import { questionToolOutput } from "./questionAnswers.js";
 import { AppError } from "./appErrors.js";
 import { TurnRetryQueue, publicRecovery } from "./turnRetry.js";
@@ -49,7 +50,7 @@ import {
 } from "./threadContext.js";
 import type { Project, RpcEnvelope, SocketClientMessage, SocketServerMessage } from "./types.js";
 import { sendUserPush } from "./webPush.js";
-import { meaningfulTurnProgressMethod, TurnWatchdog, type WatchdogProbeClaim, type WatchdogTurn } from "./turnWatchdog.js";
+import { meaningfulTurnProgressMethod, phaseFromProbe, TurnWatchdog, type WatchdogProbeClaim, type WatchdogTurn } from "./turnWatchdog.js";
 import { LatestTaskQueue } from "./streamBatch.js";
 import { requestedServiceTier, requestedTurnServiceTier } from "./serviceTier.js";
 import type { LiveAgentMessage } from "./liveState.js";
@@ -420,6 +421,14 @@ function watchdogState(turn: WatchdogTurn): string {
   return turn.phase === "waiting_approval" || turn.phase === "waiting_user_input" || turn.phase === "waiting_subagents" ? turn.phase : "no_progress";
 }
 
+function pendingRequestPhase(requests: ReturnType<CodexBridge["getPendingServerRequests"]>, threadId: string, turnId: string | null) {
+  const pending = requests.filter(request => notificationThreadId(request as RpcEnvelope) === threadId
+    && (!turnId || !notificationTurnId(request as RpcEnvelope) || notificationTurnId(request as RpcEnvelope) === turnId));
+  if (pending.some(request => isApprovalRequest(request.method))) return "waiting_approval" as const;
+  if (pending.some(request => isUserInputRequest(request.method) && asRecord(request.params).isBlocking !== false)) return "waiting_user_input" as const;
+  return null;
+}
+
 function changesFromTurnDiff(diff: string): Array<{ path: string; kind: string; diff: string }> {
   return diff.split(/(?=^diff --git )/m).filter((block) => block.trim()).map((block) => ({
     path: block.match(/^diff --git a\/.*? b\/(.+)$/m)?.[1]
@@ -737,10 +746,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         if (pending) {
           const progress = turnWatchdog.progress(pending.userId, pending.accountId, pending.threadId, pending.turnId ?? "", "serverRequest/resolved");
           if (progress) {
-            const waiting = bridge.getPendingServerRequests().some(request => isUserInputRequest(request.method)
-              && asRecord(request.params).threadId === pending.threadId && asRecord(request.params).isBlocking !== false);
-            if (waiting) turnWatchdog.setPhase(owner, pending.accountId, pending.threadId, pending.turnId, "waiting_user_input");
-            sendTurnProgress(progress.turn, waiting ? "waiting_user_input" : "active");
+            const phase = pendingRequestPhase(bridge.getPendingServerRequests(), pending.threadId, pending.turnId);
+            if (phase) turnWatchdog.setPhase(owner, pending.accountId, pending.threadId, pending.turnId, phase);
+            sendTurnProgress(progress.turn, phase ?? "active");
           }
         }
       }
@@ -764,7 +772,21 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     const progressMethod = meaningfulTurnProgressMethod(message);
     if (turnId && threadIdForWatchdog && progressMethod) {
       const progress = turnWatchdog.progress(owner, accountId, threadIdForWatchdog, turnId, progressMethod);
-      if (progress?.resumed) sendTurnProgress(progress.turn, "active");
+      const pendingPhase = pendingRequestPhase(bridge.getPendingServerRequests(), threadIdForWatchdog, turnId);
+      if (pendingPhase) turnWatchdog.setPhase(owner, accountId, threadIdForWatchdog, turnId, pendingPhase);
+      if (progress?.resumed) sendTurnProgress(progress.turn, pendingPhase ?? "active");
+    }
+    if (message.method === "thread/status/changed" && threadIdForWatchdog) {
+      const tracked = turnWatchdog.get(owner, accountId, threadIdForWatchdog);
+      const status = asRecord(asRecord(message.params).status);
+      if (tracked && status.type === "active") {
+        const phase = pendingRequestPhase(bridge.getPendingServerRequests(), threadIdForWatchdog, tracked.turnId)
+          ?? phaseFromProbe(status.activeFlags);
+        const previous = tracked.phase;
+        turnWatchdog.setPhase(owner, accountId, threadIdForWatchdog, tracked.turnId, phase,
+          Array.isArray(status.activeFlags) ? status.activeFlags.map(String) : undefined);
+        if (previous !== phase) sendTurnProgress(tracked, phase === "running" ? (tracked.diagnosed ? "no_progress" : "active") : watchdogState(tracked));
+      }
     }
     if (message.method === "turn/diff/updated" && turnId) {
       const threadId = notificationThreadId(message)
@@ -813,9 +835,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         retries.toolProgress(liveUpdate.item.threadId, liveUpdate.item.turnId, liveUpdate.item.itemId, liveUpdate.item.completed);
       }
       const label = liveUpdate.item.tool.toLowerCase();
-      const phase = liveUpdate.item.completed
+      const phase = pendingRequestPhase(bridge.getPendingServerRequests(), liveUpdate.item.threadId, liveUpdate.item.turnId) ?? (liveUpdate.item.completed
         ? "running"
-        : label.includes("collab") || label.includes("agent") ? "waiting_subagents" : "tool_running";
+        : label.includes("collab") || label.includes("agent") ? "waiting_subagents" : "tool_running");
       turnWatchdog.setPhase(owner, accountId, liveUpdate.item.threadId, liveUpdate.item.turnId, phase);
     }
     const recovery = turnId ? contextRecoveryByTurn.get(turnId) : undefined;
@@ -1012,10 +1034,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const flags = flagsRaw.map((flag) => typeof flag === "string" ? flag : pickString(asRecord(flag).type ?? asRecord(flag).name ?? asRecord(flag).flag)).filter(Boolean);
       const resolved = turnWatchdog.resolveProbe(turn.userId, turn.accountId, turn.threadId, turn.turnId, claim.token, statusName, flags);
       if (!resolved) return; // A newer turn replaced this probe while it was in flight.
-      if (bridge.getPendingServerRequests().some(request => isUserInputRequest(request.method)
-        && notificationThreadId(request as RpcEnvelope) === turn.threadId && notificationTurnId(request as RpcEnvelope) === turn.turnId)) {
-        turnWatchdog.setPhase(turn.userId, turn.accountId, turn.threadId, turn.turnId, "waiting_user_input");
-      }
+      const pendingPhase = pendingRequestPhase(bridge.getPendingServerRequests(), turn.threadId, turn.turnId);
+      if (pendingPhase) turnWatchdog.setPhase(turn.userId, turn.accountId, turn.threadId, turn.turnId, pendingPhase);
       const liveTurn = liveStateFor(turn.userId).snapshot().toolItems
         .find((item) => item.threadId === turn.threadId && item.turnId === turn.turnId && !item.completed);
       if (liveTurn && resolved.turn.phase === "running") {
@@ -1023,7 +1043,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         turnWatchdog.setPhase(turn.userId, turn.accountId, turn.threadId, turn.turnId,
           label.includes("collab") || label.includes("agent") ? "waiting_subagents" : "tool_running");
       }
-      if (resolved.changed) sendTurnProgress(turn, resolved.turn.phase, statusName);
+      sendTurnProgress(turn, watchdogState(turn), statusName);
     } catch (error) {
       const probeStillCurrent = turnWatchdog.failProbe(turn.userId, turn.accountId, turn.threadId, turn.turnId, claim.token);
       if (!probeStillCurrent) return;
@@ -1046,7 +1066,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   bridge.on("serverRequest", (request) => {
     const owner = ownerForEnvelope(request as RpcEnvelope);
     if (owner) {
-      if (request.id !== undefined && (isUserInputRequest(request.method) || request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")) {
+      if (request.id !== undefined && (isUserInputRequest(request.method) || isApprovalRequest(request.method))) {
         pendingApprovalOwners.set(request.id, owner);
         const threadId = notificationThreadId(request as RpcEnvelope);
         if (threadId) {
@@ -1134,7 +1154,17 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       type: "hello",
       ok: true,
       data: {
-        pendingServerRequests: bridge.getPendingServerRequests().filter((pending) => pendingApprovalOwners.get(pending.id) === sessionUserId),
+        pendingServerRequests: bridge.getPendingServerRequests().filter((pending) => {
+          if (!isUserInputRequest(pending.method) && !isApprovalRequest(pending.method)) return false;
+          const owner = ownerForEnvelope(pending as RpcEnvelope);
+          if (owner !== sessionUserId) return false;
+          pendingApprovalOwners.set(pending.id, owner);
+          if (!pendingApprovalTurns.has(pending.id)) pendingApprovalTurns.set(pending.id, {
+            userId: owner, accountId: notificationAccountId(pending as RpcEnvelope),
+            threadId: notificationThreadId(pending as RpcEnvelope)!, turnId: notificationTurnId(pending as RpcEnvelope)
+          });
+          return true;
+        }),
         liveState: liveStateFor(sessionUserId).snapshot(),
         turnRecoveries: retries.snapshot(sessionUserId),
         turnProgress: turnWatchdog.diagnosedForUser(sessionUserId)
@@ -1148,7 +1178,34 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         if (pending) processBridgeNotification({ method: "serverRequest/resolved", accountId: pending.accountId, params: { threadId: pending.threadId, requestId } } as RpcEnvelope);
       }, browserService, (threadId, itemId) => sendToUser(wss, sessionUserId, {
         type: "question.answered", data: { threadId, itemId }
-      }));
+      }), async (threadId, expectedTurnId) => {
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        const before = turnWatchdog.forThread(sessionUserId, threadId);
+        const revision = before?.revision;
+        if (expectedTurnId && before && before.turnId !== expectedTurnId) throw new Error("当前轮次已变化，请重新核对批准请求。");
+        const result = await bridge.request("thread/read", { threadId, includeTurns: false }, 10_000);
+        const status = asRecord(asRecord(asRecord(result).thread).status);
+        const requests = bridge.getPendingServerRequests().filter(pending => notificationThreadId(pending as RpcEnvelope) === threadId
+          && ownerForEnvelope(pending as RpcEnvelope) === sessionUserId
+          && (isApprovalRequest(pending.method) || isUserInputRequest(pending.method)));
+        for (const pending of requests) {
+          pendingApprovalOwners.set(pending.id, sessionUserId);
+          pendingApprovalTurns.set(pending.id, { userId: sessionUserId,
+            accountId: notificationAccountId(pending as RpcEnvelope) ?? before?.accountId ?? null,
+            threadId, turnId: notificationTurnId(pending as RpcEnvelope) });
+        }
+        const tracked = turnWatchdog.forThread(sessionUserId, threadId);
+        if (tracked !== before || tracked?.revision !== revision) throw new Error("核对期间轮次或运行状态已变化，请重新核对批准请求。");
+        if (tracked && status.type) {
+          const phase = pendingRequestPhase(requests, threadId, tracked.turnId) ?? phaseFromProbe(status.activeFlags);
+          turnWatchdog.setPhase(sessionUserId, tracked.accountId, threadId, tracked.turnId, phase);
+          sendTurnProgress(tracked, watchdogState(tracked), String(status.type));
+        }
+        return { threadId, turnId: tracked?.turnId ?? expectedTurnId, pendingServerRequests: requests,
+          message: requests.some(pending => isApprovalRequest(pending.method)) ? "已重新取得待批准操作。"
+            : phaseFromProbe(status.activeFlags) === "waiting_approval" ? "运行时仍报告等待批准，但未返回可操作的批准请求。不能据此判断或批准具体操作。"
+            : status.type ? "当前未发现待批准操作，已更新运行状态。" : "暂时无法确认运行状态，请稍后重新核对。" };
+      });
     });
     ws.on("close", () => {
       for (const [processId, socket] of processSockets) {
@@ -1181,7 +1238,8 @@ async function handleClientMessage(
   steerQueuedSubmission: (owner: string, threadId: string, expectedTurnId: string, queuedSubmissionId: string) => Promise<unknown>,
   onServerRequestResolved: (requestId: number | string) => void,
   browserService?: BrowserService,
-  onQuestionAnswered?: (threadId: string, itemId: string) => void
+  onQuestionAnswered?: (threadId: string, itemId: string) => void,
+  onApprovalSync?: (threadId: string, turnId: string | null) => Promise<unknown>
 ): Promise<void> {
   let message: SocketClientMessage;
   try {
@@ -1194,6 +1252,14 @@ async function handleClientMessage(
   const requestId = message.requestId ?? randomUUID();
   try {
     switch (message.type) {
+      case "approval.sync": {
+        const threadId = pickString(message.threadId);
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        if (!onApprovalSync) throw new Error("批准核对服务尚未就绪。");
+        const data = await onApprovalSync(threadId, stringOrNull(message.turnId));
+        send(ws, { type: "ack", requestId, ok: true, data });
+        break;
+      }
       case "turn.recovery.check":
       case "turn.recovery.continue": {
         const threadId = pickString(message.threadId);
@@ -1906,7 +1972,12 @@ async function handleClientMessage(
         if (message.type === "userInput.respond" && message.threadId !== notificationThreadId(pending as RpcEnvelope)) {
           throw new Error("答案与当前会话不匹配，请刷新会话。");
         }
-        const result = message.type === "userInput.respond" ? validateUserInputResponse(pending.params, message.result) : message.result;
+        if (message.type === "approval.respond" && (!isApprovalRequest(pending.method)
+          || (message.threadId !== undefined && message.threadId !== notificationThreadId(pending as RpcEnvelope)))) {
+          throw new Error("批准请求与当前会话不匹配，请重新核对批准请求。");
+        }
+        const result = message.type === "userInput.respond" ? validateUserInputResponse(pending.params, message.result)
+          : approvalResponse({ ...pending, params: asRecord(pending.params) } as ApprovalRequest, message.result);
         bridge.respondToServerRequest(responseId, result);
         if (message.type === "userInput.respond") {
           const params = asRecord(pending.params);

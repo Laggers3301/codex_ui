@@ -301,7 +301,7 @@ export class AccountPoolBridge extends EventEmitter {
   private readonly accountsById = new Map<string, AccountRuntime>();
   private readonly threadAccounts = new Map<string, string>();
   private readonly processAccounts = new Map<string, string>();
-  private readonly serverRequestAccounts = new Map<number | string, { bridge: CodexBridge; originalId: number | string }>();
+  private readonly serverRequestAccounts = new Map<number | string, { bridge: CodexBridge; originalId: number | string; accountId: string }>();
   private readonly stateFile: string;
   private readonly quotaCacheMs: number;
   private accountRefreshInFlight: Promise<void> | null = null;
@@ -670,7 +670,7 @@ export class AccountPoolBridge extends EventEmitter {
       const original = asRecord(request);
       const originalId = original.id as number | string;
       const id = `pool-${this.nextServerRequestId++}`;
-      this.serverRequestAccounts.set(id, { bridge, originalId });
+      this.serverRequestAccounts.set(id, { bridge, originalId, accountId: account.id });
       this.emit("serverRequest", { ...original, id, accountId: account.id, accountLabel: account.label });
     });
     bridge.on("status", (status) => {
@@ -1034,11 +1034,11 @@ export class AccountPoolBridge extends EventEmitter {
     }
   }
 
-  getPendingServerRequests(): Array<{ id: number | string; method: string; params: unknown; receivedAt: string }> {
+  getPendingServerRequests(): Array<{ id: number | string; method: string; params: unknown; receivedAt: string; accountId: string }> {
     return Array.from(this.serverRequestAccounts.entries()).map(([id, route]) => {
       const original = route.bridge.getPendingServerRequests().find((item) => item.id === route.originalId);
-      return original ? { ...original, id } : null;
-    }).filter((item): item is { id: number | string; method: string; params: unknown; receivedAt: string } => Boolean(item));
+      return original ? { ...original, id, accountId: route.accountId } : null;
+    }).filter((item): item is { id: number | string; method: string; params: unknown; receivedAt: string; accountId: string } => Boolean(item));
   }
 
   notify(method: string, params?: unknown): void {
@@ -1077,8 +1077,8 @@ export class AccountPoolBridge extends EventEmitter {
   respondToServerRequest(id: number | string, result: unknown): void {
     const route = this.serverRequestAccounts.get(id);
     if (!route) throw new Error(`Unknown Codex server request: ${id}`);
-    this.serverRequestAccounts.delete(id);
     route.bridge.respondToServerRequest(route.originalId, result);
+    this.serverRequestAccounts.delete(id);
   }
 
   rejectServerRequest(id: number | string, message: string): void {
