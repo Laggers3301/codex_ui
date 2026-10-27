@@ -13048,7 +13048,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     </header>
                     <SideChatMessages conversationId={temporaryAsk.id} requestId={temporaryAsk.requestId}>
                       <article className="messageItem kind-user type-userMessage temporaryAskQuote">
-                        <div className="messageMeta">已选文本片段</div>
+                        <div className="messageMeta">引用的文本片段</div>
                         <CollapsibleUserMessage text={temporaryAsk.selectedText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
                       </article>
                       {(temporaryThread?.turns ?? []).map(renderTemporaryPersistedTurn)}
@@ -13085,7 +13085,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           placeholder="随心输入"
                           disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
                         />
-                        <div className="temporarySelectionRow"><span className="temporarySelectionCount"><MessageSquare size={13} />1 个已选文本片段</span></div>
                         <div className="composerTools temporaryAskComposerTools">
                           <PolishedSelect<SandboxMode>
                             className="temporaryPolicySelect"

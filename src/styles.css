@@ -8322,7 +8322,6 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .temporaryAskComposer .composerBody { display:flex; min-width:0; flex:1; flex-direction:column; padding:0; }
 .temporaryAskComposer textarea { width:100%; min-height:48px; max-height:150px; padding:4px 2px; resize:none; border:0; outline:0; background:transparent; color:#e8ebe5; font:inherit; font-size:14px; line-height:1.5; }
 .temporaryAskComposer .temporaryAskComposerTools { display:flex; min-width:0; align-items:center; gap:7px; padding-top:7px; overflow:visible; }
-.temporarySelectionCount { display:inline-flex; min-width:0; align-items:center; gap:5px; padding:5px 8px; border:1px solid #3b3d3a; border-radius:9px; background:#242524; color:#cdd1ca; font-size:11px; white-space:nowrap; }
 .temporaryAskComposer .polishedSelectTrigger { border-color:#3b3d3a; background:#242524; color:#e4e6e1; }
 .temporaryAskComposer .polishedSelectTrigger:hover,
 .temporaryAskComposer .polishedSelect.open .polishedSelectTrigger { border-color:#555853; background:#2b2c2b; }
@@ -8863,7 +8862,6 @@ pre,
 
 .skillPickerSearch,
 .selectedSkillChip,
-.temporarySelectionCount,
 .temporaryAskHeaderButton,
 .temporaryAskPanel .temporaryAskHeaderText {
   border: 0 !important;
@@ -11629,8 +11627,7 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
 :root[data-theme="light"] .temporaryAskHeader small,
 :root[data-theme="light"] .temporaryAskStatus { color: var(--ui-content-muted) !important; }
 :root[data-theme="light"] .temporaryAskMessages .temporaryAskQuote,
-:root[data-theme="light"] .temporaryAskMessages .temporaryAskUser,
-:root[data-theme="light"] .temporarySelectionCount { background: #edf1eb !important; color: var(--ui-code-content) !important; border-color: var(--ui-divider) !important; }
+:root[data-theme="light"] .temporaryAskMessages .temporaryAskUser { background: #edf1eb !important; color: var(--ui-code-content) !important; border-color: var(--ui-divider) !important; }
 :root[data-theme="light"] .temporaryAskComposer.composer { background: linear-gradient(145deg,rgba(255,255,255,.84),rgba(246,248,245,.88)) !important; box-shadow: 0 12px 34px rgba(39,46,38,.12) !important; }
 :root[data-theme="light"] .temporaryAskComposer textarea { color: var(--ui-content) !important; }
 :root[data-theme="light"] .temporaryAskHeaderButton { background: var(--ui-control-hover) !important; color: #465248 !important; }

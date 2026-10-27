@@ -26,8 +26,6 @@
   border-radius: 20px;
 }
 .temporaryAskDocked .composerBody { gap: 6px; overflow: visible; }
-.temporaryAskDocked .temporarySelectionRow { display: flex; min-width: 0; }
-.temporaryAskDocked .temporarySelectionCount { max-width: 100%; font-size: 12px; padding: 3px 6px; }
 .rightWorkspace .temporaryAskDocked .temporaryAskComposerTools {
   display: grid !important; grid-template-columns: auto minmax(0,1fr) 32px;
   align-items: center; gap: 6px; padding-top: 0; width: 100%; min-width: 0;
