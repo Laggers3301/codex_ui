@@ -70,6 +70,23 @@ function candidate(
 }
 
 describe("account-pool routing policy", () => {
+  it("allows native quota detail fallback time without extending ordinary account reads", async () => {
+    const temporary=fs.mkdtempSync(path.join(os.tmpdir(), 'quota-fallback-budget-'));
+    const budgets=new Map<string,number | undefined>();
+    class BudgetBridge extends QuotaCodexBridge {
+      override async request(method:string,params?:unknown,timeoutMs?:number):Promise<unknown> {
+        budgets.set(method,timeoutMs);
+        return super.request(method,params);
+      }
+    }
+    const pool=new AccountPoolBridge({accounts:[{id:'a',label:'a',codexHome:temporary}],stateFile:'state.json'},temporary,()=>new BudgetBridge() as unknown as CodexBridge);
+    try {
+      await pool.refreshAccountData(true);
+      expect(budgets.get('account/read')).toBe(12_000);
+      expect(budgets.get('account/rateLimits/read')).toBe(30_000);
+      expect(budgets.get('account/usage/read')).toBe(30_000);
+    } finally {pool.stop();fs.rmSync(temporary,{recursive:true,force:true});}
+  });
   it("reloads a changed device credential only after the account becomes idle, without refreshing or rewriting tokens", async () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-10T00:00:00Z"));
     const dir=fs.mkdtempSync(path.join(os.tmpdir(),"codex-credential-reload-"));

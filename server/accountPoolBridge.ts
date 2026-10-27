@@ -432,7 +432,7 @@ export class AccountPoolBridge extends EventEmitter {
     try {
       const accountInfo=asRecord(await this.invokeAccount(account,"account/read",{refreshToken:false},12_000));
       if(!accountInfo.account)throw new Error("verification_incomplete");
-      await this.invokeAccount(account,"account/rateLimits/read",undefined,12_000);
+      await this.invokeAccount(account,"account/rateLimits/read",undefined,30_000);
       this.diagnose(account,"health_verify","success");return true;
     } catch(error){this.diagnose(account,"health_verify","deferred",error);return false;}
   }
@@ -1406,9 +1406,12 @@ export class AccountPoolBridge extends EventEmitter {
         this.updateCredentialVersion(account, this.currentCredentialVersion(account));
         const accountRead = accountSettled.status === "fulfilled" ? asRecord(accountSettled.value) : null;
         const missingAuth = accountRead?.account === null && accountRead.requiresOpenaiAuth !== false;
+        // Native quota reads may await optional reset-credit details and then
+        // fall back to the usage response. Do not time out before that bounded
+        // fallback completes. Cached snapshots remain non-blocking to viewers.
         const [limitsSettled, usageSettled] = await Promise.allSettled([
-          this.invokeAccount(account, "account/rateLimits/read", undefined, 12_000),
-          this.invokeAccount(account, "account/usage/read", undefined, 12_000)
+          this.invokeAccount(account, "account/rateLimits/read", undefined, 30_000),
+          this.invokeAccount(account, "account/usage/read", undefined, 30_000)
         ]);
         const results = [accountSettled, limitsSettled, usageSettled] as const;
         const errors = results.flatMap((result, index) => result.status === "rejected"

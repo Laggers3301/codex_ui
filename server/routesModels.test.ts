@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyThreadPresentation, inlineContentDisposition, modelProfilesFromCatalog, sanitizeMcpServerStatus, sanitizeThreadPayloadForClient } from "./routes.js";
+import { applyThreadPresentation, inlineContentDisposition, mergeModelProfiles, modelProfilesFromCatalog, sanitizeMcpServerStatus, sanitizeThreadPayloadForClient } from "./routes.js";
 
 describe("sanitizeMcpServerStatus", () => {
   it("returns only presentation status, never connector credentials or tool schemas", () => {
@@ -105,6 +105,16 @@ describe("sanitizeThreadPayloadForClient", () => {
 });
 
 describe("modelProfilesFromCatalog", () => {
+  it("merges Terra from a newer pool catalog without duplicates or unsupported UI efforts", () => {
+    const model=(slug:string,priority:number,levels=['low','medium','high','xhigh','max','ultra'])=>({slug,display_name:slug,visibility:'list',shell_type:'unified_exec',priority,supported_reasoning_levels:levels.map(effort=>({effort}))});
+    const old=modelProfilesFromCatalog({models:[model('gpt-6.1-sol',1),model('gpt-6-sol',2)]});
+    const next=modelProfilesFromCatalog({models:[model('gpt-6.1-sol',1),model('gpt-6.1-terra',3)]});
+    const merged=mergeModelProfiles([...old,...next,...next]);
+    expect(merged.filter(m=>m.model==='gpt-6.1-terra').map(m=>m.effort)).toEqual(['max','xhigh','high','medium','low']);
+    expect(new Set(merged.map(m=>m.id)).size).toBe(merged.length);
+    expect([...new Set(merged.map(m=>m.model))]).toEqual(['gpt-6.1-sol','gpt-6.1-terra','gpt-6-sol']);
+    expect(merged.some(m=>m.effort==='ultra')).toBe(false);
+  });
   it("includes both legacy shell_command and current unified_exec models", () => {
     const profiles = modelProfilesFromCatalog({
       models: [

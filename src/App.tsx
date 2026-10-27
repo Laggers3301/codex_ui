@@ -171,6 +171,7 @@ import {
   uploadProjectFiles
 } from "./api";
 import { codexSocket } from "./codexSocket";
+import { accountQuotaStatus } from "./accountQuotaStatus";
 import { TerminalPanel } from "./TerminalPanel";
 import { BrowserPanel } from "./BrowserPanel";
 import { RightWorkspace, WorkspaceOverview, WorkspaceIcon, type WorkspaceTab, type WorkspaceSection } from "./RightWorkspace";
@@ -1802,6 +1803,11 @@ const fallbackModelProfiles: ModelProfile[] = [
   { id: "gpt-6.1-sol:high", label: "GPT-6.1-Sol high", model: "gpt-6.1-sol", effort: "high" },
   { id: "gpt-6.1-sol:medium", label: "GPT-6.1-Sol medium", model: "gpt-6.1-sol", effort: "medium" },
   { id: "gpt-6.1-sol:low", label: "GPT-6.1-Sol low", model: "gpt-6.1-sol", effort: "low" },
+  { id: "gpt-6.1-terra:max", label: "GPT-6.1-Terra max", model: "gpt-6.1-terra", effort: "max" },
+  { id: "gpt-6.1-terra:xhigh", label: "GPT-6.1-Terra xhigh", model: "gpt-6.1-terra", effort: "xhigh" },
+  { id: "gpt-6.1-terra:high", label: "GPT-6.1-Terra high", model: "gpt-6.1-terra", effort: "high" },
+  { id: "gpt-6.1-terra:medium", label: "GPT-6.1-Terra medium", model: "gpt-6.1-terra", effort: "medium" },
+  { id: "gpt-6.1-terra:low", label: "GPT-6.1-Terra low", model: "gpt-6.1-terra", effort: "low" },
   { id: "gpt-6-sol:max", label: "GPT-6-Sol max", model: "gpt-6-sol", effort: "max" },
   { id: "gpt-6-sol:xhigh", label: "GPT-6-Sol xhigh", model: "gpt-6-sol", effort: "xhigh" },
   { id: "gpt-6-sol:high", label: "GPT-6-Sol high", model: "gpt-6-sol", effort: "high" },
@@ -3821,12 +3827,12 @@ function QuotaPopover({ quota, pool, loading, closing, userId }: { quota: CodexQ
           <div className="accountPoolTabs" style={{ "--account-columns": Math.min(3, quotaAccounts.length) } as CSSProperties} role="tablist" aria-label="Codex 账号额度">
             {[...quotaAccounts].sort((left,right)=>left.id.localeCompare(right.id,"en",{numeric:true})).map((account) => (
               <button
-                className={`accountPoolTab ${account.id === selectedAccount?.id ? "active" : ""} ${account.health !== "ready" ? "degraded" : ""} ${account.id === currentThreadAccount?.id ? "current" : ""} ${(remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent) ?? 100) <= 10 ? "lowQuota" : ""}`}
+                className={`accountPoolTab ${account.id === selectedAccount?.id ? "active" : ""} ${accountQuotaStatus(account) === "unavailable" ? "degraded" : ""} ${account.id === currentThreadAccount?.id ? "current" : ""} ${(remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent) ?? 100) <= 10 ? "lowQuota" : ""}`}
                 data-account-id={account.id}
                 type="button"
                 role="tab"
                 aria-selected={account.id === selectedAccount?.id}
-                title={account.selectedForNewThreads ? `${account.label} 将承接下一个新会话` : `${account.label} 已有会话保持粘性`}
+                title={accountQuotaStatus(account) === "cached" ? `${account.label} · 查询暂时超时，显示上次成功额度；并非已确认掉登录` : account.selectedForNewThreads ? `${account.label} 将承接下一个新会话` : `${account.label} 已有会话保持粘性`}
                 key={account.id}
                 onClick={() => setSelectedAccountId(account.id)}
               >
@@ -3842,6 +3848,7 @@ function QuotaPopover({ quota, pool, loading, closing, userId }: { quota: CodexQ
           {selectedProvider ? <ProviderQuotaDetails key={selectedProvider.id} item={selectedProvider} formatPeriod={period => rateWindowText({ usedPercent: period.usedPercent, windowDurationMins: null, resetsAt: period.resetsAt ? Date.parse(period.resetsAt) / 1000 : null }, ({ session: "5小时", weekly: "7天", monthly: "月度" } as Record<string, string>)[period.label] ?? period.label)} /> : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
           {!selectedProvider && selectedAccount ? (
             <div className="accountPoolSelectedMeta">
+              {accountQuotaStatus(selectedAccount) === "cached" ? <span>额度查询暂时失败 · 显示缓存，后台重试中</span> : null}
               {currentThreadAccount ? (
                 <>
                   <span className={`accountHealthDot ${currentThreadAccount.health}`} />

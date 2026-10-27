@@ -265,6 +265,7 @@ const fallbackCodexModels: Array<{
 }> = [
   { slug: "gpt-6-astra", displayName: "GPT-6-Astra", priority: 1, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-6.1-sol", displayName: "GPT-6.1-Sol", priority: 1.5, efforts: ["max", "xhigh", "high", "medium", "low"] },
+  { slug: "gpt-6.1-terra", displayName: "GPT-6.1-Terra", priority: 1.75, efforts: ["max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-6-sol", displayName: "GPT-6-Sol", priority: 2, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-6-luna", displayName: "GPT-6-Luna", priority: 3, efforts: ["max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", priority: 4, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
@@ -305,7 +306,7 @@ export type PublicModelProfile = {
   priority: number;
 };
 
-let modelCatalogCache: { expiresAt: number; data: PublicModelProfile[] } | null = null;
+let modelCatalogCache: { key: string; expiresAt: number; data: PublicModelProfile[] } | null = null;
 
 export function invalidateModelCatalogCache(): void {
   modelCatalogCache = null;
@@ -348,6 +349,7 @@ export function modelProfilesFromCatalog(catalog: unknown): PublicModelProfile[]
     // ordering independent so GPT-6.1 Sol stays between Astra and Sol.
     const priority = slug === "gpt-6.1-sol"
       ? 1.5
+      : slug === "gpt-6.1-terra" ? 1.75
       : typeof record.priority === "number" ? record.priority : 999;
     // Codex 0.153 switched current models (including GPT-6 Astra) from the
     // legacy shell_command transport to unified_exec.  Both transports are
@@ -373,12 +375,24 @@ export function modelProfilesFromCatalog(catalog: unknown): PublicModelProfile[]
   return profiles.sort((left, right) => left.priority - right.priority || effortOrder[left.effort] - effortOrder[right.effort] || left.label.localeCompare(right.label));
 }
 
-function listModelProfiles(): PublicModelProfile[] {
+export function mergeModelProfiles(profiles: PublicModelProfile[]): PublicModelProfile[] {
+  // A model available on any installed pool runtime must not disappear just
+  // because the default account is busy and still uses an older catalog.
+  // Keep first-source presentation and retain per-account routing validation.
+  const unique = new Map<string, PublicModelProfile>();
+  for (const profile of profiles) if (!unique.has(profile.id)) unique.set(profile.id, profile);
+  return [...unique.values()].sort((left, right) => left.priority - right.priority || effortOrder[left.effort] - effortOrder[right.effort] || left.label.localeCompare(right.label));
+}
+
+function listModelProfiles(poolCatalogPaths: readonly string[] = []): PublicModelProfile[] {
   const now = Date.now();
-  if (modelCatalogCache && modelCatalogCache.expiresAt > now) {
+  const key = JSON.stringify(poolCatalogPaths);
+  if (modelCatalogCache && modelCatalogCache.key === key && modelCatalogCache.expiresAt > now) {
     return modelCatalogCache.data;
   }
 
+  const profiles: PublicModelProfile[] = [];
+  let debugAvailable = false;
   try {
     const debugArgs = ["debug", "models"];
     const configuredCodexHome = process.env.CODEX_HOME?.trim();
@@ -397,18 +411,21 @@ function listModelProfiles(): PublicModelProfile[] {
       maxBuffer: 2 * 1024 * 1024,
       env: process.env
     });
-    const profiles = modelProfilesFromCatalog(JSON.parse(stdout));
-    for (const catalogPath of (process.env.CODEX_WEB_EXTRA_MODEL_CATALOGS ?? "").split(path.delimiter).filter(Boolean)) {
-      try {
-        profiles.push(...modelProfilesFromCatalog(JSON.parse(fs.readFileSync(catalogPath, "utf8"))));
-      } catch (error) {
-        console.warn(`Unable to read extra model catalog ${catalogPath}:`, error);
-      }
-    }
-    modelCatalogCache = { expiresAt: now + 5 * 60 * 1000, data: profiles.length ? profiles : fallbackModelProfiles() };
+    profiles.push(...modelProfilesFromCatalog(JSON.parse(stdout)));
+    debugAvailable = true;
   } catch {
-    modelCatalogCache = { expiresAt: now + 60 * 1000, data: fallbackModelProfiles() };
+    // Installed pool/provider catalogs remain usable if the default CLI probe
+    // fails. Do not replace valid catalogs from other accounts with a fallback.
   }
+  for (const catalogPath of new Set([...poolCatalogPaths, ...(process.env.CODEX_WEB_EXTRA_MODEL_CATALOGS ?? "").split(path.delimiter).filter(Boolean)])) {
+    try {
+      if (fs.statSync(catalogPath).size > 2 * 1024 * 1024) throw new Error("Model catalog exceeds byte budget");
+      profiles.push(...modelProfilesFromCatalog(JSON.parse(fs.readFileSync(catalogPath, "utf8"))));
+    } catch (error) {
+      console.warn(`Unable to read extra model catalog ${catalogPath}:`, error);
+    }
+  }
+  modelCatalogCache = { key, expiresAt: now + (debugAvailable ? 5 * 60 * 1000 : 60 * 1000), data: profiles.length ? mergeModelProfiles(profiles) : fallbackModelProfiles() };
   return modelCatalogCache.data;
 }
 
@@ -2880,6 +2897,7 @@ function deferLargeToolOutputs(threadValue: unknown): void {
 }
 
 export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore, options: { backgroundIndexing?: boolean; browserTools?: boolean } = {}): void {
+  const availableModelProfiles = () => listModelProfiles(isAccountPoolBridge(bridge) ? bridge.modelCatalogTargets().map(target => target.catalogPath) : []);
   registerProviderQuotaRoutes(app, request => userIdFromRequest(request, store));
   registerSideChatRoutes(app, bridge, store, request => userIdFromRequest(request, store));
   const predictions=isAccountPoolBridge(bridge)?new ComposerPredictions(bridge):null;
@@ -3134,7 +3152,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
   }));
 
   app.get("/api/models", async () => ({
-    data: listModelProfiles(),
+    data: availableModelProfiles(),
     defaultModel: defaults.model,
     defaultReasoningEffort: defaults.reasoningEffort
   }));
@@ -4091,13 +4109,13 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(404).send({ error: "Thread not found." });
       }
       const input = threadModelProfileSchema.parse(request.body);
-      const supported = listModelProfiles().some((profile) => profile.model === input.model && profile.effort === input.reasoningEffort);
+      const supported = availableModelProfiles().some((profile) => profile.model === input.model && profile.effort === input.reasoningEffort);
       if (!supported) {
         return reply.code(400).send({ error: "Selected model profile is not available." });
       }
       const poolBridge = isAccountPoolBridge(bridge) ? bridge : null;
       if (poolBridge && !poolBridge.canThreadUseModel(request.params.threadId, input.model)) {
-        return reply.code(409).send({ error: "这个会话绑定了原供应商运行时，不能直接切换到其他供应商。请从上一轮回答创建分支后再选择新模型。" });
+        return reply.code(409).send({ error: "当前会话绑定的运行时尚不支持所选模型。请等待该账号空闲后自动更新模型目录，或从上一轮回答创建分支，选择支持此模型的账号；跨供应商也须通过分支切换。" });
       }
       const data = store.setThreadModelConfig(request.params.threadId, userId, input.model, input.reasoningEffort);
       if (!data) {
