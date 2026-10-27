@@ -52,8 +52,11 @@ try {
   await page.setViewportSize({ width: 393, height: 852 });
   const collapseForCards = page.getByRole("button", { name: "折叠侧边栏", exact: true });
   if (await collapseForCards.isVisible()) await collapseForCards.click();
+  await page.evaluate(() => Promise.all(document.getAnimations().filter(animation => animation.effect?.getTiming().iterations !== Infinity).map(animation => animation.finished.catch(() => {}))));
   const cardBox = await approvals.boundingBox();
-  assert.ok(cardBox && cardBox.x >= -1 && cardBox.x + cardBox.width <= 394 && cardBox.height <= 427);
+  assert.ok(cardBox && cardBox.x >= -1 && cardBox.x + cardBox.width <= 394 && cardBox.y >= 0 && cardBox.y + cardBox.height <= 853);
+  const stopBox = await page.getByRole("button", { name: "终止当前对话", exact: true }).boundingBox();
+  assert.ok(stopBox && stopBox.y >= 0 && stopBox.y + stopBox.height <= 853, "pending approvals must leave the composer controls in view");
   await page.screenshot({ path: `${evidence}/phone-pending-approvals.png` });
   await page.setViewportSize({ width: 1600, height: 1000 });
   await permissions.getByRole("button", { name: "允许本轮所列权限", exact: true }).click();
@@ -76,7 +79,7 @@ try {
     const collapse = page.getByRole("button", { name: "折叠侧边栏", exact: true }); if (mobile && await collapse.isVisible()) await collapse.click();
     await page.evaluate(theme => document.documentElement.dataset.theme = theme, mobile ? "light" : "dark");
     const box = await approvals.boundingBox(), viewport = page.viewportSize();
-    assert.ok(box && box.x >= -1 && box.x + box.width <= viewport.width + 1);
+    assert.ok(box && box.x >= -1 && box.x + box.width <= viewport.width + 1 && box.y >= 0 && box.y + box.height <= viewport.height + 1);
     assert.ok(await approvals.evaluate(element => { const b = element.getBoundingClientRect(); return element.contains(document.elementFromPoint(b.x + b.width / 2, b.y + 10)); }));
     await page.screenshot({ path: `${evidence}/${mobile ? "phone-light" : "desktop-dark"}.png` }); layouts.push({ mobile, withinViewport: true });
   }
