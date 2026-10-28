@@ -1,3 +1,5 @@
+import { claudePendingProfiles } from "../shared/agentRuntime.js";
+import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
 import fs from "node:fs";
 import { ProviderUsageTracker } from "./providerUsage.js";
 import { registerProviderQuotaRoutes } from "./providerQuota.js";
@@ -2358,6 +2360,7 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 }
 
 function errorStatus(error: unknown): number {
+  if (error instanceof Error && "code" in error && error.code === "runtime_not_connected") return 409;
   if (error instanceof HistoryMemoryLimitError) return 413;
   if (error instanceof LegacyRollbackConflictError || error instanceof ScheduleConflictError || error instanceof BranchConflictError) return 409;
   if (error instanceof PathPolicyError || error instanceof z.ZodError || error instanceof ThreadContextConfigError) {
@@ -3152,7 +3155,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
   }));
 
   app.get("/api/models", async () => ({
-    data: availableModelProfiles(),
+    data: [...availableModelProfiles(), ...claudePendingProfiles()],
     defaultModel: defaults.model,
     defaultReasoningEffort: defaults.reasoningEffort
   }));
@@ -3550,6 +3553,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
   app.post("/api/projects", async (request, reply) => {
     try {
       const input = createProjectSchema.parse(request.body);
+      assertCodexModelRequest(input);
       const userId = userIdFromRequest(request, store);
       if (!store.getUser(userId)) {
         return reply.code(404).send({ error: "User not found." });
@@ -3614,6 +3618,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
   app.patch<{ Params: { id: string } }>("/api/projects/:id", async (request, reply) => {
     try {
       const input = updateProjectSchema.parse(request.body);
+      assertCodexModelRequest(input);
       const project = store.updateProject(request.params.id, input, userIdFromRequest(request, store));
       if (!project) {
         return reply.code(404).send({ error: "Project not found." });
@@ -4109,6 +4114,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(404).send({ error: "Thread not found." });
       }
       const input = threadModelProfileSchema.parse(request.body);
+      assertCodexModelRequest(input);
       const supported = availableModelProfiles().some((profile) => profile.model === input.model && profile.effort === input.reasoningEffort);
       if (!supported) {
         return reply.code(400).send({ error: "Selected model profile is not available." });

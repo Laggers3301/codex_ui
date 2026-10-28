@@ -41,9 +41,14 @@ it('serves installed pool catalogs even when the default account is stale or the
       expect(response.statusCode).toBe(200);
       const data=response.json().data;
       expect(data.filter((m:{model:string})=>m.model==='gpt-6.1-terra')).toHaveLength(2);
+      expect(data.filter((m:{runtime?:string})=>m.runtime==='claude-code')).toHaveLength(3);
+      expect(data.filter((m:{runtime?:string})=>m.runtime==='claude-code').every((m:{availability:string})=>m.availability==='not-connected')).toBe(true);
       expect(new Set(data.map((m:{id:string})=>m.id)).size).toBe(data.length);
     }
     expect(pool.getBranchRoutingDecision('fixture-thread','gpt-6.1-terra').targetAccount.id).toBe('new');
+    await expect(pool.request("thread/start", {model:"reclaude-sonnet"})).rejects.toMatchObject({code:"runtime_not_connected"});
+    await expect(pool.startThreadOnAccount("old", {model:"reclaude-sonnet"})).rejects.toMatchObject({code:"runtime_not_connected"});
+    await expect(pool.forkThreadOnAccount("old", {model:"reclaude-opus"})).rejects.toMatchObject({code:"runtime_not_connected"});
     expect(nativeRequests).toBe(0);
   } finally {
     await app.close();pool.stop();vi.unstubAllEnvs();invalidateModelCatalogCache();

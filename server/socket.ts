@@ -1,3 +1,4 @@
+import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import fs, { type FileHandle } from "node:fs/promises";
@@ -1296,6 +1297,7 @@ async function handleClientMessage(
 
       case "thread.start": {
         const project = getProjectOrThrow(store, message.projectId, sessionUserId);
+        assertCodexModelRequest({ model: message.model ?? project.defaultModel });
         const question = pickString(message.prompt).trim();
         const sideChatId = pickString(message.sideChatId);
         const storedSide = sideChatId ? store.sideChats.byId(sideChatId, sessionUserId) : null;

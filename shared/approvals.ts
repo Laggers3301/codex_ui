@@ -11,6 +11,7 @@ export function isApprovalRequest(method: unknown): boolean {
 }
 
 export function approvalDecisions(request: ApprovalRequest): ApprovalDecision[] {
+  if (request.method === "item/claudeTool/requestApproval") return ["decline", "accept"];
   if (request.method === "item/permissions/requestApproval") return ["decline", "accept"];
   if (request.method === "item/fileChange/requestApproval") return ["decline", "accept"];
   if (request.method !== "item/commandExecution/requestApproval") return [];
