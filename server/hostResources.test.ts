@@ -1,12 +1,19 @@
 import { describe, expect, it } from "vitest";
 import Fastify from "fastify";
 import { createSessionCookie } from "./auth.js";
-import { cpuCounters, diskCounters, memoryCounters, HostResourceMonitor, registerHostResourceRoutes, type RawResources } from "./hostResources.js";
+import { cpuCounters, diskCounters, memoryCounters, mountForPath, mountInfo, HostResourceMonitor, registerHostResourceRoutes, type RawResources } from "./hostResources.js";
 
 const sample = (at: number): RawResources => ({ at, hostname: "test", platform: "linux", cores: 2, model: "CPU", loadAverage: [1, 2, 3],
   cpu: { total: 1000 + at / 10, idle: 600 + at / 20 }, memory: memoryCounters("MemTotal: 8000 kB\nMemAvailable: 2000 kB\n", 0, 0),
   volumes: [], disks: [{ name: "vda", readBytes: 1024 + at * 2, writeBytes: 2048 + at, busyMs: 100 + at / 4 }], warnings: [] });
 describe("host resource sampling", () => {
+  it("decodes escaped mount paths and chooses the containing mount instead of a similar prefix", () => {
+    const mounts = mountInfo("30 1 259:2 / / rw shared:1 - ext4 /dev/nvme0n1p2 rw\n31 30 8:1 / /data\\040disk rw - ext4 /dev/sda1 rw\n32 30 8:2 / /data rw - ext4 /dev/sda2 rw\n33 32 8:3 / /data/nested\\134folder rw - ext4 /dev/sdb1 rw\nmalformed");
+    expect(mountForPath(mounts, "/data disk/project")).toBe("/data disk");
+    expect(mountForPath(mounts, "/database/project")).toBe("/");
+    expect(mountForPath(mounts, "/data/nested\\folder/project")).toBe("/data/nested\\folder");
+    expect(mountForPath([], "/data")).toBeNull();
+  });
   it("excludes already-counted guest time and treats I/O wait separately from CPU busy time", () => {
     expect(cpuCounters("cpu 10 20 30 40 50 60 70 80 90 100\ncpu0 1 1 1 1")).toEqual({ total: 360, idle: 90 });
     expect(cpuCounters("cpu not-a-counter")).toBeNull();

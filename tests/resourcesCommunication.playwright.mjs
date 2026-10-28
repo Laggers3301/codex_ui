@@ -44,6 +44,9 @@ try {
   await expect(resourcePanel).toContainText("fixture-host"); await expect(resourcePanel).toContainText("每 2 秒更新");
   await expect(resourcePanel.getByRole("meter", { name: "CPU 使用率", exact: true })).toHaveAttribute("aria-valuenow", "13");
   await expect(resourcePanel).toContainText("6.0 GiB"); await expect(resourcePanel).toContainText("读取 2.0 MiB/s");
+  const diskTip = a.locator('.hostResourceSummary .hostResourceDisk');
+  await diskTip.hover(); await expect(diskTip).toHaveAttribute("title", /挂载路径：\/\n系统：\/\n数据目录：\/fixture\/data/);
+  await expect(resourcePanel.getByText("vda", { exact: true })).toHaveAttribute("title", "挂载路径（含分区）：/、/boot");
   const editor = a.locator('.conversation > .composer [contenteditable="true"]').first();
   await editor.fill("用于核对资源刷新的草稿"); await editor.press("ArrowLeft"); await editor.press("ArrowLeft");
   const caretBefore = await a.evaluate(() => ({ text: getSelection().anchorNode.textContent, offset: getSelection().anchorOffset }));
@@ -59,6 +62,26 @@ try {
   await expect(resourcePanel).toContainText("更新失败", { timeout: 6000 }); await expect(resourcePanel).toContainText("6.0 GiB");
   await context.request.post(origin + "/api/__test/resource-mode", { data: { fail: false } });
   await resourcePanel.getByRole("button", { name: "刷新主机资源", exact: true }).click(); await expect(resourcePanel).not.toContainText("更新失败");
+  assert.equal((await state()).networkProbes, 0, "resource polling never runs ping automatically");
+  const dockPing = a.locator('.hostResourceDock').getByRole("button", { name: "ping google.com", exact: true });
+  const dockStatsBox = await a.getByRole("button", { name: "查看主机资源", exact: true }).boundingBox(), pingBox = await dockPing.boundingBox();
+  assert.ok(dockStatsBox.x + dockStatsBox.width <= pingBox.x + 1 && Math.abs(dockStatsBox.y + dockStatsBox.height / 2 - pingBox.y - pingBox.height / 2) < 1, "ping stays alongside CPU, memory and disk in the same row");
+  await context.request.post(origin + "/api/__test/network-mode", { data: { hold: true, fail: false } });
+  await dockPing.click(); await expect(dockPing).toBeDisabled();
+  const network = resourcePanel.getByRole("article", { name: "主机网络检测", exact: true });
+  await expect(network).toContainText("正在发送 3 次 ICMP 探测");
+  await expect(resourcePanel.getByRole("button", { name: "ping google.com", exact: true })).toBeDisabled();
+  await context.request.post(origin + "/api/__test/network-mode", { data: { hold: false } });
+  await expect(network).toContainText("平均延迟 20.5 ms · 丢包 0%"); await expect(dockPing).toBeEnabled();
+  await context.request.post(origin + "/api/__test/network-mode", { data: { fail: true } });
+  await resourcePanel.getByRole("button", { name: "ping google.com", exact: true }).click();
+  await expect(network).toContainText("本次检测未收到 ICMP 应答。");
+  const pingOutput = network.locator("pre"); await expect(pingOutput).toContainText("100% packet loss");
+  const readsBeforeError = resourceTimes.length;
+  await pingOutput.evaluate(element => { const range = document.createRange(); range.selectNodeContents(element); const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range); });
+  await expect.poll(() => resourceTimes.length).toBeGreaterThan(readsBeforeError);
+  assert.match(await a.evaluate(() => getSelection().toString()), /100% packet loss/, "diagnostics remain selectable during resource refresh");
+  assert.equal((await state()).networkProbes, 2, "only the two manual clicks run network probes");
   await a.screenshot({ path: `${evidence}/resources-desktop-dark.png` });
   await a.setViewportSize({ width: 393, height: 852 }); await a.evaluate(() => document.documentElement.dataset.theme = "light");
   assert.ok(await resourcePanel.evaluate(element => element.scrollWidth <= element.clientWidth + 1));
@@ -110,7 +133,7 @@ try {
   assert.ok(await panelA.evaluate(element => element.scrollWidth <= element.clientWidth + 1));
   await a.screenshot({ path: `${evidence}/communication-phone-light.png` });
   const finalState = await state(); assert.equal(finalState.starts.length, 0, "communication never launches a model turn or a process"); assert.deepEqual(errors, []);
-  const report = { isolatedDatabase: true, realRestAndWebsocket: true, resourceSamplingAboutTwoSeconds: intervals, hiddenPageStopsPolling: true, resourceRefreshPreservesCaret: true, failuresPreserveLastResourceData: true, topicDeliveryAndReload: true, concurrentServicesRemainIndependent: true, serviceErrorsCorrelated: true, actionFeedbackAndCancelAck: true, phoneNoHorizontalOverflow: true, noModelTurnsCreated: true, errors };
+  const report = { isolatedDatabase: true, realRestAndWebsocket: true, resourceSamplingAboutTwoSeconds: intervals, hiddenPageStopsPolling: true, resourceRefreshPreservesCaret: true, failuresPreserveLastResourceData: true, mountPathsOnHover: true, pingInSameRow: true, manualPingOnly: true, pingLatencyAndFailureOutput: true, pingOutputRemainsSelectable: true, topicDeliveryAndReload: true, concurrentServicesRemainIndependent: true, serviceErrorsCorrelated: true, actionFeedbackAndCancelAck: true, phoneNoHorizontalOverflow: true, noModelTurnsCreated: true, errors };
   await fs.writeFile(`${evidence}/results.json`, JSON.stringify(report, null, 2) + "\n"); console.log(JSON.stringify(report, null, 2));
 } finally {
   await browser?.close();

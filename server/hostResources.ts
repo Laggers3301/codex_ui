@@ -1,9 +1,11 @@
 import os from "node:os";
+import path from "node:path";
 import fs from "node:fs/promises";
 import type { FastifyInstance } from "fastify";
 import { authenticatedUserFromHeaders } from "./auth.js";
 import { serverConfig } from "./config.js";
 import type { HostResources } from "../shared/hostResources.js";
+import { HostNetworkProbe } from "./hostNetwork.js";
 
 const percent = (part: number, total: number) => total > 0 ? Math.max(0, Math.min(100, part / total * 100)) : 0;
 export function cpuCounters(text: string): { total: number; idle: number } | null {
@@ -23,7 +25,7 @@ export function memoryCounters(text: string, totalFallback: number, availableFal
     swapTotalBytes: entries.SwapTotal ?? null,
     swapUsedBytes: entries.SwapTotal === undefined || entries.SwapFree === undefined ? null : Math.max(0, entries.SwapTotal - entries.SwapFree) };
 }
-export type DiskCounter = { name: string; readBytes: number; writeBytes: number; busyMs: number };
+export type DiskCounter = { name: string; readBytes: number; writeBytes: number; busyMs: number; mountPoints?: string[] };
 export function diskCounters(text: string, devices: Set<string>): DiskCounter[] {
   return text.trim().split("\n").flatMap(line => {
     const fields = line.trim().split(/\s+/);
@@ -40,19 +42,33 @@ export type RawResources = {
 };
 type VolumeRoot = { label: string; path: string };
 const textOf = (file: string) => fs.readFile(file, "utf8").catch(() => "");
+type Mount = { device: string; mountPoint: string };
+export function mountInfo(text: string): Mount[] {
+  return text.split("\n").flatMap(line => {
+    const separator = line.indexOf(" - "), fields = line.slice(0, separator).split(" ");
+    if (separator < 0 || fields.length < 6 || !/^\d+:\d+$/.test(fields[2]) || !fields[4].startsWith("/")) return [];
+    return [{ device: fields[2], mountPoint: fields[4].replace(/\\([0-7]{3})/g, (_match, octal) => String.fromCharCode(parseInt(octal, 8))) }];
+  });
+}
+export function mountForPath(mounts: Mount[], directory: string): string | null {
+  let selected: string | null = null;
+  for (const { mountPoint } of mounts) if ((directory === mountPoint || directory.startsWith(mountPoint === "/" ? "/" : mountPoint + "/")) && mountPoint.length >= (selected?.length ?? 0)) selected = mountPoint;
+  return selected;
+}
 async function capture(roots: VolumeRoot[]): Promise<RawResources> {
-  const [cpuText, memoryText, diskText, devices, volumes] = await Promise.all([
+  const [cpuText, memoryText, diskText, mountText, devices, volumes] = await Promise.all([
     textOf("/proc/stat"), textOf("/proc/meminfo"), textOf("/proc/diskstats"),
-    fs.readdir("/sys/block").then(async names => new Set((await Promise.all(names.map(async name => {
+    textOf("/proc/self/mountinfo"),
+    fs.readdir("/sys/block").then(async names => (await Promise.all(names.map(async name => {
       const target = await fs.realpath(`/sys/block/${name}`).catch(() => "");
-      return target && !target.includes("/virtual/block/") ? name : null;
-    }))).filter((name): name is string => Boolean(name)))).catch(() => new Set<string>()),
+      return target && !target.includes("/virtual/block/") ? { name, path: target } : null;
+    }))).filter((value): value is { name: string; path: string } => value !== null)).catch(() => []),
     Promise.allSettled(roots.map(async root => {
-      const [stat, space] = await Promise.all([fs.stat(root.path), fs.statfs(root.path)]);
+      const [stat, space, directory] = await Promise.all([fs.stat(root.path), fs.statfs(root.path), fs.realpath(root.path)]);
       const totalBytes = space.blocks * space.bsize, freeBytes = space.bfree * space.bsize;
       if (!(totalBytes > 0)) throw new Error("Volume space is unavailable");
       const usedBytes = Math.max(0, totalBytes - freeBytes);
-      return { device: stat.dev, labels: [root.label], totalBytes, usedBytes, availableBytes: Math.max(0, space.bavail * space.bsize), usagePercent: percent(usedBytes, totalBytes) };
+      return { device: stat.dev, labels: [root.label], paths: [{ label: root.label, path: directory }], totalBytes, usedBytes, availableBytes: Math.max(0, space.bavail * space.bsize), usagePercent: percent(usedBytes, totalBytes) };
     }))
   ]);
   const cpus = os.cpus();
@@ -61,12 +77,21 @@ async function capture(roots: VolumeRoot[]): Promise<RawResources> {
     total: sum.total + Object.values(cpu.times).reduce((a, b) => a + b, 0), idle: sum.idle + cpu.times.idle
   }), { total: 0, idle: 0 }) : null;
   const uniqueVolumes = new Map<number, HostResources["volumes"][number]>();
+  const mounts = mountInfo(mountText);
   for (const volume of volumes) if (volume.status === "fulfilled") {
     const existing = uniqueVolumes.get(volume.value.device);
-    if (existing) existing.labels.push(...volume.value.labels);
-    else { const { device, ...value } = volume.value; uniqueVolumes.set(device, value); }
+    const mount = mountForPath(mounts, volume.value.paths[0].path);
+    if (existing) { existing.labels.push(...volume.value.labels); existing.paths.push(...volume.value.paths); if (mount && !existing.mountPoints.includes(mount)) existing.mountPoints.push(mount); }
+    else { const { device, ...value } = volume.value; uniqueVolumes.set(device, { ...value, mountPoints: mount ? [mount] : [] }); }
   }
-  const disks = diskCounters(diskText, devices);
+  const deviceMounts = await Promise.all([...new Set(mounts.map(mount => mount.device).filter(device => !device.startsWith("0:")))].map(async device => ({
+    device, path: await fs.realpath(`/sys/dev/block/${device}`).catch(() => "")
+  })));
+  const disks = diskCounters(diskText, new Set(devices.map(device => device.name))).map(disk => {
+    const device = devices.find(device => device.name === disk.name)!;
+    const ids = new Set(deviceMounts.filter(mount => mount.path === device.path || mount.path.startsWith(device.path + path.sep)).map(mount => mount.device));
+    return { ...disk, mountPoints: [...new Set(mounts.filter(mount => ids.has(mount.device)).map(mount => mount.mountPoint))] };
+  });
   return { at: performance.now(), hostname: os.hostname(), platform: os.platform(), cores: cpus.length,
     model: cpus[0]?.model ?? "", loadAverage: os.platform() === "win32" ? null : os.loadavg(),
     cpu: nativeCpu ?? fallbackCpu, memory: memoryCounters(memoryText, os.totalmem(), os.freemem()),
@@ -100,7 +125,7 @@ export class HostResourceMonitor {
         disks: raw.disks.map(disk => {
           const last = previous?.disks.find(value => value.name === disk.name);
           const valid = sampled && last && disk.readBytes >= last.readBytes && disk.writeBytes >= last.writeBytes && disk.busyMs >= last.busyMs;
-          return { name: disk.name, readBytesPerSecond: valid ? (disk.readBytes - last.readBytes) * 1000 / elapsed : null,
+          return { name: disk.name, mountPoints: disk.mountPoints ?? [], readBytesPerSecond: valid ? (disk.readBytes - last.readBytes) * 1000 / elapsed : null,
             writeBytesPerSecond: valid ? (disk.writeBytes - last.writeBytes) * 1000 / elapsed : null,
             busyPercent: valid ? percent(disk.busyMs - last.busyMs, elapsed) : null };
         })
@@ -111,11 +136,18 @@ export class HostResourceMonitor {
   }
 }
 
-export function registerHostResourceRoutes(app: FastifyInstance, monitor = new HostResourceMonitor()): void {
+export function registerHostResourceRoutes(app: FastifyInstance, monitor = new HostResourceMonitor(), network = new HostNetworkProbe()): void {
   app.get("/api/system/resources", async (request, reply) => {
     if (!authenticatedUserFromHeaders(request.headers)) return reply.code(401).send({ error: "请先登录。" });
     reply.header("Cache-Control", "no-store");
     try { return { data: await monitor.read() }; }
     catch { return reply.code(503).send({ error: "暂时无法读取主机资源状态，请稍后重试。" }); }
+  });
+  app.post("/api/system/network/ping", async (request, reply) => {
+    if (!authenticatedUserFromHeaders(request.headers)) return reply.code(401).send({ error: "请先登录。" });
+    reply.header("Cache-Control", "no-store");
+    if (request.body !== undefined && (!request.body || typeof request.body !== "object" || Array.isArray(request.body) || Object.keys(request.body).length)) return reply.code(400).send({ error: "此按钮仅支持检测 google.com。" });
+    try { return { data: await network.run() }; }
+    catch { return reply.code(503).send({ error: "暂时无法执行主机网络检测，请稍后重试。" }); }
   });
 }
