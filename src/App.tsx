@@ -34,6 +34,9 @@ import StarterKit from "@tiptap/starter-kit";
 import { toggleComposerList } from "./composerList";
 import { clipboardTable, ComposerTableKit } from "./composerTable";
 import { useMobileSidebar } from "./useMobileSidebar";
+import { TaskNotificationDialog } from "./TaskNotificationDialog";
+import { syncWebAppAppearance } from "./webAppAppearance";
+import { Bell as NotificationBell, Info as SettingsInfo, LogOut as AccountLogout } from "./PanelIcons";
 import { classifyProviderFailure, type ProviderFailureNotice } from "./providerFailure";
 import { finishActiveTurn, pendingTurnStart, rememberTerminalTurn } from "./turnLifecycle";
 import { localMessageBelongsToThread } from "./localMessageScope";
@@ -4412,8 +4415,7 @@ function beginVerticalResize(
 export function App() {
   const [colorTheme, setColorTheme] = useState<"dark" | "light">(() => window.localStorage.getItem("codex-web-color-theme") === "light" ? "light" : "dark");
   useLayoutEffect(() => {
-    document.documentElement.dataset.theme = colorTheme;
-    document.documentElement.style.colorScheme = colorTheme;
+    syncWebAppAppearance(colorTheme);
     window.localStorage.setItem("codex-web-color-theme", colorTheme);
   }, [colorTheme]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -4828,6 +4830,8 @@ export function App() {
   const [filePreviewLoading, setFilePreviewLoading] = useState(false);
   const [filePreviewError, setFilePreviewError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [notificationSettingsOpen, setNotificationSettingsOpen] = useState(false);
+  const [pushError, setPushError] = useState("");
   const [pushEnabled, setPushEnabled] = useState(() => storedBooleanWithDefault(`codex-web-push:${getApiUserId()}`, false));
   const [pushTestStatus, setPushTestStatus] = useState("");
   const [pushSaving, setPushSaving] = useState(false);
@@ -5009,6 +5013,7 @@ export function App() {
   const skillsPickerPresence = useExitPresence(skillsPickerOpen);
   const temporaryClosePresence = useExitPresence(temporaryCloseConfirm);
   const settingsPresence = useExitPresence(settingsOpen);
+  const notificationSettingsPresence = useExitPresence(notificationSettingsOpen);
   const globalSearchPresence = useExitPresence(globalSearchOpen);
   const directoryBrowserPresence = useExitPresence(directoryBrowserOpen);
 
@@ -6896,6 +6901,7 @@ export function App() {
     setFilePreview(null);
     setFilePreviewObjectUrl("");
     setSettingsOpen(false);
+    setNotificationSettingsOpen(false);
     setLocalSendSettings(defaultLocalSendSettings);
     localSendSettingsRef.current = defaultLocalSendSettings;
     setDetectedClientHost("");
@@ -8356,12 +8362,13 @@ export function App() {
   }
 
   async function togglePushNotifications() {
+    setPushError(""); setPushTestStatus("");
     if (!nativeFeaturesReady) {
-      setError("网页推送接口等待后端服务安全重启后启用。");
+      setPushError("通知服务暂不可用，请稍后重试。");
       return;
     }
     if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
-      setError("此浏览器不支持网页推送；iPhone 请先将网页添加到主屏幕，再在主屏幕中开启。");
+      setPushError("此浏览器不支持通知。iPhone 请添加到主屏幕后，从网页 App 中开启。");
       return;
     }
     setPushSaving(true);
@@ -8380,6 +8387,7 @@ export function App() {
         }
         window.localStorage.setItem(`codex-web-push:${selectedUserId}`, "false");
         setPushEnabled(false);
+        setPushTestStatus("已关闭此设备通知。");
         return;
       }
       const { data } = await getPushPublicKey();
@@ -8390,11 +8398,24 @@ export function App() {
       await savePushSubscription(subscription.toJSON());
       window.localStorage.setItem(`codex-web-push:${selectedUserId}`, "true");
       setPushEnabled(true);
+      setPushTestStatus("已开启此设备通知。");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setPushError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setPushSaving(false);
     }
+  }
+
+  async function sendTestPush() {
+    if (!selectedThread?.id) return;
+    setPushSaving(true); setPushError(""); setPushTestStatus("正在提交推送…");
+    try {
+      const { data } = await testPushNotification(selectedThread.id);
+      if (!data.subscriptions) { setPushTestStatus(""); setPushError("未找到接收设备，请重新开启通知。"); }
+      else if (data.accepted) setPushTestStatus(`已提交 ${data.accepted} 台设备的推送，请查看系统通知。${data.failed ? ` ${data.failed} 台提交失败。` : ""}`);
+      else { setPushTestStatus(""); setPushError("推送提交失败，请稍后重试。"); }
+    } catch (error) { setPushTestStatus(""); setPushError(error instanceof Error ? error.message : "推送提交失败。"); }
+    finally { setPushSaving(false); }
   }
 
   async function unsubscribePushAndLogout() {
@@ -11307,6 +11328,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
   }
   const showPromptNavigator = promptNavigationItems.length > 0 || Boolean(selectedThread && threadHistory?.hasOlder);
   const globalEnterSendBlocked = Boolean(
+    notificationSettingsPresence.present ||
     settingsPresence.present ||
     globalSearchPresence.present ||
     renamingThread ||
@@ -12212,13 +12234,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         </div>
       ) : null}
 
+      {notificationSettingsPresence.present ? <TaskNotificationDialog enabled={pushEnabled} busy={pushSaving} ready={nativeFeaturesReady} canTest={Boolean(selectedThread?.id)} closing={notificationSettingsPresence.closing} status={pushTestStatus} error={pushError} onToggle={() => void togglePushNotifications()} onTest={() => void sendTestPush()} onClose={() => setNotificationSettingsOpen(false)} /> : null}
+
       {settingsPresence.present ? (
-        <div className={`modalScrim uiExitLayer${settingsPresence.closing ? " uiClosing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title" aria-hidden={settingsPresence.closing} inert={settingsPresence.closing}>
-          <section className="settingsDialog">
+        <div className={`modalScrim deviceSettingsScrim uiExitLayer${settingsPresence.closing ? " uiClosing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title" aria-hidden={settingsPresence.closing} inert={settingsPresence.closing}>
+          <section className="settingsDialog deviceExportDialog">
             <header className="settingsHeader">
               <div>
-                <h2 id="settings-dialog-title">设置</h2>
-                <p>通过 SSH 把 4090-left 上生成的图片、文件和导出记录发送到你的设备。</p>
+                <h2 id="settings-dialog-title">设备与导出</h2>
               </div>
               <button className="iconButton" type="button" onClick={() => setSettingsOpen(false)} title="关闭设置">
                 <X size={17} />
@@ -12227,7 +12250,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <div className="settingsBody">
               <div className="settingsGrid">
                 <label>
-                  <span>访问设备 ZeroTier IP / SSH 地址</span>
+                  <span>设备 SSH 地址</span>
                   <input
                     value={localSendSettings.sshHost}
                     onChange={(event) => updateLocalSendSetting("sshHost", event.target.value)}
@@ -12253,7 +12276,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   />
                 </label>
                 <label>
-                  <span>访问设备下载目录</span>
+                  <span>设备下载目录</span>
                   <input
                     value={localSendSettings.destinationPath}
                     onChange={(event) => updateLocalSendSetting("destinationPath", event.target.value)}
@@ -12261,7 +12284,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   />
                 </label>
                 <label className="settingsWide">
-                  <span>4090-left 私钥路径（可选）</span>
+                  <span>服务器私钥路径（可选）</span>
                   <input
                     value={localSendSettings.identityFile}
                     onChange={(event) => updateLocalSendSetting("identityFile", event.target.value)}
@@ -12269,7 +12292,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   />
                 </label>
                 <label className="settingsWide">
-                  <span>4090-left 临时中转目录</span>
+                  <span>临时中转目录</span>
                   <input
                     value={localSendSettings.outputPath}
                     onChange={(event) => updateLocalSendSetting("outputPath", event.target.value)}
@@ -12277,49 +12300,25 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   />
                 </label>
               </div>
-              <p className="settingsHint">
-                ZeroTier IP、当前登录名和下载目录会自动填入；下载目录默认是远端 SSH 用户的 Downloads。SSH 用户名可修改，需与设备上的系统用户名一致。保存并测试 SSH 成功后，可手动发送文件；仅勾选下方自动发送选项才会在任务完成后自动发送。设备需开启 SSH/远程登录并允许 4090-left 免密登录；4090-left 目录只作临时中转，不是最终保存位置。
-                {detectedClientHost ? ` 当前浏览器来源 ZeroTier IP：${detectedClientHost}` : ""}
-              </p>
+              <details className="settingsHint"><summary><SettingsInfo size={15} />连接帮助</summary><p>设备需开启 SSH 并允许服务器免密连接，用户名应与设备系统账号一致。文件保存到设备下载目录，中转目录仅作临时存放。{detectedClientHost ? ` 检测到的设备地址：${detectedClientHost}` : ""}</p></details>
               {settingsTestStatus ? <p className={`settingsTestStatus ${settingsTestStatus.kind}`}>{settingsTestStatus.message}</p> : null}
               <div className="settingsExportBox">
-                <strong>任务通知</strong>
-                <span>回答完成、等待批准或需要回答选择题／输入题时通知，显示会话名称和简短内容摘要（锁屏可见）。同一会话更新同一条通知。需要浏览器授权和 HTTPS；iPhone 需从主屏幕打开。</span>
-                <button className="iconTextButton" type="button" disabled={pushSaving || !nativeFeaturesReady} onClick={() => void togglePushNotifications()}>
-                  {!nativeFeaturesReady ? "等待服务更新" : pushSaving ? "设置中…" : pushEnabled ? "关闭此设备通知" : "开启此设备通知"}
-                </button>
-                {pushEnabled ? <button className="iconTextButton" type="button" disabled={pushSaving || !selectedThread?.id} onClick={async () => {
-                  if (!selectedThread?.id) return;
-                  setPushSaving(true); setPushTestStatus("发送中…");
-                  try {
-                    const { data } = await testPushNotification(selectedThread.id);
-                    setPushTestStatus(!data.subscriptions ? "未找到接收设备，请重新开启此设备通知。" : data.accepted
-                      ? `推送服务已接受 ${data.accepted} 台设备的通知；请查看电脑或手机系统通知，服务接受不等于设备已显示。`
-                      : "推送服务未接受通知，请稍后重试或检查连接。");
-                  } catch (error) { setPushTestStatus(error instanceof Error ? error.message : "发送失败"); }
-                  finally { setPushSaving(false); }
-                }}>发送测试通知</button> : null}
-                {pushTestStatus ? <span role="status">{pushTestStatus}</span> : null}
-              </div>
-              <div className="settingsExportBox">
-                <strong>自动发送生成文件</strong>
-                <span>会话完成后，检测到的图片、PDF、PPT、Word、表格等生成文件会自动通过 SSH 写入当前设备的 Downloads 文件夹。仅发送当前登录用户会话中检测到的文件。</span>
+                <strong>文件传输</strong>
                 <label className="inlineCheckbox">
                   <input type="checkbox" checked={autoSendGeneratedFiles} onChange={(event) => updateAutoSendGeneratedFiles(event.target.checked)} />
-                  <span>自动发送生成文件到 Downloads</span>
+                  <span>任务完成后自动发送生成文件</span>
                 </label>
               </div>
               <div className="settingsExportBox">
                 <strong>对话记录导出</strong>
-                <span>导出文件会先写入 4090-left 输出目录；勾选后再通过 SSH 发送到访问设备保存目录。</span>
                 <div className="settingsExportControls">
-                  <select value={exportFormat} onChange={(event) => setExportFormat(event.target.value as ThreadExportFormat)}>
+                  <select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value as ThreadExportFormat)}>
                     <option value="markdown">Markdown</option>
                     <option value="json">JSON</option>
                   </select>
                   <label className="inlineCheckbox">
                     <input type="checkbox" checked={exportSendLocal} onChange={(event) => setExportSendLocal(event.target.checked)} />
-                    <span>导出后发送到当前访问设备</span>
+                    <span>同时发送到当前设备</span>
                   </label>
                   <button className="iconTextButton" type="button" onClick={() => void exportCurrentThread()} disabled={!selectedThread || exportingThread}>
                     {exportingThread ? "导出中" : "导出当前会话"}
@@ -12329,7 +12328,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               <div className="dialogActions">
                 {detectedClientHost || localSendSettings.sshHost ? (
                   <button className="iconTextButton" type="button" onClick={() => void applySuggestedLocalSendSettings()} disabled={settingsSaving || settingsTesting}>
-                    {settingsTesting ? "测试中" : "一键填入并测试"}
+                    {settingsTesting ? "测试中" : "自动填写并测试"}
                   </button>
                 ) : null}
                 <button className="iconTextButton" type="button" onClick={() => setSettingsOpen(false)}>
@@ -12791,15 +12790,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               }}
             >
               <div className={`v2AccountMenu${accountMenuPresence.closing ? " uiClosing" : ""}`} hidden={!accountMenuPresence.present} aria-hidden={!accountMenuOpen} inert={!accountMenuOpen}>
-                <div className="v2AccountIdentity">
-                  <span className="v2Avatar">{userInitials(selectedUser?.name ?? selectedUserId)}</span>
-                  <strong>{selectedUser?.name ?? selectedUserId}</strong>
-                </div>
-                <button type="button" onClick={() => window.location.assign("/__v2_logout")}>
-                  <span className="v2MenuIcon">↪</span><span>退出登录</span>
+                <button type="button" onClick={() => { setAccountMenuOpen(false); setPushError(""); setPushTestStatus(""); setNotificationSettingsOpen(true); }}>
+                  <span className="v2MenuIcon"><NotificationBell size={14} /></span><span>任务通知</span>
                 </button>
                 <button type="button" onClick={() => { setAccountMenuOpen(false); window.dispatchEvent(new Event("codex:open-pets")); }}>
                   <span className="v2MenuIcon"><PanelMore size={14} /></span><span>我的宠物</span>
+                </button>
+                <button className="accountMenuLogout" type="button" onClick={() => window.location.assign("/__v2_logout")}>
+                  <span className="v2MenuIcon"><AccountLogout size={14} /></span><span>退出登录</span>
                 </button>
               </div>
               <button
