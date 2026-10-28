@@ -86,7 +86,10 @@ export function useMobileSidebar(collapsed: boolean, change: (collapsed: boolean
           state.current.change(false);
         }
       }
-      if (event.cancelable) event.preventDefault();
+      // .threadColumn uses touch-action: pan-y pinch-zoom. Horizontal drags
+      // belong to us; vertical scrolling stays on the browser compositor.
+      // A permanent non-passive touchmove listener forces every scroll frame
+      // to wait for JS, especially noticeable under mobile power throttling.
       drag.dx = dx;
       const offset = Math.max(-width(), Math.min(0, (drag.open ? 0 : -width()) + dx));
       pendingOffset = offset;
@@ -107,7 +110,7 @@ export function useMobileSidebar(collapsed: boolean, change: (collapsed: boolean
     const resize = () => { drag = null; cancelAnimationFrame(frame); frame = 0; if (timer.current) clearTimeout(timer.current); generation.current++; reset(); };
     const surface = document.querySelector(".threadColumn") ?? document;
     surface.addEventListener("touchstart", start as EventListener, { passive: true, capture: true });
-    surface.addEventListener("touchmove", move as EventListener, { passive: false, capture: true });
+    surface.addEventListener("touchmove", move as EventListener, { passive: true, capture: true });
     surface.addEventListener("touchend", end as EventListener, { passive: false, capture: true });
     surface.addEventListener("touchcancel", cancel, true);
     window.addEventListener("resize", resize);
