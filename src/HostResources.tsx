@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Cpu, Globe, HardDrive, MemoryStick, RefreshCcw } from "lucide-react";
-import { pingHostNetwork, readHostResources } from "./api";
+import { checkHostNetwork, readHostResources } from "./api";
 import type { HostNetworkProbeResult, HostResources } from "../shared/hostResources";
 import "./hostResources.css";
 
@@ -63,7 +63,7 @@ function useNetworkProbe(userId: string) {
     const request = new AbortController(); controller.current = request;
     setChecking(true); setError(""); setResult(null);
     try {
-      const response = await pingHostNetwork(request.signal);
+      const response = await checkHostNetwork(request.signal);
       if (controller.current === request && !request.signal.aborted) setResult(response.data);
     } catch (caught) {
       if (controller.current === request && !request.signal.aborted) setError(caught instanceof Error ? caught.message : String(caught));
@@ -100,27 +100,25 @@ const volumeTitle = (volume: HostResources["volumes"][number]) => [
 function NetworkProbeButton({ compact = false, onOpen }: { compact?: boolean; onOpen?: () => void }) {
   const { network } = useResources();
   const result = network.result;
-  const summary = network.error ? "检测失败" : result?.averageLatencyMs != null ? `${result.averageLatencyMs.toFixed(1)} ms`
-    : result ? ({ reachable: "已连通", timeout: "超时", dns_error: "DNS失败", unavailable: "不可用", permission_denied: "无权限", unreachable: "不可达", error: "检测失败" })[result.status] : "ping";
-  return <button type="button" className={`hostNetworkButton${compact ? " compact" : ""}`} aria-label="ping google.com" disabled={network.checking}
-    data-status={result?.status} title={network.checking ? "正在从服务主机检测 google.com…" : network.error ? `${network.error} 点击重新检测。` : result ? `${result.message}${result.averageLatencyMs != null ? ` 平均 ${result.averageLatencyMs.toFixed(1)} ms。` : ""} 点击重新检测。` : "从当前服务主机 ping google.com，发送 3 次探测。"}
+  const summary = network.error ? "检测失败" : result?.status === "reachable" ? `${result.durationMs} ms`
+    : result ? ({ reachable: "已连通", timeout: "超时", dns_error: "DNS失败", proxy_unconfigured: "未配置", proxy_error: "代理失败", tls_error: "TLS失败", http_error: `HTTP ${result.httpStatus ?? "异常"}`, error: "检测失败" })[result.status] : "HTTPS";
+  return <button type="button" className={`hostNetworkButton${compact ? " compact" : ""}`} aria-label="检测 Google HTTPS" disabled={network.checking}
+    data-status={result?.status} title={network.checking ? "正在通过服务代理检测 Google HTTPS…" : network.error ? `${network.error} 点击重新检测。` : result ? `${result.message}${result.status === "reachable" ? ` 请求总耗时 ${result.durationMs} ms。` : ""} 点击重新检测。` : "通过服务配置的代理检测 www.google.com 的 HTTPS 连通性。"}
     onClick={() => { onOpen?.(); void network.check(); }}>
-    <Globe size={14} />{compact ? <span aria-live="polite" aria-atomic="true">{network.checking ? "检测中" : network.showSummary ? summary : "ping"}<small>google.com</small></span> : <span>{network.checking ? "检测中…" : "ping google.com"}</span>}
+    <Globe size={14} />{compact ? <span aria-live="polite" aria-atomic="true">{network.checking ? "检测中" : network.showSummary ? summary : "HTTPS"}<small>Google</small></span> : <span>{network.checking ? "检测中…" : "检测 Google HTTPS"}</span>}
   </button>;
 }
 function NetworkProbeResult() {
   const { network } = useResources(), result = network.result;
   if (!network.checking && !result && !network.error) return null;
   return <article className="hostNetworkResult" aria-label="主机网络检测">
-    <h3><Globe size={16} />网络连通性</h3><p>服务主机 → google.com</p>
-    {network.checking ? <p role="status">正在发送 3 次 ICMP 探测，最长约 10 秒…</p> : null}
+    <h3><Globe size={16} />网络连通性</h3><p>服务主机 → 配置的代理 → www.google.com（HTTPS）</p>
+    {network.checking ? <p role="status">正在通过服务代理发送 HTTPS 请求，最长约 10 秒…</p> : null}
     {network.error ? <p role="alert">{network.error}</p> : null}
     {result ? <>
       <p role="status">{result.message}</p>
-      {result.averageLatencyMs != null ? <p>平均延迟 {result.averageLatencyMs.toFixed(1)} ms{result.packetLossPercent != null ? ` · 丢包 ${result.packetLossPercent}%` : ""}</p> : null}
-      {result.packetsTransmitted != null ? <p>发送 {result.packetsTransmitted} · 收到 {result.packetsReceived ?? 0}{result.averageLatencyMs == null && result.packetLossPercent != null ? ` · 丢包 ${result.packetLossPercent}%` : ""}</p> : null}
-      <p>{result.address ? `${result.address} · ` : ""}{new Date(result.startedAt).toLocaleTimeString()} · 用时 {(result.durationMs / 1000).toFixed(1)} 秒</p>
-      {result.status !== "reachable" ? <p>这是 ICMP 探测结果；未收到应答时，还需结合代理、防火墙和其他连接测试判断。</p> : null}
+      {result.httpStatus != null ? <p>目标响应 HTTP {result.httpStatus}</p> : null}
+      <p>{new Date(result.startedAt).toLocaleTimeString()} · 请求总耗时 {result.durationMs} ms</p>
       {result.output ? <details open={result.status !== "reachable"}><summary>诊断输出</summary><pre>{result.output}</pre></details> : null}
     </> : null}
   </article>;

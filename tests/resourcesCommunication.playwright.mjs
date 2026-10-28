@@ -62,31 +62,31 @@ try {
   await expect(resourcePanel).toContainText("更新失败", { timeout: 15000 }); await expect(resourcePanel).toContainText("6.0 GiB");
   await context.request.post(origin + "/api/__test/resource-mode", { data: { fail: false } });
   await resourcePanel.getByRole("button", { name: "刷新主机资源", exact: true }).click(); await expect(resourcePanel).not.toContainText("更新失败");
-  assert.equal((await state()).networkProbes, 0, "resource polling never runs ping automatically");
-  const dockPing = a.locator('.hostResourceDock').getByRole("button", { name: "ping google.com", exact: true });
+  assert.equal((await state()).networkProbes, 0, "resource polling never runs HTTPS probes automatically");
+  const dockPing = a.locator('.hostResourceDock').getByRole("button", { name: "检测 Google HTTPS", exact: true });
   const dockStatsBox = await a.getByRole("button", { name: "查看主机资源", exact: true }).boundingBox(), pingBox = await dockPing.boundingBox();
-  assert.ok(dockStatsBox.x + dockStatsBox.width <= pingBox.x + 1 && Math.abs(dockStatsBox.y + dockStatsBox.height / 2 - pingBox.y - pingBox.height / 2) < 1, "ping stays alongside CPU, memory and disk in the same row");
+  assert.ok(dockStatsBox.x + dockStatsBox.width <= pingBox.x + 1 && Math.abs(dockStatsBox.y + dockStatsBox.height / 2 - pingBox.y - pingBox.height / 2) < 1, "HTTPS check stays alongside CPU, memory and disk in the same row");
   await context.request.post(origin + "/api/__test/network-mode", { data: { hold: true, fail: false } });
   await dockPing.click(); await expect(dockPing).toBeDisabled();
   const network = resourcePanel.getByRole("article", { name: "主机网络检测", exact: true });
-  await expect(network).toContainText("正在发送 3 次 ICMP 探测");
-  await expect(resourcePanel.getByRole("button", { name: "ping google.com", exact: true })).toBeDisabled();
+  await expect(network).toContainText("正在通过服务代理发送 HTTPS 请求");
+  await expect(resourcePanel.getByRole("button", { name: "检测 Google HTTPS", exact: true })).toBeDisabled();
   await context.request.post(origin + "/api/__test/network-mode", { data: { hold: false } });
-  await expect(network).toContainText("平均延迟 20.5 ms · 丢包 0%"); await expect(dockPing).toBeEnabled();
-  await expect(dockPing).toContainText("20.5 ms");
-  await a.waitForTimeout(4500); await expect(dockPing).toContainText("20.5 ms");
-  await a.screenshot({ path: `${evidence}/resources-ping-inline.png` });
-  await expect(dockPing).toContainText("ping", { timeout: 6000 });
-  await expect(network).toContainText("平均延迟 20.5 ms · 丢包 0%", { timeout: 1000 });
+  await expect(network).toContainText("请求总耗时 2000 ms"); await expect(dockPing).toBeEnabled();
+  await expect(dockPing).toContainText("2000 ms");
+  await a.waitForTimeout(4500); await expect(dockPing).toContainText("2000 ms");
+  await a.screenshot({ path: `${evidence}/resources-https-inline.png` });
+  await expect(dockPing).toContainText("HTTPS", { timeout: 6000 });
+  await expect(network).toContainText("请求总耗时 2000 ms", { timeout: 1000 });
   await context.request.post(origin + "/api/__test/network-mode", { data: { fail: true } });
-  await resourcePanel.getByRole("button", { name: "ping google.com", exact: true }).click();
-  await expect(network).toContainText("本次检测未收到 ICMP 应答。");
+  await resourcePanel.getByRole("button", { name: "检测 Google HTTPS", exact: true }).click();
+  await expect(network).toContainText("代理 HTTPS 检测超时，请稍后重试。");
   await expect(dockPing).toContainText("超时"); await expect(dockPing).not.toContainText("ms");
-  const pingOutput = network.locator("pre"); await expect(pingOutput).toContainText("100% packet loss");
+  const pingOutput = network.locator("pre"); await expect(pingOutput).toContainText("ETIMEDOUT");
   const readsBeforeError = resourceTimes.length;
   await pingOutput.evaluate(element => { const range = document.createRange(); range.selectNodeContents(element); const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range); });
   await expect.poll(() => resourceTimes.length, { timeout: 15000 }).toBeGreaterThan(readsBeforeError);
-  assert.match(await a.evaluate(() => getSelection().toString()), /100% packet loss/, "diagnostics remain selectable during resource refresh");
+  assert.match(await a.evaluate(() => getSelection().toString()), /ETIMEDOUT/, "diagnostics remain selectable during resource refresh");
   assert.equal((await state()).networkProbes, 2, "only the two manual clicks run network probes");
   const scrollResourcePanel = async () => {
     await resourcePanel.evaluate(element => { element.scrollTop = 0; });
@@ -228,7 +228,7 @@ try {
   await expect(panelA.getByRole("textbox", { name: "广播内容", exact: true })).toHaveValue("侧边独立草稿");
   await expect(panelA.locator(".communicationMessage")).toContainText("主会话通过工具发送到侧边");
   const finalState = await state(); assert.equal(finalState.starts.length, 2, "only the two explicit simulated user messages start turns"); assert.deepEqual(errors, []);
-  const report = { isolatedDatabase: true, realRestAndWebsocket: true, resourceSamplingAboutTenSeconds: intervals, hiddenPageStopsPolling: true, resourceRefreshPreservesCaret: true, failuresPreserveLastResourceData: true, mountPathsOnHover: true, pingInSameRow: true, manualPingOnly: true, inlinePingSummaryRetainedEightSeconds: true, pingLatencyAndFailureOutput: true, resourcePanelDesktopAndPhoneScroll: true, pingOutputRemainsSelectable: true, topicDeliveryAndReload: true, concurrentServicesRemainIndependent: true, serviceErrorsCorrelated: true, actionFeedbackAndCancelAck: true, mainSideIdentityAndDraftIsolation: true, realMcpWithSocketResumeAndForkCredentials: true, mainSideTopicAndServiceToolCalls: true, unsubscribedMainReceivesNoTopic: true, toolStatusFailureKeepsInbox: true, toolStatusNotPolled: true, phoneNoHorizontalOverflow: true, communicationNeverStartsModelTurns: true, simulatedUserTurns: 2, errors };
+  const report = { isolatedDatabase: true, realRestAndWebsocket: true, resourceSamplingAboutTenSeconds: intervals, hiddenPageStopsPolling: true, resourceRefreshPreservesCaret: true, failuresPreserveLastResourceData: true, mountPathsOnHover: true, httpsInSameRow: true, manualHttpsOnly: true, inlineHttpsSummaryRetainedEightSeconds: true, httpsTimingAndFailureOutput: true, resourcePanelDesktopAndPhoneScroll: true, httpsOutputRemainsSelectable: true, topicDeliveryAndReload: true, concurrentServicesRemainIndependent: true, serviceErrorsCorrelated: true, actionFeedbackAndCancelAck: true, mainSideIdentityAndDraftIsolation: true, realMcpWithSocketResumeAndForkCredentials: true, mainSideTopicAndServiceToolCalls: true, unsubscribedMainReceivesNoTopic: true, toolStatusFailureKeepsInbox: true, toolStatusNotPolled: true, phoneNoHorizontalOverflow: true, communicationNeverStartsModelTurns: true, simulatedUserTurns: 2, errors };
   await fs.writeFile(`${evidence}/results.json`, JSON.stringify(report, null, 2) + "\n"); console.log(JSON.stringify(report, null, 2));
 } catch (error) {
   for (const [index, page] of (browser?.contexts().flatMap(context => context.pages()) ?? []).entries()) {

@@ -1,46 +1,105 @@
-import { execFile } from "node:child_process";
+import { request as httpRequest, type ClientRequest } from "node:http";
+import { Agent, request as httpsRequest } from "node:https";
+import type { Socket } from "node:net";
+import { connect as tlsConnect, type ConnectionOptions, type TLSSocket } from "node:tls";
 import type { HostNetworkProbeResult } from "../shared/hostResources.js";
 
-type PingOutput = { stdout: string; stderr: string; code?: string | number | null; timedOut?: boolean };
-export const hostPingArgs = ["-n", "-c", "3", "-W", "2", "-w", "7", "google.com"] as const;
-function runPing(): Promise<PingOutput> {
-  if (process.platform !== "linux") return Promise.resolve({ stdout: "", stderr: "", code: "UNSUPPORTED" });
+export const hostNetworkTarget = new URL("https://www.google.com/");
+type ProbeStatus = HostNetworkProbeResult["status"];
+export type HttpsProbeOutput = { status: ProbeStatus; message: string; httpStatus: number | null; proxyStatus: number | null; errorCode?: string };
+const failed = (status: ProbeStatus, message: string, errorCode: string): HttpsProbeOutput => ({ status, message, httpStatus: null, proxyStatus: null, errorCode });
+
+export function runHttpsProbe(env: NodeJS.ProcessEnv = process.env, timeoutMs = 10_000, ca?: ConnectionOptions["ca"]): Promise<HttpsProbeOutput> {
+  const configured = env.https_proxy || env.HTTPS_PROXY || env.all_proxy || env.ALL_PROXY || env.http_proxy || env.HTTP_PROXY;
+  if (!configured?.trim()) return Promise.resolve(failed("proxy_unconfigured", "服务尚未配置代理，无法执行代理 HTTPS 检测。", "PROXY_NOT_CONFIGURED"));
+  let proxy: URL, authorization: string | undefined;
+  try {
+    proxy = new URL(configured.trim());
+    if (!["http:", "https:"].includes(proxy.protocol) || !proxy.hostname || proxy.pathname !== "/" || proxy.search || proxy.hash) throw new Error();
+    if (proxy.username || proxy.password) authorization = "Basic " + Buffer.from(`${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`).toString("base64");
+  } catch {
+    return Promise.resolve(failed("proxy_error", "代理配置无效；当前检测支持 HTTP/HTTPS 代理地址。", "INVALID_PROXY_CONFIGURATION"));
+  }
   return new Promise(resolve => {
-    execFile("ping", [...hostPingArgs], { timeout: 9000, killSignal: "SIGTERM", maxBuffer: 16_384,
-      env: { ...process.env, LC_ALL: "C", LANG: "C" } }, (error, stdout, stderr) => {
-      resolve({ stdout, stderr, code: error?.code ?? 0, timedOut: error?.killed === true });
-    });
+    let settled = false, stage: "proxy" | "https" = "proxy", proxyStatus: number | null = null;
+    let tunnel: Socket | undefined, secure: TLSSocket | undefined, targetRequest: ClientRequest | undefined, connectRequest: ClientRequest | undefined;
+    let agent: Agent | undefined;
+    const finish = (result: HttpsProbeOutput) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      targetRequest?.destroy(); connectRequest?.destroy();
+      secure?.destroy(); tunnel?.destroy(); agent?.destroy();
+      resolve({ ...result, proxyStatus });
+    };
+    const failure = (error: NodeJS.ErrnoException) => {
+      const code = typeof error.code === "string" && /^[A-Z0-9_]+$/.test(error.code) ? error.code : "REQUEST_FAILED";
+      const tls = /CERT|TLS|SSL|SELF_SIGNED|UNABLE_TO_VERIFY/.test(code);
+      const status: ProbeStatus = tls ? "tls_error" : ["ENOTFOUND", "EAI_AGAIN"].includes(code) ? "dns_error" : "proxy_error";
+      const message = tls ? "HTTPS 证书或 TLS 握手验证失败。" : status === "dns_error" ? "无法解析代理服务器地址。" : stage === "proxy" ? "无法通过配置的代理建立 HTTPS 通道。" : "代理通道已建立，但 HTTPS 请求未能完成。";
+      finish(failed(status, message, code));
+    };
+    const timer = setTimeout(() => finish(failed("timeout", "代理 HTTPS 检测超时，请稍后重试。", "ETIMEDOUT")), timeoutMs);
+    try {
+      const headers: Record<string, string> = { Host: `${hostNetworkTarget.hostname}:443` };
+      if (authorization) headers["Proxy-Authorization"] = authorization;
+      // Connect explicitly to the configured proxy, without a global Agent
+      // that might automatically proxy the proxy request a second time.
+      connectRequest = (proxy.protocol === "https:" ? httpsRequest : httpRequest)({
+        hostname: proxy.hostname.replace(/^\[|\]$/g, ""), port: proxy.port || (proxy.protocol === "https:" ? 443 : 80),
+        method: "CONNECT", path: `${hostNetworkTarget.hostname}:443`, headers, agent: false, maxHeaderSize: 16_384, ...(ca ? { ca } : {}),
+      });
+      connectRequest.on("error", failure);
+      connectRequest.on("response", response => {
+        proxyStatus = response.statusCode ?? null; response.resume();
+        finish(failed("proxy_error", "代理没有建立 HTTPS 通道，请检查代理设置。", "PROXY_CONNECT_FAILED"));
+      });
+      connectRequest.on("connect", (response, socket, head) => {
+        tunnel = socket;
+        if (settled) { socket.destroy(); return; }
+        proxyStatus = response.statusCode ?? null;
+        if (proxyStatus !== 200) {
+          finish(failed("proxy_error", proxyStatus === 407 ? "代理要求身份认证，请检查服务的代理凭据。" : `代理拒绝建立 HTTPS 通道（HTTP ${proxyStatus ?? "未知"}）。`, "PROXY_CONNECT_REJECTED"));
+          return;
+        }
+        if (head.length) socket.unshift(head);
+        stage = "https";
+        try {
+          secure = tlsConnect({ socket, servername: hostNetworkTarget.hostname, rejectUnauthorized: true, ...(ca ? { ca } : {}) });
+          secure.on("error", failure);
+          agent = new Agent({ keepAlive: false, maxCachedSessions: 0 });
+          agent.createConnection = () => secure!;
+          targetRequest = httpsRequest(hostNetworkTarget, { agent, method: "HEAD", maxHeaderSize: 16_384 }, result => {
+            const httpStatus = result.statusCode ?? null;
+            result.on("error", failure);
+            result.on("end", () => finish({
+              status: httpStatus != null && httpStatus >= 200 && httpStatus < 400 ? "reachable" : "http_error",
+              message: httpStatus != null && httpStatus >= 200 && httpStatus < 400 ? `通过服务代理的 HTTPS 连接成功（HTTP ${httpStatus}）。` : `代理及 HTTPS 连接成功，但目标返回 HTTP ${httpStatus ?? "未知"}。`,
+              httpStatus, proxyStatus,
+            }));
+            result.resume();
+          });
+          targetRequest.on("error", failure); targetRequest.end();
+        } catch (error) { failure(error as NodeJS.ErrnoException); }
+      });
+      connectRequest.end();
+    } catch (error) { failure(error as NodeJS.ErrnoException); }
   });
 }
-export function pingResult(raw: PingOutput, startedAt: string, durationMs: number): HostNetworkProbeResult {
-  const output = [raw.stdout, raw.stderr].filter(Boolean).join("\n").trim().slice(0, 8000);
-  const packets = output.match(/(\d+) packets transmitted,\s*(\d+) (?:packets )?received/);
-  const loss = output.match(/([\d.]+)% packet loss/);
-  const latency = output.match(/(?:rtt|round-trip) min\/avg\/max\/(?:mdev|stddev) = [\d.]+\/([\d.]+)\//);
-  const received = packets ? Number(packets[2]) : null;
-  let status: HostNetworkProbeResult["status"], message: string;
-  if (received != null && received > 0) { status = "reachable"; message = "已收到 google.com 的 ICMP 应答。"; }
-  else if (raw.code === "ENOENT" || raw.code === "UNSUPPORTED") { status = "unavailable"; message = "当前主机未提供可用的 ping 命令。"; }
-  else if (["EACCES", "EPERM"].includes(String(raw.code)) || /permission denied|operation not permitted/i.test(output)) { status = "permission_denied"; message = "当前主机没有发送 ICMP 探测的权限。"; }
-  else if (/name or service not known|temporary failure in name resolution|unknown host|bad address/i.test(output)) { status = "dns_error"; message = "无法解析 google.com，请检查主机 DNS。"; }
-  else if (/unreachable|network is down/i.test(output)) { status = "unreachable"; message = "主机或网络返回不可达错误。"; }
-  else if (raw.timedOut || received === 0 || raw.code === 1) { status = "timeout"; message = "本次检测未收到 ICMP 应答。"; }
-  else { status = "error"; message = "ping 检测未正常完成，请查看诊断输出。"; }
-  return { target: "google.com", startedAt, durationMs, status, message,
-    address: output.match(/^PING\s+[^\s(]+\s+\(([^)]+)\)/m)?.[1] ?? null,
-    packetsTransmitted: packets ? Number(packets[1]) : null, packetsReceived: received,
-    packetLossPercent: loss ? Number(loss[1]) : null, averageLatencyMs: latency ? Number(latency[1]) : null, output };
-}
 
-/** Manual probes share one bounded process; resource polling never invokes it. */
+/** Manual probes share one bounded request; resource polling never invokes it. */
 export class HostNetworkProbe {
   private inFlight: Promise<HostNetworkProbeResult> | null = null;
-  constructor(private runner: () => Promise<PingOutput> = runPing) {}
+  constructor(private runner: () => Promise<HttpsProbeOutput> = runHttpsProbe) {}
   run(): Promise<HostNetworkProbeResult> {
     if (this.inFlight) return this.inFlight;
     const startedAt = new Date().toISOString(), start = performance.now();
-    this.inFlight = this.runner().then(raw => pingResult(raw, startedAt, Math.round(performance.now() - start)))
-      .finally(() => { this.inFlight = null; });
+    this.inFlight = this.runner().then(raw => ({
+      target: "www.google.com" as const, protocol: "HTTPS" as const, viaProxy: true as const,
+      startedAt, durationMs: Math.round(performance.now() - start), status: raw.status, message: raw.message,
+      httpStatus: raw.httpStatus, proxyStatus: raw.proxyStatus,
+      output: [`HEAD ${hostNetworkTarget.href}`, "连接方式：服务配置的代理", raw.proxyStatus != null ? `代理 CONNECT：HTTP ${raw.proxyStatus}` : "", raw.httpStatus != null ? `目标响应：HTTP ${raw.httpStatus}` : "", raw.errorCode ? `诊断代码：${raw.errorCode}` : ""].filter(Boolean).join("\n"),
+    })).finally(() => { this.inFlight = null; });
     return this.inFlight;
   }
 }

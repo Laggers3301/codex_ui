@@ -143,10 +143,11 @@ export function registerHostResourceRoutes(app: FastifyInstance, monitor = new H
     try { return { data: await monitor.read() }; }
     catch { return reply.code(503).send({ error: "暂时无法读取主机资源状态，请稍后重试。" }); }
   });
-  app.post("/api/system/network/ping", async (request, reply) => {
+  // Keep the old URL for tabs opened before the HTTPS checker was released.
+  for (const url of ["/api/system/network/check", "/api/system/network/ping"]) app.post(url, async (request, reply) => {
     if (!authenticatedUserFromHeaders(request.headers)) return reply.code(401).send({ error: "请先登录。" });
     reply.header("Cache-Control", "no-store");
-    if (request.body !== undefined && (!request.body || typeof request.body !== "object" || Array.isArray(request.body) || Object.keys(request.body).length)) return reply.code(400).send({ error: "此按钮仅支持检测 google.com。" });
+    if (request.body !== undefined && (!request.body || typeof request.body !== "object" || Array.isArray(request.body) || Object.keys(request.body).length)) return reply.code(400).send({ error: "此按钮仅支持通过服务代理检测 www.google.com。" });
     try { return { data: await network.run() }; }
     catch { return reply.code(503).send({ error: "暂时无法执行主机网络检测，请稍后重试。" }); }
   });

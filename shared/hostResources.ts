@@ -11,15 +11,14 @@ export interface HostResources {
 }
 
 export interface HostNetworkProbeResult {
-  target: "google.com";
+  target: "www.google.com";
+  protocol: "HTTPS";
+  viaProxy: true;
   startedAt: string;
   durationMs: number;
-  status: "reachable" | "timeout" | "dns_error" | "unavailable" | "permission_denied" | "unreachable" | "error";
+  status: "reachable" | "timeout" | "dns_error" | "proxy_unconfigured" | "proxy_error" | "tls_error" | "http_error" | "error";
   message: string;
-  address: string | null;
-  packetsTransmitted: number | null;
-  packetsReceived: number | null;
-  packetLossPercent: number | null;
-  averageLatencyMs: number | null;
+  httpStatus: number | null;
+  proxyStatus: number | null;
   output: string;
 }

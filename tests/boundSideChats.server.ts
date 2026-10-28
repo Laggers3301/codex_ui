@@ -135,10 +135,9 @@ registerHostResourceRoutes(app, { read: async () => {
     disks: [{ name: "vda", mountPoints: ["/", "/boot"], readBytesPerSecond: 2 * 1024 ** 2, writeBytesPerSecond: 1024 ** 2, busyPercent: 30 }], warnings: [] };
 } } as any, { run: async () => {
   networkProbes++; if (networkHold) await new Promise<void>(resolve => { releaseNetwork = resolve; });
-  return { target: "google.com", startedAt: new Date().toISOString(), durationMs: 2000, status: networkFailure ? "timeout" : "reachable",
-    message: networkFailure ? "本次检测未收到 ICMP 应答。" : "已收到 google.com 的 ICMP 应答。", address: "142.250.1.1", packetsTransmitted: 3,
-    packetsReceived: networkFailure ? 0 : 3, packetLossPercent: networkFailure ? 100 : 0, averageLatencyMs: networkFailure ? null : 20.5,
-    output: `PING google.com (142.250.1.1) 56(84) bytes of data.\n3 packets transmitted, ${networkFailure ? 0 : 3} received, ${networkFailure ? 100 : 0}% packet loss` };
+  return { target: "www.google.com", protocol: "HTTPS", viaProxy: true, startedAt: new Date().toISOString(), durationMs: 2000, status: networkFailure ? "timeout" : "reachable",
+    message: networkFailure ? "代理 HTTPS 检测超时，请稍后重试。" : "通过服务代理的 HTTPS 连接成功（HTTP 200）。", httpStatus: networkFailure ? null : 200, proxyStatus: 200,
+    output: `HEAD https://www.google.com/\n代理 CONNECT：HTTP 200\n${networkFailure ? "诊断代码：ETIMEDOUT" : "目标响应：HTTP 200"}` };
 } } as any);
 registerSessionCommunicationRoutes(app, store);
 app.post<{ Body: { fail: boolean } }>("/api/__test/resource-mode", async request => { resourceFailure = request.body.fail; return { ok: true }; });
