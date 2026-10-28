@@ -21,6 +21,7 @@ import { registerPetRoutes } from "./pets.js";
 import { registerUiUpdateRoutes } from "./uiUpdates.js";
 import { registerSpeechRoutes } from "./speech.js";
 import { registerFeishuRoutes } from "./feishu.js";
+import { registerHostResourceRoutes } from "./hostResources.js";
 import {AuthDiagnosticLog,type AuthDiagnostic} from "./authDiagnostics.js";
 import {DeviceAuthorization,startAuthorizationControl} from "./deviceAuthorization.js";
 
@@ -154,6 +155,7 @@ registerPetRoutes(app);
 registerUiUpdateRoutes(app);
 registerSpeechRoutes(app);
 registerFeishuRoutes(app);
+registerHostResourceRoutes(app);
 app.addHook("onClose", async () => { await browserService.dispose(); });
 
 function escapeHtml(value: string): string {

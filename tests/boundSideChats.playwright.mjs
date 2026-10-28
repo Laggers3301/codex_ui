@@ -107,7 +107,10 @@ try {
   await mainInput.evaluate(element => element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "" })));
   await composer(first).fill("A 的草稿");
   await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "true");
-  await composer(first).fill("");
+  // Use the user's select-all/delete sequence so ProseMirror observes its own
+  // selection before deletion, rather than racing fill()'s native DOM range.
+  await composer(first).press("ControlOrMeta+A");
+  await composer(first).press("Backspace");
   await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "false");
   assert.ok(await composer(first).evaluate(element => document.activeElement === element), "clearing the side editor also fades the glow without losing focus");
   await composer(first).fill("A 的草稿");

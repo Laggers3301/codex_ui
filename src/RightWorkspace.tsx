@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode, type MouseEvent } from "re
 import { Browser, Terminal, FileCode, FileEditing, FileText, FolderOpen, LayoutOne, List, People, Plus, X, Target, Link, RightBar, Clock, Chat } from "./PanelIcons";
 import "./rightWorkspace.css";
 
-const icons = { overview: List, chat: Chat, browser: Browser, terminal: Terminal, diff: FileCode, agents: People, remote: FolderOpen, goal: Target, schedules: Clock, outputs: FileText, sources: Link, preview: FileText, writing: FileEditing, feishu: FileText, panel: RightBar, plus: Plus, close: X, layout: LayoutOne };
+const icons = { overview: List, chat: Chat, browser: Browser, terminal: Terminal, diff: FileCode, agents: People, remote: FolderOpen, goal: Target, schedules: Clock, outputs: FileText, sources: Link, preview: FileText, writing: FileEditing, feishu: FileText, resources: LayoutOne, panel: RightBar, plus: Plus, close: X, layout: LayoutOne };
 export type WorkspaceIconName = keyof typeof icons;
 export function WorkspaceIcon({ name }: { name: WorkspaceIconName }) {
   const Glyph = icons[name];

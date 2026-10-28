@@ -34,6 +34,9 @@ import type {
 } from "./types";
 
 const defaultUserId = "admin";
+export function readHostResources(signal: AbortSignal): Promise<{ data: import("../shared/hostResources").HostResources }> {
+  return request("/api/system/resources", { signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]) });
+}
 export const THREAD_READ_MAX_LIMIT = 240;
 
 let currentUserId = localStorage.getItem("codex-web-user-id") || defaultUserId;

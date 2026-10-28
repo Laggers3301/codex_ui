@@ -12,8 +12,8 @@ process.env.CODEX_WEB_ACCOUNT_POOL_FILE = "";
 // The public repository is flat; the production host keeps frontend/backend
 // separately. Both layouts must run this isolated fixture without live APIs.
 const serverRoot = new URL(fs.existsSync(new URL('../server/db.ts', import.meta.url)) ? '../server/' : '../../backend/server/', import.meta.url);
-const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, auth] = await Promise.all(
-  ['db', 'sideChatRoutes', 'socket', 'auth'].map(name => import(new URL(name + '.js', serverRoot).href))
+const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, auth, { registerHostResourceRoutes }] = await Promise.all(
+  ['db', 'sideChatRoutes', 'socket', 'auth', 'hostResources'].map(name => import(new URL(name + '.js', serverRoot).href))
 );
 const store = new ProjectStore(path.join(root, "store.sqlite"));
 const project = store.createProject({ name: "侧边绑定验收", rootPath: root, defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "high" });
@@ -88,6 +88,16 @@ class FixtureBridge extends EventEmitter {
 const bridge = new FixtureBridge(), app = Fastify();
 const user = (request: { headers: Record<string, unknown> }) => auth.authenticatedUserFromHeaders(request.headers as any) ?? "anonymous";
 registerSideChatRoutes(app, bridge as any, store, user);
+let resourceReads = 0, resourceFailure = false;
+registerHostResourceRoutes(app, { read: async () => {
+  resourceReads++; if (resourceFailure) throw new Error('fixture resource failure');
+  return { sampledAt: new Date().toISOString(), intervalMs: 2000, hostname: "fixture-host", platform: "linux",
+    cpu: { cores: 8, model: "Fixture CPU", usagePercent: 12.5, loadAverage: [1, .8, .6] },
+    memory: { totalBytes: 8 * 1024 ** 3, usedBytes: 6 * 1024 ** 3, availableBytes: 2 * 1024 ** 3, usagePercent: 75, swapTotalBytes: 2 * 1024 ** 3, swapUsedBytes: 1024 ** 3 },
+    volumes: [{ labels: ["系统", "数据目录", "工作目录"], totalBytes: 100 * 1024 ** 3, usedBytes: 40 * 1024 ** 3, availableBytes: 60 * 1024 ** 3, usagePercent: 40 }],
+    disks: [{ name: "vda", readBytesPerSecond: 2 * 1024 ** 2, writeBytesPerSecond: 1024 ** 2, busyPercent: 30 }], warnings: [] };
+} } as any);
+app.post<{ Body: { fail: boolean } }>("/api/__test/resource-mode", async request => { resourceFailure = request.body.fail; return { ok: true }; });
 const wss = attachSocketServer(app.server, bridge as any, store);
 app.post("/api/auth/login", async (_request, reply) => { reply.header("Set-Cookie", auth.createSessionCookie("admin")); return { ok: true }; });
 app.post<{ Body: { threadId: string } }>("/api/__test/complete", async request => { bridge.complete(request.body.threadId); return { ok: true }; });
@@ -143,7 +153,7 @@ app.post<{ Body: { threadId: string; waiting: boolean; clearRequests?: boolean }
   return { ok: true };
 });
 app.get("/api/__test/state", async () => ({ fixture: "bound-side-chats", projectId: project.id,
-  calls: bridge.calls, starts:bridge.starts, pendingApprovals: bridge.pending, approvalResponses: bridge.approvalResponses, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
+  calls: bridge.calls, starts:bridge.starts, resourceReads, pendingApprovals: bridge.pending, approvalResponses: bridge.approvalResponses, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
 app.get("/api/projects", async () => ({ data: [project], projectRoot: root }));
 app.get("/api/users", async () => ({ data: [{ id: "admin", name: "admin" }], defaultUserId: "admin" }));
 app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }] }));
