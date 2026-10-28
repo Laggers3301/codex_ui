@@ -17,6 +17,15 @@ it("deduplicates the new persisted user without swallowing repeated prompt text"
   const native:ThreadItem={id:"native-steer",type:"userMessage",text:"继续",timelineAt:boundary.timelineAt};
   const result=mergeSteerTimelineItems([...old,native,{id:"answer",type:"agentMessage",timelineLive:true}],[boundary]);expect(result.map(i=>i.id)).toEqual(["first-user","old-call","native-steer","answer"]);
 });
+it("matches an upload-only steer by submitted content while preserving its display caption",()=>{
+  const submittedText="上传文件：\n- handoff.md: /tmp/uploads/handoff.md";
+  const upload={...boundary,text:"上传了 1 个文件：handoff.md",submittedText};
+  const pending=mergeSteerTimelineItems(old,[upload]);
+  expect(pending.at(-1)).toMatchObject({id:upload.id,text:upload.text});
+  const native:ThreadItem={id:"native-upload",type:"userMessage",text:submittedText,timelineAt:boundary.timelineAt};
+  const result=mergeSteerTimelineItems([...old,native,{id:"answer",type:"agentMessage",timelineLive:true}],[upload]);
+  expect(result.map(item=>item.id)).toEqual(["first-user","old-call","native-upload","answer"]);
+});
 it("keeps successive steers ordered and lets old-history pagination remain before them",()=>{
   const next={...boundary,id:"steer-2",text:"再补充",timelineAt:"2026-10-25T00:02:00Z",beforeItemIds:[...boundary.beforeItemIds,boundary.id,"answer-1"]};
   const result=mergeSteerTimelineItems([...old,{id:"answer-1",type:"agentMessage",timelineLive:true},{id:"answer-2",type:"agentMessage",timelineLive:true}],[boundary,next]);

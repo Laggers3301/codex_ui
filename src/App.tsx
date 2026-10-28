@@ -696,6 +696,8 @@ interface PendingUserMessage {
   turnId?: string | null;
   viewToken: number;
   text: string;
+  // Upload captions differ from the actual message saved by the runtime.
+  submittedText?: string;
   keepAtBottomUntil: number;
   attachments?: ComposerUpload[];
   steerBoundary?: SteerTimelineBoundary;
@@ -1675,9 +1677,10 @@ function threadHasUserText(thread: ThreadSummary, text: string): boolean {
 }
 
 function threadHasPendingUserText(thread: ThreadSummary, entry: PendingUserMessage): boolean {
-  if (!entry.steerBoundary) return threadHasUserText(thread, entry.text);
+  const text = entry.submittedText ?? entry.text;
+  if (!entry.steerBoundary) return threadHasUserText(thread, text);
   const old = new Set(entry.steerBoundary.beforeItemIds);
-  return (thread.turns.find(turn => turn.id === entry.turnId)?.items ?? []).some(item => itemKind(item) === "user" && !old.has(item.id) && userTextsMatch(itemText(item), entry.text));
+  return (thread.turns.find(turn => turn.id === entry.turnId)?.items ?? []).some(item => itemKind(item) === "user" && !old.has(item.id) && userTextsMatch(itemText(item), text));
 }
 
 function threadItemKey(item: ThreadItem, fallbackIndex: number): string {
@@ -3490,11 +3493,12 @@ function persistedUserAttachmentsFromText(text: string): PersistedUserAttachment
 
 function threadHasPendingAttachments(thread: ThreadSummary, entry: PendingUserMessage): boolean {
   if (!entry.attachments?.length) return true;
+  const text = entry.submittedText ?? entry.text;
   const turn = entry.turnId
     ? thread.turns?.find((candidate) => candidate.id === entry.turnId)
     : thread.turns?.find((candidate) => (
-      (candidate.items ?? []).some((item) => itemKind(item) === "user" && userTextsMatch(itemText(item), entry.text))
-      || (!turnHasUserItem(candidate) && userTextsMatch(turnUserText(candidate), entry.text))
+      (candidate.items ?? []).some((item) => itemKind(item) === "user" && userTextsMatch(itemText(item), text))
+      || (!turnHasUserItem(candidate) && userTextsMatch(turnUserText(candidate), text))
     ));
   if (!turn) return false;
   const userText = [
@@ -9240,7 +9244,11 @@ export function App() {
           threadId: selectedThread?.id ?? null,
           viewToken: requestViewToken,
           text: visibleText,
-          ...(payload.type === "turn.steer" ? {turnId: payload.expectedTurnId, steerBoundary: captureSteerBoundary(`user-${requestId}`, visibleText, payload.expectedTurnId!)} : {}),
+          submittedText: sentPromptText,
+          ...(payload.type === "turn.steer" ? {
+            turnId: payload.expectedTurnId,
+            steerBoundary: { ...captureSteerBoundary(`user-${requestId}`, visibleText, payload.expectedTurnId!), submittedText: sentPromptText }
+          } : {}),
           keepAtBottomUntil,
           attachments: promptUploads
         }
@@ -9453,6 +9461,7 @@ export function App() {
           threadId: null,
           viewToken: requestViewToken,
           text: continuation.visibleText,
+          submittedText: continuation.sentPromptText,
           keepAtBottomUntil
         }
       ]);
@@ -11146,7 +11155,7 @@ export function App() {
       const candidates = (syntheticUserItem ? [syntheticUserItem, ...(turn.items ?? [])] : turn.items ?? [])
         .filter((item) => itemKind(item) === "user" && itemText(item).trim());
       for (const heldEntry of heldEntries) {
-        const candidateIndex = candidates.findIndex((item) => userTextsMatch(itemText(item), heldEntry.text));
+        const candidateIndex = candidates.findIndex((item) => userTextsMatch(itemText(item), heldEntry.submittedText ?? heldEntry.text));
         const candidate = candidateIndex >= 0 ? candidates[candidateIndex] : candidates.length === 1 ? candidates[0] : null;
         if (!candidate) {
           continue;
@@ -13225,7 +13234,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   // Merge identities and chronology before introducing message boundaries.
                   const pendingSteers = visiblePendingUserMessages.filter(entry => entry.turnId === turn.id && entry.steerBoundary);
                   const mergedItems = mergeTimelineItems(coalesceToolOutputs(historyItems, true), liveItems);
-                  const items = collapseCodeModeWrappers(coalesceToolOutputs(mergeSteerTimelineItems(mergedItems, pendingSteers.map(entry => entry.steerBoundary!), (item, boundary) => userTextsMatch(itemText(item), boundary.text))));
+                  const items = collapseCodeModeWrappers(coalesceToolOutputs(mergeSteerTimelineItems(mergedItems, pendingSteers.map(entry => entry.steerBoundary!), (item, boundary) => userTextsMatch(itemText(item), boundary.submittedText ?? boundary.text))));
                   const hasAgentAnswerFromIndex = new Array<boolean>(items.length + 1).fill(false);
                   for (let index = items.length - 1; index >= 0; index -= 1) {
                     const item = items[index];
