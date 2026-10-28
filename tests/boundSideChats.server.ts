@@ -35,6 +35,11 @@ class FixtureBridge extends EventEmitter {
   taskToolOutputs: Array<{ threadId: string; value: any }> = [];
   creationGate: Promise<void> | null = null;
   releaseCreation: (() => void) | null = null;
+  turnStartGate: Promise<void> | null = null;
+  releaseTurnStart: (() => void) | null = null;
+  interruptGate: Promise<void> | null = null;
+  releaseInterrupt: (() => void) | null = null;
+  failNextInterrupt = false;
   failNextTurn = false;
   failNextApproval = false;
   pending: Array<{ id: number; method: string; params: Record<string, unknown>; receivedAt: string }> = [];
@@ -77,6 +82,7 @@ class FixtureBridge extends EventEmitter {
     if (method === "thread/turns/list") return { data: thread?.turns.slice(-1).map(({id,status}) => ({id,status})) ?? [] };
     if (method === "thread/items/list") return { data: (thread?.turns.find(turn => turn.id === params.turnId)?.items ?? []).map((item: unknown) => ({ turnId: params.turnId, item })) };
     if (method === "turn/start" && thread) {
+      await this.turnStartGate;
       if (this.failNextTurn) { this.failNextTurn = false; throw new Error("用于选中复制的完整错误详情"); }
       const callback = params.toolOutput ? JSON.parse(params.toolOutput.output) : null;
       if (callback) {
@@ -95,7 +101,11 @@ class FixtureBridge extends EventEmitter {
       setTimeout(() => this.emit("notification", { method: "item/agentMessage/delta", params: { threadId: thread.id, turnId: id, itemId: id + "-answer", delta: answer } }), 30);
       return { turn: { id } };
     }
-    if (method === "turn/interrupt" && thread) this.complete(thread.id, "interrupted");
+    if (method === "turn/interrupt" && thread) {
+      if (this.failNextInterrupt) { this.failNextInterrupt = false; throw new Error("模拟侧边会话停止失败，请重试"); }
+      await this.interruptGate;
+      this.complete(thread.id, "interrupted");
+    }
     return {};
   }
   complete(threadId: string, status = "completed") {
@@ -189,6 +199,17 @@ app.post<{ Body: { pause: boolean } }>("/api/__test/hold-create", async request 
   return { ok: true };
 });
 app.post("/api/__test/fail-next", async () => { bridge.failNextTurn = true; return { ok: true }; });
+app.post("/api/__test/fail-next-interrupt", async () => { bridge.failNextInterrupt = true; return { ok: true }; });
+app.post<{ Body: { pause: boolean } }>("/api/__test/hold-turn-start", async request => {
+  if (request.body.pause) bridge.turnStartGate = new Promise(resolve => { bridge.releaseTurnStart = resolve; });
+  else { bridge.releaseTurnStart?.(); bridge.turnStartGate = null; bridge.releaseTurnStart = null; }
+  return { ok: true };
+});
+app.post<{ Body: { pause: boolean } }>("/api/__test/hold-interrupt", async request => {
+  if (request.body.pause) bridge.interruptGate = new Promise(resolve => { bridge.releaseInterrupt = resolve; });
+  else { bridge.releaseInterrupt?.(); bridge.interruptGate = null; bridge.releaseInterrupt = null; }
+  return { ok: true };
+});
 app.post("/api/__test/fail-next-approval", async () => { bridge.failNextApproval = true; return { ok: true }; });
 app.post<{ Body: { threadId: string; kind: string; emit?: boolean } }>("/api/__test/approval", async request => {
   const { threadId, kind, emit = true } = request.body, id = bridge.nextApprovalId++;

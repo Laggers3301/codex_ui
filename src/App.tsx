@@ -4999,6 +4999,9 @@ export function App() {
   const temporaryThread = boundSideChats.session?.thread ?? null;
   const temporaryPrompt = boundSideChats.session?.draft ?? "";
   const temporaryModelProfileId = boundSideChats.session?.modelProfileId ?? defaultModelProfileId;
+  const temporaryShowsStop = Boolean(temporaryAsk && ["starting", "running"].includes(temporaryAsk.status));
+  const temporaryStopBusy = Boolean(temporaryAsk && (queuedInterruptPrompts[temporaryAsk.requestId]
+    || (temporaryAsk.turnId && interruptingTurns[temporaryAsk.turnId])));
   const setTemporaryPrompt = useCallback((text: string) => {
     if (selectedThread?.id) sideChatController.setDraft(selectedUserId, selectedThread.id, text);
   }, [sideChatController, selectedUserId, selectedThread?.id]);
@@ -5252,6 +5255,17 @@ export function App() {
       const failed = { ...next, status: "error" as const };
       sideChatController.updateAsk(failed);
       setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
+
+  function requestInterruptTemporaryConversation() {
+    const current = temporaryAskRef.current;
+    if (!current || !["starting", "running"].includes(current.status)
+      || queuedInterruptPromptRequestIdsRef.current.has(current.requestId)) return;
+    if (current.threadId && current.turnId) {
+      interruptCurrentTurn(current.threadId, current.turnId, current.projectId);
+    } else {
+      queueInterruptAfterTurnStarts(current.requestId);
     }
   }
 
@@ -9542,7 +9556,8 @@ export function App() {
     const requestId = `interrupt-${requestToken()}`;
     interruptRequestContextsRef.current.set(requestId, { threadId, turnId, projectId });
     interruptRequestedTurnIdsRef.current.add(turnId);
-    setLastStoppedTurnForEdit({ threadId, turnId });
+    const side = sideChatController.forThread(threadId);
+    if (!side) setLastStoppedTurnForEdit({ threadId, turnId });
     setInterruptingTurns((current) => ({ ...current, [turnId]: true }));
     setActiveTurnsByThread((current) => {
       if (current[threadId] !== turnId) {
@@ -9576,12 +9591,15 @@ export function App() {
         ))
       }
     )));
-    setLiveDeltas((current) => Object.fromEntries(
-      Object.entries(current).filter(([, entry]) => entry.threadId !== threadId || entry.turnId !== turnId)
-    ));
-    setLiveTools((current) => Object.fromEntries(
-      Object.entries(current).filter(([, entry]) => entry.threadId !== threadId || entry.turnId !== turnId)
-    ));
+    // Keep a side chat's partial answer until its interrupted turn is persisted.
+    if (!side) {
+      setLiveDeltas((current) => Object.fromEntries(
+        Object.entries(current).filter(([, entry]) => entry.threadId !== threadId || entry.turnId !== turnId)
+      ));
+      setLiveTools((current) => Object.fromEntries(
+        Object.entries(current).filter(([, entry]) => entry.threadId !== threadId || entry.turnId !== turnId)
+      ));
+    }
     setError("");
     const timeoutId = window.setTimeout(() => {
       interruptRequestedTurnIdsRef.current.delete(turnId);
@@ -10073,11 +10091,14 @@ export function App() {
         return;
       }
       if (message.requestId?.startsWith("temp-")) {
+        const interruptQueued = queuedInterruptPromptRequestIdsRef.current.has(message.requestId);
         const temporary = sideChatController.forRequest(message.requestId)?.ask;
         if (!temporary || temporary.requestId !== message.requestId) {
+          if (interruptQueued) clearQueuedInterrupt(message.requestId);
           return;
         }
         if (!message.ok) {
+          if (interruptQueued) clearQueuedInterrupt(message.requestId);
           const failed = { ...temporary, status: "error" as const };
           sideChatController.updateAsk(failed);
           if (temporary.parentThreadId === selectedThreadRef.current?.id && temporary.userId === selectedUserId) setError(`侧边提问失败：${message.error ?? "Codex 未接受请求。"}`);
@@ -10105,10 +10126,17 @@ export function App() {
           activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [threadId]: turnId };
           setActiveTurnsByThread((current) => ({ ...current, [threadId]: turnId }));
         }
+        if (interruptQueued) {
+          clearQueuedInterrupt(message.requestId);
+          if (turnId && threadId && next.status === "running") {
+            interruptCurrentTurn(threadId, turnId, temporary.projectId);
+          }
+        }
         return;
       }
     const interruptContext = message.requestId ? interruptRequestContextsRef.current.get(message.requestId) : undefined;
       if (interruptContext) {
+        const side = sideChatController.forThread(interruptContext.threadId);
         if (message.requestId) {
           interruptRequestContextsRef.current.delete(message.requestId);
         }
@@ -10128,7 +10156,9 @@ export function App() {
           // The turn may have finished just before the interrupt reached Codex.
           // Keep the user's stop intent so the latest prompt does not briefly
           // show an edit action and then lose it on the next thread refresh.
-          setError(`终止请求未生效：${message.error ?? "回答可能已结束。"} 可编辑这条提问；发送修改时会再次核对会话状态。`);
+          setError(side
+            ? `侧边会话停止失败：${message.error ?? "回答可能已结束。"} 可以重试停止。`
+            : `终止请求未生效：${message.error ?? "回答可能已结束。"} 可编辑这条提问；发送修改时会再次核对会话状态。`);
           return;
         }
         setActiveTurnsByThread((current) => {
@@ -10139,9 +10169,13 @@ export function App() {
           delete next[interruptContext.threadId];
           return next;
         });
-        setLiveDeltas((current) => Object.fromEntries(
-          Object.entries(current).filter(([, entry]) => entry.turnId !== interruptContext.turnId)
-        ));
+        if (side) {
+          void sideChatController.load(side.record.userId, side.record.projectId, side.record.parentThreadId);
+        } else {
+          setLiveDeltas((current) => Object.fromEntries(
+            Object.entries(current).filter(([, entry]) => entry.turnId !== interruptContext.turnId)
+          ));
+        }
         if (selectedThreadRef.current?.id === interruptContext.threadId) {
           const viewToken = threadViewTokenRef.current;
           window.setTimeout(() => void openThread(interruptContext.threadId, interruptContext.projectId, viewToken), 350);
@@ -10554,7 +10588,7 @@ export function App() {
         if (!wasInterrupted && completedStatus === "completed" && threadProjectId && !isTemporaryThread) {
           scheduleAutoSendGeneratedFiles(threadId, threadProjectId, turnId);
         }
-        if (isTemporaryThread && !wasInterrupted) {
+        if (isTemporaryThread) {
           const temporary = sideChatController.forThread(threadId)?.ask;
           if (temporary) {
             const completed = { ...temporary, status: "complete" as const };
@@ -13182,7 +13216,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         <div className="temporaryAskHeaderText">
                           <span className="temporaryAskHeaderTitle">侧边聊天</span>
                           <span className={`temporaryAskHeaderState ${temporaryAsk.status}`}>
-                            {temporaryAsk.status === "closing" ? "正在关闭" : temporaryAsk.status === "running"
+                            {temporaryAsk.status === "closing" ? "正在关闭" : temporaryStopBusy ? "正在停止" : temporaryAsk.status === "running"
                               ? "实时处理中"
                               : temporaryAsk.status === "starting"
                                 ? "启动中"
@@ -13220,8 +13254,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                             {entry.output ? <pre className="outputBlock">{displayOutputText(entry.output)}</pre> : entry.completed ? null : <div className="messageBody">正在执行...</div>}
                           </article>
                         ))}
-                      {temporaryAsk.status === "starting" ? <div className="v2ThinkingLine">正在建立临时会话</div> : null}
-                      {temporaryAsk.status === "running" ? <div className="v2ThinkingLine">正在思考</div> : null}
+                      {temporaryStopBusy ? <div className="v2ThinkingLine">正在停止侧边对话</div>
+                        : temporaryAsk.status === "starting" ? <div className="v2ThinkingLine">正在建立临时会话</div>
+                        : temporaryAsk.status === "running" ? <div className="v2ThinkingLine">正在思考</div> : null}
                       {temporaryAsk.error ? <div className="v2ThinkingLine" role="alert">{temporaryAsk.error}</div> : temporaryAsk.status === "error" ? <div className="v2ThinkingLine">本轮发送失败，可以修改后重试</div> : null}
                       <div className="messagesEnd" aria-hidden="true" />
                     </SideChatMessages>
@@ -13248,7 +13283,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                             disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
                             profiles={modelProfiles}
                           />
-                          <button className="iconButton sendButton primary" type="button" onClick={sendTemporaryPrompt} disabled={!temporaryPrompt.trim() || ["starting", "running", "closing"].includes(temporaryAsk.status)} title="发送临时提问"><Send size={16} /></button>
+                          <button className={`iconButton sendButton ${temporaryShowsStop ? "stopMode" : "primary"}`} type="button"
+                            onClick={temporaryShowsStop ? requestInterruptTemporaryConversation : sendTemporaryPrompt}
+                            disabled={temporaryShowsStop ? temporaryStopBusy : !temporaryPrompt.trim() || temporaryAsk.status === "closing"}
+                            aria-label={temporaryShowsStop ? "终止侧边对话" : "发送临时提问"}
+                            title={temporaryShowsStop ? (temporaryStopBusy ? "正在停止侧边对话" : "终止侧边对话") : "发送临时提问"}>
+                            {temporaryShowsStop ? <Square size={16} fill="currentColor" /> : <Send size={16} />}
+                          </button>
                         </div>
                       </div>
                     </div>
