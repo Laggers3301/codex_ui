@@ -15,13 +15,14 @@ export function ApprovalRequests({ requests, waiting, checking, message, answeri
     {requests.map(request => {
       const params = request.params;
       const network = params.networkApprovalContext;
+      const claude = request.method === "item/claudeTool/requestApproval";
       const permissions = request.method === "item/permissions/requestApproval";
       const fileChange = request.method === "item/fileChange/requestApproval";
-      const title = permissions ? "权限申请" : fileChange ? "文件修改" : network ? "网络访问" : request.method === "item/commandExecution/requestApproval" ? "命令执行" : "操作";
+      const title = claude ? `工具 ${String(params.toolName ?? "操作")}` : permissions ? "权限申请" : fileChange ? "文件修改" : network ? "网络访问" : request.method === "item/commandExecution/requestApproval" ? "命令执行" : "操作";
       const decisions = approvalDecisions(request);
-      const detail = operation(request);
+      const detail = claude ? JSON.stringify(params.toolInput ?? {}, null, 2) : operation(request);
       return <div className="codexApprovalCard" role="alert" aria-label={`批准${title}`} key={String(request.id)}>
-        <strong>Codex 等待批准{title}</strong>
+        <strong>{claude ? "Claude" : "Codex"} 等待批准{title}</strong>
         {typeof params.reason === "string" && params.reason ? <p>申请原因：{params.reason}</p> : null}
         {detail ? <pre>{detail}</pre> : permissions || network || params.grantRoot ? null : <p>运行时未提供具体操作内容。可以先重新核对，再决定是否批准。</p>}
         {typeof params.cwd === "string" ? <p>工作目录：<code>{params.cwd}</code></p> : null}

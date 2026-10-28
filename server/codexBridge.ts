@@ -1,3 +1,4 @@
+import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -144,6 +145,7 @@ export class CodexBridge extends EventEmitter {
   }
 
   async request(method: string, params?: unknown, timeoutMs = 120_000): Promise<unknown> {
+    assertCodexModelRequest(params);
     await this.start();
     if (["turn/start", "thread/start", "thread/queue/start", "thread/queue/add"].includes(method)) {
       const headroom = this.getMemoryHeadroom();

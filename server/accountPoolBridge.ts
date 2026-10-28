@@ -1,3 +1,4 @@
+import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
 import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -1148,6 +1149,7 @@ export class AccountPoolBridge extends EventEmitter {
   }
 
   async startThreadOnAccount(accountId: string, params: unknown, timeoutMs = 120_000): Promise<unknown> {
+    assertCodexModelRequest(params);
     const account = this.accountsById.get(accountId);
     if (!account) throw new Error(`Unknown account-pool account: ${accountId}`);
     const model = asRecord(params).model;
@@ -1165,6 +1167,7 @@ export class AccountPoolBridge extends EventEmitter {
 
   /** Execute an exact native fork on a specific account selected by branch routing. */
   async forkThreadOnAccount(accountId: string, params: unknown, timeoutMs = 120_000): Promise<unknown> {
+    assertCodexModelRequest(params);
     const account = this.accountsById.get(accountId);
     if (!account) throw new Error(`Unknown account-pool account: ${accountId}`);
     try {
@@ -1278,6 +1281,7 @@ export class AccountPoolBridge extends EventEmitter {
   }
 
   private async accountForRequest(method: string, params: unknown): Promise<AccountRuntime> {
+    assertCodexModelRequest(params);
     const threadId = threadIdFromParams(params);
     if (threadId) {
       const known = this.accountsById.get(this.threadAccounts.get(threadId) ?? "");

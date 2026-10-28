@@ -1,3 +1,4 @@
+import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
 import { Children, cloneElement, Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { lazy, Suspense } from "react";
@@ -501,7 +502,7 @@ function PolishedSelect<T extends string>({
   );
 }
 
-type ModelPickerSection = "root" | "gpt" | "domestic" | "doubao" | "deepseek" | "kimi" | "mimo" | "glm" | "minimax";
+type ModelPickerSection = "root" | "gpt" | "claude" | "domestic" | "doubao" | "deepseek" | "kimi" | "mimo" | "glm" | "minimax";
 const domesticModelGroups: Array<{ key: ModelPickerSection; label: string }> = [
   { key: "doubao", label: "Doubao" },
   { key: "deepseek", label: "DeepSeek" },
@@ -513,6 +514,7 @@ const domesticModelGroups: Array<{ key: ModelPickerSection; label: string }> = [
 ];
 
 function modelPickerGroup(model: string): ModelPickerSection {
+  if (isReclaudeModel(model)) return "claude";
   if (model.startsWith("gpt-")) return "gpt";
   if (model.startsWith("doubao-") || model === "ark-code-latest") return "doubao";
   if (model.startsWith("deepseek-")) return "deepseek";
@@ -530,7 +532,7 @@ function MobileModelPage({ active, children }: { active: boolean; children: Reac
     aria-hidden={!active} inert={!active}>{children}</div>;
 }
 
-function ModelGroupedSelect({
+export function ModelGroupedSelect({
   value, profiles, onChange, disabled = false, title
 }: {
   value: string;
@@ -549,8 +551,8 @@ function ModelGroupedSelect({
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
   }, []);
-  const [branch, setBranch] = useState<"gpt" | "domestic" | null>(null);
-  const [lastBranch, setLastBranch] = useState<"gpt" | "domestic">("domestic");
+  const [branch, setBranch] = useState<"gpt" | "claude" | "domestic" | null>(null);
+  const [lastBranch, setLastBranch] = useState<"gpt" | "claude" | "domestic">("domestic");
   const [provider, setProvider] = useState<ModelPickerSection | null>(null);
   const [lastProvider, setLastProvider] = useState<ModelPickerSection>("doubao");
   const menuPresence = useExitPresence(open);
@@ -571,7 +573,7 @@ function ModelGroupedSelect({
   const selected = visibleProfiles.find((profile) => profile.id === value) ?? visibleProfiles[0];
   const modelNames = [...new Set(visibleProfiles.map((profile) => profile.model))];
   const groupCount = (group: ModelPickerSection) => modelNames.filter((model) => modelPickerGroup(model) === group).length;
-  const selectBranch = (next: "gpt" | "domestic") => {
+  const selectBranch = (next: "gpt" | "claude" | "domestic") => {
     setLastBranch(next);
     setBranch(next);
     setProvider(null);
@@ -580,11 +582,14 @@ function ModelGroupedSelect({
     setLastProvider(next);
     setProvider(next);
   };
+  const branchTitle = lastBranch === "gpt" ? "GPT" : lastBranch === "claude" ? "Claude" : "国产模型";
+  const claudeNotice = lastBranch === "claude" ? <p className="groupedModelConnectionNote" role="status">尚未连接 ReClaude。以下为模型系列预览，可用型号将在账号连接后验证。</p> : null;
   const profileOptions = (group: ModelPickerSection) => visibleProfiles.filter((profile) => modelPickerGroup(profile.model) === group).map((profile) => (
     <button className={`polishedSelectOption groupedModelProfile${profile.id === value ? " selected" : ""}`}
       type="button" role="option" aria-selected={profile.id === value} key={profile.id}
-      onClick={() => { onChange(profile.id); setOpen(false); }}>
-      <span><strong>{profile.label}</strong></span>
+      disabled={!modelIsAvailable(profile)} title={profile.unavailableReason}
+      onClick={() => { if (modelIsAvailable(profile)) { onChange(profile.id); setOpen(false); } }}>
+      <span><strong>{profile.label}</strong>{!modelIsAvailable(profile) ? <small className="groupedModelConnectionStatus">待连接</small> : null}</span>
       <span className="polishedSelectCheck" aria-hidden="true">{profile.id === value ? "✓" : ""}</span>
     </button>
   ));
@@ -607,15 +612,17 @@ function ModelGroupedSelect({
               <div className="groupedModelHeading">选择模型</div>
               <div className="groupedModelRows">
                 <button className="groupedModelRow" type="button" onClick={() => selectBranch("gpt")}><span>GPT</span><ChevronRight size={15} /></button>
+                <button className="groupedModelRow" type="button" onClick={() => selectBranch("claude")}><span>Claude</span><ChevronRight size={15} /></button>
                 <button className="groupedModelRow" type="button" onClick={() => selectBranch("domestic")}><span>国产模型</span><ChevronRight size={15} /></button>
               </div>
             </MobileModelPage>
             <MobileModelPage active={Boolean(branch) && !provider}>
               <button className="groupedModelBack" type="button" onClick={() => { setProvider(null); setBranch(null); }} aria-label="返回模型分类">
-                <ChevronLeft size={16} /><span>{lastBranch === "gpt" ? "GPT" : "国产模型"}</span>
+                <ChevronLeft size={16} /><span>{branchTitle}</span>
               </button>
-              <div className="groupedModelRows" role={lastBranch === "gpt" ? "listbox" : undefined}>
-                {lastBranch === "gpt" ? profileOptions("gpt") : domesticModelGroups.filter(group => groupCount(group.key) > 0).map(group => (
+              {claudeNotice}
+              <div className="groupedModelRows" role={lastBranch !== "domestic" ? "listbox" : undefined}>
+                {lastBranch !== "domestic" ? profileOptions(lastBranch) : domesticModelGroups.filter(group => groupCount(group.key) > 0).map(group => (
                   <button className="groupedModelRow" type="button" key={group.key} onClick={() => selectProvider(group.key)}>
                     <span>{group.label}</span><ChevronRight size={15} />
                   </button>
@@ -632,14 +639,16 @@ function ModelGroupedSelect({
           <div className="groupedModelHeading">选择模型</div>
           <div className="groupedModelRows">
             <button className={`groupedModelRow${branch === "gpt" ? " active" : ""}`} type="button" aria-expanded={branch === "gpt"} onClick={() => selectBranch("gpt")}><span>GPT</span><ChevronRight size={15} /></button>
+            <button className={`groupedModelRow${branch === "claude" ? " active" : ""}`} type="button" aria-expanded={branch === "claude"} onClick={() => selectBranch("claude")}><span>Claude</span><ChevronRight size={15} /></button>
             <button className={`groupedModelRow${branch === "domestic" ? " active" : ""}`} type="button" aria-expanded={branch === "domestic"} onClick={() => selectBranch("domestic")}><span>国产模型</span><ChevronRight size={15} /></button>
           </div>
           <div className="groupedModelCascade groupedModelSecond" data-branch={lastBranch} data-visible={Boolean(branch)} aria-hidden={!branch} inert={!branch}>
             <button className="groupedModelBack" type="button" onClick={() => { setProvider(null); setBranch(null); }} aria-label="收起子目录">
-              <ChevronLeft size={16} /><span>{lastBranch === "gpt" ? "GPT" : "国产模型"}</span>
+              <ChevronLeft size={16} /><span>{branchTitle}</span>
             </button>
-            <div className="groupedModelRows" role={lastBranch === "gpt" ? "listbox" : undefined}>
-              {lastBranch === "gpt" ? profileOptions("gpt") : domesticModelGroups.filter((group) => groupCount(group.key) > 0).map((group) => (
+            {claudeNotice}
+              <div className="groupedModelRows" role={lastBranch !== "domestic" ? "listbox" : undefined}>
+              {lastBranch !== "domestic" ? profileOptions(lastBranch) : domesticModelGroups.filter((group) => groupCount(group.key) > 0).map((group) => (
                 <button className={`groupedModelRow${provider === group.key ? " active" : ""}`} type="button" key={group.key}
                   aria-expanded={provider === group.key} onClick={() => selectProvider(group.key)}>
                   <span>{group.label}</span><ChevronRight size={15} />
@@ -1837,7 +1846,8 @@ const fallbackModelProfiles: ModelProfile[] = [
   { id: "gpt-5.6-luna:xhigh", label: "GPT-5.6-Luna xhigh", model: "gpt-5.6-luna", effort: "xhigh" },
   { id: "gpt-5.6-luna:high", label: "GPT-5.6-Luna high", model: "gpt-5.6-luna", effort: "high" },
   { id: "gpt-5.6-luna:medium", label: "GPT-5.6-Luna medium", model: "gpt-5.6-luna", effort: "medium" },
-  { id: "gpt-5.6-luna:low", label: "GPT-5.6-Luna low", model: "gpt-5.6-luna", effort: "low" }
+  { id: "gpt-5.6-luna:low", label: "GPT-5.6-Luna low", model: "gpt-5.6-luna", effort: "low" },
+  ...claudePendingProfiles(),
 ];
 
 const defaultModelProfileId = "gpt-6.1-sol:xhigh";
@@ -7057,7 +7067,7 @@ export function App() {
       const nextProfiles = visibleProfiles.length ? visibleProfiles : fallbackModelProfiles;
       setModelProfiles(nextProfiles);
       setNewThreadModelProfileId((current) => (
-        nextProfiles.some((profile) => profile.id === current)
+        nextProfiles.some((profile) => profile.id === current && modelIsAvailable(profile))
           ? current
           : modelProfileIdFor(response.defaultModel, response.defaultReasoningEffort, nextProfiles)
       ));
@@ -7807,6 +7817,7 @@ export function App() {
     const profile = thread
       ? modelProfileById(nextProfileId, selectableModelProfiles)
       : modelProfileById(nextProfileId, modelProfiles);
+    if (!modelIsAvailable(profile)) { setError(profile.unavailableReason ?? CLAUDE_NOT_CONNECTED); return; }
     const isCatalogProfile = modelProfiles.some((item) => item.id === profile.id);
     if (!thread?.id) {
       setNewThreadModelProfileId(profile.id);
@@ -9030,6 +9041,10 @@ export function App() {
   }
 
   async function sendPrompt(mode: "queue" | "steer" = "queue", questionAnswer?: string, predictedPrompt?: string): Promise<boolean> {
+    if (!modelIsAvailable(selectedModelProfile) || isReclaudeModel(selectedModelProfile.model)) {
+      setError(selectedModelProfile.unavailableReason ?? CLAUDE_NOT_CONNECTED);
+      return false;
+    }
     const isQuestionAnswer = questionAnswer !== undefined;
     const isEditedPrompt = Boolean(editingPromptDraft);
     const promptText = (questionAnswer ?? predictedPrompt ?? prompt).trim();
@@ -12880,7 +12895,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     : `仅影响${selectedThread ? "当前会话后续轮次" : "这次新会话"}：${selectedModelProfile.model} / ${selectedModelProfile.effort}`}
                 >
                   {selectableModelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => (
-                    <option key={profile.id} value={profile.id}>
+                    <option key={profile.id} value={profile.id} disabled={!modelIsAvailable(profile)}>
                       {profile.label}
                     </option>
                   ))}

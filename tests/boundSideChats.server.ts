@@ -1,3 +1,5 @@
+import { claudePendingProfiles } from "../shared/agentRuntime.js";
+import { ClaudeStreamAdapter } from "../server/claudeStreamAdapter.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -140,7 +142,7 @@ app.post<{ Body: { threadId: string; kind: string; emit?: boolean } }>("/api/__t
     reason: "核对 lzc 分支的最新代码", cwd: root,
     ...(kind === "commandExecution" ? { command: "git fetch origin lzc" } : kind === "permissions"
       ? { permissions: { network: { enabled: true }, fileSystem: { read: ["/tmp/approval-fixture"], write: null } } }
-      : kind === "fileChange" ? { grantRoot: "/tmp/approval-fixture" } : {})
+      : kind === "fileChange" ? { grantRoot: "/tmp/approval-fixture" } : kind === "claudeTool" ? {toolName:"Bash",toolInput:{command:"git status --short"}} : {})
   } };
   bridge.pending.push(pending); bridge.flags.set(threadId, ["waitingOnApproval"]);
   if (emit) bridge.emit("serverRequest", pending);
@@ -158,7 +160,7 @@ app.get("/api/__test/state", async () => ({ fixture: "bound-side-chats", project
   calls: bridge.calls, starts:bridge.starts, resourceReads, pendingApprovals: bridge.pending, approvalResponses: bridge.approvalResponses, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
 app.get("/api/projects", async () => ({ data: [project], projectRoot: root }));
 app.get("/api/users", async () => ({ data: [{ id: "admin", name: "admin" }], defaultUserId: "admin" }));
-app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }] }));
+app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }, ...(process.env.RECLAUDE_FIXTURE_TEST === "1" ? claudePendingProfiles() : [])] }));
 app.get("/api/pets", async () => ({ pets: [], activePetId: null, visible: false, position: null }));
 app.get("/api/codex/account-pool", async () => ({ data: { strategy: "single-account", accounts: [] } }));
 app.get<{ Params: { id: string } }>("/api/projects/:id/threads", async () => ({ data: ["main-a", "main-b", "main-c"].map(id => threads.get(id)), hiddenThreadIds: [...store.sideChats.threadIds("admin", project.id)] }));
@@ -174,6 +176,26 @@ app.setNotFoundHandler(async (request, reply) => {
   if (request.url.startsWith("/api/")) return { data: [] };
   return reply.code(404).send();
 });
+// Opt-in native-message fixtures: never registered by the production server.
+if (process.env.RECLAUDE_FIXTURE_TEST === "1") {
+  let adapter: ClaudeStreamAdapter;
+  app.post("/api/__test/claude-begin", async () => {
+    const thread = threads.get("main-a")!;
+    const turn = {id: randomUUID(), status: "inProgress", items: [{id:randomUUID(),type:"userMessage",content:[{type:"text",text:"请检查示例文件并说明结果。"}]}] as any[]};
+    thread.turns.push(turn); thread.status="active";
+    adapter=new ClaudeStreamAdapter(thread.id,turn.id,event=>{
+      const params=event.params as any;
+      if (event.method==="item/completed") {
+        const index=turn.items.findIndex(item=>item.id===params.item.id);
+        if(index<0)turn.items.push(params.item);else turn.items[index]=params.item;
+      }
+      if (event.method==="turn/completed") {turn.status=params.turn.status;thread.status="idle";}
+      bridge.emit("notification",event);
+    });
+    adapter.start();return {turnId:turn.id};
+  });
+  app.post<{Body:Record<string,unknown>}>("/api/__test/claude-event",async request=>{adapter.accept(request.body);return {ok:true};});
+}
 await app.listen({ host: "127.0.0.1", port: 0 });
 console.log(JSON.stringify({ ready: true, origin: `http://127.0.0.1:${(app.server.address() as { port: number }).port}`, projectId: project.id }));
 let stopping = false;
