@@ -507,6 +507,9 @@ function runDedupedPrompt<T>(
 
 export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, store: ProjectStore, browserService?: BrowserService): WebSocketServer {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const communicationChanged = (change: { userId: string; threadIds: string[] }) => sendToUser(wss, change.userId, { type: "communication.changed", data: { threadIds: change.threadIds } });
+  store.communication.on("change", communicationChanged);
+  wss.on("close", () => store.communication.off("change", communicationChanged));
   const unsubscribeSideChats = store.sideChats.subscribe(change => sendToUser(wss, change.userId, { type: "side.chat", data: change }));
   wss.on("close", unsubscribeSideChats);
   // Canonical native rollouts retain every delta. The UI journal checkpoints

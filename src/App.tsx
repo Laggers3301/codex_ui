@@ -179,6 +179,7 @@ import { TerminalPanel } from "./TerminalPanel";
 import { BrowserPanel } from "./BrowserPanel";
 import { RightWorkspace, WorkspaceOverview, WorkspaceIcon, type WorkspaceTab, type WorkspaceSection } from "./RightWorkspace";
 import { HostResourcePanel, HostResourceProvider, HostResourceSummary } from "./HostResources";
+import { SessionCommunication } from "./SessionCommunication";
 import { normalizeGfmTableBoundaries, normalizeMathMarkdown, stripInterruptArtifacts } from "./markdown";
 import { createRevealPass, emptyRevealSnapshot, StreamRevealSpan } from "./streamReveal";
 import { rehypeLatinApostrophes } from "./proseTypography";
@@ -4672,7 +4673,7 @@ export function App() {
   const showRightWindow = useCallback((id: string) => {
     setRightWorkspaceTab(id);
     setRightWorkspaceOpen(true);
-    if (["remote", "goal", "schedules", "outputs", "sources", "feishu", "resources"].includes(id)) setRightUtilityTabs(current => current.includes(id) ? current : [...current, id]);
+    if (["remote", "goal", "schedules", "outputs", "sources", "feishu", "resources", "communication"].includes(id)) setRightUtilityTabs(current => current.includes(id) ? current : [...current, id]);
   }, []);
   const openFeishuWindow = useCallback(() => showRightWindow("feishu"), [showRightWindow]);
   const feishuPendingCount = useFeishuAttention(selectedUserId, selectedThread?.id, openFeishuWindow);
@@ -9755,6 +9756,10 @@ export function App() {
       }
       return;
     }
+    if (message.type === "communication.changed") {
+      window.dispatchEvent(new CustomEvent("codex:communication", { detail: message.data }));
+      return;
+    }
     if (message.type === "hello") {
       const data = message.data as { liveState?: LiveStateSnapshot; turnProgress?: unknown[]; turnRecoveries?: TurnRecoveryView[]; pendingServerRequests?: Array<{ id: string | number; method: string; params: Record<string, unknown> }> } | undefined;
       setTurnRecoveries(current => ({ ...Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${selectedUserId}:`))),
@@ -11473,6 +11478,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     ], more: threadSchedules.schedules.length > 4 ? { label: "查看全部定时任务", onOpen: () => showRightWindow("schedules") } : undefined },
     { title: "工作窗口", entries: [
       { id: "resources", title: "主机资源", icon: "resources", onOpen: () => showRightWindow("resources") },
+      { id: "communication", title: "会话通信", icon: "communication", onOpen: () => showRightWindow("communication"), disabled: !selectedThread },
       ...(temporaryAsk ? [{ id: "side-chat", title: "侧边聊天", icon: "chat" as const, onOpen: () => showRightWindow("side-chat") }] : []),
       { id: "remote", title: "远程文件", icon: "remote", onOpen: () => showRightWindow("remote") },
       { id: "browser", title: "浏览器", icon: "browser", onOpen: () => launchWorkspaceAction("browser"), disabled: !selectedProject },
@@ -11512,9 +11518,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390);
   }, content: <TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={false} onClose={() => { setTerminalVisible(false); terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390); }} /> });
   for (const id of rightUtilityTabs) {
-    const title = ({ remote: "远程文件", goal: "持续目标", schedules: "定时任务", outputs: "输出内容", sources: "来源", feishu: "飞书办公", resources: "主机资源" })[id] ?? id;
-    rightTabs.push({ id, title, icon: id as "remote" | "goal" | "schedules" | "outputs" | "sources" | "feishu" | "resources", attention: id === "feishu" && feishuPendingCount > 0, onClose: () => closeUtilityWindow(id), content:
+    const title = ({ remote: "远程文件", goal: "持续目标", schedules: "定时任务", outputs: "输出内容", sources: "来源", feishu: "飞书办公", resources: "主机资源", communication: "会话通信" })[id] ?? id;
+    rightTabs.push({ id, title, icon: id as "remote" | "goal" | "schedules" | "outputs" | "sources" | "feishu" | "resources" | "communication", attention: id === "feishu" && feishuPendingCount > 0, onClose: () => closeUtilityWindow(id), content:
       id === "resources" ? <HostResourcePanel /> :
+      id === "communication" ? <SessionCommunication key={`${selectedUserId}:${selectedThread?.id}`} userId={selectedUserId} threadId={selectedThread?.id} threadName={selectedThread?.name ?? selectedThread?.preview} visible={rightWorkspaceOpen && rightWorkspaceTab === "communication"} /> :
       id === "feishu" ? <FeishuOffice userId={selectedUserId} threadId={selectedThread?.id} inline visible={rightWorkspaceOpen && rightWorkspaceTab === "feishu"} onClose={() => setRightWorkspaceOpen(false)} /> :
       id === "remote" ? <RemoteFolderSidebar key={`remote-folders-${selectedUserId}-${selectedThread?.id ?? openingThreadId ?? remoteDraftId}`} userId={selectedUserId} threadId={selectedThread?.id ?? openingThreadId ?? remoteDraftId} isDraft={!selectedThread && !openingThreadId} visible={rightWorkspaceOpen && rightWorkspaceTab === "remote"} onClose={() => setRightWorkspaceOpen(false)}
         onBusyChange={busy => { const scope = selectedThread?.id ?? openingThreadId ?? remoteDraftId; if (busy) remoteConnectionsInProgress.current.add(scope); else remoteConnectionsInProgress.current.delete(scope); }}

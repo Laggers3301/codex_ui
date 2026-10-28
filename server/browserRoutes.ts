@@ -109,6 +109,10 @@ export function mintBrowserMcpConfig(userId: string, projectId: string, threadId
       url: `http://127.0.0.1:${serverConfig.port}/api/schedules/mcp`,
       http_headers: { "x-codex-browser-token": token },
       startup_timeout_sec: 10, tool_timeout_sec: 30, enabled: true
+    }, "mcp_servers.codex_communication": {
+      url: `http://127.0.0.1:${serverConfig.port}/api/communication/mcp`,
+      http_headers: { "x-codex-browser-token": token },
+      startup_timeout_sec: 10, tool_timeout_sec: 15, enabled: true
     }, "mcp_servers.codex_feishu": {
       url: `http://127.0.0.1:${serverConfig.port}/api/feishu/mcp`,
       http_headers: { "x-codex-browser-token": token },

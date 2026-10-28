@@ -37,6 +37,12 @@ const defaultUserId = "admin";
 export function readHostResources(signal: AbortSignal): Promise<{ data: import("../shared/hostResources").HostResources }> {
   return request("/api/system/resources", { signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]) });
 }
+export function readCommunication(threadId: string, signal?: AbortSignal): Promise<{ data: import("../shared/sessionCommunication").CommunicationSnapshot }> {
+  return request(`/api/threads/${encodeURIComponent(threadId)}/communication`, { signal });
+}
+export function sendCommunication(threadId: string, command: import("../shared/sessionCommunication").CommunicationCommand): Promise<{ data: Record<string, unknown> }> {
+  return request(`/api/threads/${encodeURIComponent(threadId)}/communication`, { method: "POST", body: JSON.stringify(command), signal: AbortSignal.timeout(15000) });
+}
 export const THREAD_READ_MAX_LIMIT = 240;
 
 let currentUserId = localStorage.getItem("codex-web-user-id") || defaultUserId;

@@ -7,6 +7,7 @@ import { defaults, serverConfig } from "./config.js";
 import type { CreateProjectInput, LocalSendSettings, Project, ReasoningEffort, UpdateLocalSendSettingsInput, UpdateProjectInput, UserProfile } from "./types.js";
 import type { TurnRecoveryState } from "./turnRetry.js";
 import { SideChatStore } from "./sideChats.js";
+import { SessionCommunicationStore } from "./sessionCommunication.js";
 
 export const ADMIN_USER_ID = "admin";
 export const DEFAULT_USER_ID = ADMIN_USER_ID;
@@ -239,6 +240,7 @@ function toUnusedThread(row: UnusedThreadRow): UnusedThread {
 export class ProjectStore {
   private readonly db: DatabaseSync;
   readonly sideChats: SideChatStore;
+  readonly communication: SessionCommunicationStore;
 
   constructor(dbPath = path.join(serverConfig.dataDir, "codex-web.sqlite")) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -273,6 +275,7 @@ export class ProjectStore {
       answer_json TEXT NOT NULL, PRIMARY KEY(thread_id, item_id)
     )`);
     this.sideChats = new SideChatStore(this.db, this);
+    this.communication = new SessionCommunicationStore(this.db, this);
   }
 
   getQuestionAnswer(threadId: string, itemId: string, userId: string): unknown | null {

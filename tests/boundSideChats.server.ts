@@ -12,8 +12,8 @@ process.env.CODEX_WEB_ACCOUNT_POOL_FILE = "";
 // The public repository is flat; the production host keeps frontend/backend
 // separately. Both layouts must run this isolated fixture without live APIs.
 const serverRoot = new URL(fs.existsSync(new URL('../server/db.ts', import.meta.url)) ? '../server/' : '../../backend/server/', import.meta.url);
-const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, auth, { registerHostResourceRoutes }] = await Promise.all(
-  ['db', 'sideChatRoutes', 'socket', 'auth', 'hostResources'].map(name => import(new URL(name + '.js', serverRoot).href))
+const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, auth, { registerHostResourceRoutes }, { registerSessionCommunicationRoutes }] = await Promise.all(
+  ['db', 'sideChatRoutes', 'socket', 'auth', 'hostResources', 'sessionCommunicationRoutes'].map(name => import(new URL(name + '.js', serverRoot).href))
 );
 const store = new ProjectStore(path.join(root, "store.sqlite"));
 const project = store.createProject({ name: "侧边绑定验收", rootPath: root, defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "high" });
@@ -21,6 +21,7 @@ type Thread = { id: string; name: string; cwd: string; status: string; historyMo
 const threads = new Map<string, Thread>();
 for (const [id, name, quote] of [["main-a", "主会话 A", "第一段正文用于主会话 A 的侧边提问。"], ["main-b", "主会话 B", "第二段正文用于主会话 B 的侧边提问。"], ["main-c", "主会话 C", "这个主会话还没有侧边会话。"]]) {
   store.registerThreadOwner({ threadId: id, userId: "admin", projectId: project.id, rootPath: root });
+  store.updateThreadDisplayName(id, "admin", name);
   threads.set(id, { id, name, cwd: root, status: "idle", historyMode: "paginated", createdAt: 1, updatedAt: 1, turns: [{ id: id + "-turn", status: "completed", items: [{ id: id + "-answer", type: "agentMessage", text: quote }] }] });
 }
 
@@ -97,6 +98,7 @@ registerHostResourceRoutes(app, { read: async () => {
     volumes: [{ labels: ["系统", "数据目录", "工作目录"], totalBytes: 100 * 1024 ** 3, usedBytes: 40 * 1024 ** 3, availableBytes: 60 * 1024 ** 3, usagePercent: 40 }],
     disks: [{ name: "vda", readBytesPerSecond: 2 * 1024 ** 2, writeBytesPerSecond: 1024 ** 2, busyPercent: 30 }], warnings: [] };
 } } as any);
+registerSessionCommunicationRoutes(app, store);
 app.post<{ Body: { fail: boolean } }>("/api/__test/resource-mode", async request => { resourceFailure = request.body.fail; return { ok: true }; });
 const wss = attachSocketServer(app.server, bridge as any, store);
 app.post("/api/auth/login", async (_request, reply) => { reply.header("Set-Cookie", auth.createSessionCookie("admin")); return { ok: true }; });
