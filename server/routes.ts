@@ -715,7 +715,8 @@ export function sanitizeMcpServerStatus(result: unknown) {
         pluginId: typeof server.pluginId === "string" ? server.pluginId.slice(0, 128) : null,
         runtimeStatus: typeof server.runtimeStatus === "string" ? server.runtimeStatus : null,
         authStatus: typeof server.authStatus === "string" ? server.authStatus : "unknown",
-        toolCount: Object.keys(asRecord(server.tools)).length
+        toolCount: Object.keys(asRecord(server.tools)).length,
+        toolNames: Object.keys(asRecord(server.tools)).slice(0, 100).map(name => name.slice(0, 256))
       };
     }),
     nextCursor: typeof root.nextCursor === "string" ? root.nextCursor : null,

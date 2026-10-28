@@ -11536,7 +11536,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     const title = ({ remote: "远程文件", goal: "持续目标", schedules: "定时任务", outputs: "输出内容", sources: "来源", feishu: "飞书办公", resources: "主机资源", communication: "会话通信" })[id] ?? id;
     rightTabs.push({ id, title, icon: id as "remote" | "goal" | "schedules" | "outputs" | "sources" | "feishu" | "resources" | "communication", attention: id === "feishu" && feishuPendingCount > 0, onClose: () => closeUtilityWindow(id), content:
       id === "resources" ? <HostResourcePanel /> :
-      id === "communication" ? <SessionCommunication key={`${selectedUserId}:${selectedThread?.id}`} userId={selectedUserId} threadId={selectedThread?.id} threadName={selectedThread?.name ?? selectedThread?.preview} visible={rightWorkspaceOpen && rightWorkspaceTab === "communication"} /> :
+      id === "communication" ? <SessionCommunication key={`${selectedUserId}:${selectedThread?.id}`}
+        userId={selectedUserId} projectId={selectedProject?.id} threadId={selectedThread?.id}
+        threadName={selectedThread?.name ?? selectedThread?.preview}
+        sideChat={temporaryAsk && temporaryAsk.parentThreadId === selectedThread?.id
+          ? { threadId: temporaryAsk.threadId ?? undefined, name: `${selectedThread?.name || "当前主会话"}的侧边会话` } : undefined}
+        visible={rightWorkspaceOpen && rightWorkspaceTab === "communication"} /> :
       id === "feishu" ? <FeishuOffice userId={selectedUserId} threadId={selectedThread?.id} inline visible={rightWorkspaceOpen && rightWorkspaceTab === "feishu"} onClose={() => setRightWorkspaceOpen(false)} /> :
       id === "remote" ? <RemoteFolderSidebar key={`remote-folders-${selectedUserId}-${selectedThread?.id ?? openingThreadId ?? remoteDraftId}`} userId={selectedUserId} threadId={selectedThread?.id ?? openingThreadId ?? remoteDraftId} isDraft={!selectedThread && !openingThreadId} visible={rightWorkspaceOpen && rightWorkspaceTab === "remote"} onClose={() => setRightWorkspaceOpen(false)}
         onBusyChange={busy => { const scope = selectedThread?.id ?? openingThreadId ?? remoteDraftId; if (busy) remoteConnectionsInProgress.current.add(scope); else remoteConnectionsInProgress.current.delete(scope); }}

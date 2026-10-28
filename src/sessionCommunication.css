@@ -7,7 +7,10 @@
 .communicationPanel button:disabled { opacity: .45; cursor: default; }
 .communicationPanel [role="tab"][aria-selected="true"],.communicationPanel .communicationSend { color: var(--ui-surface); background: var(--ui-contrast); }
 .communicationPanel label { display: grid; gap: 6px; margin: 10px 0; }
-.communicationPanel input,.communicationPanel textarea { width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--ui-divider); border-radius: 8px; background: var(--ui-surface-raised); color: var(--ui-content); box-sizing: border-box; font: inherit; }
+.communicationPanel input,.communicationPanel textarea,.communicationPanel select { width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--ui-divider); border-radius: 8px; background: var(--ui-surface-raised); color: var(--ui-content); box-sizing: border-box; font: inherit; }
+.communicationThreadHeader { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.communicationToolStatus { padding: 8px; border: 1px solid var(--ui-divider); border-radius: 8px; }
+.communicationToolStatus pre { max-height: 140px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
 .communicationPanel textarea { min-height: 82px; resize: vertical; line-height: 1.6; }
 .communicationDirectory { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; max-height: 120px; overflow-y: auto; }
 .communicationDirectory button { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

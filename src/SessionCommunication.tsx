@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { readCommunication, sendCommunication } from "./api";
+import { readCommunication, readThreadMcpStatus, sendCommunication } from "./api";
 import { communicationStateLabels, type CommunicationCommand, type CommunicationKind, type CommunicationMessage, type CommunicationOperation, type CommunicationSnapshot } from "../shared/sessionCommunication";
 import "./sessionCommunication.css";
 
@@ -10,7 +10,50 @@ const normalizedName = (value: string) => "/" + value.trim().replace(/^\/+|\/+$/
 function stored<T>(key: string, fallback: T): T { try { return JSON.parse(sessionStorage.getItem(key) ?? "null") ?? fallback; } catch { return fallback; } }
 function save(key: string, value: unknown) { try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* A full browser store must not block reading the inbox. */ } }
 
-export function SessionCommunication({ userId, threadId, threadName, visible }: { userId: string; threadId?: string; threadName?: string; visible: boolean }) {
+type CommunicationProps = { userId: string; projectId?: string; threadId?: string; threadName?: string; visible: boolean };
+
+export function SessionCommunication({ sideChat, ...props }: CommunicationProps & { sideChat?: { threadId?: string; name: string } }) {
+  const [target, setTarget] = useState<"main" | "side">("main");
+  useEffect(() => { if (!sideChat?.threadId) setTarget("main"); }, [sideChat?.threadId]);
+  const useSide = target === "side" && Boolean(sideChat?.threadId);
+  const threadId = useSide ? sideChat?.threadId : props.threadId;
+  const threadName = useSide ? sideChat?.name : props.threadName;
+  return <section className="communicationPanel" aria-label="会话通信">
+    <header><h2>会话通信</h2></header>
+    <label>通信身份<select aria-label="通信身份" value={useSide ? "side" : "main"} onChange={event => setTarget(event.target.value as "main" | "side")}>
+      <option value="main">主会话 · {props.threadName || props.threadId || "尚未打开"}</option>
+      <option value="side" disabled={!sideChat?.threadId}>{sideChat?.threadId ? `侧边会话 · ${sideChat.name}` : sideChat ? "侧边会话（首次发送后可用）" : "侧边会话（尚未创建）"}</option>
+    </select></label>
+    <ThreadCommunication key={`${props.userId}:${threadId ?? ""}`} {...props} threadId={threadId} threadName={threadName} />
+  </section>;
+}
+
+function CommunicationToolStatus({ projectId, threadId, visible }: { projectId?: string; threadId: string; visible: boolean }) {
+  const [attempt, setAttempt] = useState(0);
+  const [status, setStatus] = useState<"checking" | "ready" | "missing" | "error">("checking");
+  const [error, setError] = useState("");
+  useEffect(() => {
+    if (!visible || !projectId) return;
+    const controller = new AbortController();
+    setStatus("checking"); setError("");
+    void readThreadMcpStatus(projectId, threadId, AbortSignal.any([controller.signal, AbortSignal.timeout(32_000)]))
+      .then(result => {
+        if (controller.signal.aborted) return;
+        const server = result.data.find(server => server.name === "codex_communication");
+        setStatus(server?.toolNames?.some(name => name === "session_communication" || name.endsWith("__session_communication")) ? "ready" : "missing");
+      })
+      .catch(caught => { if (!controller.signal.aborted) { setStatus("error"); setError(caught instanceof Error ? caught.message : String(caught)); } });
+    return () => controller.abort();
+  }, [projectId, threadId, visible, attempt]);
+  return <div className="communicationToolStatus" aria-label="模型通信工具状态">
+    <p role="status">模型通信工具：{!projectId ? "等待工作区加载…" : status === "ready" ? "已注册 session_communication" : status === "checking" ? "检查中…" : status === "missing" ? "本轮尚未检测到" : "暂时无法确认"}</p>
+    {status === "missing" || status === "error" ? <p>会话尚未加载时可能无法查询。下次发送消息后可重新检查。</p> : null}
+    {error ? <details><summary>查看工具状态错误</summary><pre>{error}</pre></details> : null}
+    <button type="button" disabled={!projectId || status === "checking"} onClick={() => setAttempt(value => value + 1)}>检查工具</button>
+  </div>;
+}
+
+function ThreadCommunication({ userId, projectId, threadId, threadName, visible }: CommunicationProps) {
   const scope = `${userId}:${threadId ?? ""}`;
   const draftKey = `communication-draft:${scope}`;
   const [mode, setMode] = useState<CommunicationKind>("topic");
@@ -103,10 +146,11 @@ export function SessionCommunication({ userId, threadId, threadName, visible }: 
       <details className="communicationIdentifier"><summary>消息编号</summary><code>{message.id}</code></details>
     </article>;
   }
-  return <section className="communicationPanel" aria-label="会话通信">
-    <header><h2>会话通信</h2><button type="button" onClick={() => refreshRef.current()} disabled={!threadId}>刷新</button></header>
+  return <>
+    <div className="communicationThreadHeader"><p>当前会话：{threadName || threadId || "尚未打开"}</p><button type="button" onClick={() => refreshRef.current()} disabled={!threadId}>刷新</button></div>
     {!threadId ? <p>请先打开一个会话，再订阅话题或注册服务。</p> : <>
-      <p>当前会话：{threadName || threadId}</p><p>模型可使用 session_communication 工具读取收件箱和回复。空闲会话的消息会保留到下次运行读取。</p>
+      <CommunicationToolStatus projectId={projectId} threadId={threadId} visible={visible} />
+      <p>模型通过 session_communication 工具主动读取和回复。Topic 仅投递给明确订阅的会话，消息正文不会自动注入提示词；空闲会话不会自动运行。</p>
       <div role="tablist" aria-label="通信方式">{(["topic", "service", "action"] as const).map(kind => <button role="tab" aria-selected={mode === kind} key={kind} type="button" onClick={() => { setMode(kind); setNotice(""); }}>{labels[kind]}</button>)}</div>
       <div role="tabpanel" aria-label={labels[mode]}><p>{descriptions[mode]}</p>
         <label>{mode === "topic" ? "话题名称" : mode === "service" ? "服务名称" : "任务名称"}<input value={draft.name} maxLength={120} onChange={event => setDraft(current => ({ ...current, name: event.target.value }))} /></label>
@@ -123,5 +167,5 @@ export function SessionCommunication({ userId, threadId, threadName, visible }: 
       {!data?.outbox.some(message => message.kind === mode) ? <p>暂无此类记录。</p> : null}
       <p>展示近期通信记录，单条消息最多 16,000 字符，任务保留最近 50 条进度反馈。</p>
     </>}
-  </section>;
+  </>;
 }

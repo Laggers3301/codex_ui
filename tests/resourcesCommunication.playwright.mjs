@@ -93,13 +93,13 @@ try {
     await page.locator(".rightWorkspaceHome").click();
     await page.locator(".rightWorkspaceOverview").getByRole("button", { name: "会话通信", exact: true }).click();
     const panel = page.getByRole("region", { name: "会话通信", exact: true });
-    await expect(panel.getByRole("button", { name: /^(订阅话题|取消订阅)$/ })).toBeEnabled(); return panel;
+    await expect(panel.getByRole("button", { name: /^(订阅话题|取消订阅|注册服务提供者|注册任务提供者|注销提供者)$/ })).toBeEnabled(); return panel;
   };
   const b = await create("main-b"), panelA = await openCommunication(a);
   let panelB = await openCommunication(b);
   await panelB.getByLabel("话题名称", { exact: true }).fill("/status"); await panelB.getByRole("button", { name: "订阅话题", exact: true }).click();
   await expect(panelB.getByRole("button", { name: "取消订阅", exact: true })).toBeVisible();
-  await panelA.getByLabel("话题名称", { exact: true }).fill("/status"); await panelA.getByLabel("广播内容", { exact: true }).fill("状态消息 42"); await panelA.getByRole("button", { name: "发布消息", exact: true }).click();
+  await panelA.getByLabel("话题名称", { exact: true }).fill("/status"); await panelA.getByRole("textbox", { name: "广播内容", exact: true }).fill("状态消息 42"); await panelA.getByRole("button", { name: "发布消息", exact: true }).click();
   await expect(panelB.locator(".communicationMessage")).toContainText("状态消息 42");
   await panelB.getByRole("button", { name: "标记已读", exact: true }).click(); await expect(panelB).toContainText("收件箱 · 0 未读");
   await b.reload({ waitUntil: "domcontentloaded" }); await b.locator('[data-thread-id="main-b"] .threadSelectButton').click(); panelB = await openCommunication(b);
@@ -132,9 +132,95 @@ try {
   await a.setViewportSize({ width: 393, height: 852 }); await a.evaluate(() => document.documentElement.dataset.theme = "light");
   assert.ok(await panelA.evaluate(element => element.scrollWidth <= element.clientWidth + 1));
   await a.screenshot({ path: `${evidence}/communication-phone-light.png` });
-  const finalState = await state(); assert.equal(finalState.starts.length, 0, "communication never launches a model turn or a process"); assert.deepEqual(errors, []);
-  const report = { isolatedDatabase: true, realRestAndWebsocket: true, resourceSamplingAboutTwoSeconds: intervals, hiddenPageStopsPolling: true, resourceRefreshPreservesCaret: true, failuresPreserveLastResourceData: true, mountPathsOnHover: true, pingInSameRow: true, manualPingOnly: true, pingLatencyAndFailureOutput: true, pingOutputRemainsSelectable: true, topicDeliveryAndReload: true, concurrentServicesRemainIndependent: true, serviceErrorsCorrelated: true, actionFeedbackAndCancelAck: true, phoneNoHorizontalOverflow: true, noModelTurnsCreated: true, errors };
+  assert.equal((await state()).starts.length, 0, "communication never launches a model turn or a process");
+  await a.setViewportSize({ width: 1600, height: 1000 });
+  await expect(panelA.getByRole("option", { name: "侧边会话（尚未创建）", exact: true })).toHaveAttribute("disabled", "");
+  await expect(panelA.getByLabel("模型通信工具状态", { exact: true })).toContainText("本轮尚未检测到");
+  // Load the main/side tools through the real socket resume/fork paths. Only
+  // the independent fixture's model execution is simulated.
+  await editor.fill("注册主会话通信工具"); await editor.press("Enter");
+  await expect.poll(async () => (await state()).starts.length).toBe(1);
+  await context.request.post(origin + "/api/__test/complete", { data: { threadId: "main-a" } });
+  await panelA.getByRole("button", { name: "检查工具", exact: true }).click();
+  await expect(panelA.getByLabel("模型通信工具状态", { exact: true })).toContainText("已注册 session_communication");
+  const quote = "第一段正文用于主会话 A 的侧边提问。";
+  await a.locator("#conversation-messages").getByText(quote, { exact: true }).evaluate(element => {
+    const range = document.createRange(); range.selectNodeContents(element);
+    const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range); document.dispatchEvent(new Event("selectionchange"));
+  });
+  await a.getByRole("button", { name: "在侧边提问", exact: true }).click();
+  await openCommunication(a);
+  await expect(panelA.getByRole("option", { name: "侧边会话（首次发送后可用）", exact: true })).toHaveAttribute("disabled", "");
+  await a.getByRole("tab", { name: "侧边聊天", exact: true }).click();
+  const sidePanel = a.getByRole("complementary", { name: "临时侧边对话", exact: true });
+  const sideEditor = sidePanel.locator('[contenteditable="true"]');
+  await sideEditor.fill("为通信测试创建侧边会话"); await sideEditor.press("Enter");
+  await expect.poll(async () => (await state()).sides.find(side => side?.parentThreadId === "main-a")?.threadId).toBeTruthy();
+  const side = (await state()).sides.find(side => side?.parentThreadId === "main-a");
+  await context.request.post(origin + "/api/__test/complete", { data: { threadId: side.threadId } });
+  await openCommunication(a);
+  await panelA.getByRole("tab", { name: "Topic 话题", exact: true }).click();
+  await panelA.getByLabel("话题名称", { exact: true }).fill("/main-draft");
+  await panelA.getByRole("textbox", { name: "广播内容", exact: true }).fill("主会话独立草稿");
+  await panelA.getByLabel("通信身份", { exact: true }).selectOption("side");
+  await expect(panelA.getByLabel("话题名称", { exact: true })).toHaveValue("/updates");
+  await expect(panelA.getByLabel("模型通信工具状态", { exact: true })).toContainText("已注册 session_communication");
+  const modelCall = async (threadId, command) => {
+    const response = await context.request.post(origin + "/api/__test/model-communication", { data: { threadId, command } });
+    assert.equal(response.status(), 200); const rpc = await response.json();
+    assert.equal(rpc.result?.isError, false, JSON.stringify(rpc.error ?? rpc.result));
+    return JSON.parse(rpc.result.content[0].text);
+  };
+  assert.equal((await modelCall(side.threadId, { operation: "read" })).threadId, side.threadId, "a fork's tool credential resolves to the side identity");
+  assert.equal((await modelCall("main-a", { operation: "read" })).threadId, "main-a");
+  await modelCall(side.threadId, { operation: "topic.subscribe", name: "/main-side", requestId: "side-model-subscribe" });
+  await modelCall("main-a", { operation: "topic.publish", name: "/main-side", message: "主会话通过工具发送到侧边", requestId: "main-model-publish" });
+  await expect(panelA.locator(".communicationMessage")).toContainText("主会话通过工具发送到侧边");
+  assert.ok((await modelCall(side.threadId, { operation: "read" })).inbox.some(message => message.message === "主会话通过工具发送到侧边"));
+  assert.ok(!(await modelCall("main-a", { operation: "read" })).inbox.some(message => message.message === "主会话通过工具发送到侧边"), "an unsubscribed main thread never receives its side's topic inbox");
+  await modelCall(side.threadId, { operation: "service.advertise", name: "/main-side-service", requestId: "side-model-advertise" });
+  const request = await modelCall("main-a", { operation: "service.call", name: "/main-side-service", message: "请侧边核对结果", timeoutSeconds: 120, requestId: "main-model-service-call" });
+  await modelCall(side.threadId, { operation: "service.respond", id: request.id, result: "侧边通过工具返回核对结果", success: true, requestId: "side-model-service-response" });
+  assert.equal((await modelCall("main-a", { operation: "get", id: request.id })).result, "侧边通过工具返回核对结果");
+  await panelA.getByRole("textbox", { name: "广播内容", exact: true }).fill("侧边独立草稿");
+  await panelA.getByLabel("通信身份", { exact: true }).selectOption("main");
+  await expect(panelA.getByLabel("话题名称", { exact: true })).toHaveValue("/main-draft");
+  await expect(panelA.getByRole("textbox", { name: "广播内容", exact: true })).toHaveValue("主会话独立草稿");
+  await panelA.getByLabel("通信身份", { exact: true }).selectOption("side");
+  await expect(panelA.getByRole("textbox", { name: "广播内容", exact: true })).toHaveValue("侧边独立草稿");
+  const statusPath = `**/api/projects/${meta.projectId}/threads/${side.threadId}/mcp-status`;
+  await a.route(statusPath, route => route.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "thread not found: fixture-unloaded" }) }));
+  await panelA.getByRole("button", { name: "检查工具", exact: true }).click();
+  await expect(panelA.getByLabel("模型通信工具状态", { exact: true })).toContainText("暂时无法确认");
+  await panelA.getByText("查看工具状态错误", { exact: true }).click();
+  await expect(panelA).toContainText("thread not found: fixture-unloaded");
+  await expect(panelA.locator(".communicationMessage")).toContainText("主会话通过工具发送到侧边");
+  await a.unroute(statusPath); await panelA.getByRole("button", { name: "检查工具", exact: true }).click();
+  await expect(panelA.getByLabel("模型通信工具状态", { exact: true })).toContainText("已注册 session_communication");
+  const statusChecks = (await state()).calls.filter(call => call.method === "mcpServerStatus/list").length;
+  await a.waitForTimeout(5500);
+  assert.equal((await state()).calls.filter(call => call.method === "mcpServerStatus/list").length, statusChecks, "inbox polling never repeatedly queries native tool status");
+  await a.screenshot({ path: `${evidence}/communication-main-side.png` });
+  await a.setViewportSize({ width: 393, height: 852 });
+  assert.ok(await panelA.evaluate(element => element.scrollWidth <= element.clientWidth + 1));
+  await a.setViewportSize({ width: 1600, height: 1000 });
+  await a.locator('[data-thread-id="main-b"] .threadSelectButton').click(); await openCommunication(a);
+  await expect(panelA.getByLabel("通信身份", { exact: true })).toHaveValue("main");
+  await expect(panelA.getByRole("option", { name: "侧边会话（尚未创建）", exact: true })).toHaveAttribute("disabled", "");
+  await a.locator('[data-thread-id="main-a"] .threadSelectButton').click();
+  await expect(a.getByRole("tab", { name: "侧边聊天", exact: true })).toHaveAttribute("aria-selected", "true");
+  await openCommunication(a); await panelA.getByLabel("通信身份", { exact: true }).selectOption("side");
+  await expect(panelA.getByRole("textbox", { name: "广播内容", exact: true })).toHaveValue("侧边独立草稿");
+  await expect(panelA.locator(".communicationMessage")).toContainText("主会话通过工具发送到侧边");
+  const finalState = await state(); assert.equal(finalState.starts.length, 2, "only the two explicit simulated user messages start turns"); assert.deepEqual(errors, []);
+  const report = { isolatedDatabase: true, realRestAndWebsocket: true, resourceSamplingAboutTwoSeconds: intervals, hiddenPageStopsPolling: true, resourceRefreshPreservesCaret: true, failuresPreserveLastResourceData: true, mountPathsOnHover: true, pingInSameRow: true, manualPingOnly: true, pingLatencyAndFailureOutput: true, pingOutputRemainsSelectable: true, topicDeliveryAndReload: true, concurrentServicesRemainIndependent: true, serviceErrorsCorrelated: true, actionFeedbackAndCancelAck: true, mainSideIdentityAndDraftIsolation: true, realMcpWithSocketResumeAndForkCredentials: true, mainSideTopicAndServiceToolCalls: true, unsubscribedMainReceivesNoTopic: true, toolStatusFailureKeepsInbox: true, toolStatusNotPolled: true, phoneNoHorizontalOverflow: true, communicationNeverStartsModelTurns: true, simulatedUserTurns: 2, errors };
   await fs.writeFile(`${evidence}/results.json`, JSON.stringify(report, null, 2) + "\n"); console.log(JSON.stringify(report, null, 2));
+} catch (error) {
+  for (const [index, page] of (browser?.contexts().flatMap(context => context.pages()) ?? []).entries()) {
+    await page.screenshot({ path: `${evidence}/failure-${index}.png` }).catch(() => {});
+    await fs.writeFile(`${evidence}/failure-${index}.html`, await page.content()).catch(() => {});
+  }
+  throw error;
 } finally {
   await browser?.close();
   for (const child of children.reverse()) { if (child.exitCode !== null) continue; const closed = new Promise(resolve => child.once("exit", resolve)); child.kill("SIGTERM"); await closed; }

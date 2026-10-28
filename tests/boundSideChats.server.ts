@@ -11,11 +11,12 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "bound-side-chat-browser-"));
 process.env.CODEX_WEB_DATA_DIR = path.join(root, "data");
 process.env.CODEX_THREAD_INDEX_DB = path.join(root, "index.sqlite");
 process.env.CODEX_WEB_ACCOUNT_POOL_FILE = "";
+process.env.CODEX_WEB_PORT = "0";
 // The public repository is flat; the production host keeps frontend/backend
 // separately. Both layouts must run this isolated fixture without live APIs.
 const serverRoot = new URL(fs.existsSync(new URL('../server/db.ts', import.meta.url)) ? '../server/' : '../../backend/server/', import.meta.url);
-const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, auth, { registerHostResourceRoutes }, { registerSessionCommunicationRoutes }] = await Promise.all(
-  ['db', 'sideChatRoutes', 'socket', 'auth', 'hostResources', 'sessionCommunicationRoutes'].map(name => import(new URL(name + '.js', serverRoot).href))
+const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, auth, { registerHostResourceRoutes }, { registerSessionCommunicationRoutes }, { registerBrowserRoutes }, { sanitizeMcpServerStatus }, { serverConfig }] = await Promise.all(
+  ['db', 'sideChatRoutes', 'socket', 'auth', 'hostResources', 'sessionCommunicationRoutes', 'browserRoutes', 'routes', 'config'].map(name => import(new URL(name + '.js', serverRoot).href))
 );
 const store = new ProjectStore(path.join(root, "store.sqlite"));
 const project = store.createProject({ name: "侧边绑定验收", rootPath: root, defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "high" });
@@ -30,6 +31,7 @@ for (const [id, name, quote] of [["main-a", "主会话 A", "第一段正文用�
 class FixtureBridge extends EventEmitter {
   calls: Array<{ method: string; threadId?: string }> = [];
   starts: Array<{ threadId: string; text: string }> = [];
+  mcpConfigs = new Map<string, Record<string, any>>();
   creationGate: Promise<void> | null = null;
   releaseCreation: (() => void) | null = null;
   failNextTurn = false;
@@ -52,12 +54,23 @@ class FixtureBridge extends EventEmitter {
       await this.creationGate;
       const inherited = method === "thread/fork" ? structuredClone(threads.get(params.threadId)!.turns) : [];
       const thread = { id: randomUUID(), name: "侧边聊天", cwd: root, status: "idle", historyMode: "paginated", createdAt: 1, updatedAt: 1, turns: inherited };
+      this.mcpConfigs.set(thread.id, structuredClone(params.config ?? {}));
       threads.set(thread.id, thread); return { thread };
     }
     const thread = threads.get(params.threadId);
     if (method === "thread/name/set" && thread) thread.name = params.name;
     if (method === "thread/read") return { thread: thread ? { ...thread, status: { type: thread.status, activeFlags: this.flags.get(thread.id) ?? [] }, turns: params.includeTurns === false ? [] : thread.turns } : thread };
-    if (method === "thread/resume") return { thread };
+    if (method === "thread/resume") {
+      if (params.config) this.mcpConfigs.set(params.threadId, structuredClone(params.config));
+      return { thread };
+    }
+    if (method === "mcpServerStatus/list") {
+      const config = this.mcpConfigs.get(params.threadId)?.["mcp_servers.codex_communication"];
+      if (!config) return { data: [] };
+      const result = await callFixtureMcp(config, { jsonrpc: "2.0", id: 1, method: "tools/list" });
+      if (result.error) throw new Error("fixture MCP identity unavailable");
+      return { data: [{ name: "codex_communication", runtimeStatus: "connected", tools: Object.fromEntries(result.result.tools.map((tool: any) => [tool.name, tool])) }] };
+    }
     if (method === "thread/queue/list") return { data: [] };
     if (method === "thread/turns/list") return { data: thread?.turns.slice(-1).map(({id,status}) => ({id,status})) ?? [] };
     if (method === "turn/start" && thread) {
@@ -89,6 +102,16 @@ class FixtureBridge extends EventEmitter {
   }
 }
 const bridge = new FixtureBridge(), app = Fastify();
+async function callFixtureMcp(config: Record<string, any>, payload: unknown) {
+  const expected = `http://127.0.0.1:${(app.server.address() as { port: number }).port}/api/communication/mcp`;
+  if (config.url !== expected) throw new Error("MCP must use the isolated fixture server");
+  const response = await fetch(config.url, { method: "POST", headers: { ...config.http_headers, "Content-Type": "application/json" },
+    body: JSON.stringify(payload), signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw new Error("fixture MCP transport failed: " + response.status);
+  return response.json();
+}
+const browserService = Object.assign(new EventEmitter(), { get: () => null });
+registerBrowserRoutes(app, store, browserService as any);
 const user = (request: { headers: Record<string, unknown> }) => auth.authenticatedUserFromHeaders(request.headers as any) ?? "anonymous";
 registerSideChatRoutes(app, bridge as any, store, user);
 let resourceReads = 0, resourceFailure = false, networkProbes = 0, networkFailure = false, networkHold = false;
@@ -114,7 +137,18 @@ app.post<{ Body: { fail?: boolean; hold?: boolean } }>("/api/__test/network-mode
   if (request.body.hold !== undefined) networkHold = request.body.hold;
   if (!networkHold) { releaseNetwork?.(); releaseNetwork = null; } return { ok: true };
 });
-const wss = attachSocketServer(app.server, bridge as any, store);
+const wss = attachSocketServer(app.server, bridge as any, store, browserService as any);
+app.get<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/mcp-status", async (request, reply) => {
+  if (request.params.id !== project.id || !store.userCanAccessThread(request.params.threadId, user(request), project.id)) return reply.code(404).send({ error: "Thread not found." });
+  return sanitizeMcpServerStatus(await bridge.request("mcpServerStatus/list", { threadId: request.params.threadId }));
+});
+// Exercise the actual credentials passed through socket start/resume/fork;
+// this adapter never invokes a model or exposes its private MCP headers.
+app.post<{ Body: { threadId: string; command: unknown } }>("/api/__test/model-communication", async (request, reply) => {
+  const config = bridge.mcpConfigs.get(request.body.threadId)?.["mcp_servers.codex_communication"];
+  if (!config) return reply.code(409).send({ error: "Thread tools are not loaded." });
+  return callFixtureMcp(config, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "session_communication", arguments: request.body.command } });
+});
 app.post("/api/auth/login", async (_request, reply) => { reply.header("Set-Cookie", auth.createSessionCookie("admin")); return { ok: true }; });
 app.post<{ Body: { threadId: string } }>("/api/__test/complete", async request => { bridge.complete(request.body.threadId); return { ok: true }; });
 app.post<{ Body: { threadId: string; delta: string } }>("/api/__test/append", async request => { bridge.append(request.body.threadId, request.body.delta); return { ok: true }; });
@@ -209,6 +243,7 @@ if (process.env.RECLAUDE_FIXTURE_TEST === "1") {
   app.post<{Body:Record<string,unknown>}>("/api/__test/claude-event",async request=>{adapter.accept(request.body);return {ok:true};});
 }
 await app.listen({ host: "127.0.0.1", port: 0 });
+serverConfig.port = (app.server.address() as { port: number }).port;
 console.log(JSON.stringify({ ready: true, origin: `http://127.0.0.1:${(app.server.address() as { port: number }).port}`, projectId: project.id }));
 let stopping = false;
 const stop = async () => {

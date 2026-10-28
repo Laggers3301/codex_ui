@@ -11,7 +11,7 @@ describe("sanitizeMcpServerStatus", () => {
       accessToken: "secret-token",
       tools: { search: { inputSchema: { token: "secret-schema" } } }
     }] });
-    expect(result.data).toEqual([{ name: "private-provider", pluginId: "provider@official", runtimeStatus: "connected", authStatus: "oAuth", toolCount: 1 }]);
+    expect(result.data).toEqual([{ name: "private-provider", pluginId: "provider@official", runtimeStatus: "connected", authStatus: "oAuth", toolCount: 1, toolNames: ["search"] }]);
     expect(JSON.stringify(result)).not.toContain("secret");
   });
 });

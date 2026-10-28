@@ -371,14 +371,15 @@ export interface McpServerSummary {
   runtimeStatus: string | null;
   authStatus: string;
   toolCount: number;
+  toolNames: string[];
 }
 
-export function readThreadMcpStatus(projectId: string, threadId: string): Promise<{
+export function readThreadMcpStatus(projectId: string, threadId: string, signal?: AbortSignal): Promise<{
   data: McpServerSummary[];
   nextCursor: string | null;
   sharedRuntimeWarning: string;
 }> {
-  return request(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/mcp-status`, { cache: "no-store" });
+  return request(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/mcp-status`, { cache: "no-store", signal });
 }
 
 export function createUser(input: { name: string }): Promise<{ data: UserProfile }> {
