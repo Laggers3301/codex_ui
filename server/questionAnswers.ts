@@ -3,6 +3,21 @@ import type { ProjectStore } from "./db.js";
 import { findThreadJsonlPathById } from "./threadFallback.js";
 import { readIndexedThreadItem } from "./threadEventIndex.js";
 
+/** Only include replies for question items on this bounded history page. */
+export function questionAnswersForPage(store: ProjectStore, threadId: string, userId: string, thread: unknown): Record<string, unknown> {
+  const turns = (thread as { turns?: Array<{ items?: Array<Parameters<typeof parseQuestionToolItem>[0] & { id: string }> }> } | null)?.turns;
+  const answers: Record<string, unknown> = Object.create(null);
+  for (const turn of turns ?? []) for (const item of turn.items ?? []) {
+    if (!parseQuestionToolItem(item)) continue;
+    const raw = item as Record<string, unknown>;
+    for (const id of new Set([item.id, raw.callId, raw.call_id, raw.sourceItemId].filter((id): id is string => typeof id === "string" && Boolean(id)))) {
+      const answer = store.getQuestionAnswer(threadId, id, userId);
+      if (answer !== null) { answers[item.id] = answer; answers[id] = answer; break; }
+    }
+  }
+  return answers;
+}
+
 /** Historical async tools have already returned their receipt. Deliver their
  * answer as a correlated tool output, rather than inventing a user message. */
 export async function questionToolOutput(store: ProjectStore, threadId: string, itemId: string, answers: unknown) {

@@ -4,6 +4,24 @@ import { composerGlassMode } from "./composerGlassPolicy";
 import "./composerLiquidGlass.css";
 
 const stationaryGlassPointer = { x: 0, y: 0 };
+let scrollObservers = 0;
+let stopScrollObservation: (() => void) | undefined;
+/** Share one passive observer across all five glass surfaces. Never rerender
+ * React or measure layout on a scrolling frame. SVG optics resume at rest. */
+function observeGlassScrolling() {
+  if (++scrollObservers === 1) {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const root = document.documentElement;
+    const scroll = () => {
+      if (!root.hasAttribute('data-glass-scrolling')) root.setAttribute('data-glass-scrolling', '');
+      clearTimeout(timer);
+      timer = setTimeout(() => root.removeAttribute('data-glass-scrolling'), 160);
+    };
+    document.addEventListener('scroll', scroll, { capture: true, passive: true });
+    stopScrollObservation = () => { document.removeEventListener('scroll', scroll, true); clearTimeout(timer); root.removeAttribute('data-glass-scrolling'); };
+  }
+  return () => { if (--scrollObservers === 0) { stopScrollObservation?.(); stopScrollObservation = undefined; } };
+}
 
 /** Use the upstream optical renderer on ONE decorative backing layer.
  * The editor, popovers and control hit targets are not reparented or warped.
@@ -23,11 +41,12 @@ export const ComposerGlassMaterial = memo(function ComposerGlassMaterial({ varia
     const host = anchor.current?.parentElement;
     if (!host) return;
     hostRef.current = host;
+    const stopObservingScroll = observeGlassScrolling();
     const motion = matchMedia("(prefers-reduced-motion: reduce)");
     let pointerFrame = 0;
     let pointerX = 0, pointerY = 0;
     const pointer = (event: PointerEvent) => {
-      if (variant !== "composer" || event.pointerType === "touch" || motion.matches) return;
+      if (variant !== "composer" || event.pointerType === "touch" || motion.matches || document.documentElement.hasAttribute('data-glass-scrolling')) return;
       pointerX = event.clientX; pointerY = event.clientY;
       if (pointerFrame) return;
       pointerFrame = requestAnimationFrame(() => {
@@ -51,6 +70,7 @@ export const ComposerGlassMaterial = memo(function ComposerGlassMaterial({ varia
     host.addEventListener("pointermove", pointer, { passive: true });
     updateMotion(); updateTheme(); setReady(true);
     return () => {
+      stopObservingScroll();
       theme.disconnect();
       motion.removeEventListener("change", updateMotion);
       host.removeEventListener("pointermove", pointer);

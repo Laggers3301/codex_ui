@@ -32,6 +32,8 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import { BubbleMenu } from "@tiptap/react/menus";
 import StarterKit from "@tiptap/starter-kit";
 import { toggleComposerList } from "./composerList";
+import { clipboardTable, ComposerTableKit } from "./composerTable";
+import { useMobileSidebar } from "./useMobileSidebar";
 import { classifyProviderFailure, type ProviderFailureNotice } from "./providerFailure";
 import { finishActiveTurn, pendingTurnStart, rememberTerminalTurn } from "./turnLifecycle";
 import { localMessageBelongsToThread } from "./localMessageScope";
@@ -108,7 +110,7 @@ import { useBoundSideChats } from "./useBoundSideChats";
 import type { TemporaryAsk } from "./sideChats";
 import type { SideChatChange } from "./types";
 import {setSidebarThreadHidden,sidebarVisibilityVersion,visibleSidebarThreads,reconcileSidebarVisibility} from "./sidebarVisibility";
-import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, type UserInputRequest } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, questionAnswerValues, type ToolQuestion, type UserInputRequest } from "./questionTool";
 import { ToolQuestionCard, ToolQuestionMessage } from "./ToolQuestionCard";
 import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
@@ -126,6 +128,7 @@ import {
   exportThreadRecord,
   getApiUserId,
   getPushPublicKey,
+  testPushNotification,
   fetchProjectFileBlob,
   listDirectories,
   listModels,
@@ -1745,7 +1748,7 @@ function mergeThreadHistoryPages(older: ThreadSummary, newer: ThreadSummary): Th
 
   appendTurns(older.turns);
   appendTurns(newer.turns);
-  return { ...newer, turns: Array.from(mergedTurns.values()) };
+  return { ...newer, questionAnswers: { ...older.questionAnswers, ...newer.questionAnswers }, turns: Array.from(mergedTurns.values()) };
 }
 
 function formatTime(seconds: number): string {
@@ -2344,6 +2347,7 @@ const ComposerBlockMath = BlockMath.extend({
 
 const composerExtensions = [
   StarterKit.configure({ link: { markdownLinks: true } }),
+  ComposerTableKit,
   Markdown,
   ComposerInlineMath.configure({ katexOptions: { throwOnError: false } }),
   ComposerBlockMath.configure({ katexOptions: { throwOnError: false } }),
@@ -2679,6 +2683,21 @@ export const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
     // the glass. Height may animate; CSS alone owns the hard minimum/maximum.
     style={height === undefined ? undefined : { height: animatedHeight }}
     onPasteCapture={(event) => {
+      const html = event.clipboardData.getData("text/html");
+      if (editor && !editor.isActive("codeBlock")) {
+        // Spreadsheet clips may also carry a PNG; the actual table takes priority.
+        if (html.length <= 500_000 && /<table[\s>]/i.test(html)) {
+          event.preventDefault();
+          editor.commands.insertContent(html, { contentType: "html" });
+          return;
+        }
+        const table = clipboardTable(event.clipboardData.getData("text/plain"));
+        if (table) {
+          event.preventDefault();
+          editor.commands.insertContent(table);
+          return;
+        }
+      }
       if (!onPaste) return;
       const hasFiles = Array.from(event.clipboardData.items).some((item) => item.kind === "file");
       if (hasFiles) {
@@ -4509,6 +4528,10 @@ export function App() {
   const [composerHeight, setComposerHeight] = useState(() => storedNumber(composerHeightStorageKey, 54, 38, 520));
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => storedBoolean(sidebarCollapsedStorageKey));
   const [threadListCollapsed, setThreadListCollapsed] = useState(() => storedBoolean(threadListCollapsedStorageKey));
+  const setMobileSidebarOpen = useMobileSidebar(threadListCollapsed, collapsed => {
+    setThreadListCollapsed(collapsed);
+    window.localStorage.setItem(threadListCollapsedStorageKey, String(collapsed));
+  });
   const [systemDirectoryPickerAvailable, setSystemDirectoryPickerAvailable] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState<string>(() => {
     const link = new URLSearchParams(window.location.search);
@@ -4650,6 +4673,7 @@ export function App() {
   const [terminalProjectId, setTerminalProjectId] = useState<string | null>(null);
   const [terminalVisible, setTerminalVisible] = useState(false);
   const [rightWorkspaceOpen, setRightWorkspaceOpen] = useState(false);
+  const setMobileRightWorkspaceOpen = useMobileSidebar(!rightWorkspaceOpen, collapsed => setRightWorkspaceOpen(!collapsed), "right");
   const [rightWorkspaceTab, setRightWorkspaceTab] = useState("overview");
   const rightWorkspaceOpenRef = useRef(rightWorkspaceOpen);
   rightWorkspaceOpenRef.current = rightWorkspaceOpen;
@@ -4757,6 +4781,8 @@ export function App() {
   const [turnProgress, setTurnProgress] = useState<Record<string, TurnProgress>>({});
   const [turnRecoveries, setTurnRecoveries] = useState<Record<string, TurnRecoveryView>>({});
   const [answeredQuestionItems, setAnsweredQuestionItems] = useState<Record<string, true>>({});
+  const [questionAnswersByItem, setQuestionAnswersByItem] = useState<Record<string, unknown>>({});
+  useEffect(() => { setQuestionAnswersByItem({}); setAnsweredQuestionItems({}); }, [selectedUserId]);
   const submittingQuestionItemsRef = useRef(new Set<string>());
   const pendingUserInputsRef = useRef(new Map<string, UserInputRequest>());
   const liveQuestionIdentitiesRef = useRef(new Map<string, { threadId: string; turnId: string }>());
@@ -4803,6 +4829,7 @@ export function App() {
   const [filePreviewError, setFilePreviewError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [pushEnabled, setPushEnabled] = useState(() => storedBooleanWithDefault(`codex-web-push:${getApiUserId()}`, false));
+  const [pushTestStatus, setPushTestStatus] = useState("");
   const [pushSaving, setPushSaving] = useState(false);
   const [nativeFeaturesReady, setNativeFeaturesReady] = useState(false);
   const [pendingApprovals, setPendingApprovals] = useState<Record<string, { id: string | number; method: string; params: Record<string, unknown> }>>({});
@@ -5796,8 +5823,7 @@ export function App() {
     olderHistoryRearmTopRef.current = null;
     olderHistoryNextEligibleAtRef.current = 0;
     if (window.matchMedia("(max-width: 720px)").matches) {
-      setThreadListCollapsed(true);
-      window.localStorage.setItem(threadListCollapsedStorageKey, "true");
+      setMobileSidebarOpen(false);
     }
     setDismissedExhaustedThreadId(null);
     try {
@@ -5886,6 +5912,8 @@ export function App() {
     if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
     let cancelled = false;
     void navigator.serviceWorker.getRegistration("/").then(async (registration) => {
+      // This worker only handles notifications, not page caching or transport.
+      void registration?.update().catch(() => {});
       const subscription = await registration?.pushManager.getSubscription();
       if (!subscription || cancelled) return;
       const enabledForCurrentUser = storedBooleanWithDefault(`codex-web-push:${selectedUserId}`, false);
@@ -9220,6 +9248,12 @@ export function App() {
     }
   }
 
+  function displayedQuestionAnswers(itemId: string, questions: ToolQuestion[], output?: unknown): string[] | null {
+    const threadId = selectedThread?.id;
+    return questionAnswerValues(questions, threadId ? questionAnswersByItem[`${threadId}:${itemId}`] ?? selectedThread?.questionAnswers?.[itemId] : null)
+      ?? questionAnswerValues(questions, output);
+  }
+
   function questionIsAnswered(itemId: string, turnId?: string, visibleItems?: ThreadItem[]): boolean {
     const threadId = selectedThread?.id;
     if (!threadId) return false;
@@ -9323,7 +9357,9 @@ export function App() {
           finishQuestionAnswerAck(requestId, false);
           throw caught;
         }
-        return await accepted;
+        const delivered = await accepted;
+        if (delivered) setQuestionAnswersByItem(current => ({ ...current, [key]: answers }));
+        return delivered;
       }
       const item = liveTools[itemId] ?? selectedThread?.turns.flatMap(turn => turn.items ?? []).find(item => item.id === itemId);
       if (item && typeof item.tool === "string" && /(?:^|\.)request_user_input$/.test(item.tool)) {
@@ -9339,7 +9375,10 @@ export function App() {
         throw caught;
       }
       const accepted = await acceptedPromise;
-      if (accepted) setAnsweredQuestionItems((current) => ({ ...current, [key]: true }));
+      if (accepted) {
+        setAnsweredQuestionItems((current) => ({ ...current, [key]: true }));
+        setQuestionAnswersByItem(current => ({ ...current, [key]: answers }));
+      }
       return accepted;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -9762,8 +9801,12 @@ export function App() {
     }
 
     if (message.type === "question.answered") {
-      const data = message.data as { threadId?: string; itemId?: string } | undefined;
-      if (data?.threadId && data.itemId) setAnsweredQuestionItems(current => ({ ...current, [`${data.threadId}:${data.itemId}`]: true }));
+      const data = message.data as { threadId?: string; itemId?: string; answer?: unknown } | undefined;
+      if (data?.threadId && data.itemId) {
+        const key = `${data.threadId}:${data.itemId}`;
+        setAnsweredQuestionItems(current => ({ ...current, [key]: true }));
+        if (data.answer != null) setQuestionAnswersByItem(current => ({ ...current, [key]: data.answer }));
+      }
       return;
     }
 
@@ -10483,7 +10526,7 @@ export function App() {
     const collaborationItem = { ...liveToolItem, aggregatedOutput: entry.output, completed: entry.completed };
     if (parseAgentOperation(collaborationItem)) return <article className="messageItem kind-tool subagentMessage" key={entry.id}><SubagentToolCard item={collaborationItem} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} /></article>;
     const liveQuestions = parseQuestionTool(safeText(entry.tool), entry.input);
-    if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} />;
+    if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} answers={displayedQuestionAnswers(entry.id, liveQuestions, entry.output)} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} />;
     if (isQuestionToolName(entry.tool)) return !questionIsAnswered(entry.id, entry.turnId ?? undefined) && questionIsGenerating(entry)
       ? <div className="v2ThinkingLine" role="status" key={entry.id}>正在生成问题…</div> : null;
     return (
@@ -12241,10 +12284,22 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               {settingsTestStatus ? <p className={`settingsTestStatus ${settingsTestStatus.kind}`}>{settingsTestStatus.message}</p> : null}
               <div className="settingsExportBox">
                 <strong>任务通知</strong>
-                <span>任务完成或等待批准时发送系统通知。需要浏览器授权和 HTTPS；iPhone 需先将网页添加到主屏幕。通知不包含回答正文。</span>
+                <span>回答完成、等待批准或需要回答选择题／输入题时通知，显示会话名称和简短内容摘要（锁屏可见）。同一会话更新同一条通知。需要浏览器授权和 HTTPS；iPhone 需从主屏幕打开。</span>
                 <button className="iconTextButton" type="button" disabled={pushSaving || !nativeFeaturesReady} onClick={() => void togglePushNotifications()}>
                   {!nativeFeaturesReady ? "等待服务更新" : pushSaving ? "设置中…" : pushEnabled ? "关闭此设备通知" : "开启此设备通知"}
                 </button>
+                {pushEnabled ? <button className="iconTextButton" type="button" disabled={pushSaving || !selectedThread?.id} onClick={async () => {
+                  if (!selectedThread?.id) return;
+                  setPushSaving(true); setPushTestStatus("发送中…");
+                  try {
+                    const { data } = await testPushNotification(selectedThread.id);
+                    setPushTestStatus(!data.subscriptions ? "未找到接收设备，请重新开启此设备通知。" : data.accepted
+                      ? `推送服务已接受 ${data.accepted} 台设备的通知；请查看电脑或手机系统通知，服务接受不等于设备已显示。`
+                      : "推送服务未接受通知，请稍后重试或检查连接。");
+                  } catch (error) { setPushTestStatus(error instanceof Error ? error.message : "发送失败"); }
+                  finally { setPushSaving(false); }
+                }}>发送测试通知</button> : null}
+                {pushTestStatus ? <span role="status">{pushTestStatus}</span> : null}
               </div>
               <div className="settingsExportBox">
                 <strong>自动发送生成文件</strong>
@@ -12294,6 +12349,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
       <section className="threadColumn">
         <header className="topbar">
+          <button className="mobileSidebarToggle" type="button" aria-label={threadListCollapsed ? "展开侧边栏" : "收起侧边栏"} aria-expanded={!threadListCollapsed} aria-controls="conversation-sidebar" onClick={() => setMobileSidebarOpen(threadListCollapsed)}><IconParkSmallArrow direction="left" /></button>
           <div className="projectTitle">
             <h1>{selectedThread?.name || selectedThread?.preview || "新对话"}</h1>
             <p>{selectedProject?.rootPath ?? projectRoot}</p>
@@ -12382,7 +12438,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 { value: "untrusted", label: "不可信命令询问", detail: "仅危险操作需要确认" }
               ]}
             />
-            <button className="rightWorkspaceToggle topbarGlassControl" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} title={rightWorkspaceOpen ? "隐藏右栏（Ctrl+Shift+B）" : "显示右栏（Ctrl+Shift+B）"} aria-expanded={rightWorkspaceOpen} onClick={() => setRightWorkspaceOpen(open => !open)}><WorkspaceIcon name="panel" /><ComposerGlassMaterial variant="topbar" /></button>
+            <button className="rightWorkspaceToggle topbarGlassControl" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} title={rightWorkspaceOpen ? "隐藏右栏（Ctrl+Shift+B）" : "显示右栏（Ctrl+Shift+B）"} aria-expanded={rightWorkspaceOpen} onClick={() => setMobileRightWorkspaceOpen(!rightWorkspaceOpen)}><WorkspaceIcon name="panel" /><ComposerGlassMaterial variant="topbar" /></button>
           </div>
         </header>
 
@@ -12414,7 +12470,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
 
         <div className={`workspace${rightWorkspaceOpen ? " diffPanelOpen" : ""}${diffPanelResizing ? " diffPanelResizing" : ""}`} style={{ gridTemplateColumns: `${threadListCollapsed ? 56 : threadListWidth}px 0px minmax(0, 1fr) auto` }}>
-          <nav className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
+          {!threadListCollapsed ? <button className="mobileSidebarBackdrop" type="button" aria-label="收起侧边栏" onClick={() => setMobileSidebarOpen(false)} /> : null}
+          <nav id="conversation-sidebar" className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
             <div className="v2ProjectDock">
               <div className="v2BrandRow">
                 <strong>Codex</strong>
@@ -12429,10 +12486,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   className="v2SidebarToggle"
                   type="button"
                   onClick={() => {
-                    setThreadListCollapsed((collapsed) => {
-                      window.localStorage.setItem(threadListCollapsedStorageKey, String(!collapsed));
-                      return !collapsed;
-                    });
+                    setMobileSidebarOpen(threadListCollapsed);
                   }}
                   title={threadListCollapsed ? "展开侧边栏" : "折叠侧边栏"}
                   aria-label={threadListCollapsed ? "展开侧边栏" : "折叠侧边栏"}
@@ -13216,7 +13270,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     const inlineQuestions = kind === "tool" ? parseQuestionToolItem(item) : null;
                     if (inlineQuestions) {
                       toolGroupIndex = flushToolGroup(toolGroupIndex, true);
-                      renderedHistoryItems.push(<ToolQuestionMessage key={`${turn.id}-${item.id}-question`} open={!questionIsAnswered(item.id, turn.id, items)} questions={inlineQuestions} onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers)} />);
+                      renderedHistoryItems.push(<ToolQuestionMessage key={`${turn.id}-${item.id}-question`} open={!questionIsAnswered(item.id, turn.id, items)} questions={inlineQuestions} answers={displayedQuestionAnswers(item.id, inlineQuestions, item.aggregatedOutput ?? item.output)} onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers)} />);
                       continue;
                     }
                     if (kind === "tool" && isQuestionToolName(item.tool)) {
@@ -13335,7 +13389,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   {conversationLocalMessageLayout.tail.map(renderLocalMessage)}
                   {heldPendingUserMessages.map((entry) => renderPendingUserMessage(entry))}
                   {!selectedThread && !openingThreadId && !openingThreadPresence.present && liveTimelineEntries.length === 0 && visiblePendingUserMessages.length === 0 && localMessages.length === 0 ? (
-                    <div className="emptyState">Ready for a new Codex turn.</div>
+                    <div className="emptyState newConversationWelcome"><h2>从当前项目开始一个新的 Codex 对话</h2></div>
                   ) : null}
                   <div ref={messagesEndRef} className="messagesEnd" aria-hidden="true" />
                 </div>
@@ -13717,7 +13771,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </section>
           </div>
           <RightWorkspace scope={`${selectedUserId}:${selectedThread?.id ?? "new"}`} open={rightWorkspaceOpen} active={rightWorkspaceTab} width={diffPanelWidth} tabs={rightTabs}
-            overview={<WorkspaceOverview sections={workspaceSections} />} onSelect={setRightWorkspaceTab} onHide={() => setRightWorkspaceOpen(false)}
+            overview={<WorkspaceOverview sections={workspaceSections} />} onSelect={setRightWorkspaceTab} onHide={() => setMobileRightWorkspaceOpen(false)}
             onResize={event => {
               setDiffPanelResizing(true);
               beginRightPanelResize(event, diffPanelWidth, setDiffPanelWidth, "codex-web-diff-panel-width", 350, Math.min(900, window.innerWidth - (threadListCollapsed ? 56 : threadListWidth) - 320));

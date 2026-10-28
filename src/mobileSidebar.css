@@ -1,0 +1,69 @@
+.mobileSidebarToggle, .mobileSidebarBackdrop { display: none; }
+.messages:has(.newConversationWelcome) { position: relative; }
+.messages:has(.newConversationWelcome) :is(.virtualConversationFlow,.virtualConversationFlowRow,.virtualConversationSizer,.virtualConversationRow,.conversationLiveTail) { position: static !important; contain: none !important; }
+.messages .newConversationWelcome {
+  position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%);
+  width: min(780px, calc(100% - 48px)); margin: 0 !important; padding: 0 !important;
+  text-align: center; border: 0; background: transparent;
+}
+.newConversationWelcome h2 {
+  margin: 0; color: var(--muted); font-family: inherit;
+  font-size: clamp(22px, 1.7vw, 26px); font-weight: 400; line-height: 1.5; letter-spacing: normal; text-wrap: balance; text-align: center;
+}
+.newConversationWelcome h2 { animation: welcomeDrift 9s ease-in-out infinite; }
+@supports (background-clip: text) or (-webkit-background-clip: text) {
+  .newConversationWelcome h2 {
+    background-image: linear-gradient(105deg, var(--muted) 35%, var(--ui-heading, #ddd) 49%, var(--muted) 63%);
+    background-size: 260% 100%; background-position: 160% 0;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: welcomeDrift 9s ease-in-out infinite, welcomeShimmer 6.5s ease-in-out infinite;
+  }
+}
+@keyframes welcomeShimmer { 0%,15% { background-position: 160% 0; } 75%,100% { background-position: -60% 0; } }
+/* Scroll changes the sampled backdrop every frame. Keep the translucent,
+   blurred material but avoid the SVG displacement pass until scrolling ends. */
+html[data-glass-scrolling] .conversation > .composer.composerLiquidGlass {
+  --composer-backdrop-optics: blur(8px) saturate(1.12) !important;
+}
+html[data-glass-scrolling] .topbar .controls button.topbarGlassControl {
+  --topbar-backdrop-optics: blur(6px) saturate(1.12) !important;
+}
+@keyframes welcomeDrift { 0%,100% { opacity: .85; transform: translateY(0); } 45% { opacity: 1; transform: translateY(-2px); } 70% { opacity: .9; transform: translateY(1px); } }
+@media (max-width: 720px) {
+  .topbar { grid-template-columns: 36px minmax(0, 1fr) 36px !important; gap: 2px 6px; min-height: 86px; }
+  .mobileSidebarToggle { display: grid; grid-column: 1; grid-row: 1; place-items: center; width: 36px; height: 36px; padding: 0; border: 0; background: transparent; border-radius: 12px; color: var(--ui-heading); transition: background .2s ease; }
+  .mobileSidebarToggle:hover { background: var(--ui-composer-block-bg); }
+  .mobileSidebarToggle svg { width: 22px; height: 22px; }
+  .topbar .controls > .rightWorkspaceToggle { top: max(7px, env(safe-area-inset-top)); width: 36px; min-width: 36px; max-width: 36px; height: 36px; min-height: 36px; }
+  .topbar > .projectTitle { grid-column: 2; grid-row: 1; padding-left: 0 !important; }
+  .topbar > .projectTitle h1 { margin: 0; font-family: inherit !important; font-size: 14px !important; font-weight: 400 !important; line-height: 20px !important; }
+  .topbar > .controls { grid-column: 1 / -1; grid-row: 2; }
+  .topbar { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  .topbar .controls.trackedQuotaVisible :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) {
+    font-family: var(--pool-ui-font) !important; font-size: 14px !important; font-weight: 400 !important;
+    line-height: 20px !important; letter-spacing: normal !important;
+  }
+  .topbar .controls :is(button, .polishedSelectTrigger, .polishedSelectTrigger span) { font-family: inherit !important; font-size: 14px !important; font-weight: 400 !important; }
+  .topbar .controls.trackedQuotaVisible > .topbarPolicySelect > button.polishedSelectTrigger { font-family: inherit !important; font-size: 14px !important; font-weight: 400 !important; line-height: 20px !important; }
+  .topbar .controls :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) > :is(span,strong) { font-family: inherit !important; font-size: 14px !important; font-weight: 400 !important; line-height: 20px !important; }
+  .threadListRestoreButton { display: none !important; }
+  .workspace > .threadList:not(.collapsed) { z-index: 900 !important; width: min(360px, 88dvw) !important; max-width: 88dvw !important; transform: translate3d(var(--mobile-sidebar-offset, 0px),0,0); transition: transform .28s cubic-bezier(.22,1,.36,1); border-radius: 0 20px 20px 0; box-shadow: 12px 0 35px rgb(0 0 0 / .15); }
+  .workspace > .threadList:not(.collapsed) :is(.v2ProjectDock,.v2AccountDock) { width: 100% !important; max-width: 100% !important; }
+  .mobileSidebarBackdrop { display: block; position: fixed; inset: 0; z-index: 890; border: 0; padding: 0; background: #000; opacity: calc(var(--mobile-sidebar-progress, 1) * .3); transition: opacity .28s cubic-bezier(.22,1,.36,1); }
+  html[data-sidebar-dragging] .workspace > .threadList:not(.collapsed), html[data-sidebar-dragging] .mobileSidebarBackdrop { transition: none; }
+  .workspace.diffPanelOpen > .rightWorkspace.diffReviewPanel { transform: translate3d(var(--mobile-right-panel-offset,0px),0,0); transition: transform .28s cubic-bezier(.22,1,.36,1), opacity .25s ease; }
+  html[data-right-panel-dragging] .workspace.diffPanelOpen > .rightWorkspace.diffReviewPanel { transition: none; }
+  html:is([data-sidebar-dragging],[data-right-panel-dragging]) :is(.threadList,.rightWorkspace.diffReviewPanel) { will-change: transform; }
+  /* Moving filtered panels otherwise resample the transcript on every frame.
+     Retain the tinted surface during a drag; restore full optics at rest. */
+  html:is([data-sidebar-dragging],[data-right-panel-dragging]) :is(.threadList,.rightWorkspace.diffReviewPanel),
+  html:is([data-sidebar-dragging],[data-right-panel-dragging]) .topbar .controls button.topbarGlassControl::before {
+    -webkit-backdrop-filter: none !important; backdrop-filter: none !important;
+  }
+  .threadColumn { touch-action: pan-y pinch-zoom; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mobileSidebarToggle, .mobileSidebarBackdrop, .workspace > .threadList:not(.collapsed) { transition: none !important; }
+  .newConversationWelcome h2 { animation: none; background: none; color: var(--muted); }
+  .workspace.diffPanelOpen > .rightWorkspace.diffReviewPanel { transition: none !important; }
+}

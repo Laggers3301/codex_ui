@@ -4186,6 +4186,12 @@ pre,
 
 .composerRichInput p { margin: 0 0 .45em; }
 .composerRichInput p:last-child { margin-bottom: 0; }
+.composerRichInput .tableWrapper { max-width: 100%; overflow-x: auto; margin: .4em 0; }
+.composerRichInput table { border-collapse: collapse; table-layout: fixed; width: 100%; margin: .4em 0; font: inherit; }
+.composerRichInput td, .composerRichInput th { border: 1px solid var(--ui-content-muted); padding: .35em .55em; min-width: 5em; vertical-align: top; position: relative; color: var(--ui-content); }
+.composerRichInput th { background: var(--ui-composer-block-bg); font-weight: 600; }
+.composerRichInput td p, .composerRichInput th p { margin: 0; }
+.composerRichInput .selectedCell::after { content: ""; position: absolute; inset: 0; background: rgb(96 145 210 / .15); pointer-events: none; }
 .composerRichInput h1, .composerRichInput h2, .composerRichInput h3 { margin: .45em 0 .2em; line-height: 1.25; }
 .composerRichInput h1:first-child, .composerRichInput h2:first-child, .composerRichInput h3:first-child { margin-top: 0; }
 .composerRichInput h1 { font-size: 1.35em; }

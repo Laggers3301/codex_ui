@@ -4,6 +4,24 @@ export interface ToolQuestion {
   options: string[];
 }
 
+/** Display-only receipt decoding. accepted:true is never a user's answer. */
+export function questionAnswerValues(questions: ToolQuestion[], value: unknown): string[] | null {
+  let parsed = value;
+  if (typeof parsed === "string") {
+    try { parsed = JSON.parse(parsed); } catch { return null; }
+  }
+  const root = record(parsed);
+  const values: unknown[] = Array.isArray(parsed) ? parsed
+    : root.type === "codex_web_question_answer" && Array.isArray(root.questions)
+      ? root.questions.map(row => record(row).answer)
+      : questions.map((question, index) => {
+          const answer = record(record(root.answers)[question.id ?? String(index)]).answers;
+          return Array.isArray(answer) && answer.every(part => typeof part === "string") ? answer.join("\n") : null;
+        });
+  return values.length === questions.length && values.every(answer => typeof answer === "string" && answer.trim())
+    ? (values as string[]).map(answer => answer.trim()) : null;
+}
+
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
