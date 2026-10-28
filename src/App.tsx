@@ -9377,7 +9377,7 @@ export function App() {
     const turns = thread?.turns ?? [];
     const turnIndex = turns.findIndex((turn) => turn.id === turnId || (turn.items ?? []).some((item) => questionItemId(item) === itemId));
     if (turnIndex < 0) return false;
-    if (synchronousQuestionHasResult((turns[turnIndex].items ?? []).find(item => questionItemId(item) === itemId) ?? {})) return true;
+    if (synchronousQuestionHasResult(coalesceToolOutputs(turns[turnIndex].items ?? [], true).find(item => questionItemId(item) === itemId) ?? {})) return true;
     return questionHasAnswer(turns.flatMap(turn => turn.items ?? []), itemId);
   }
 
@@ -11079,7 +11079,7 @@ export function App() {
   // Moving a card between transcript parents would discard another answer draft.
   const temporaryQuestions = new Map<string, { item: ThreadItem; turnId?: string }>();
   for (const turn of temporaryThread?.turns ?? []) {
-    for (const item of turn.items ?? []) {
+    for (const item of coalesceToolOutputs(turn.items ?? [], true)) {
       if (parseQuestionToolItem(item) || isQuestionToolName(item.tool)) {
         const id = questionItemId(item) ?? item.id;
         temporaryQuestions.set(id, { item: { ...item, id }, turnId: turn.id });

@@ -222,7 +222,10 @@ app.post<{ Body: { threadId: string; itemId: string; sourceItemId?: string; kind
   const { threadId, itemId, sourceItemId = itemId, kind, questions, emit = true } = request.body;
   const thread = threads.get(threadId)!, turn = thread.turns.at(-1)!;
   const blocking = kind === "sync";
-  if (blocking || kind === "nonblocking") {
+  if (kind === "resolved-sync") {
+    turn.items.push({ id: sourceItemId, callId: itemId, type: "toolCall", tool: "request_user_input", input: JSON.stringify({ questions }) },
+      { id: itemId + "-output", callId: itemId, type: "functionCallOutput", output: "该历史工具调用已经返回，不再等待用户回答。" });
+  } else if (blocking || kind === "nonblocking") {
     turn.items.push({ id: sourceItemId, callId: itemId, type: "toolCall", tool: blocking ? "request_user_input" : "request_user_input_async", input: JSON.stringify({ questions }), completed: false });
     const pending = { id: bridge.nextApprovalId++, method: "item/tool/requestUserInput", receivedAt: new Date().toISOString(), params: { threadId, turnId: turn.id, itemId, questions, isBlocking: blocking } };
     bridge.pending.push(pending);

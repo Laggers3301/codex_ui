@@ -53,6 +53,7 @@ try {
   await expect.poll(async () => (await state()).sides[0]?.status).toBe("running");
   const sideId = (await state()).sides[0].threadId;
   const question = async (itemId, kind, title, options, threadId = sideId) => post("question", { threadId, itemId, sourceItemId: threadId === sideId ? "fc-" + itemId : itemId, kind, questions: [{ id: itemId + "-field", question: title, title, options }] });
+  await question("side-resolved-sync", "resolved-sync", "已经结束的同步问题", []);
   await question("side-sync-a", "sync", "侧边同步问题一", [{ label: "先测试", description: "独立验证" }]);
   await question("side-sync-b", "sync", "侧边同步问题二", []);
   await expect(card(page, "侧边同步问题一")).toBeVisible();
@@ -76,6 +77,7 @@ try {
   await expect(mainEditor).toHaveText("保留主会话草稿"); await expect(mainCard).toBeVisible();
   assert.deepEqual((await state()).questionResponses.map(value => [value.threadId, value.itemId]), [[sideId, "side-sync-a"]]);
   await page.reload({ waitUntil: "domcontentloaded" }); await openMain("main-a");
+  await expect(card(page, "已经结束的同步问题")).toHaveCount(0);
   await expect(card(page, "侧边同步问题一")).toHaveCount(0);
   await expect(card(page, "侧边同步问题二")).toBeVisible();
   await expect(panel(page).getByRole("article", { name: "已提交的问答" })).toContainText("先测试");
@@ -128,7 +130,7 @@ try {
   assert.deepEqual(errors, []);
   const result = { isolatedDatabase: true, realRestAndWebsocket: true, mockModelOnly: true, synchronousSideInputs: true,
     nativeTypedAsyncSideInputs: true, legacyAsyncSideInputs: true, nativeNonblockingSideInput: true,
-    answersReachSideThread: true, nativeCallIdsCorrelated: true, noDuplicateQuestionCards: true, mainQuestionUnaffected: true, failedAnswersRetryable: true, secondQuestionDraftPreserved: true,
+    answersReachSideThread: true, nativeCallIdsCorrelated: true, noDuplicateQuestionCards: true, resolvedSyncHistoryHidden: true, mainQuestionUnaffected: true, failedAnswersRetryable: true, secondQuestionDraftPreserved: true,
     pendingSyncRestoredOnReload: true, completedAsyncRestoredOnReload: true, answersPersisted: true,
     switchMainRestoresQuestions: true, mobileAnswerSubmitted: true, noAnswersSentAsNewMessages: true, pageErrors: errors };
   await fs.writeFile(evidence + "/result.json", JSON.stringify(result, null, 2) + "\n"); console.log(JSON.stringify(result));
