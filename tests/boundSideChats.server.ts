@@ -58,7 +58,7 @@ class FixtureBridge extends EventEmitter {
       const threadId = String(request.params.threadId), itemId = String(request.params.itemId);
       this.questionResponses.push({ threadId, itemId, result });
       const turn = threads.get(threadId)?.turns.find(turn => turn.id === request.params.turnId);
-      const item = turn?.items.find((item: any) => item.id === itemId);
+      const item = turn?.items.find((item: any) => item.id === itemId || item.callId === itemId || item.call_id === itemId);
       if (item) { item.completed = true; item.output = JSON.stringify(result); }
       this.pending = this.pending.filter(request => request.id !== id);
       this.flags.set(threadId, this.pending.some(request => request.params.threadId === threadId) ? ["waitingOnUserInput"] : []);
@@ -218,20 +218,20 @@ app.post<{ Body: { pause: boolean } }>("/api/__test/hold-create", async request 
 });
 app.post("/api/__test/fail-next", async () => { bridge.failNextTurn = true; return { ok: true }; });
 app.post("/api/__test/fail-next-question", async () => { bridge.failNextQuestion = true; return { ok: true }; });
-app.post<{ Body: { threadId: string; itemId: string; kind: string; questions: unknown[]; emit?: boolean } }>("/api/__test/question", async request => {
-  const { threadId, itemId, kind, questions, emit = true } = request.body;
+app.post<{ Body: { threadId: string; itemId: string; sourceItemId?: string; kind: string; questions: unknown[]; emit?: boolean } }>("/api/__test/question", async request => {
+  const { threadId, itemId, sourceItemId = itemId, kind, questions, emit = true } = request.body;
   const thread = threads.get(threadId)!, turn = thread.turns.at(-1)!;
   const blocking = kind === "sync";
   if (blocking || kind === "nonblocking") {
-    turn.items.push({ id: itemId, type: "toolCall", tool: blocking ? "request_user_input" : "request_user_input_async", input: JSON.stringify({ questions }), completed: false });
+    turn.items.push({ id: sourceItemId, callId: itemId, type: "toolCall", tool: blocking ? "request_user_input" : "request_user_input_async", input: JSON.stringify({ questions }), completed: false });
     const pending = { id: bridge.nextApprovalId++, method: "item/tool/requestUserInput", receivedAt: new Date().toISOString(), params: { threadId, turnId: turn.id, itemId, questions, isBlocking: blocking } };
     bridge.pending.push(pending);
     bridge.flags.set(threadId, blocking ? ["waitingOnUserInput"] : []);
     if (emit) bridge.emit("serverRequest", pending);
   } else {
     const item = kind === "function"
-      ? { id: itemId, type: "functionCall", name: "functions.request_user_input_async", arguments: JSON.stringify({ questions }), completed: true, output: '{"accepted":true}' }
-      : { id: itemId, type: "agentMessage", delivery: "async", questions, text: "请回答以下问题" };
+      ? { id: sourceItemId, callId: itemId, type: "functionCall", name: "functions.request_user_input_async", arguments: JSON.stringify({ questions }), completed: true, output: '{"accepted":true}' }
+      : { id: sourceItemId, callId: itemId, type: "agentMessage", delivery: "async", questions, text: "请回答以下问题" };
     turn.items.push(item);
     if (emit) for (const method of ["item/started", "item/completed"]) bridge.emit("notification", { method, params: { threadId, turnId: turn.id, item } });
   }

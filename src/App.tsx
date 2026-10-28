@@ -117,7 +117,7 @@ import { useBoundSideChats } from "./useBoundSideChats";
 import type { TemporaryAsk } from "./sideChats";
 import type { SideChatChange } from "./types";
 import {setSidebarThreadHidden,sidebarVisibilityVersion,visibleSidebarThreads,reconcileSidebarVisibility} from "./sidebarVisibility";
-import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, questionAnswerValues, type ToolQuestion, type UserInputRequest } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, questionItemId, questionAnswerValues, type ToolQuestion, type UserInputRequest } from "./questionTool";
 import { ToolQuestionCard, ToolQuestionMessage } from "./ToolQuestionCard";
 import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
@@ -5295,7 +5295,7 @@ export function App() {
             item.threadId !== threadId || (turnId !== null && item.turnId !== turnId)
             || (isQuestionToolName(item.tool) && parseQuestionTool(item.tool, item.input)
               && !questionIsAnswered(item.itemId, item.turnId ?? undefined, undefined, threadId)
-              && !persistedThread.turns.some(turn => turn.items.some(persisted => persisted.id === item.itemId)))
+              && !persistedThread.turns.some(turn => turn.items.some(persisted => questionItemId(persisted) === item.itemId)))
           ))));
           return;
         }
@@ -9351,7 +9351,14 @@ export function App() {
     return selectedThread?.id === threadId ? selectedThread : sideChatController.forThread(threadId)?.thread ?? null;
   }
 
+  function questionIdentityInThread(itemId: string, threadId: string | undefined): string {
+    const item = questionThreadForId(threadId)?.turns.flatMap(turn => turn.items ?? [])
+      .find(item => item.id === itemId || questionItemId(item) === itemId);
+    return item ? questionItemId(item) ?? itemId : itemId;
+  }
+
   function displayedQuestionAnswers(itemId: string, questions: ToolQuestion[], output?: unknown, threadId = selectedThread?.id): string[] | null {
+    itemId = questionIdentityInThread(itemId, threadId);
     const thread = questionThreadForId(threadId);
     return questionAnswerValues(questions, threadId ? questionAnswersByItem[`${threadId}:${itemId}`] ?? thread?.questionAnswers?.[itemId] : null)
       ?? questionAnswerValues(questions, output);
@@ -9359,6 +9366,7 @@ export function App() {
 
   function questionIsAnswered(itemId: string, turnId?: string, visibleItems?: ThreadItem[], threadId = selectedThread?.id): boolean {
     if (!threadId) return false;
+    itemId = questionIdentityInThread(itemId, threadId);
     const thread = questionThreadForId(threadId);
     if ([...pendingUserInputsRef.current.values()].some(request => request.params.threadId === threadId && request.params.itemId === itemId)) return false;
     if (answeredQuestionItems[`${threadId}:${itemId}`]) return true;
@@ -9367,9 +9375,9 @@ export function App() {
     if (liveItem?.threadId === threadId && synchronousQuestionHasResult(liveItem)) return true;
     if (visibleItems && questionHasAnswer(visibleItems, itemId)) return true;
     const turns = thread?.turns ?? [];
-    const turnIndex = turns.findIndex((turn) => turn.id === turnId || (turn.items ?? []).some((item) => item.id === itemId));
+    const turnIndex = turns.findIndex((turn) => turn.id === turnId || (turn.items ?? []).some((item) => questionItemId(item) === itemId));
     if (turnIndex < 0) return false;
-    if (synchronousQuestionHasResult((turns[turnIndex].items ?? []).find(item => item.id === itemId) ?? {})) return true;
+    if (synchronousQuestionHasResult((turns[turnIndex].items ?? []).find(item => questionItemId(item) === itemId) ?? {})) return true;
     return questionHasAnswer(turns.flatMap(turn => turn.items ?? []), itemId);
   }
 
@@ -9444,6 +9452,7 @@ export function App() {
 
   async function chooseToolQuestion(itemId: string, answer: string, answers: string[], threadId = selectedThread?.id, projectId = selectedProject?.id): Promise<boolean> {
     if (!threadId || !projectId || !answer.trim()) return false;
+    itemId = questionIdentityInThread(itemId, threadId);
     const key = `${threadId}:${itemId}`;
     if (submittingQuestionItemsRef.current.has(key) || questionIsAnswered(itemId, undefined, undefined, threadId)) return false;
     submittingQuestionItemsRef.current.add(key);
@@ -9464,7 +9473,7 @@ export function App() {
         return delivered;
       }
       const item = (liveTools[itemId]?.threadId === threadId ? liveTools[itemId] : undefined)
-        ?? questionThreadForId(threadId)?.turns.flatMap(turn => turn.items ?? []).find(item => item.id === itemId);
+        ?? questionThreadForId(threadId)?.turns.flatMap(turn => turn.items ?? []).find(item => questionItemId(item) === itemId);
       if (item && typeof item.tool === "string" && /(?:^|\.)request_user_input$/.test(item.tool)) {
         setError("该提问的待回答请求尚未同步，请刷新会话后再回答。");
         return false;
@@ -11071,7 +11080,10 @@ export function App() {
   const temporaryQuestions = new Map<string, { item: ThreadItem; turnId?: string }>();
   for (const turn of temporaryThread?.turns ?? []) {
     for (const item of turn.items ?? []) {
-      if (parseQuestionToolItem(item) || isQuestionToolName(item.tool)) temporaryQuestions.set(item.id, { item, turnId: turn.id });
+      if (parseQuestionToolItem(item) || isQuestionToolName(item.tool)) {
+        const id = questionItemId(item) ?? item.id;
+        temporaryQuestions.set(id, { item: { ...item, id }, turnId: turn.id });
+      }
     }
   }
   for (const live of Object.values(liveTools)) {
@@ -13292,10 +13304,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         {[...temporaryQuestions.values()].map(({ item, turnId }) => {
                           const questions = parseQuestionToolItem(item);
                           const threadId = temporaryAsk.threadId ?? undefined;
-                          if (questions) return <ToolQuestionMessage key={`${threadId}:${item.id}`}
+                          if (questions) return <div key={`${threadId}:${item.id}`} data-question-item-id={item.id}>
+                            <ToolQuestionMessage
                             open={!questionIsAnswered(item.id, turnId, undefined, threadId)} questions={questions}
                             answers={displayedQuestionAnswers(item.id, questions, item.aggregatedOutput ?? item.output, threadId)}
-                            onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers, threadId, temporaryAsk.projectId)} />;
+                            onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers, threadId, temporaryAsk.projectId)} />
+                          </div>;
                           return !questionIsAnswered(item.id, turnId, undefined, threadId) && questionIsGenerating(item)
                             ? <div className="v2ThinkingLine" role="status" key={`${threadId}:${item.id}`}>正在生成问题…</div> : null;
                         })}

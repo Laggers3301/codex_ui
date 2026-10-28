@@ -52,11 +52,12 @@ try {
   await editor.fill("验证侧边提问输入框"); await editor.press("Enter");
   await expect.poll(async () => (await state()).sides[0]?.status).toBe("running");
   const sideId = (await state()).sides[0].threadId;
-  const question = async (itemId, kind, title, options, threadId = sideId) => post("question", { threadId, itemId, kind, questions: [{ id: itemId + "-field", question: title, title, options }] });
+  const question = async (itemId, kind, title, options, threadId = sideId) => post("question", { threadId, itemId, sourceItemId: threadId === sideId ? "fc-" + itemId : itemId, kind, questions: [{ id: itemId + "-field", question: title, title, options }] });
   await question("side-sync-a", "sync", "侧边同步问题一", [{ label: "先测试", description: "独立验证" }]);
   await question("side-sync-b", "sync", "侧边同步问题二", []);
   await expect(card(page, "侧边同步问题一")).toBeVisible();
   await expect(card(page, "侧边同步问题二")).toBeVisible();
+  await expect(panel(page).locator('[data-question-item-id="side-sync-a"]')).toHaveCount(1);
   await post("start-main", { threadId: "main-a" });
   await question("main-sync", "sync", "主会话同步问题", [{ label: "主会话的回答", description: "保留主会话范围" }], "main-a");
   const mainCard = page.locator("#conversation-messages .toolQuestionCard").filter({ hasText: "主会话同步问题" });
@@ -127,7 +128,7 @@ try {
   assert.deepEqual(errors, []);
   const result = { isolatedDatabase: true, realRestAndWebsocket: true, mockModelOnly: true, synchronousSideInputs: true,
     nativeTypedAsyncSideInputs: true, legacyAsyncSideInputs: true, nativeNonblockingSideInput: true,
-    answersReachSideThread: true, mainQuestionUnaffected: true, failedAnswersRetryable: true, secondQuestionDraftPreserved: true,
+    answersReachSideThread: true, nativeCallIdsCorrelated: true, noDuplicateQuestionCards: true, mainQuestionUnaffected: true, failedAnswersRetryable: true, secondQuestionDraftPreserved: true,
     pendingSyncRestoredOnReload: true, completedAsyncRestoredOnReload: true, answersPersisted: true,
     switchMainRestoresQuestions: true, mobileAnswerSubmitted: true, noAnswersSentAsNewMessages: true, pageErrors: errors };
   await fs.writeFile(evidence + "/result.json", JSON.stringify(result, null, 2) + "\n"); console.log(JSON.stringify(result));
