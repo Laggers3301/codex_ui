@@ -5293,6 +5293,9 @@ export function App() {
           ))));
           setLiveTools((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => (
             item.threadId !== threadId || (turnId !== null && item.turnId !== turnId)
+            || (isQuestionToolName(item.tool) && parseQuestionTool(item.tool, item.input)
+              && !questionIsAnswered(item.itemId, item.turnId ?? undefined, undefined, threadId)
+              && !persistedThread.turns.some(turn => turn.items.some(persisted => persisted.id === item.itemId)))
           ))));
           return;
         }
@@ -9343,22 +9346,27 @@ export function App() {
     }
   }
 
-  function displayedQuestionAnswers(itemId: string, questions: ToolQuestion[], output?: unknown): string[] | null {
-    const threadId = selectedThread?.id;
-    return questionAnswerValues(questions, threadId ? questionAnswersByItem[`${threadId}:${itemId}`] ?? selectedThread?.questionAnswers?.[itemId] : null)
+  function questionThreadForId(threadId: string | undefined): ThreadSummary | null {
+    if (!threadId) return null;
+    return selectedThread?.id === threadId ? selectedThread : sideChatController.forThread(threadId)?.thread ?? null;
+  }
+
+  function displayedQuestionAnswers(itemId: string, questions: ToolQuestion[], output?: unknown, threadId = selectedThread?.id): string[] | null {
+    const thread = questionThreadForId(threadId);
+    return questionAnswerValues(questions, threadId ? questionAnswersByItem[`${threadId}:${itemId}`] ?? thread?.questionAnswers?.[itemId] : null)
       ?? questionAnswerValues(questions, output);
   }
 
-  function questionIsAnswered(itemId: string, turnId?: string, visibleItems?: ThreadItem[]): boolean {
-    const threadId = selectedThread?.id;
+  function questionIsAnswered(itemId: string, turnId?: string, visibleItems?: ThreadItem[], threadId = selectedThread?.id): boolean {
     if (!threadId) return false;
+    const thread = questionThreadForId(threadId);
     if ([...pendingUserInputsRef.current.values()].some(request => request.params.threadId === threadId && request.params.itemId === itemId)) return false;
     if (answeredQuestionItems[`${threadId}:${itemId}`]) return true;
-    if (selectedThread.answeredQuestionItemIds?.includes(itemId)) return true;
+    if (thread?.answeredQuestionItemIds?.includes(itemId)) return true;
     const liveItem = liveTools[itemId];
     if (liveItem?.threadId === threadId && synchronousQuestionHasResult(liveItem)) return true;
     if (visibleItems && questionHasAnswer(visibleItems, itemId)) return true;
-    const turns = selectedThread.turns;
+    const turns = thread?.turns ?? [];
     const turnIndex = turns.findIndex((turn) => turn.id === turnId || (turn.items ?? []).some((item) => item.id === itemId));
     if (turnIndex < 0) return false;
     if (synchronousQuestionHasResult((turns[turnIndex].items ?? []).find(item => item.id === itemId) ?? {})) return true;
@@ -9434,11 +9442,10 @@ export function App() {
     setLiveTools(current => current[itemId] ? { ...current, [itemId]: { ...current[itemId], completed: true } } : current);
   }
 
-  async function chooseToolQuestion(itemId: string, answer: string, answers: string[]): Promise<boolean> {
-    const threadId = selectedThread?.id;
-    if (!threadId || !selectedProject || !answer.trim()) return false;
+  async function chooseToolQuestion(itemId: string, answer: string, answers: string[], threadId = selectedThread?.id, projectId = selectedProject?.id): Promise<boolean> {
+    if (!threadId || !projectId || !answer.trim()) return false;
     const key = `${threadId}:${itemId}`;
-    if (submittingQuestionItemsRef.current.has(key) || questionIsAnswered(itemId)) return false;
+    if (submittingQuestionItemsRef.current.has(key) || questionIsAnswered(itemId, undefined, undefined, threadId)) return false;
     submittingQuestionItemsRef.current.add(key);
     try {
       const request = [...pendingUserInputsRef.current.values()].find(request => request.params.threadId === threadId && request.params.itemId === itemId);
@@ -9456,7 +9463,8 @@ export function App() {
         if (delivered) setQuestionAnswersByItem(current => ({ ...current, [key]: answers }));
         return delivered;
       }
-      const item = liveTools[itemId] ?? selectedThread?.turns.flatMap(turn => turn.items ?? []).find(item => item.id === itemId);
+      const item = (liveTools[itemId]?.threadId === threadId ? liveTools[itemId] : undefined)
+        ?? questionThreadForId(threadId)?.turns.flatMap(turn => turn.items ?? []).find(item => item.id === itemId);
       if (item && typeof item.tool === "string" && /(?:^|\.)request_user_input$/.test(item.tool)) {
         setError("该提问的待回答请求尚未同步，请刷新会话后再回答。");
         return false;
@@ -9464,7 +9472,7 @@ export function App() {
       const requestId = `question-answer-${requestToken()}`;
       const acceptedPromise = waitForQuestionAnswerAck(requestId);
       try {
-        codexSocket.send({ type: "question.respond", requestId, projectId: selectedProject.id, threadId, itemId, answers });
+        codexSocket.send({ type: "question.respond", requestId, projectId, threadId, itemId, answers });
       } catch (caught) {
         finishQuestionAnswerAck(requestId, false);
         throw caught;
@@ -10814,7 +10822,7 @@ export function App() {
     const inputText = safeText(call.input) || safeText(call.command);
     const agentOperation = parseAgentOperation(call);
     const questions = parseQuestionToolItem(call);
-    if (questions && !historyContext?.readOnly && questionIsAnswered(call.id, contextTurnId)) return null;
+    if (questions && !historyContext?.readOnly && questionIsAnswered(call.id, contextTurnId, undefined, contextThreadId)) return null;
     const toolSummary = agentOperation?.agents.map(agent => agent.name.replace(/^\/root\//, "")).join(" · ") || questions?.map((question) => question.title).join(" · ") || skillReadSummary(call) || (agentOperation ? "" : [
       ...(Array.isArray(call.summary) ? call.summary.map(safeText) : []),
       safeText(call.command),
@@ -10857,7 +10865,7 @@ export function App() {
       >
         <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
         <ToolReveal open={expanded}>
-        {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer, answers) => chooseToolQuestion(call.id, answer, answers)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
+        {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer, answers) => chooseToolQuestion(call.id, answer, answers, contextThreadId, contextProjectId)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
         <MessageImagePreviews item={call} projectId={contextProjectId} onOpenFileLink={openFilePreview} />
         {hasChanges ? <button className="openDiffReviewButton" type="button" onClick={(event) => { event.stopPropagation(); openDiffReview(call.changes ?? [], "本轮文件变更", contextTurnId, call.id, contextThreadId); }}><FileText size={14} /> 查看变更 · {call.changes?.length ?? 0} 个文件</button> : null}
         {!agentOperation && (!questions || historyContext?.readOnly) && (outputText || deferredOutputItem) ? <DeferredToolOutput text={displayOutputText(outputText)} deferred={Boolean(deferredOutputItem)} threadId={contextThreadId} itemId={String(deferredOutputItem?.outputItemId ?? deferredOutputItem?.id ?? call.id)} projectId={contextProjectId} loadOutput={historyContext?.loadOutput} /> : null}
@@ -11058,6 +11066,30 @@ export function App() {
   const temporaryPersistedItemIds = new Set((temporaryThread?.turns ?? [])
     .flatMap((turn) => turn.items ?? [])
     .map((item) => item.id));
+  // Keep question cards in one stable list while live items become history.
+  // Moving a card between transcript parents would discard another answer draft.
+  const temporaryQuestions = new Map<string, { item: ThreadItem; turnId?: string }>();
+  for (const turn of temporaryThread?.turns ?? []) {
+    for (const item of turn.items ?? []) {
+      if (parseQuestionToolItem(item) || isQuestionToolName(item.tool)) temporaryQuestions.set(item.id, { item, turnId: turn.id });
+    }
+  }
+  for (const live of Object.values(liveTools)) {
+    if (!temporaryAsk?.threadId || live.threadId !== temporaryAsk.threadId || !isQuestionToolName(live.tool)) continue;
+    const previous = temporaryQuestions.get(live.itemId);
+    temporaryQuestions.set(live.itemId, { turnId: live.turnId ?? previous?.turnId, item: {
+      ...previous?.item, id: live.itemId, type: "toolCall", tool: live.tool,
+      input: live.input?.trim() ? live.input : previous?.item.input ?? previous?.item.arguments,
+      output: live.output || previous?.item.output, completed: live.completed
+    } });
+  }
+  for (const request of pendingUserInputsRef.current.values()) {
+    if (!temporaryAsk?.threadId || request.params.threadId !== temporaryAsk.threadId) continue;
+    const { itemId, turnId, questions } = request.params;
+    temporaryQuestions.set(itemId, { turnId, item: { id: itemId, type: "toolCall",
+      tool: request.params.isBlocking === false ? "request_user_input_async" : "request_user_input",
+      input: JSON.stringify({ questions }), completed: false } });
+  }
   const temporaryLiveTimeline = temporaryAsk?.threadId ? [
     ...Object.values(liveReasoning).filter(item => item.threadId === temporaryAsk.threadId).map(item => ({ id: item.itemId, kind: "reasoning" as const, ...item })),
     ...Object.entries(liveDeltas)
@@ -11067,6 +11099,7 @@ export function App() {
       .filter((item) => item.threadId === temporaryAsk.threadId)
       .map((item) => ({ id: item.itemId, kind: "tool" as const, sequence: liveTimelineSequence("tool", item.itemId), ...item }))
   ]
+    .filter((entry) => entry.kind !== "tool" || !isQuestionToolName(entry.tool))
     .filter((entry) => !temporaryCompletedTurnIds.has(entry.turnId ?? ""))
     .filter((entry) => !temporaryPersistedItemIds.has(entry.kind === "agent" ? entry.sourceItemId ?? entry.id : entry.id))
     .sort((left, right) => left.sequence - right.sequence || left.startedAt.localeCompare(right.startedAt)) : [];
@@ -11114,6 +11147,7 @@ export function App() {
     };
     for (const item of turn.items ?? []) {
       if (isInternalRuntimeUserMessage(item)) continue;
+      if (parseQuestionToolItem(item) || isQuestionToolName(item.tool)) { flushTools(); continue; }
       const kind = itemKind(item);
       if (kind === "user") continue;
       if (kind === "tool" || kind === "reasoning") {
@@ -13254,6 +13288,18 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                             {entry.output ? <pre className="outputBlock">{displayOutputText(entry.output)}</pre> : entry.completed ? null : <div className="messageBody">正在执行...</div>}
                           </article>
                         ))}
+                      {temporaryQuestions.size ? <div className="temporaryAskQuestions" role="region" aria-label="侧边会话提问">
+                        {[...temporaryQuestions.values()].map(({ item, turnId }) => {
+                          const questions = parseQuestionToolItem(item);
+                          const threadId = temporaryAsk.threadId ?? undefined;
+                          if (questions) return <ToolQuestionMessage key={`${threadId}:${item.id}`}
+                            open={!questionIsAnswered(item.id, turnId, undefined, threadId)} questions={questions}
+                            answers={displayedQuestionAnswers(item.id, questions, item.aggregatedOutput ?? item.output, threadId)}
+                            onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers, threadId, temporaryAsk.projectId)} />;
+                          return !questionIsAnswered(item.id, turnId, undefined, threadId) && questionIsGenerating(item)
+                            ? <div className="v2ThinkingLine" role="status" key={`${threadId}:${item.id}`}>正在生成问题…</div> : null;
+                        })}
+                      </div> : null}
                       {temporaryStopBusy ? <div className="v2ThinkingLine">正在停止侧边对话</div>
                         : temporaryAsk.status === "starting" ? <div className="v2ThinkingLine">正在建立临时会话</div>
                         : temporaryAsk.status === "running" ? <div className="v2ThinkingLine">正在思考</div> : null}

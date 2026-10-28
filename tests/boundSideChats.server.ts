@@ -40,6 +40,9 @@ class FixtureBridge extends EventEmitter {
   interruptGate: Promise<void> | null = null;
   releaseInterrupt: (() => void) | null = null;
   failNextInterrupt = false;
+  failNextQuestion = false;
+  questionResponses: Array<{ threadId: string; itemId: string; result: unknown }> = [];
+  questionOutputs: Array<{ threadId: string; output: any }> = [];
   failNextTurn = false;
   failNextApproval = false;
   pending: Array<{ id: number; method: string; params: Record<string, unknown>; receivedAt: string }> = [];
@@ -50,6 +53,17 @@ class FixtureBridge extends EventEmitter {
   respondToServerRequest(id: number | string, result: unknown) {
     if (this.failNextApproval) { this.failNextApproval = false; throw new Error("模拟批准提交失败，请重试"); }
     const request = this.pending.find(request => request.id === id)!;
+    if (request.method === "item/tool/requestUserInput") {
+      if (this.failNextQuestion) { this.failNextQuestion = false; throw new Error("模拟问题回答失败，请重试"); }
+      const threadId = String(request.params.threadId), itemId = String(request.params.itemId);
+      this.questionResponses.push({ threadId, itemId, result });
+      const turn = threads.get(threadId)?.turns.find(turn => turn.id === request.params.turnId);
+      const item = turn?.items.find((item: any) => item.id === itemId);
+      if (item) { item.completed = true; item.output = JSON.stringify(result); }
+      this.pending = this.pending.filter(request => request.id !== id);
+      this.flags.set(threadId, this.pending.some(request => request.params.threadId === threadId) ? ["waitingOnUserInput"] : []);
+      return;
+    }
     this.approvalResponses.push({ id, result }); this.pending = this.pending.filter(request => request.id !== id);
     const threadId = String(request.params.threadId);
     this.flags.set(threadId, this.pending.some(request => request.params.threadId === threadId) ? ["waitingOnApproval"] : []);
@@ -85,6 +99,10 @@ class FixtureBridge extends EventEmitter {
       await this.turnStartGate;
       if (this.failNextTurn) { this.failNextTurn = false; throw new Error("用于选中复制的完整错误详情"); }
       const callback = params.toolOutput ? JSON.parse(params.toolOutput.output) : null;
+      if (callback?.type === "codex_web_question_answer") {
+        if (this.failNextQuestion) { this.failNextQuestion = false; throw new Error("模拟问题回答失败，请重试"); }
+        this.questionOutputs.push({ threadId: thread.id, output: callback });
+      }
       if (callback) {
         this.taskToolOutputs.push({ threadId: thread.id, value: callback });
         if (thread.status === "active") return { turn: { id: thread.turns.at(-1)!.id } };
@@ -199,6 +217,26 @@ app.post<{ Body: { pause: boolean } }>("/api/__test/hold-create", async request 
   return { ok: true };
 });
 app.post("/api/__test/fail-next", async () => { bridge.failNextTurn = true; return { ok: true }; });
+app.post("/api/__test/fail-next-question", async () => { bridge.failNextQuestion = true; return { ok: true }; });
+app.post<{ Body: { threadId: string; itemId: string; kind: string; questions: unknown[]; emit?: boolean } }>("/api/__test/question", async request => {
+  const { threadId, itemId, kind, questions, emit = true } = request.body;
+  const thread = threads.get(threadId)!, turn = thread.turns.at(-1)!;
+  const blocking = kind === "sync";
+  if (blocking || kind === "nonblocking") {
+    turn.items.push({ id: itemId, type: "toolCall", tool: blocking ? "request_user_input" : "request_user_input_async", input: JSON.stringify({ questions }), completed: false });
+    const pending = { id: bridge.nextApprovalId++, method: "item/tool/requestUserInput", receivedAt: new Date().toISOString(), params: { threadId, turnId: turn.id, itemId, questions, isBlocking: blocking } };
+    bridge.pending.push(pending);
+    bridge.flags.set(threadId, blocking ? ["waitingOnUserInput"] : []);
+    if (emit) bridge.emit("serverRequest", pending);
+  } else {
+    const item = kind === "function"
+      ? { id: itemId, type: "functionCall", name: "functions.request_user_input_async", arguments: JSON.stringify({ questions }), completed: true, output: '{"accepted":true}' }
+      : { id: itemId, type: "agentMessage", delivery: "async", questions, text: "请回答以下问题" };
+    turn.items.push(item);
+    if (emit) for (const method of ["item/started", "item/completed"]) bridge.emit("notification", { method, params: { threadId, turnId: turn.id, item } });
+  }
+  return { ok: true };
+});
 app.post("/api/__test/fail-next-interrupt", async () => { bridge.failNextInterrupt = true; return { ok: true }; });
 app.post<{ Body: { pause: boolean } }>("/api/__test/hold-turn-start", async request => {
   if (request.body.pause) bridge.turnStartGate = new Promise(resolve => { bridge.releaseTurnStart = resolve; });
@@ -233,7 +271,7 @@ app.post<{ Body: { threadId: string; waiting: boolean; clearRequests?: boolean }
   return { ok: true };
 });
 app.get("/api/__test/state", async () => ({ fixture: "bound-side-chats", projectId: project.id,
-  calls: bridge.calls, starts:bridge.starts, taskToolOutputs: bridge.taskToolOutputs, resourceReads, networkProbes, pendingApprovals: bridge.pending, approvalResponses: bridge.approvalResponses, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
+  calls: bridge.calls, starts:bridge.starts, taskToolOutputs: bridge.taskToolOutputs, questionResponses: bridge.questionResponses, questionOutputs: bridge.questionOutputs, resourceReads, networkProbes, pendingApprovals: bridge.pending, approvalResponses: bridge.approvalResponses, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
 app.get("/api/projects", async () => ({ data: [project], projectRoot: root }));
 app.get("/api/users", async () => ({ data: [{ id: "admin", name: "admin" }], defaultUserId: "admin" }));
 app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }, ...(process.env.RECLAUDE_FIXTURE_TEST === "1" ? claudePendingProfiles() : [])] }));
@@ -243,7 +281,8 @@ app.get<{ Params: { id: string } }>("/api/projects/:id/threads", async () => ({ 
 app.get<{ Params: { threadId: string } }>("/api/threads/:threadId", async (request, reply) => {
   if (!store.userCanAccessThread(request.params.threadId, user(request), project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
   const thread = threads.get(request.params.threadId)!;
-  return { thread, history: { totalItems: thread.turns.reduce((count, turn) => count + turn.items.length, 0), returnedItems: thread.turns.reduce((count, turn) => count + turn.items.length, 0), before: 0, hasOlder: false } };
+  const answered: string[] = store.answeredQuestionItemIds(thread.id, user(request));
+  return { thread: { ...thread, answeredQuestionItemIds: answered, questionAnswers: Object.fromEntries(answered.map(id => [id, store.getQuestionAnswer(thread.id, id, user(request))])) }, history: { totalItems: thread.turns.reduce((count, turn) => count + turn.items.length, 0), returnedItems: thread.turns.reduce((count, turn) => count + turn.items.length, 0), before: 0, hasOlder: false } };
 });
 app.setNotFoundHandler(async (request, reply) => {
   if (request.url.includes("/execution-settings")) return { data: { sandbox: "read-only", approvalPolicy: "never" } };

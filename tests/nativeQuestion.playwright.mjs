@@ -57,7 +57,7 @@ try {
     else if (path === "/api/threads/fixture-thread") json = { thread, history: { totalItems: 2, returnedItems: 2, before: 0, hasOlder: false } };
     else if (path === "/api/projects/fixture-project/threads") json = { data: [thread] };
     else if (path.endsWith("/execution-settings")) json = { data: { sandbox: "danger-full-access", approvalPolicy: "never" } };
-    else if (path.endsWith("/context")) json = { data: null };
+    else if (path.endsWith("/context") || path.endsWith("/side-chat") || path === "/api/system/resources") json = { data: null };
     else if (path.endsWith("/subagents")) json = { data: [], page: { total: 0, activeCount: 0, historyCount: 0, hasMore: false } };
     else if (path === "/api/codex/account-pool") json = { data: { strategy: "highest-remaining-sticky-thread", accounts: [] } };
     else if (path === "/api/models") json = { data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }] };
