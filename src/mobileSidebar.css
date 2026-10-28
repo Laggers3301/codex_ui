@@ -1,0 +1,85 @@
+.mobileSidebarToggle, .mobileSidebarBackdrop { display: none; }
+.messages:has(.newConversationWelcome) { position: relative; }
+.messages:has(.newConversationWelcome) :is(.virtualConversationFlow,.virtualConversationFlowRow,.virtualConversationSizer,.virtualConversationRow,.conversationLiveTail) { position: static !important; contain: none !important; }
+.messages .newConversationWelcome {
+  position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%);
+  width: min(780px, calc(100% - 48px)); margin: 0 !important; padding: 0 !important;
+  text-align: center; border: 0; background: transparent;
+  animation: welcomeArrive .85s cubic-bezier(.16,1,.3,1) both;
+}
+@keyframes welcomeArrive {
+  0% { opacity: 0; filter: blur(9px); transform: translate(-50%, calc(-50% + 24px)) scale(.98); }
+  72% { opacity: 1; filter: blur(0); transform: translate(-50%, calc(-50% - 2px)) scale(1); }
+  100% { opacity: 1; filter: none; transform: translate(-50%, -50%); }
+}
+.newConversationWelcome h2 {
+  margin: 0; color: var(--muted); font-family: inherit;
+  font-size: clamp(22px, 1.7vw, 26px); font-weight: 400; line-height: 1.5; letter-spacing: normal; text-wrap: balance; text-align: center;
+}
+.newConversationWelcome h2 { animation: welcomeDrift 9s ease-in-out infinite; }
+@supports (background-clip: text) or (-webkit-background-clip: text) {
+  .newConversationWelcome h2 {
+    background-image: linear-gradient(105deg, var(--muted) 35%, var(--ui-heading, #ddd) 49%, var(--muted) 63%);
+    background-size: 260% 100%; background-position: 160% 0;
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: welcomeDrift 9s ease-in-out infinite, welcomeShimmer 3s ease-in-out infinite;
+  }
+}
+@keyframes welcomeShimmer { 0%,15% { background-position: 160% 0; } 75%,100% { background-position: -60% 0; } }
+/* Scroll changes the sampled backdrop every frame. Keep the translucent,
+   blurred material but avoid the SVG displacement pass until scrolling ends. */
+html[data-glass-scrolling] .conversation > .composer.composerLiquidGlass {
+  --composer-backdrop-optics: blur(8px) saturate(1.12) !important;
+}
+html[data-glass-scrolling] .topbar .controls button.topbarGlassControl {
+  --topbar-backdrop-optics: blur(6px) saturate(1.12) !important;
+}
+@keyframes welcomeDrift { 0%,100% { opacity: .85; transform: translateY(0); } 45% { opacity: 1; transform: translateY(-2px); } 70% { opacity: .9; transform: translateY(1px); } }
+@media (max-width: 720px) {
+  .topbar { grid-template-columns: 32px minmax(0, 1fr) 32px !important; grid-template-rows: 32px 30px; gap: 2px 6px; min-height: 72px; padding-top: max(4px, env(safe-area-inset-top)); padding-bottom: 4px; }
+  .mobileSidebarToggle { display: grid; grid-column: 1; grid-row: 1; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; background: transparent; border-radius: 10px; color: var(--ui-heading); transition: background .2s ease; }
+  .mobileSidebarToggle:hover { background: var(--ui-composer-block-bg); }
+  .mobileSidebarToggle svg { width: 18px; height: 18px; }
+  .topbar .controls > .rightWorkspaceToggle { top: max(4px, env(safe-area-inset-top)); width: 32px; min-width: 32px; max-width: 32px; height: 32px; min-height: 32px; }
+  .topbar .controls > .rightWorkspaceToggle > svg { width: 18px; height: 18px; }
+  .topbar > .projectTitle { grid-column: 2; grid-row: 1; padding-left: 0 !important; }
+  .topbar > .projectTitle h1 { margin: 0; font-family: inherit !important; font-size: 14px !important; font-weight: 400 !important; line-height: 20px !important; }
+  .topbar > .controls { grid-column: 1 / -1; grid-row: 2; }
+  .topbar { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  .topbar .controls.trackedQuotaVisible :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) {
+    font-family: var(--pool-ui-font) !important; font-size: 13px !important; font-weight: 400 !important;
+    line-height: 18px !important; letter-spacing: normal !important;
+    height: 30px !important; min-height: 30px !important;
+  }
+  .topbar .controls :is(button, .polishedSelectTrigger, .polishedSelectTrigger span) { font-family: inherit !important; font-size: 13px !important; font-weight: 400 !important; }
+  .topbar .controls.trackedQuotaVisible > .topbarPolicySelect > button.polishedSelectTrigger,
+  .topbar .controls.trackedQuotaVisible > .topbarPolicySelect > button.polishedSelectTrigger > span:first-child { font-family: inherit !important; font-size: 13px !important; font-weight: 400 !important; line-height: 18px !important; }
+  .topbar .controls :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) > :is(span,strong) { font-family: inherit !important; font-size: 13px !important; font-weight: 400 !important; line-height: 18px !important; }
+  .threadListRestoreButton { display: none !important; }
+  /* Anchor above the entire dock, including the iPhone home-indicator inset.
+     A fixed 58px offset puts the final menu row underneath the account button. */
+  .workspace > .threadList > .v2AccountDock .v2AccountMenu {
+    bottom: calc(100% + 6px); left: 10px; right: 10px;
+    max-height: calc(var(--phone-viewport-height, 100dvh) - 110px); overflow-y: auto;
+  }
+  .workspace > .threadList:not(.collapsed) { z-index: 900 !important; width: min(360px, 88dvw) !important; max-width: 88dvw !important; transform: translate3d(var(--mobile-sidebar-offset, 0px),0,0); transition: transform .28s cubic-bezier(.22,1,.36,1); border-radius: 0 20px 20px 0; box-shadow: 12px 0 35px rgb(0 0 0 / .15); }
+  .workspace > .threadList:not(.collapsed) :is(.v2ProjectDock,.v2AccountDock) { width: 100% !important; max-width: 100% !important; }
+  .mobileSidebarBackdrop { display: block; position: fixed; inset: 0; z-index: 890; border: 0; padding: 0; background: #000; opacity: calc(var(--mobile-sidebar-progress, 1) * .3); transition: opacity .28s cubic-bezier(.22,1,.36,1); }
+  html[data-sidebar-dragging] .workspace > .threadList:not(.collapsed), html[data-sidebar-dragging] .mobileSidebarBackdrop { transition: none; }
+  .workspace.diffPanelOpen > .rightWorkspace.diffReviewPanel { transform: translate3d(var(--mobile-right-panel-offset,0px),0,0); transition: transform .28s cubic-bezier(.22,1,.36,1), opacity .25s ease; }
+  html[data-right-panel-dragging] .workspace.diffPanelOpen > .rightWorkspace.diffReviewPanel { transition: none; }
+  html:is([data-sidebar-dragging],[data-right-panel-dragging]) :is(.threadList,.rightWorkspace.diffReviewPanel) { will-change: transform; }
+  /* Moving filtered panels otherwise resample the transcript on every frame.
+     Retain the tinted surface during a drag; restore full optics at rest. */
+  html:is([data-sidebar-dragging],[data-right-panel-dragging]) :is(.threadList,.rightWorkspace.diffReviewPanel),
+  html:is([data-sidebar-dragging],[data-right-panel-dragging]) .topbar .controls button.topbarGlassControl::before {
+    -webkit-backdrop-filter: none !important; backdrop-filter: none !important;
+  }
+  .threadColumn { touch-action: pan-y pinch-zoom; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mobileSidebarToggle, .mobileSidebarBackdrop, .workspace > .threadList:not(.collapsed) { transition: none !important; }
+  .newConversationWelcome h2 { animation: none; background: none; color: var(--muted); }
+  .messages .newConversationWelcome { animation: none; }
+  .workspace.diffPanelOpen > .rightWorkspace.diffReviewPanel { transition: none !important; }
+}

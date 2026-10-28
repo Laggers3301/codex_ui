@@ -1,3 +1,4 @@
+import { setContentViewport } from "./contentViewport.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
@@ -95,13 +96,13 @@ try {
     await expect.poll(() => resourcePanel.evaluate(element => element.scrollTop)).toBeGreaterThan(100);
     await a.mouse.wheel(0, -2000); await expect.poll(() => resourcePanel.evaluate(element => element.scrollTop)).toBe(0);
   };
-  await a.setViewportSize({ width: 1600, height: 600 }); await scrollResourcePanel();
+  await setContentViewport(a, { width: 1600, height: 600 }); await scrollResourcePanel();
   await a.screenshot({ path: `${evidence}/resources-desktop-dark.png` });
-  await a.setViewportSize({ width: 393, height: 600 }); await a.evaluate(() => document.documentElement.dataset.theme = "light");
+  await setContentViewport(a, { width: 393, height: 600 }); await a.evaluate(() => document.documentElement.dataset.theme = "light");
   await scrollResourcePanel();
   assert.ok(await resourcePanel.evaluate(element => element.scrollWidth <= element.clientWidth + 1));
   await a.screenshot({ path: `${evidence}/resources-phone-light.png` });
-  await a.setViewportSize({ width: 1600, height: 1000 }); await a.evaluate(() => document.documentElement.dataset.theme = "dark");
+  await setContentViewport(a, { width: 1600, height: 1000 }); await a.evaluate(() => document.documentElement.dataset.theme = "dark");
 
   const openCommunication = async page => {
     if (!await page.locator(".rightWorkspace.isOpen").isVisible()) await page.locator(".topbar .rightWorkspaceToggle").click();
@@ -144,11 +145,11 @@ try {
   await actionB.getByRole("textbox").fill("已核对并停止该任务"); await actionB.getByRole("button", { name: "确认已取消", exact: true }).click();
   await expect(actionA).toContainText("已确认取消"); await expect(actionA).toContainText("已核对并停止该任务");
   await a.screenshot({ path: `${evidence}/communication-desktop-dark.png` });
-  await a.setViewportSize({ width: 393, height: 852 }); await a.evaluate(() => document.documentElement.dataset.theme = "light");
+  await setContentViewport(a, { width: 393, height: 852 }); await a.evaluate(() => document.documentElement.dataset.theme = "light");
   assert.ok(await panelA.evaluate(element => element.scrollWidth <= element.clientWidth + 1));
   await a.screenshot({ path: `${evidence}/communication-phone-light.png` });
   assert.equal((await state()).starts.length, 0, "communication never launches a model turn or a process");
-  await a.setViewportSize({ width: 1600, height: 1000 });
+  await setContentViewport(a, { width: 1600, height: 1000 });
   await expect(panelA.getByRole("option", { name: "侧边会话（尚未创建）", exact: true })).toHaveAttribute("disabled", "");
   await expect(panelA.getByLabel("模型通信工具状态", { exact: true })).toContainText("本轮尚未检测到");
   // Load the main/side tools through the real socket resume/fork paths. Only
@@ -216,9 +217,9 @@ try {
   await a.waitForTimeout(5500);
   assert.equal((await state()).calls.filter(call => call.method === "mcpServerStatus/list").length, statusChecks, "inbox polling never repeatedly queries native tool status");
   await a.screenshot({ path: `${evidence}/communication-main-side.png` });
-  await a.setViewportSize({ width: 393, height: 852 });
+  await setContentViewport(a, { width: 393, height: 852 });
   assert.ok(await panelA.evaluate(element => element.scrollWidth <= element.clientWidth + 1));
-  await a.setViewportSize({ width: 1600, height: 1000 });
+  await setContentViewport(a, { width: 1600, height: 1000 });
   await a.locator('[data-thread-id="main-b"] .threadSelectButton').click(); await openCommunication(a);
   await expect(panelA.getByLabel("通信身份", { exact: true })).toHaveValue("main");
   await expect(panelA.getByRole("option", { name: "侧边会话（尚未创建）", exact: true })).toHaveAttribute("disabled", "");

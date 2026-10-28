@@ -1,0 +1,27 @@
+.questionAnswerMessage .questionAnswerPair + .questionAnswerPair {
+  margin-top: 10px;
+}
+.questionAnswerMessage .questionAnswerQuote {
+  color: inherit;
+  opacity: .62;
+  font: inherit;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  margin-bottom: 6px;
+}
+.questionAnswerMessage .questionAnswerValue {
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.questionAnswerMessage {
+  animation: questionAnswerAppear 240ms cubic-bezier(.2,.75,.25,1) both;
+}
+@keyframes questionAnswerAppear {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .questionAnswerMessage { animation: none; }
+}

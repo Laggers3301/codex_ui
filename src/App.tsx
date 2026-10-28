@@ -34,6 +34,11 @@ import { EditorContent, useEditor } from "@tiptap/react";
 import { BubbleMenu } from "@tiptap/react/menus";
 import StarterKit from "@tiptap/starter-kit";
 import { toggleComposerList } from "./composerList";
+import { clipboardTable, ComposerTableKit } from "./composerTable";
+import { useMobileSidebar } from "./useMobileSidebar";
+import { TaskNotificationDialog } from "./TaskNotificationDialog";
+import { syncWebAppAppearance } from "./webAppAppearance";
+import { Bell as NotificationBell, Info as SettingsInfo, LogOut as AccountLogout } from "./PanelIcons";
 import { classifyProviderFailure, type ProviderFailureNotice } from "./providerFailure";
 import { finishActiveTurn, pendingTurnStart, rememberTerminalTurn } from "./turnLifecycle";
 import { localMessageBelongsToThread } from "./localMessageScope";
@@ -112,7 +117,7 @@ import { useBoundSideChats } from "./useBoundSideChats";
 import type { TemporaryAsk } from "./sideChats";
 import type { SideChatChange } from "./types";
 import {setSidebarThreadHidden,sidebarVisibilityVersion,visibleSidebarThreads,reconcileSidebarVisibility} from "./sidebarVisibility";
-import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, type UserInputRequest } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, questionAnswerValues, type ToolQuestion, type UserInputRequest } from "./questionTool";
 import { ToolQuestionCard, ToolQuestionMessage } from "./ToolQuestionCard";
 import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
@@ -130,6 +135,7 @@ import {
   exportThreadRecord,
   getApiUserId,
   getPushPublicKey,
+  testPushNotification,
   fetchProjectFileBlob,
   listDirectories,
   listModels,
@@ -1762,7 +1768,7 @@ function mergeThreadHistoryPages(older: ThreadSummary, newer: ThreadSummary): Th
 
   appendTurns(older.turns);
   appendTurns(newer.turns);
-  return { ...newer, turns: Array.from(mergedTurns.values()) };
+  return { ...newer, questionAnswers: { ...older.questionAnswers, ...newer.questionAnswers }, turns: Array.from(mergedTurns.values()) };
 }
 
 function formatTime(seconds: number): string {
@@ -2362,6 +2368,7 @@ const ComposerBlockMath = BlockMath.extend({
 
 const composerExtensions = [
   StarterKit.configure({ link: { markdownLinks: true } }),
+  ComposerTableKit,
   Markdown,
   ComposerInlineMath.configure({ katexOptions: { throwOnError: false } }),
   ComposerBlockMath.configure({ katexOptions: { throwOnError: false } }),
@@ -2697,6 +2704,21 @@ export const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
     // the glass. Height may animate; CSS alone owns the hard minimum/maximum.
     style={height === undefined ? undefined : { height: animatedHeight }}
     onPasteCapture={(event) => {
+      const html = event.clipboardData.getData("text/html");
+      if (editor && !editor.isActive("codeBlock")) {
+        // Spreadsheet clips may also carry a PNG; the actual table takes priority.
+        if (html.length <= 500_000 && /<table[\s>]/i.test(html)) {
+          event.preventDefault();
+          editor.commands.insertContent(html, { contentType: "html" });
+          return;
+        }
+        const table = clipboardTable(event.clipboardData.getData("text/plain"));
+        if (table) {
+          event.preventDefault();
+          editor.commands.insertContent(table);
+          return;
+        }
+      }
       if (!onPaste) return;
       const hasFiles = Array.from(event.clipboardData.items).some((item) => item.kind === "file");
       if (hasFiles) {
@@ -4412,8 +4434,7 @@ function beginVerticalResize(
 export function App() {
   const [colorTheme, setColorTheme] = useState<"dark" | "light">(() => window.localStorage.getItem("codex-web-color-theme") === "light" ? "light" : "dark");
   useLayoutEffect(() => {
-    document.documentElement.dataset.theme = colorTheme;
-    document.documentElement.style.colorScheme = colorTheme;
+    syncWebAppAppearance(colorTheme);
     window.localStorage.setItem("codex-web-color-theme", colorTheme);
   }, [colorTheme]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -4527,6 +4548,10 @@ export function App() {
   const [composerHeight, setComposerHeight] = useState(() => storedNumber(composerHeightStorageKey, 54, 38, 520));
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => storedBoolean(sidebarCollapsedStorageKey));
   const [threadListCollapsed, setThreadListCollapsed] = useState(() => storedBoolean(threadListCollapsedStorageKey));
+  const setMobileSidebarOpen = useMobileSidebar(threadListCollapsed, collapsed => {
+    setThreadListCollapsed(collapsed);
+    window.localStorage.setItem(threadListCollapsedStorageKey, String(collapsed));
+  });
   const [systemDirectoryPickerAvailable, setSystemDirectoryPickerAvailable] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState<string>(() => {
     const link = new URLSearchParams(window.location.search);
@@ -4668,6 +4693,7 @@ export function App() {
   const [terminalProjectId, setTerminalProjectId] = useState<string | null>(null);
   const [terminalVisible, setTerminalVisible] = useState(false);
   const [rightWorkspaceOpen, setRightWorkspaceOpen] = useState(false);
+  const setMobileRightWorkspaceOpen = useMobileSidebar(!rightWorkspaceOpen, collapsed => setRightWorkspaceOpen(!collapsed), "right");
   const [rightWorkspaceTab, setRightWorkspaceTab] = useState("overview");
   const rightWorkspaceOpenRef = useRef(rightWorkspaceOpen);
   rightWorkspaceOpenRef.current = rightWorkspaceOpen;
@@ -4775,6 +4801,8 @@ export function App() {
   const [turnProgress, setTurnProgress] = useState<Record<string, TurnProgress>>({});
   const [turnRecoveries, setTurnRecoveries] = useState<Record<string, TurnRecoveryView>>({});
   const [answeredQuestionItems, setAnsweredQuestionItems] = useState<Record<string, true>>({});
+  const [questionAnswersByItem, setQuestionAnswersByItem] = useState<Record<string, unknown>>({});
+  useEffect(() => { setQuestionAnswersByItem({}); setAnsweredQuestionItems({}); }, [selectedUserId]);
   const submittingQuestionItemsRef = useRef(new Set<string>());
   const pendingUserInputsRef = useRef(new Map<string, UserInputRequest>());
   const liveQuestionIdentitiesRef = useRef(new Map<string, { threadId: string; turnId: string }>());
@@ -4820,7 +4848,10 @@ export function App() {
   const [filePreviewLoading, setFilePreviewLoading] = useState(false);
   const [filePreviewError, setFilePreviewError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [notificationSettingsOpen, setNotificationSettingsOpen] = useState(false);
+  const [pushError, setPushError] = useState("");
   const [pushEnabled, setPushEnabled] = useState(() => storedBooleanWithDefault(`codex-web-push:${getApiUserId()}`, false));
+  const [pushTestStatus, setPushTestStatus] = useState("");
   const [pushSaving, setPushSaving] = useState(false);
   const [nativeFeaturesReady, setNativeFeaturesReady] = useState(false);
   const [pendingApprovals, setPendingApprovals] = useState<Record<string, ApprovalRequest>>({});
@@ -5003,6 +5034,7 @@ export function App() {
   const skillsPickerPresence = useExitPresence(skillsPickerOpen);
   const temporaryClosePresence = useExitPresence(temporaryCloseConfirm);
   const settingsPresence = useExitPresence(settingsOpen);
+  const notificationSettingsPresence = useExitPresence(notificationSettingsOpen);
   const globalSearchPresence = useExitPresence(globalSearchOpen);
   const directoryBrowserPresence = useExitPresence(directoryBrowserOpen);
 
@@ -5817,8 +5849,7 @@ export function App() {
     olderHistoryRearmTopRef.current = null;
     olderHistoryNextEligibleAtRef.current = 0;
     if (window.matchMedia("(max-width: 720px)").matches) {
-      setThreadListCollapsed(true);
-      window.localStorage.setItem(threadListCollapsedStorageKey, "true");
+      setMobileSidebarOpen(false);
     }
     setDismissedExhaustedThreadId(null);
     try {
@@ -5907,6 +5938,8 @@ export function App() {
     if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
     let cancelled = false;
     void navigator.serviceWorker.getRegistration("/").then(async (registration) => {
+      // This worker only handles notifications, not page caching or transport.
+      void registration?.update().catch(() => {});
       const subscription = await registration?.pushManager.getSubscription();
       if (!subscription || cancelled) return;
       const enabledForCurrentUser = storedBooleanWithDefault(`codex-web-push:${selectedUserId}`, false);
@@ -6889,6 +6922,7 @@ export function App() {
     setFilePreview(null);
     setFilePreviewObjectUrl("");
     setSettingsOpen(false);
+    setNotificationSettingsOpen(false);
     setLocalSendSettings(defaultLocalSendSettings);
     localSendSettingsRef.current = defaultLocalSendSettings;
     setDetectedClientHost("");
@@ -8350,12 +8384,13 @@ export function App() {
   }
 
   async function togglePushNotifications() {
+    setPushError(""); setPushTestStatus("");
     if (!nativeFeaturesReady) {
-      setError("网页推送接口等待后端服务安全重启后启用。");
+      setPushError("通知服务暂不可用，请稍后重试。");
       return;
     }
     if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
-      setError("此浏览器不支持网页推送；iPhone 请先将网页添加到主屏幕，再在主屏幕中开启。");
+      setPushError("此浏览器不支持通知。iPhone 请添加到主屏幕后，从网页 App 中开启。");
       return;
     }
     setPushSaving(true);
@@ -8374,6 +8409,7 @@ export function App() {
         }
         window.localStorage.setItem(`codex-web-push:${selectedUserId}`, "false");
         setPushEnabled(false);
+        setPushTestStatus("已关闭此设备通知。");
         return;
       }
       const { data } = await getPushPublicKey();
@@ -8384,11 +8420,24 @@ export function App() {
       await savePushSubscription(subscription.toJSON());
       window.localStorage.setItem(`codex-web-push:${selectedUserId}`, "true");
       setPushEnabled(true);
+      setPushTestStatus("已开启此设备通知。");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setPushError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setPushSaving(false);
     }
+  }
+
+  async function sendTestPush() {
+    if (!selectedThread?.id) return;
+    setPushSaving(true); setPushError(""); setPushTestStatus("正在提交推送…");
+    try {
+      const { data } = await testPushNotification(selectedThread.id);
+      if (!data.subscriptions) { setPushTestStatus(""); setPushError("未找到接收设备，请重新开启通知。"); }
+      else if (data.accepted) setPushTestStatus(`已提交 ${data.accepted} 台设备的推送，请查看系统通知。${data.failed ? ` ${data.failed} 台提交失败。` : ""}`);
+      else { setPushTestStatus(""); setPushError("推送提交失败，请稍后重试。"); }
+    } catch (error) { setPushTestStatus(""); setPushError(error instanceof Error ? error.message : "推送提交失败。"); }
+    finally { setPushSaving(false); }
   }
 
   async function unsubscribePushAndLogout() {
@@ -9280,6 +9329,12 @@ export function App() {
     }
   }
 
+  function displayedQuestionAnswers(itemId: string, questions: ToolQuestion[], output?: unknown): string[] | null {
+    const threadId = selectedThread?.id;
+    return questionAnswerValues(questions, threadId ? questionAnswersByItem[`${threadId}:${itemId}`] ?? selectedThread?.questionAnswers?.[itemId] : null)
+      ?? questionAnswerValues(questions, output);
+  }
+
   function questionIsAnswered(itemId: string, turnId?: string, visibleItems?: ThreadItem[]): boolean {
     const threadId = selectedThread?.id;
     if (!threadId) return false;
@@ -9383,7 +9438,9 @@ export function App() {
           finishQuestionAnswerAck(requestId, false);
           throw caught;
         }
-        return await accepted;
+        const delivered = await accepted;
+        if (delivered) setQuestionAnswersByItem(current => ({ ...current, [key]: answers }));
+        return delivered;
       }
       const item = liveTools[itemId] ?? selectedThread?.turns.flatMap(turn => turn.items ?? []).find(item => item.id === itemId);
       if (item && typeof item.tool === "string" && /(?:^|\.)request_user_input$/.test(item.tool)) {
@@ -9399,7 +9456,10 @@ export function App() {
         throw caught;
       }
       const accepted = await acceptedPromise;
-      if (accepted) setAnsweredQuestionItems((current) => ({ ...current, [key]: true }));
+      if (accepted) {
+        setAnsweredQuestionItems((current) => ({ ...current, [key]: true }));
+        setQuestionAnswersByItem(current => ({ ...current, [key]: answers }));
+      }
       return accepted;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -9831,8 +9891,12 @@ export function App() {
     }
 
     if (message.type === "question.answered") {
-      const data = message.data as { threadId?: string; itemId?: string } | undefined;
-      if (data?.threadId && data.itemId) setAnsweredQuestionItems(current => ({ ...current, [`${data.threadId}:${data.itemId}`]: true }));
+      const data = message.data as { threadId?: string; itemId?: string; answer?: unknown } | undefined;
+      if (data?.threadId && data.itemId) {
+        const key = `${data.threadId}:${data.itemId}`;
+        setAnsweredQuestionItems(current => ({ ...current, [key]: true }));
+        if (data.answer != null) setQuestionAnswersByItem(current => ({ ...current, [key]: data.answer }));
+      }
       return;
     }
 
@@ -10569,7 +10633,7 @@ export function App() {
     const collaborationItem = { ...liveToolItem, aggregatedOutput: entry.output, completed: entry.completed };
     if (parseAgentOperation(collaborationItem)) return <article className="messageItem kind-tool subagentMessage" key={entry.id}><SubagentToolCard item={collaborationItem} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} /></article>;
     const liveQuestions = parseQuestionTool(safeText(entry.tool), entry.input);
-    if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} />;
+    if (liveQuestions) return <ToolQuestionMessage key={entry.id} open={!questionIsAnswered(entry.id, entry.turnId ?? undefined)} questions={liveQuestions} answers={displayedQuestionAnswers(entry.id, liveQuestions, entry.output)} onChoose={(answer, answers) => chooseToolQuestion(entry.id, answer, answers)} />;
     if (isQuestionToolName(entry.tool)) return !questionIsAnswered(entry.id, entry.turnId ?? undefined) && questionIsGenerating(entry)
       ? <div className="v2ThinkingLine" role="status" key={entry.id}>正在生成问题…</div> : null;
     return (
@@ -11350,6 +11414,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
   }
   const showPromptNavigator = promptNavigationItems.length > 0 || Boolean(selectedThread && threadHistory?.hasOlder);
   const globalEnterSendBlocked = Boolean(
+    notificationSettingsPresence.present ||
     settingsPresence.present ||
     globalSearchPresence.present ||
     renamingThread ||
@@ -12257,13 +12322,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         </div>
       ) : null}
 
+      {notificationSettingsPresence.present ? <TaskNotificationDialog enabled={pushEnabled} busy={pushSaving} ready={nativeFeaturesReady} canTest={Boolean(selectedThread?.id)} closing={notificationSettingsPresence.closing} status={pushTestStatus} error={pushError} onToggle={() => void togglePushNotifications()} onTest={() => void sendTestPush()} onClose={() => setNotificationSettingsOpen(false)} /> : null}
+
       {settingsPresence.present ? (
-        <div className={`modalScrim uiExitLayer${settingsPresence.closing ? " uiClosing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title" aria-hidden={settingsPresence.closing} inert={settingsPresence.closing}>
-          <section className="settingsDialog">
+        <div className={`modalScrim deviceSettingsScrim uiExitLayer${settingsPresence.closing ? " uiClosing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title" aria-hidden={settingsPresence.closing} inert={settingsPresence.closing}>
+          <section className="settingsDialog deviceExportDialog">
             <header className="settingsHeader">
               <div>
-                <h2 id="settings-dialog-title">设置</h2>
-                <p>通过 SSH 把 4090-left 上生成的图片、文件和导出记录发送到你的设备。</p>
+                <h2 id="settings-dialog-title">设备与导出</h2>
               </div>
               <button className="iconButton" type="button" onClick={() => setSettingsOpen(false)} title="关闭设置">
                 <X size={17} />
@@ -12272,7 +12338,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <div className="settingsBody">
               <div className="settingsGrid">
                 <label>
-                  <span>访问设备 ZeroTier IP / SSH 地址</span>
+                  <span>设备 SSH 地址</span>
                   <input
                     value={localSendSettings.sshHost}
                     onChange={(event) => updateLocalSendSetting("sshHost", event.target.value)}
@@ -12298,7 +12364,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   />
                 </label>
                 <label>
-                  <span>访问设备下载目录</span>
+                  <span>设备下载目录</span>
                   <input
                     value={localSendSettings.destinationPath}
                     onChange={(event) => updateLocalSendSetting("destinationPath", event.target.value)}
@@ -12306,7 +12372,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   />
                 </label>
                 <label className="settingsWide">
-                  <span>4090-left 私钥路径（可选）</span>
+                  <span>服务器私钥路径（可选）</span>
                   <input
                     value={localSendSettings.identityFile}
                     onChange={(event) => updateLocalSendSetting("identityFile", event.target.value)}
@@ -12314,7 +12380,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   />
                 </label>
                 <label className="settingsWide">
-                  <span>4090-left 临时中转目录</span>
+                  <span>临时中转目录</span>
                   <input
                     value={localSendSettings.outputPath}
                     onChange={(event) => updateLocalSendSetting("outputPath", event.target.value)}
@@ -12322,37 +12388,25 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   />
                 </label>
               </div>
-              <p className="settingsHint">
-                ZeroTier IP、当前登录名和下载目录会自动填入；下载目录默认是远端 SSH 用户的 Downloads。SSH 用户名可修改，需与设备上的系统用户名一致。保存并测试 SSH 成功后，可手动发送文件；仅勾选下方自动发送选项才会在任务完成后自动发送。设备需开启 SSH/远程登录并允许 4090-left 免密登录；4090-left 目录只作临时中转，不是最终保存位置。
-                {detectedClientHost ? ` 当前浏览器来源 ZeroTier IP：${detectedClientHost}` : ""}
-              </p>
+              <details className="settingsHint"><summary><SettingsInfo size={15} />连接帮助</summary><p>设备需开启 SSH 并允许服务器免密连接，用户名应与设备系统账号一致。文件保存到设备下载目录，中转目录仅作临时存放。{detectedClientHost ? ` 检测到的设备地址：${detectedClientHost}` : ""}</p></details>
               {settingsTestStatus ? <p className={`settingsTestStatus ${settingsTestStatus.kind}`}>{settingsTestStatus.message}</p> : null}
               <div className="settingsExportBox">
-                <strong>任务通知</strong>
-                <span>任务完成或等待批准时发送系统通知。需要浏览器授权和 HTTPS；iPhone 需先将网页添加到主屏幕。通知不包含回答正文。</span>
-                <button className="iconTextButton" type="button" disabled={pushSaving || !nativeFeaturesReady} onClick={() => void togglePushNotifications()}>
-                  {!nativeFeaturesReady ? "等待服务更新" : pushSaving ? "设置中…" : pushEnabled ? "关闭此设备通知" : "开启此设备通知"}
-                </button>
-              </div>
-              <div className="settingsExportBox">
-                <strong>自动发送生成文件</strong>
-                <span>会话完成后，检测到的图片、PDF、PPT、Word、表格等生成文件会自动通过 SSH 写入当前设备的 Downloads 文件夹。仅发送当前登录用户会话中检测到的文件。</span>
+                <strong>文件传输</strong>
                 <label className="inlineCheckbox">
                   <input type="checkbox" checked={autoSendGeneratedFiles} onChange={(event) => updateAutoSendGeneratedFiles(event.target.checked)} />
-                  <span>自动发送生成文件到 Downloads</span>
+                  <span>任务完成后自动发送生成文件</span>
                 </label>
               </div>
               <div className="settingsExportBox">
                 <strong>对话记录导出</strong>
-                <span>导出文件会先写入 4090-left 输出目录；勾选后再通过 SSH 发送到访问设备保存目录。</span>
                 <div className="settingsExportControls">
-                  <select value={exportFormat} onChange={(event) => setExportFormat(event.target.value as ThreadExportFormat)}>
+                  <select aria-label="导出格式" value={exportFormat} onChange={(event) => setExportFormat(event.target.value as ThreadExportFormat)}>
                     <option value="markdown">Markdown</option>
                     <option value="json">JSON</option>
                   </select>
                   <label className="inlineCheckbox">
                     <input type="checkbox" checked={exportSendLocal} onChange={(event) => setExportSendLocal(event.target.checked)} />
-                    <span>导出后发送到当前访问设备</span>
+                    <span>同时发送到当前设备</span>
                   </label>
                   <button className="iconTextButton" type="button" onClick={() => void exportCurrentThread()} disabled={!selectedThread || exportingThread}>
                     {exportingThread ? "导出中" : "导出当前会话"}
@@ -12362,7 +12416,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               <div className="dialogActions">
                 {detectedClientHost || localSendSettings.sshHost ? (
                   <button className="iconTextButton" type="button" onClick={() => void applySuggestedLocalSendSettings()} disabled={settingsSaving || settingsTesting}>
-                    {settingsTesting ? "测试中" : "一键填入并测试"}
+                    {settingsTesting ? "测试中" : "自动填写并测试"}
                   </button>
                 ) : null}
                 <button className="iconTextButton" type="button" onClick={() => setSettingsOpen(false)}>
@@ -12382,6 +12436,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
       <section className="threadColumn">
         <header className="topbar">
+          <button className="mobileSidebarToggle" type="button" aria-label={threadListCollapsed ? "展开侧边栏" : "收起侧边栏"} aria-expanded={!threadListCollapsed} aria-controls="conversation-sidebar" onClick={() => setMobileSidebarOpen(threadListCollapsed)}><IconParkSmallArrow direction="left" /></button>
           <div className="projectTitle">
             <h1>{selectedThread?.name || selectedThread?.preview || "新对话"}</h1>
             <p>{selectedProject?.rootPath ?? projectRoot}</p>
@@ -12470,7 +12525,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 { value: "untrusted", label: "不可信命令询问", detail: "仅危险操作需要确认" }
               ]}
             />
-            <button className="rightWorkspaceToggle topbarGlassControl" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} title={rightWorkspaceOpen ? "隐藏右栏（Ctrl+Shift+B）" : "显示右栏（Ctrl+Shift+B）"} aria-expanded={rightWorkspaceOpen} onClick={() => setRightWorkspaceOpen(open => !open)}><WorkspaceIcon name="panel" /><ComposerGlassMaterial variant="topbar" /></button>
+            <button className="rightWorkspaceToggle topbarGlassControl" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} title={rightWorkspaceOpen ? "隐藏右栏（Ctrl+Shift+B）" : "显示右栏（Ctrl+Shift+B）"} aria-expanded={rightWorkspaceOpen} onClick={() => setMobileRightWorkspaceOpen(!rightWorkspaceOpen)}><WorkspaceIcon name="panel" /><ComposerGlassMaterial variant="topbar" /></button>
           </div>
         </header>
 
@@ -12502,7 +12557,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
 
         <div className={`workspace${rightWorkspaceOpen ? " diffPanelOpen" : ""}${diffPanelResizing ? " diffPanelResizing" : ""}`} style={{ gridTemplateColumns: `${threadListCollapsed ? 56 : threadListWidth}px 0px minmax(0, 1fr) auto` }}>
-          <nav className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
+          {!threadListCollapsed ? <button className="mobileSidebarBackdrop" type="button" aria-label="收起侧边栏" onClick={() => setMobileSidebarOpen(false)} /> : null}
+          <nav id="conversation-sidebar" className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
             <div className="v2ProjectDock">
               <div className="v2BrandRow">
                 <strong>Codex</strong>
@@ -12517,10 +12573,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   className="v2SidebarToggle"
                   type="button"
                   onClick={() => {
-                    setThreadListCollapsed((collapsed) => {
-                      window.localStorage.setItem(threadListCollapsedStorageKey, String(!collapsed));
-                      return !collapsed;
-                    });
+                    setMobileSidebarOpen(threadListCollapsed);
                   }}
                   title={threadListCollapsed ? "展开侧边栏" : "折叠侧边栏"}
                   aria-label={threadListCollapsed ? "展开侧边栏" : "折叠侧边栏"}
@@ -12826,15 +12879,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             >
               <HostResourceSummary onOpen={() => showRightWindow("resources")} />
               <div className={`v2AccountMenu${accountMenuPresence.closing ? " uiClosing" : ""}`} hidden={!accountMenuPresence.present} aria-hidden={!accountMenuOpen} inert={!accountMenuOpen}>
-                <div className="v2AccountIdentity">
-                  <span className="v2Avatar">{userInitials(selectedUser?.name ?? selectedUserId)}</span>
-                  <strong>{selectedUser?.name ?? selectedUserId}</strong>
-                </div>
-                <button type="button" onClick={() => window.location.assign("/__v2_logout")}>
-                  <span className="v2MenuIcon">↪</span><span>退出登录</span>
+                <button type="button" onClick={() => { setAccountMenuOpen(false); setPushError(""); setPushTestStatus(""); setNotificationSettingsOpen(true); }}>
+                  <span className="v2MenuIcon"><NotificationBell size={14} /></span><span>任务通知</span>
                 </button>
                 <button type="button" onClick={() => { setAccountMenuOpen(false); window.dispatchEvent(new Event("codex:open-pets")); }}>
                   <span className="v2MenuIcon"><PanelMore size={14} /></span><span>我的宠物</span>
+                </button>
+                <button className="accountMenuLogout" type="button" onClick={() => window.location.assign("/__v2_logout")}>
+                  <span className="v2MenuIcon"><AccountLogout size={14} /></span><span>退出登录</span>
                 </button>
               </div>
               <button
@@ -13305,7 +13357,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     const inlineQuestions = kind === "tool" ? parseQuestionToolItem(item) : null;
                     if (inlineQuestions) {
                       toolGroupIndex = flushToolGroup(toolGroupIndex, true);
-                      renderedHistoryItems.push(<ToolQuestionMessage key={`${turn.id}-${item.id}-question`} open={!questionIsAnswered(item.id, turn.id, items)} questions={inlineQuestions} onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers)} />);
+                      renderedHistoryItems.push(<ToolQuestionMessage key={`${turn.id}-${item.id}-question`} open={!questionIsAnswered(item.id, turn.id, items)} questions={inlineQuestions} answers={displayedQuestionAnswers(item.id, inlineQuestions, item.aggregatedOutput ?? item.output)} onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers)} />);
                       continue;
                     }
                     if (kind === "tool" && isQuestionToolName(item.tool)) {
@@ -13424,7 +13476,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   {conversationLocalMessageLayout.tail.map(renderLocalMessage)}
                   {heldPendingUserMessages.map((entry) => renderPendingUserMessage(entry))}
                   {!selectedThread && !openingThreadId && !openingThreadPresence.present && liveTimelineEntries.length === 0 && visiblePendingUserMessages.length === 0 && localMessages.length === 0 ? (
-                    <div className="emptyState">Ready for a new Codex turn.</div>
+                    <div className="emptyState newConversationWelcome"><h2>从当前项目开始一个新的 Codex 对话</h2></div>
                   ) : null}
                   <div ref={messagesEndRef} className="messagesEnd" aria-hidden="true" />
                 </div>
@@ -13801,7 +13853,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </section>
           </div>
           <RightWorkspace scope={`${selectedUserId}:${selectedThread?.id ?? "new"}`} open={rightWorkspaceOpen} active={rightWorkspaceTab} width={diffPanelWidth} tabs={rightTabs}
-            overview={<WorkspaceOverview sections={workspaceSections} />} onSelect={setRightWorkspaceTab} onHide={() => setRightWorkspaceOpen(false)}
+            overview={<WorkspaceOverview sections={workspaceSections} />} onSelect={setRightWorkspaceTab} onHide={() => setMobileRightWorkspaceOpen(false)}
             onResize={event => {
               setDiffPanelResizing(true);
               beginRightPanelResize(event, diffPanelWidth, setDiffPanelWidth, "codex-web-diff-panel-width", 350, Math.min(900, window.innerWidth - (threadListCollapsed ? 56 : threadListWidth) - 320));

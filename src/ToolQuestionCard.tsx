@@ -4,6 +4,8 @@ import { ToolReveal } from "./ToolReveal";
 import type { ToolQuestion } from "./questionTool";
 import { AccountUpdateIndicator } from "./AccountUpdateIndicator";
 import { getApiUserId } from "./api";
+import { Copy } from "./PanelIcons";
+import "./questionAnswerMessage.css";
 
 export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuestion[]; onChoose: (answer: string, answers: string[]) => Promise<boolean> }) {
   const [answers, setAnswers] = useState<(string | null)[]>(() => questions.map(() => null));
@@ -53,10 +55,18 @@ export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuest
 }
 
 /** Receipt/completion does not close a question. Only an actual user reply does. */
-export function ToolQuestionMessage({ open, questions, onChoose }: { open: boolean; questions: ToolQuestion[]; onChoose: (answer: string, answers: string[]) => Promise<boolean> }) {
-  return <ToolReveal open={open} className="toolQuestionPresence">
+export function ToolQuestionMessage({ open, questions, answers, onChoose }: { open: boolean; questions: ToolQuestion[]; answers?: string[] | null; onChoose: (answer: string, answers: string[]) => Promise<boolean> }) {
+  return <><ToolReveal open={open && !answers} className="toolQuestionPresence">
     <article className="messageItem kind-question">
       <ToolQuestionCard questions={questions} onChoose={onChoose} />
     </article>
-  </ToolReveal>;
+  </ToolReveal>{answers ? <article className="messageItem kind-user type-userMessage questionAnswerMessage" aria-label="已提交的问答">
+    <div className="messageMarkdown">{questions.map((question, index) => <section className="questionAnswerPair" key={question.id ?? index}>
+      <div className="questionAnswerQuote" title={question.title}>{question.title}</div>
+      <div className="questionAnswerValue">{answers[index]}</div>
+    </section>)}</div>
+    <div className="v2UserMessageActions">
+      <button type="button" title="复制回答" aria-label="复制回答" onClick={() => void navigator.clipboard.writeText(answers.join("\n\n")).catch(() => undefined)}><Copy size={15} /></button>
+    </div>
+  </article> : null}</>;
 }

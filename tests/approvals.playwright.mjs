@@ -1,3 +1,4 @@
+import { setContentViewport } from "./contentViewport.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
@@ -49,7 +50,7 @@ try {
   await page.locator('[data-thread-id="main-a"] .threadSelectButton').click();
   const permissions = page.getByRole("alert", { name: "批准权限申请", exact: true });
   await expect(command).toBeVisible(); await expect(permissions).toContainText("/tmp/approval-fixture");
-  await page.setViewportSize({ width: 393, height: 852 });
+  await setContentViewport(page, { width: 393, height: 852 });
   const collapseForCards = page.getByRole("button", { name: "折叠侧边栏", exact: true });
   if (await collapseForCards.isVisible()) await collapseForCards.click();
   await page.evaluate(() => Promise.all(document.getAnimations().filter(animation => animation.effect?.getTiming().iterations !== Infinity).map(animation => animation.finished.catch(() => {}))));
@@ -58,7 +59,7 @@ try {
   const stopBox = await page.getByRole("button", { name: "终止当前对话", exact: true }).boundingBox();
   assert.ok(stopBox && stopBox.y >= 0 && stopBox.y + stopBox.height <= 853, "pending approvals must leave the composer controls in view");
   await page.screenshot({ path: `${evidence}/phone-pending-approvals.png` });
-  await page.setViewportSize({ width: 1600, height: 1000 });
+  await setContentViewport(page, { width: 1600, height: 1000 });
   await permissions.getByRole("button", { name: "允许本轮所列权限", exact: true }).click();
   await expect(permissions).toHaveCount(0); await expect(command).toBeVisible();
   const response = (await state()).approvalResponses[0];
@@ -75,7 +76,7 @@ try {
   await expect(approvals).toContainText("未返回可操作的批准请求");
   const layouts = [];
   for (const mobile of [false, true]) {
-    await page.setViewportSize(mobile ? { width: 393, height: 852 } : { width: 1600, height: 1000 });
+    await setContentViewport(page, mobile ? { width: 393, height: 852 } : { width: 1600, height: 1000 });
     const collapse = page.getByRole("button", { name: "折叠侧边栏", exact: true }); if (mobile && await collapse.isVisible()) await collapse.click();
     await page.evaluate(theme => document.documentElement.dataset.theme = theme, mobile ? "light" : "dark");
     const box = await approvals.boundingBox(), viewport = page.viewportSize();
@@ -85,7 +86,7 @@ try {
   }
   await post("approval-state", { threadId: "main-a", waiting: false }); await expect(approvals).toHaveCount(0);
   await post("complete", { threadId: "main-a" });
-  await page.setViewportSize({ width: 1600, height: 1000 });
+  await setContentViewport(page, { width: 1600, height: 1000 });
   await page.locator("#conversation-messages").getByText(quote, { exact: true }).evaluate(element => {
     const range = document.createRange(); range.selectNodeContents(element); const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range); document.dispatchEvent(new Event("selectionchange"));
   });

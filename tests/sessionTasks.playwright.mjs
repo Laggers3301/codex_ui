@@ -1,3 +1,4 @@
+import { setContentViewport } from "./contentViewport.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
@@ -85,7 +86,7 @@ try {
   assert.equal((await state()).taskToolOutputs.length, 2);await complete("main-a");
   await expect(card("模型主动向普通会话 C 派发任务")).toContainText("已交回来源会话");
   await a.screenshot({ path: `${evidence}/existing-sessions-auto-task.png` });
-  await a.setViewportSize({ width: 393, height: 650 });
+  await setContentViewport(a, { width: 393, height: 650 });
   assert.ok(await panel.evaluate(element => element.scrollWidth <= element.clientWidth + 1));
   await panel.hover({ position: { x: 24, y: 100 } });await a.mouse.wheel(0, 700);
   await expect.poll(() => panel.evaluate(element => element.scrollTop)).toBeGreaterThan(100);

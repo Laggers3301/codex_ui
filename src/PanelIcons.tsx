@@ -8,7 +8,8 @@ import {
   LoadingFour as IpLoading, More as IpMore, Pause as IpPause, PeoplesTwo as IpPeople,
   Play as IpPlay, Plus as IpPlus, ReduceOne as IpMinus, Refresh as IpRefresh,
   RightBar as IpRightBar, Search as IpSearch, Target as IpTarget, Terminal as IpTerminal,
-  Time as IpClock, Edit as IpEdit, Delete as IpTrash, Copy as IpCopy, Branch as IpBranch, Microphone as IpMicrophone, Message as IpMessage
+  Time as IpClock, Edit as IpEdit, Delete as IpTrash, Copy as IpCopy, Branch as IpBranch, Microphone as IpMicrophone, Message as IpMessage,
+  BellRing as IpBell, Info as IpInfo, Logout as IpLogout
 } from "@icon-park/svg";
 
 type Props = { size?: number; className?: string; fill?: string };
@@ -25,6 +26,9 @@ function iconPark(factory: typeof IpPlus, name: string) {
 }
 
 export const ArrowLeft = iconPark(IpArrowLeft, "arrow-left");
+export const Bell = iconPark(IpBell, "bell-ring");
+export const Info = iconPark(IpInfo, "info");
+export const LogOut = iconPark(IpLogout, "logout");
 export const ArrowRight = iconPark(IpArrowRight, "arrow-right");
 export const Browser = iconPark(IpBrowser, "browser");
 export const Check = iconPark(IpCheck, "check");

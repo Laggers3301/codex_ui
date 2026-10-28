@@ -1,16 +1,17 @@
+self.addEventListener("install", (event) => event.waitUntil(self.skipWaiting()));
+self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+
 self.addEventListener("push", (event) => {
   event.waitUntil((async () => {
     let message;
     try { message = event.data?.json(); } catch { return; }
     if (!message || typeof message.threadId !== "string") return;
-    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    if (windows.some((client) => client.visibilityState === "visible")) return;
     const url = new URL("/", self.location.origin);
     url.searchParams.set("thread", message.threadId);
     if (message.projectId) url.searchParams.set("project", message.projectId);
     await self.registration.showNotification(message.title || "Codex 有新进展", {
       body: message.body || "点开查看会话",
-      tag: `codex-${message.type}-${message.threadId}`,
+      tag: `codex-${message.type === "test" ? "test-" : ""}${message.threadId}`,
       icon: "/chatgpt-favicon.svg",
       data: { url: url.href, threadId: message.threadId, projectId: message.projectId }
     });

@@ -1,6 +1,7 @@
 // Run as an independent systemd user service, not an agent's shell child.
 // Normally wait for the protected conversation to finish. --now is reserved
-// for the user's explicit permission to interrupt it; it is still never resumed.
+// for explicit permission to interrupt it. --resume-current additionally requires
+// explicit permission to send a continuation to the protected conversation.
 // Snapshot before restarting, then resume the other interrupted conversations.
 const fs = require('node:fs');
 const path = require('node:path');
@@ -14,6 +15,8 @@ const root = path.resolve(__dirname, '..');
 const WebSocket = createRequire(path.join(root, 'package.json'))('ws');
 const protectedThread = process.argv[process.argv.indexOf('--after-thread') + 1];
 const allIdle = process.argv.includes('--all-idle');
+const resumeCurrent = process.argv.includes('--resume-current');
+if (resumeCurrent && !process.argv.includes('--now')) throw new Error('--resume-current requires an explicitly authorized --now deployment');
 const verificationIndex = process.argv.indexOf('--verify-authorization');
 const authorizationSession = verificationIndex < 0 ? null : process.argv[verificationIndex + 1];
 if (verificationIndex >= 0 && !/^[a-f0-9-]{36}$/i.test(authorizationSession ?? '')) throw new Error('Invalid authorization verification session');
@@ -88,7 +91,7 @@ async function run() {
         for (const turn of await connect(user)) {
           const thread = db.prepare('SELECT project_id FROM thread_owners WHERE thread_id=? AND user_id=?').get(turn.threadId, user);
           if (!thread) throw new Error('Active conversation ownership unavailable; no restart performed');
-          if (turn.threadId !== protectedThread) active.push({ ...turn, user, projectId: thread.project_id });
+          if (turn.threadId !== protectedThread || resumeCurrent) active.push({ ...turn, user, projectId: thread.project_id });
         }
       }
       if (allIdle && active.length) {
@@ -97,6 +100,8 @@ async function run() {
       }
       if (immediate || !await busy()) break;
     }
+    // Resume the controlling conversation last, after the other users recover.
+    active.sort((a, b) => Number(a.threadId === protectedThread) - Number(b.threadId === protectedThread));
     const snapshot = path.join(root, 'data/backend/deployment-active.json');
     fs.writeFileSync(snapshot, JSON.stringify({ createdAt: new Date().toISOString(), protectedThread, active }), { mode: 0o600 });
     const pool = JSON.parse(fs.readFileSync(path.join(root, 'account-pool.json'), 'utf8'));

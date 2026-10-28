@@ -7,7 +7,6 @@ import type { IncomingHttpHeaders } from "node:http";
 import type { Server as HttpServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
-import { serverConfig } from "./config.js";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
@@ -51,6 +50,9 @@ import {
 } from "./threadContext.js";
 import type { Project, RpcEnvelope, SocketClientMessage, SocketServerMessage } from "./types.js";
 import { sendUserPush } from "./webPush.js";
+import { serverConfig } from "./config.js";
+import { questionNotificationIdentity } from "./pushProtocol.js";
+import { parseQuestionTool, readLiveQuestionNotification } from "../src/questionTool.js";
 import { meaningfulTurnProgressMethod, phaseFromProbe, TurnWatchdog, type WatchdogProbeClaim, type WatchdogTurn } from "./turnWatchdog.js";
 import { LatestTaskQueue } from "./streamBatch.js";
 import { requestedServiceTier, requestedTurnServiceTier } from "./serviceTier.js";
@@ -544,6 +546,17 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   };
   const turnWatchdog = new TurnWatchdog();
   const resourceStops = new Map<string, AppError>();
+  const notifiedQuestions = new Set<string>();
+  const notifyQuestion = (owner: string, threadId: string, itemId: string, preview?: string) => {
+    const key = JSON.stringify([owner, threadId, itemId]);
+    if (notifiedQuestions.has(key) || store.getQuestionAnswer(threadId, itemId, owner)) return;
+    notifiedQuestions.add(key);
+    if (notifiedQuestions.size > 2048) notifiedQuestions.delete(notifiedQuestions.values().next().value!);
+    void sendUserPush(store, owner, { type: "question", threadId,
+      projectId: store.getThreadOwner(threadId)?.projectId,
+      title: "Codex 等待你的回答", body: "有一道选择题或输入题，请点开会话作答", preview
+    }).catch(error => console.warn("Question push failed", error));
+  };
   let socketServerClosed = false;
   const retries = new TurnRetryQueue(store, {
     busy: threadId => guards.activeTurnsByThread.has(threadId) || guards.startingThreads.has(threadId),
@@ -742,6 +755,11 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       }
     }
     const accountId = notificationAccountId(message);
+    const questionIdentity = questionNotificationIdentity(message);
+    if (questionIdentity) {
+      const question = readLiveQuestionNotification(message)!;
+      notifyQuestion(owner, questionIdentity.threadId, questionIdentity.itemId, parseQuestionTool(question.tool, question.input)?.map(q => q.title).join("；"));
+    }
     if (message.method === "serverRequest/resolved") {
       const requestId = asRecord(message.params).requestId as number | string | undefined;
       if (requestId !== undefined && pendingApprovalOwners.get(requestId) === owner) {
@@ -1001,7 +1019,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
             threadId,
             projectId: threadOwner?.projectId,
             title: "Codex 已完成回答",
-            body: "点开查看本轮结果"
+            body: "点开查看本轮结果",
+            preview: [...completingAgentMessages].reverse().find(item => item.text.trim())?.text
           }).catch((error) => console.warn("Completion push failed", error));
         }
       }
@@ -1096,7 +1115,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
             const waiting = turnWatchdog.setPhase(owner, accountId, threadId, turnId, phase);
             if (waiting) sendTurnProgress(waiting, phase);
           }
-          if (!isUserInputRequest(request.method)) void sendUserPush(store, owner, {
+          if (isUserInputRequest(request.method)) notifyQuestion(owner, threadId, pickString(asRecord(request.params).itemId) || String(request.id), parseQuestionTool("request_user_input", request.params)?.map(q => q.title).join("；"));
+          else void sendUserPush(store, owner, {
             type: "approval",
             threadId,
             projectId: store.getThreadOwner(threadId)?.projectId,
@@ -1195,7 +1215,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         const pending = pendingApprovalTurns.get(requestId);
         if (pending) processBridgeNotification({ method: "serverRequest/resolved", accountId: pending.accountId, params: { threadId: pending.threadId, requestId } } as RpcEnvelope);
       }, browserService, (threadId, itemId) => sendToUser(wss, sessionUserId, {
-        type: "question.answered", data: { threadId, itemId }
+        type: "question.answered", data: { threadId, itemId, answer: store.getQuestionAnswer(threadId, itemId, sessionUserId) }
       }), async (threadId, expectedTurnId) => {
         assertThreadOwnedBy(store, threadId, sessionUserId);
         const before = turnWatchdog.forThread(sessionUserId, threadId);
@@ -2001,6 +2021,7 @@ async function handleClientMessage(
         if (message.type === "userInput.respond") {
           const params = asRecord(pending.params);
           store.recordQuestionAnswer(pickString(params.threadId), pickString(params.itemId), sessionUserId, result);
+          onQuestionAnswered?.(pickString(params.threadId), pickString(params.itemId));
         }
         onServerRequestResolved(responseId);
         send(ws, { type: "ack", requestId, ok: true });

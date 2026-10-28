@@ -284,12 +284,18 @@ export function getPushPublicKey(): Promise<{ data: { publicKey: string } }> {
   return request("/api/push/key");
 }
 
-export function savePushSubscription(subscription: PushSubscriptionJSON): Promise<{ ok: boolean }> {
-  return request("/api/push/subscription", { method: "POST", body: JSON.stringify(subscription) });
+export function savePushSubscription(subscription: PushSubscriptionJSON, includePreview?: boolean): Promise<{ ok: boolean }> {
+  // Browser JSON also contains expirationTime. Older servers accept only these fields.
+  const { endpoint, keys } = subscription;
+  return request("/api/push/subscription", { method: "POST", body: JSON.stringify({ endpoint, keys, ...(includePreview === undefined ? {} : { includePreview }) }) });
 }
 
 export function removePushSubscription(endpoint: string): Promise<{ ok: boolean }> {
   return request("/api/push/subscription", { method: "DELETE", body: JSON.stringify({ endpoint }) });
+}
+
+export function testPushNotification(threadId: string): Promise<{ data: { subscriptions: number; accepted: number; failed: number } }> {
+  return request("/api/push/test", { method: "POST", body: JSON.stringify({ threadId }) });
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {

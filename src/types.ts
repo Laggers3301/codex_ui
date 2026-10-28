@@ -258,6 +258,7 @@ export interface DirectoryListResponse {
 export interface ThreadSummary {
   id: string;
   answeredQuestionItemIds?: string[];
+  questionAnswers?: Record<string, unknown>;
   sessionId: string;
   preview: string;
   name: string | null;

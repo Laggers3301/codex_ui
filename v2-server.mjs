@@ -22,6 +22,7 @@ const mime = new Map([
   [".mjs", "text/javascript; charset=utf-8"],
   [".css", "text/css; charset=utf-8"],
   [".json", "application/json; charset=utf-8"],
+  [".webmanifest", "application/manifest+json; charset=utf-8"],
   [".svg", "image/svg+xml"],
   [".png", "image/png"],
   [".jpg", "image/jpeg"],
@@ -125,7 +126,7 @@ const server = http.createServer(async (request, response) => {
     const extension = path.extname(filePath).toLowerCase();
     response.writeHead(200, {
       "Content-Type": mime.get(extension) ?? "application/octet-stream",
-      "Cache-Control": extension === ".html" || ["sw.js", "loader.mjs"].includes(path.basename(filePath)) ? "no-store" : "public, max-age=31536000, immutable"
+      "Cache-Control": [".html", ".webmanifest"].includes(extension) || ["sw.js", "loader.mjs"].includes(path.basename(filePath)) ? "no-store" : "public, max-age=31536000, immutable"
     });
     response.end(body);
     return;

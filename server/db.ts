@@ -312,7 +312,7 @@ export class ProjectStore {
       .run(threadId, userId, sandbox, approvalPolicy, new Date().toISOString());
   }
 
-  savePushSubscription(userId: string, subscription: { endpoint: string; keys: { p256dh: string; auth: string } }): void {
+  savePushSubscription(userId: string, subscription: { endpoint: string; keys: { p256dh: string; auth: string }; includePreview?: boolean }): void {
     this.db.prepare(`INSERT INTO push_subscriptions (endpoint, user_id, subscription_json, updated_at)
       VALUES (?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET
       user_id = excluded.user_id, subscription_json = excluded.subscription_json, updated_at = excluded.updated_at`)
@@ -323,7 +323,7 @@ export class ProjectStore {
     this.db.prepare("DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?").run(endpoint, userId);
   }
 
-  listPushSubscriptions(userId: string): Array<{ endpoint: string; keys: { p256dh: string; auth: string } }> {
+  listPushSubscriptions(userId: string): Array<{ endpoint: string; keys: { p256dh: string; auth: string }; includePreview?: boolean }> {
     return (this.db.prepare("SELECT subscription_json FROM push_subscriptions WHERE user_id = ? ORDER BY updated_at DESC LIMIT 12")
       .all(userId) as Array<{ subscription_json: string }>).map((row) => JSON.parse(row.subscription_json));
   }

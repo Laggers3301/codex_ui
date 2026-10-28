@@ -1,4 +1,14 @@
 import { describe, expect, it } from "vitest";
+import { questionAnswerValues } from "./questionTool";
+
+it("decodes displayed answers without treating accepted receipts or partial input as a reply", () => {
+  const questions = [{ id: "scope", title: "选择范围", options: ["A"] }, { id: "note", title: "补充说明", options: [] }];
+  expect(questionAnswerValues(questions, ["A", "自定义\n多行"])).toEqual(["A", "自定义\n多行"]);
+  expect(questionAnswerValues(questions, { answers: { note: { answers: ["我的", "说明"] }, scope: { answers: ["A"] } } })).toEqual(["A", "我的\n说明"]);
+  expect(questionAnswerValues(questions, JSON.stringify({ type: "codex_web_question_answer", questions: [{ answer: "A" }, { answer: "说明" }] }))).toEqual(["A", "说明"]);
+  for (const value of [{ accepted: true }, [], ["A"], ["A", ""], { answers: { scope: { answers: ["A"] } } }, "bad json"])
+    expect(questionAnswerValues(questions, value)).toBeNull();
+});
 import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification } from "./questionTool";
 
 describe("question tool presentation", () => {

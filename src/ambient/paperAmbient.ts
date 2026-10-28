@@ -25,6 +25,14 @@ export function mountPaperAmbient(host: HTMLElement, theme: AmbientTheme) {
   let drawn = 0;
   const draw = (now: number) => {
     if (!running || disposed) return;
+    // Keep the last rendered glow while the transcript moves. The shared
+    // passive scroll observer clears this marker after momentum scrolling.
+    // Reset time so the light resumes smoothly, rather than jumping ahead.
+    if (document.documentElement.hasAttribute('data-glass-scrolling')) {
+      last = now;
+      raf = requestAnimationFrame(draw);
+      return;
+    }
     const delta = now - last;
     if (delta >= 1000 / 30) {
       // Do not jump across time spent hidden or paused.

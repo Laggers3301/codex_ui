@@ -1,3 +1,4 @@
+import { setContentViewport } from "./contentViewport.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -86,11 +87,11 @@ try {
   await checkPolicyMenu(first, first.locator('.topbarPolicySelect:not(.approvalSelect) .polishedSelectTrigger'));
   const sideAccess = panel(first).locator('.polishedSelectTrigger').filter({ hasText: /完全访问|项目可写|只读/ });
   await checkPolicyMenu(first, sideAccess);
-  await first.setViewportSize({ width: 1100, height: 500 });
+  await setContentViewport(first, { width: 1100, height: 500 });
   await checkPolicyMenu(first, sideAccess);
-  await first.setViewportSize({ width: 393, height: 780 });
+  await setContentViewport(first, { width: 393, height: 780 });
   await checkPolicyMenu(first, sideAccess);
-  await first.setViewportSize({ width: 1600, height: 1000 });
+  await setContentViewport(first, { width: 1600, height: 1000 });
   const mainInput = first.locator('.composer:not(.temporaryAskComposer) [contenteditable="true"]').first();
   const glow = first.locator('.composerAmbientGlow');
   await mainInput.focus();

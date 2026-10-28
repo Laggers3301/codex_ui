@@ -4,6 +4,7 @@ import fs from "node:fs";
 import { ProviderUsageTracker } from "./providerUsage.js";
 import { registerProviderQuotaRoutes } from "./providerQuota.js";
 import { overlayJournal } from "./timelineJournal.js";
+import { questionAnswersForPage } from "./questionAnswers.js";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -54,7 +55,8 @@ import {
   threadTurnContextConfigOverrides
 } from "./threadContext.js";
 import { importStagedUserHandoff, type ImportedUserHandoff } from "./userHandoff.js";
-import { pushPublicKey } from "./webPush.js";
+import { pushPublicKey, sendUserPush } from "./webPush.js";
+import { pushSubscriptionSchema, validatePushEndpoint } from "./pushProtocol.js";
 import { advanceTrackedQuotaLedger, type TrackedQuotaLedgerAccount } from "./trackedQuotaLedger.js";
 import { configuredSubagentRuntimeHomes, findSubagentDescendant, readSubagentDirectoryPage } from "./subagentHistory.js";
 import { executionSettingsOverrides, queueScheduledPrompt, resumeThreadIfUnloaded, ScheduleConflictError, ScheduledTaskStore, type ScheduleRule } from "./scheduledTasks.js";
@@ -2984,20 +2986,20 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       scheduledTasks.delete(request.params.scheduleId, userId); return { ok: true, ...(alreadyQueued ? { warning: "An already queued run cannot be recalled by deleting its schedule." } : {}) };
     } catch (error) { return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) }); }
   });
-  const pushSubscriptionSchema = z.object({
-    endpoint: z.string().url().max(2048),
-    keys: z.object({ p256dh: z.string().min(32).max(256), auth: z.string().min(8).max(128) }).strict()
-  }).strict();
-  const trustedPushHosts = new Set(["fcm.googleapis.com", "updates.push.services.mozilla.com", "web.push.apple.com"]);
-  const validatePushEndpoint = (endpoint: string) => {
-    const url = new URL(endpoint);
-    if (url.protocol !== "https:" || !trustedPushHosts.has(url.hostname) || url.username || url.password || url.port) {
-      throw new Error("Unsupported browser push endpoint.");
-    }
-  };
   app.get("/api/push/key", async (request) => {
     userIdFromRequest(request, store);
     return { data: { publicKey: pushPublicKey() } };
+  });
+  app.post("/api/push/test", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const { threadId } = z.object({ threadId: z.string().min(1).max(128) }).strict().parse(request.body);
+      if (!store.userCanAccessThread(threadId, userId)) return reply.code(403).send({ error: "无权访问此会话。" });
+      const result = await sendUserPush(store, userId, { type: "test", threadId,
+        projectId: store.getThreadOwner(threadId)?.projectId,
+        title: "Codex 通知测试", body: "如果你看到了这条系统通知，说明此设备已收到测试推送。" });
+      return { data: result };
+    } catch { return reply.code(400).send({ error: "测试通知发送失败，请检查通知订阅和服务器推送链路。" }); }
   });
   app.post("/api/push/subscription", async (request, reply) => {
     try {
@@ -4676,7 +4678,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         deferLargeToolOutputs(clientThread);
         return {
           thread: { ...asRecord(applyThreadPresentation(clientThread, presentation, modelPresentation)),
-            answeredQuestionItemIds: store.answeredQuestionItemIds(request.params.threadId, userId) },
+            answeredQuestionItemIds: store.answeredQuestionItemIds(request.params.threadId, userId),
+            questionAnswers: questionAnswersForPage(store, request.params.threadId, userId, clientThread) },
           history: indexedPage.history
         };
       } else {
@@ -4689,7 +4692,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       return {
         ...page,
         thread: { ...asRecord(applyThreadPresentation(page.thread, presentation, modelPresentation)),
-          answeredQuestionItemIds: store.answeredQuestionItemIds(request.params.threadId, userId) }
+          answeredQuestionItemIds: store.answeredQuestionItemIds(request.params.threadId, userId),
+          questionAnswers: questionAnswersForPage(store, request.params.threadId, userId, page.thread) }
       };
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
