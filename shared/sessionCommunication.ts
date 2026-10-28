@@ -1,6 +1,8 @@
 export type CommunicationKind = "topic" | "service" | "action";
 export type CommunicationState = "published" | "pending" | "accepted" | "executing" | "cancel_requested" | "succeeded" | "failed" | "rejected" | "canceled" | "timed_out";
 export type CommunicationOperation =
+  | { operation: "task.send"; targetThreadId: string; message: string; returnToSource?: boolean }
+  | { operation: "task.cancel"; id: string }
   | { operation: "topic.subscribe" | "topic.unsubscribe" | "service.advertise" | "service.unadvertise" | "action.advertise" | "action.unadvertise"; name: string }
   | { operation: "topic.publish"; name: string; message: string }
   | { operation: "service.call"; name: string; message: string; timeoutSeconds?: number }
@@ -18,6 +20,7 @@ export interface CommunicationMessage {
   createdAt: string; updatedAt: string; deadlineAt: string | null; unread: boolean;
 }
 export interface CommunicationSnapshot {
+  tasks: import("./sessionTasks").SessionTask[];
   threadId: string; sampledAt: string; directory: CommunicationBinding[]; bindings: CommunicationBinding[];
   inbox: CommunicationMessage[]; outbox: CommunicationMessage[]; unreadCount: number;
 }

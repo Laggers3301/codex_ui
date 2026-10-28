@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import { readCommunication, readThreadMcpStatus, sendCommunication } from "./api";
 import { communicationStateLabels, type CommunicationCommand, type CommunicationKind, type CommunicationMessage, type CommunicationOperation, type CommunicationSnapshot } from "../shared/sessionCommunication";
 import "./sessionCommunication.css";
+import { SessionTasks } from "./SessionTasks";
 
-const labels = { topic: "Topic 话题", service: "Service 服务", action: "Action 任务" };
+const labels = { topic: "Topic 话题", service: "Service 服务", action: "Action 任务", task: "直接任务" };
 const descriptions = { topic: "订阅同名话题的会话会收到广播，可用于同步状态和共享消息。", service: "注册提供会话后，通过名称发起请求，由提供会话返回一次结果。", action: "提交长任务目标，提供会话接收后可反馈进度、返回结果并确认取消。" };
 const ended = new Set(["succeeded", "failed", "rejected", "canceled", "timed_out"]);
 const normalizedName = (value: string) => "/" + value.trim().replace(/^\/+|\/+$/g, "");
@@ -56,7 +57,7 @@ function CommunicationToolStatus({ projectId, threadId, visible }: { projectId?:
 function ThreadCommunication({ userId, projectId, threadId, threadName, visible }: CommunicationProps) {
   const scope = `${userId}:${threadId ?? ""}`;
   const draftKey = `communication-draft:${scope}`;
-  const [mode, setMode] = useState<CommunicationKind>("topic");
+  const [mode, setMode] = useState<CommunicationKind | "task">("topic");
   const [draft, setDraft] = useState(() => stored(draftKey, { name: "/updates", message: "", timeout: 120 }));
   const [data, setData] = useState<CommunicationSnapshot | null>(null);
   const [error, setError] = useState("");
@@ -98,7 +99,9 @@ function ThreadCommunication({ userId, projectId, threadId, threadName, visible 
     try {
       const result = await sendCommunication(threadId, { ...operation, requestId } as CommunicationCommand);
       delete requests.current[key]; save(`communication-retries:${scope}`, requests.current);
-      setNotice(operation.operation === "topic.publish" ? `已发布，投递给 ${result.data.delivered ?? 0} 个订阅会话。`
+      setNotice(operation.operation === "task.send" ? "任务已派发，目标会话空闲后自动执行。"
+        : operation.operation === "task.cancel" ? "取消请求已保存。"
+        : operation.operation === "topic.publish" ? `已发布，投递给 ${result.data.delivered ?? 0} 个订阅会话。`
         : operation.operation === "service.call" ? "请求已投递。"
           : operation.operation === "action.send" ? "目标已投递。"
             : operation.operation === "action.cancel" ? result.data.state === "canceled" ? "尚未接收的目标已取消。" : "取消请求已发送。" : "操作已保存。");
@@ -110,6 +113,7 @@ function ThreadCommunication({ userId, projectId, threadId, threadName, visible 
   const registration = mode === "topic" ? binding ? "topic.unsubscribe" : "topic.subscribe" : mode === "service" ? binding ? "service.unadvertise" : "service.advertise" : binding ? "action.unadvertise" : "action.advertise";
   const registrationLabel = mode === "topic" ? binding ? "取消订阅" : "订阅话题" : binding ? "注销提供者" : mode === "service" ? "注册服务提供者" : "注册任务提供者";
   const send = async () => {
+    if (mode === "task") return;
     const input = { name: draft.name, message: draft.message };
     const operation: CommunicationOperation = mode === "topic" ? { ...input, operation: "topic.publish" }
       : mode === "service" ? { ...input, operation: "service.call", timeoutSeconds: draft.timeout }
@@ -150,8 +154,9 @@ function ThreadCommunication({ userId, projectId, threadId, threadName, visible 
     <div className="communicationThreadHeader"><p>当前会话：{threadName || threadId || "尚未打开"}</p><button type="button" onClick={() => refreshRef.current()} disabled={!threadId}>刷新</button></div>
     {!threadId ? <p>请先打开一个会话，再订阅话题或注册服务。</p> : <>
       <CommunicationToolStatus projectId={projectId} threadId={threadId} visible={visible} />
-      <p>模型通过 session_communication 工具主动读取和回复。Topic 仅投递给明确订阅的会话，消息正文不会自动注入提示词；空闲会话不会自动运行。</p>
-      <div role="tablist" aria-label="通信方式">{(["topic", "service", "action"] as const).map(kind => <button role="tab" aria-selected={mode === kind} key={kind} type="button" onClick={() => { setMode(kind); setNotice(""); }}>{labels[kind]}</button>)}</div>
+      <p>模型通过 session_communication 工具主动读取和回复。Topic 仅投递给明确订阅的会话，消息正文不会自动注入提示词；普通通信不自动运行模型，“直接任务”会自动执行并可回传结果。</p>
+      <div role="tablist" aria-label="通信方式">{(["topic", "service", "action", "task"] as const).map(kind => <button role="tab" aria-selected={mode === kind} key={kind} type="button" onClick={() => { setMode(kind); setNotice(""); }}>{labels[kind]}</button>)}</div>
+      {mode === "task" ? <SessionTasks userId={userId} threadId={threadId} tasks={data?.tasks ?? []} perform={perform} busy={busy} visible={visible} /> : <>
       <div role="tabpanel" aria-label={labels[mode]}><p>{descriptions[mode]}</p>
         <label>{mode === "topic" ? "话题名称" : mode === "service" ? "服务名称" : "任务名称"}<input value={draft.name} maxLength={120} onChange={event => setDraft(current => ({ ...current, name: event.target.value }))} /></label>
         <button type="button" disabled={busy || !draft.name.trim() || !data} onClick={() => void perform({ operation: registration, name: draft.name })}>{registrationLabel}</button>
@@ -166,6 +171,10 @@ function ThreadCommunication({ userId, projectId, threadId, threadName, visible 
       <h3>发件记录</h3>{data?.outbox.filter(message => message.kind === mode).map(message => renderMessage(message, false))}
       {!data?.outbox.some(message => message.kind === mode) ? <p>暂无此类记录。</p> : null}
       <p>展示近期通信记录，单条消息最多 16,000 字符，任务保留最近 50 条进度反馈。</p>
+      </>}
+      {mode === "task" && error ? <p role="alert" className="communicationError">{error}</p> : null}
+      {mode === "task" && readError ? <p role="status" className="communicationError">读取失败，保留上次任务记录：{readError}</p> : null}
+      {mode === "task" && notice ? <p role="status">{notice}</p> : null}
     </>}
   </>;
 }

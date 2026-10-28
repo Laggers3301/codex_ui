@@ -39,7 +39,17 @@ describe("communication HTTP and model tool identity", () => {
       expect(injected.isError).toBe(true); expect(store.communication.snapshot("admin", "b").bindings).toEqual([]);
       store.communication.execute("admin", "b", { operation: "topic.publish", name: "/status", message: "模型可读消息", requestId: "publish-to-model-a" });
       expect(JSON.parse((await rpc("tools/call", { operation: "read" })).json().result.content[0].text).inbox[0].message).toBe("模型可读消息");
+      const targets = JSON.parse((await rpc("tools/call", { operation: "task.targets", query: "b" })).json().result.content[0].text);
+      expect(targets.map((target: any) => target.threadId)).toEqual(["b"]);
+      const task = { operation: "task.send", targetThreadId: "b", message: "模型派发给另一个普通会话", returnToSource: false, requestId: "mcp-native-task-send" };
+      const dispatch = JSON.parse((await rpc("tools/call", task)).json().result.content[0].text);
+      expect(dispatch).toMatchObject({ sourceThreadId: "a", targetThreadId: "b", state: "queued" });
+      expect(JSON.parse((await rpc("tools/call", task)).json().result.content[0].text).id).toBe(dispatch.id);
+      expect(JSON.parse((await rpc("tools/call", { operation: "task.get", id: dispatch.id })).json().result.content[0].text).sourceThreadId).toBe("a");
+      expect((await rpc("tools/call", { ...task, requestId: "mcp-forged-task-source", sourceThreadId: "b" })).json().result.isError).toBe(true);
       const cookie = createSessionCookie("admin");
+      expect((await app.inject({ url: "/api/threads/a/communication/targets", headers: { cookie } })).headers["cache-control"]).toBe("no-store");
+      expect((await app.inject({ url: "/api/threads/a/communication/targets", headers: { cookie: createSessionCookie("other") } })).statusCode).toBe(403);
       expect((await app.inject({ url: "/api/threads/a/communication" })).statusCode).toBe(401);
       expect((await app.inject({ url: "/api/threads/a/communication", headers: { cookie: createSessionCookie("other"), "x-codex-web-user-id": "admin" } })).statusCode).toBe(403);
       expect((await app.inject({ url: "/api/threads/a/communication", headers: { cookie } })).headers["cache-control"]).toBe("no-store");

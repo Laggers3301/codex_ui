@@ -43,6 +43,9 @@ export function pingHostNetwork(signal: AbortSignal): Promise<{ data: import("..
 export function readCommunication(threadId: string, signal?: AbortSignal): Promise<{ data: import("../shared/sessionCommunication").CommunicationSnapshot }> {
   return request(`/api/threads/${encodeURIComponent(threadId)}/communication`, { signal });
 }
+export function readCommunicationTargets(threadId: string, query: string, signal: AbortSignal): Promise<{ data: import("../shared/sessionTasks").SessionTaskTarget[] }> {
+  return request(`/api/threads/${encodeURIComponent(threadId)}/communication/targets?query=${encodeURIComponent(query)}`, { signal, cache: "no-store" });
+}
 export function sendCommunication(threadId: string, command: import("../shared/sessionCommunication").CommunicationCommand): Promise<{ data: Record<string, unknown> }> {
   return request(`/api/threads/${encodeURIComponent(threadId)}/communication`, { method: "POST", body: JSON.stringify(command), signal: AbortSignal.timeout(15000) });
 }

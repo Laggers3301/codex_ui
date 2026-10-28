@@ -1,4 +1,6 @@
-.communicationPanel { padding: 16px; color: var(--ui-content); font-size: 12px; overflow-wrap: anywhere; }
+.communicationPanel { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px; color: var(--ui-content); font-size: 12px; overflow-wrap: anywhere; }
+.communicationPanel .sessionTaskReturn { display: flex; align-items: center; gap: 8px; }
+.communicationPanel .sessionTaskReturn input { width: auto; }
 .communicationPanel > header,.communicationMessage > header { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
 .communicationPanel h2 { margin: 0; font-size: 17px; }.communicationPanel h3 { margin: 20px 0 8px; font-size: 13px; }
 .communicationPanel p { margin: 8px 0; line-height: 1.6; color: var(--ui-content-muted); }

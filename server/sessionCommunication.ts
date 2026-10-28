@@ -4,6 +4,7 @@ import type { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import type { ProjectStore } from "./db.js";
 import type { CommunicationBinding, CommunicationCommand, CommunicationKind, CommunicationMessage, CommunicationSnapshot, CommunicationState } from "../shared/sessionCommunication.js";
+import { SessionTaskStore, taskCancelSchema, taskSendSchema } from "./sessionTasks.js";
 
 export class CommunicationError extends Error {
   constructor(message: string, readonly statusCode = 409) { super(message); }
@@ -14,6 +15,7 @@ const requestId = z.string().min(6).max(128);
 const id = z.string().min(1).max(128);
 const base = { requestId };
 export const communicationCommandSchema = z.discriminatedUnion("operation", [
+  taskSendSchema, taskCancelSchema,
   z.object({ ...base, operation: z.enum(["topic.subscribe", "topic.unsubscribe", "service.advertise", "service.unadvertise", "action.advertise", "action.unadvertise"]), name }).strict(),
   z.object({ ...base, operation: z.literal("topic.publish"), name, message }).strict(),
   z.object({ ...base, operation: z.literal("service.call"), name, message, timeoutSeconds: z.number().int().min(1).max(3600).default(120) }).strict(),
@@ -32,6 +34,7 @@ export type CommunicationChange = { userId: string; threadIds: string[] };
 /** A per-user, persisted message bus. It never starts a model turn or a process.
  * Providers explicitly register and consume work through their own inbox. */
 export class SessionCommunicationStore extends EventEmitter {
+  readonly tasks: SessionTaskStore;
   constructor(private db: DatabaseSync, private owners: ProjectStore, private clock: () => number = Date.now) {
     super();
     db.exec(`CREATE TABLE IF NOT EXISTS communication_bindings (
@@ -56,6 +59,7 @@ export class SessionCommunicationStore extends EventEmitter {
       user_id TEXT NOT NULL,thread_id TEXT NOT NULL,request_id TEXT NOT NULL,digest TEXT NOT NULL,result_json TEXT NOT NULL,
       PRIMARY KEY(user_id,thread_id,request_id)
     );`);
+    this.tasks = new SessionTaskStore(db, owners, (userId, threadIds) => this.notify(userId, threadIds));
   }
   private accessible(userId: string, threadId: string): boolean {
     return this.owners.userCanAccessThread(threadId, userId) && !this.owners.isThreadArchivedLocal(threadId, userId);
@@ -96,7 +100,7 @@ export class SessionCommunicationStore extends EventEmitter {
       ORDER BY CASE WHEN m.state IN ('pending','accepted','executing','cancel_requested') THEN 0 ELSE 1 END,m.updated_at DESC,m.id DESC LIMIT ?`).all(userId, threadId, limit) as Row[]).map(row => this.present(userId, row));
     const count = this.db.prepare(`SELECT count(*) AS count FROM communication_deliveries d JOIN communication_messages m ON m.id=d.message_id
       WHERE m.user_id=? AND d.thread_id=? AND d.read_at IS NULL`).get(userId, threadId) as { count: number };
-    return { threadId, sampledAt: new Date(this.clock()).toISOString(), directory, bindings: directory.filter(binding => binding.threadId === threadId), inbox, outbox, unreadCount: count.count };
+    return { threadId, sampledAt: new Date(this.clock()).toISOString(), directory, bindings: directory.filter(binding => binding.threadId === threadId), inbox, outbox, unreadCount: count.count, tasks: this.tasks.list(userId, threadId) };
   }
   get(userId: string, threadId: string, messageId: string): CommunicationMessage {
     this.assertAccess(userId, threadId); this.notify(userId, this.expire(userId));
@@ -108,6 +112,8 @@ export class SessionCommunicationStore extends EventEmitter {
   execute(userId: string, threadId: string, input: unknown): Record<string, unknown> {
     this.assertAccess(userId, threadId);
     const command = communicationCommandSchema.parse(input) as CommunicationCommand;
+    if (command.operation === "task.send") return { ...this.tasks.send(userId, threadId, command) };
+    if (command.operation === "task.cancel") return { ...this.tasks.cancel(userId, threadId, command) };
     const digest = createHash("sha256").update(JSON.stringify(command)).digest("hex");
     let changed = [threadId];
     this.db.exec("BEGIN IMMEDIATE");

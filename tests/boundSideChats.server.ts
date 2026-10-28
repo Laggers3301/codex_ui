@@ -32,6 +32,7 @@ class FixtureBridge extends EventEmitter {
   calls: Array<{ method: string; threadId?: string }> = [];
   starts: Array<{ threadId: string; text: string }> = [];
   mcpConfigs = new Map<string, Record<string, any>>();
+  taskToolOutputs: Array<{ threadId: string; value: any }> = [];
   creationGate: Promise<void> | null = null;
   releaseCreation: (() => void) | null = null;
   failNextTurn = false;
@@ -58,6 +59,7 @@ class FixtureBridge extends EventEmitter {
       threads.set(thread.id, thread); return { thread };
     }
     const thread = threads.get(params.threadId);
+    if (method === "thread/loaded/list") return { data: [...this.mcpConfigs.keys()] };
     if (method === "thread/name/set" && thread) thread.name = params.name;
     if (method === "thread/read") return { thread: thread ? { ...thread, status: { type: thread.status, activeFlags: this.flags.get(thread.id) ?? [] }, turns: params.includeTurns === false ? [] : thread.turns } : thread };
     if (method === "thread/resume") {
@@ -73,13 +75,21 @@ class FixtureBridge extends EventEmitter {
     }
     if (method === "thread/queue/list") return { data: [] };
     if (method === "thread/turns/list") return { data: thread?.turns.slice(-1).map(({id,status}) => ({id,status})) ?? [] };
+    if (method === "thread/items/list") return { data: (thread?.turns.find(turn => turn.id === params.turnId)?.items ?? []).map((item: unknown) => ({ turnId: params.turnId, item })) };
     if (method === "turn/start" && thread) {
       if (this.failNextTurn) { this.failNextTurn = false; throw new Error("用于选中复制的完整错误详情"); }
+      const callback = params.toolOutput ? JSON.parse(params.toolOutput.output) : null;
+      if (callback) {
+        this.taskToolOutputs.push({ threadId: thread.id, value: callback });
+        if (thread.status === "active") return { turn: { id: thread.turns.at(-1)!.id } };
+      }
       const id = randomUUID(), userText = params.input.map((item: any) => item.text ?? "").join("\n");
       this.starts.push({threadId:thread.id,text:userText});
       const sideTurnCount = thread.turns.filter(turn => turn.items.some((item: any) => item.type === "userMessage")).length;
-      const answer = `侧边回答 ${sideTurnCount + 1}：${userText.split("用户问题：\n").at(-1)}`;
-      const turn = { id, status: "running", items: [{ id: id + "-user", type: "userMessage", text: userText }, { id: id + "-answer", type: "agentMessage", text: answer }] };
+      const answer = callback ? `已自动接收协作结果：${callback.result ?? callback.error}` : `侧边回答 ${sideTurnCount + 1}：${userText.split("用户问题：\n").at(-1)}`;
+      const turn = { id, status: "running", items: [callback
+        ? { id: id + "-tool-output", type: "functionCallOutput", name: "session_communication", output: params.toolOutput.output }
+        : { id: id + "-user", type: "userMessage", text: userText }, { id: id + "-answer", type: "agentMessage", text: answer }] };
       thread.turns.push(turn); thread.status = "active";
       this.emit("notification", { method: "turn/started", params: { threadId: thread.id, turn: { id, status: "running" } } });
       setTimeout(() => this.emit("notification", { method: "item/agentMessage/delta", params: { threadId: thread.id, turnId: id, itemId: id + "-answer", delta: answer } }), 30);
@@ -203,7 +213,7 @@ app.post<{ Body: { threadId: string; waiting: boolean; clearRequests?: boolean }
   return { ok: true };
 });
 app.get("/api/__test/state", async () => ({ fixture: "bound-side-chats", projectId: project.id,
-  calls: bridge.calls, starts:bridge.starts, resourceReads, networkProbes, pendingApprovals: bridge.pending, approvalResponses: bridge.approvalResponses, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
+  calls: bridge.calls, starts:bridge.starts, taskToolOutputs: bridge.taskToolOutputs, resourceReads, networkProbes, pendingApprovals: bridge.pending, approvalResponses: bridge.approvalResponses, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
 app.get("/api/projects", async () => ({ data: [project], projectRoot: root }));
 app.get("/api/users", async () => ({ data: [{ id: "admin", name: "admin" }], defaultUserId: "admin" }));
 app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }, ...(process.env.RECLAUDE_FIXTURE_TEST === "1" ? claudePendingProfiles() : [])] }));

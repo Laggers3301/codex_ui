@@ -57,6 +57,7 @@ import { requestedServiceTier, requestedTurnServiceTier } from "./serviceTier.js
 import type { LiveAgentMessage } from "./liveState.js";
 import { reconcileSideChat, settleClosedSideChat, SideChatError } from "./sideChats.js";
 import { forkSideChatContext } from "./sideChatFork.js";
+import { SessionTaskRunner } from "./sessionTaskRunner.js";
 
 const commandSchema = z.array(z.string()).min(1);
 const threadStartContextConfigSchema = z.object({
@@ -1007,6 +1008,19 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
   };
   bridge.on("notification", processBridgeNotification);
+  const sessionTasks = new SessionTaskRunner(bridge, store, {
+    registry: guards,
+    beforeStart: (userId, threadId) => assertTrackedUserQuotaAvailable(bridge, store, userId, threadId),
+    retryPending: threadId => retries.pending(threadId),
+    accepted: (threadId, requestId, result, autonomous) => {
+      rememberAcceptedTurn(guards, threadId, requestId, result);
+      // An ambiguous delegated operation must not replay an older user's turn
+      // template. Its durable task record exposes the result for inspection.
+      const turnId = turnIdFromStartResult(result);
+      if (autonomous && turnId) guards.recoverableTurnIds.delete(turnId);
+    }
+  });
+  wss.on("close", () => sessionTasks.close());
 
   const runWatchdogProbe = async (claim: WatchdogProbeClaim): Promise<void> => {
     const turn = claim.turn;
