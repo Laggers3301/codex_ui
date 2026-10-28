@@ -9,9 +9,10 @@
 .hostNetworkButton { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: 5px; min-height: 38px; padding: 6px 8px; border: 0; border-radius: 8px; background: var(--ui-hover); color: var(--ui-content-muted); font: inherit; font-size: 11px; cursor: pointer; }
 .hostNetworkButton:disabled { opacity: .6; cursor: wait; }
 .hostNetworkButton small { display: block; font-size: 10px; }
+.hostNetworkButton.compact { min-width: 90px; font-variant-numeric: tabular-nums; }
 .hostNetworkButton[data-status="reachable"] { color: #53816a; }
 .workspace > .threadList:has(.hostResourceSummary) { padding-bottom: calc(112px + env(safe-area-inset-bottom, 0px)) !important; }
-.hostResourcesPanel { padding: 18px; color: var(--ui-content); font-size: 12px; overflow-wrap: anywhere; }
+.hostResourcesPanel { flex: 1; min-height: 0; min-width: 0; padding: 18px; overflow-y: auto; overscroll-behavior: contain; box-sizing: border-box; color: var(--ui-content); font-size: 12px; overflow-wrap: anywhere; }
 .hostResourcesPanel > header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
 .hostResourcesPanel > header > div:first-child { min-width: 0; }
 .hostResourceActions { display: flex; flex: none; align-items: center; gap: 5px; }

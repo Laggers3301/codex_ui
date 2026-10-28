@@ -4,6 +4,9 @@ import { pingHostNetwork, readHostResources } from "./api";
 import type { HostNetworkProbeResult, HostResources } from "../shared/hostResources";
 import "./hostResources.css";
 
+const RESOURCE_REFRESH_MS = 10_000;
+const NETWORK_SUMMARY_MS = 8_000;
+
 export function useHostResources(userId: string) {
   const [data, setData] = useState<HostResources | null>(null);
   const [error, setError] = useState(false);
@@ -24,7 +27,7 @@ export function useHostResources(userId: string) {
       } finally {
         if (active && controller === request) {
           controller = null; setFetching(false);
-          if (!document.hidden) timer = window.setTimeout(() => void refresh(), 2000);
+          if (!document.hidden) timer = window.setTimeout(() => void refresh(), RESOURCE_REFRESH_MS);
         }
       }
     };
@@ -43,7 +46,14 @@ function useNetworkProbe(userId: string) {
   const [result, setResult] = useState<HostNetworkProbeResult | null>(null);
   const [error, setError] = useState("");
   const [checking, setChecking] = useState(false);
+  const [showSummary, setShowSummary] = useState(false);
   const controller = useRef<AbortController | null>(null);
+  useEffect(() => {
+    setShowSummary(Boolean(result || error));
+    if (!result && !error) return;
+    const timer = window.setTimeout(() => setShowSummary(false), NETWORK_SUMMARY_MS);
+    return () => window.clearTimeout(timer);
+  }, [result, error]);
   useEffect(() => {
     controller.current?.abort(); controller.current = null; setResult(null); setError(""); setChecking(false);
     return () => { controller.current?.abort(); controller.current = null; };
@@ -61,7 +71,7 @@ function useNetworkProbe(userId: string) {
       if (controller.current === request) { controller.current = null; setChecking(false); }
     }
   };
-  return { result, error, checking, check };
+  return { result, error, checking, showSummary, check };
 }
 export type HostResourceState = ReturnType<typeof useHostResources> & { network: ReturnType<typeof useNetworkProbe> };
 const ResourceContext = createContext<HostResourceState | null>(null);
@@ -89,10 +99,13 @@ const volumeTitle = (volume: HostResources["volumes"][number]) => [
 ].join("\n");
 function NetworkProbeButton({ compact = false, onOpen }: { compact?: boolean; onOpen?: () => void }) {
   const { network } = useResources();
+  const result = network.result;
+  const summary = network.error ? "检测失败" : result?.averageLatencyMs != null ? `${result.averageLatencyMs.toFixed(1)} ms`
+    : result ? ({ reachable: "已连通", timeout: "超时", dns_error: "DNS失败", unavailable: "不可用", permission_denied: "无权限", unreachable: "不可达", error: "检测失败" })[result.status] : "ping";
   return <button type="button" className={`hostNetworkButton${compact ? " compact" : ""}`} aria-label="ping google.com" disabled={network.checking}
-    data-status={network.result?.status} title={network.checking ? "正在从服务主机检测 google.com…" : network.result ? `${network.result.message}${network.result.averageLatencyMs != null ? ` 平均 ${network.result.averageLatencyMs.toFixed(1)} ms。` : ""} 点击重新检测。` : "从当前服务主机 ping google.com，发送 3 次探测。"}
+    data-status={result?.status} title={network.checking ? "正在从服务主机检测 google.com…" : network.error ? `${network.error} 点击重新检测。` : result ? `${result.message}${result.averageLatencyMs != null ? ` 平均 ${result.averageLatencyMs.toFixed(1)} ms。` : ""} 点击重新检测。` : "从当前服务主机 ping google.com，发送 3 次探测。"}
     onClick={() => { onOpen?.(); void network.check(); }}>
-    <Globe size={14} />{compact ? <span>{network.checking ? "检测中" : "ping"}<small>google.com</small></span> : <span>{network.checking ? "检测中…" : "ping google.com"}</span>}
+    <Globe size={14} />{compact ? <span aria-live="polite" aria-atomic="true">{network.checking ? "检测中" : network.showSummary ? summary : "ping"}<small>google.com</small></span> : <span>{network.checking ? "检测中…" : "ping google.com"}</span>}
   </button>;
 }
 function NetworkProbeResult() {
@@ -126,7 +139,7 @@ export function HostResourcePanel() {
   const { data, error, fetching, refresh } = state;
   return <section className="hostResourcesPanel" aria-label="主机资源">
     <header><div><h2>主机资源</h2><p>{data ? `${data.hostname} · ${data.platform}` : "正在读取服务主机状态"}</p></div><div className="hostResourceActions"><NetworkProbeButton /><button type="button" onClick={refresh} disabled={fetching} aria-label="刷新主机资源"><RefreshCcw size={16} /></button></div></header>
-    <p className="hostResourceUpdate" role="status">{error ? "更新失败，保留上次数据；可点击刷新重试。" : data ? `每 2 秒更新 · 最近采样 ${new Date(data.sampledAt).toLocaleTimeString()}` : "正在采样…"}</p>
+    <p className="hostResourceUpdate" role="status">{error ? "更新失败，保留上次数据；可点击刷新重试。" : data ? `每 ${RESOURCE_REFRESH_MS / 1000} 秒更新 · 最近采样 ${new Date(data.sampledAt).toLocaleTimeString()}` : "正在采样…"}</p>
     <NetworkProbeResult />
     {data ? <>
       <article><h3><Cpu size={16} />CPU <strong>{percentage(data.cpu.usagePercent)}</strong></h3><Meter label="CPU 使用率" value={data.cpu.usagePercent} /><p>{data.cpu.cores} 个逻辑核心 · {data.cpu.model}</p>

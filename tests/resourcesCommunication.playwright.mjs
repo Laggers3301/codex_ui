@@ -41,7 +41,7 @@ try {
   a.on("request", request => { if (new URL(request.url()).pathname === "/api/system/resources") resourceTimes.push(Date.now()); });
   await a.getByRole("button", { name: "查看主机资源", exact: true }).click();
   const resourcePanel = a.getByRole("region", { name: "主机资源", exact: true });
-  await expect(resourcePanel).toContainText("fixture-host"); await expect(resourcePanel).toContainText("每 2 秒更新");
+  await expect(resourcePanel).toContainText("fixture-host"); await expect(resourcePanel).toContainText("每 10 秒更新");
   await expect(resourcePanel.getByRole("meter", { name: "CPU 使用率", exact: true })).toHaveAttribute("aria-valuenow", "13");
   await expect(resourcePanel).toContainText("6.0 GiB"); await expect(resourcePanel).toContainText("读取 2.0 MiB/s");
   const diskTip = a.locator('.hostResourceSummary .hostResourceDisk');
@@ -50,16 +50,16 @@ try {
   const editor = a.locator('.conversation > .composer [contenteditable="true"]').first();
   await editor.fill("用于核对资源刷新的草稿"); await editor.press("ArrowLeft"); await editor.press("ArrowLeft");
   const caretBefore = await a.evaluate(() => ({ text: getSelection().anchorNode.textContent, offset: getSelection().anchorOffset }));
-  await expect.poll(() => resourceTimes.length, { timeout: 10000 }).toBeGreaterThanOrEqual(3);
+  await expect.poll(() => resourceTimes.length, { timeout: 35000 }).toBeGreaterThanOrEqual(3);
   const intervals = resourceTimes.slice(-3).slice(1).map((time, index) => time - resourceTimes.slice(-3)[index]);
-  assert.ok(intervals.every(interval => interval >= 1750 && interval <= 3500), "visible resource sampling should be about two seconds apart");
+  assert.ok(intervals.every(interval => interval >= 9500 && interval <= 14000), "visible resource sampling should be about ten seconds apart");
   assert.deepEqual(await a.evaluate(() => ({ text: getSelection().anchorNode.textContent, offset: getSelection().anchorOffset })), caretBefore, "resource refresh must preserve the composer's caret");
   await a.evaluate(() => { Object.defineProperty(document, "hidden", { configurable: true, get: () => true }); document.dispatchEvent(new Event("visibilitychange")); });
-  const beforeHidden = resourceTimes.length; await a.waitForTimeout(2800); assert.equal(resourceTimes.length, beforeHidden, "hidden pages stop resource polling");
+  const beforeHidden = resourceTimes.length; await a.waitForTimeout(11000); assert.equal(resourceTimes.length, beforeHidden, "hidden pages stop resource polling");
   await a.evaluate(() => { Object.defineProperty(document, "hidden", { configurable: true, get: () => false }); document.dispatchEvent(new Event("visibilitychange")); });
   await expect.poll(() => resourceTimes.length).toBeGreaterThan(beforeHidden);
   await context.request.post(origin + "/api/__test/resource-mode", { data: { fail: true } });
-  await expect(resourcePanel).toContainText("更新失败", { timeout: 6000 }); await expect(resourcePanel).toContainText("6.0 GiB");
+  await expect(resourcePanel).toContainText("更新失败", { timeout: 15000 }); await expect(resourcePanel).toContainText("6.0 GiB");
   await context.request.post(origin + "/api/__test/resource-mode", { data: { fail: false } });
   await resourcePanel.getByRole("button", { name: "刷新主机资源", exact: true }).click(); await expect(resourcePanel).not.toContainText("更新失败");
   assert.equal((await state()).networkProbes, 0, "resource polling never runs ping automatically");
@@ -73,17 +73,32 @@ try {
   await expect(resourcePanel.getByRole("button", { name: "ping google.com", exact: true })).toBeDisabled();
   await context.request.post(origin + "/api/__test/network-mode", { data: { hold: false } });
   await expect(network).toContainText("平均延迟 20.5 ms · 丢包 0%"); await expect(dockPing).toBeEnabled();
+  await expect(dockPing).toContainText("20.5 ms");
+  await a.waitForTimeout(4500); await expect(dockPing).toContainText("20.5 ms");
+  await a.screenshot({ path: `${evidence}/resources-ping-inline.png` });
+  await expect(dockPing).toContainText("ping", { timeout: 6000 });
+  await expect(network).toContainText("平均延迟 20.5 ms · 丢包 0%", { timeout: 1000 });
   await context.request.post(origin + "/api/__test/network-mode", { data: { fail: true } });
   await resourcePanel.getByRole("button", { name: "ping google.com", exact: true }).click();
   await expect(network).toContainText("本次检测未收到 ICMP 应答。");
+  await expect(dockPing).toContainText("超时"); await expect(dockPing).not.toContainText("ms");
   const pingOutput = network.locator("pre"); await expect(pingOutput).toContainText("100% packet loss");
   const readsBeforeError = resourceTimes.length;
   await pingOutput.evaluate(element => { const range = document.createRange(); range.selectNodeContents(element); const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range); });
-  await expect.poll(() => resourceTimes.length).toBeGreaterThan(readsBeforeError);
+  await expect.poll(() => resourceTimes.length, { timeout: 15000 }).toBeGreaterThan(readsBeforeError);
   assert.match(await a.evaluate(() => getSelection().toString()), /100% packet loss/, "diagnostics remain selectable during resource refresh");
   assert.equal((await state()).networkProbes, 2, "only the two manual clicks run network probes");
+  const scrollResourcePanel = async () => {
+    await resourcePanel.evaluate(element => { element.scrollTop = 0; });
+    assert.ok(await resourcePanel.evaluate(element => element.scrollHeight > element.clientHeight + 100), "the panel has content below the viewport");
+    await resourcePanel.hover(); await a.mouse.wheel(0, 700);
+    await expect.poll(() => resourcePanel.evaluate(element => element.scrollTop)).toBeGreaterThan(100);
+    await a.mouse.wheel(0, -2000); await expect.poll(() => resourcePanel.evaluate(element => element.scrollTop)).toBe(0);
+  };
+  await a.setViewportSize({ width: 1600, height: 600 }); await scrollResourcePanel();
   await a.screenshot({ path: `${evidence}/resources-desktop-dark.png` });
-  await a.setViewportSize({ width: 393, height: 852 }); await a.evaluate(() => document.documentElement.dataset.theme = "light");
+  await a.setViewportSize({ width: 393, height: 600 }); await a.evaluate(() => document.documentElement.dataset.theme = "light");
+  await scrollResourcePanel();
   assert.ok(await resourcePanel.evaluate(element => element.scrollWidth <= element.clientWidth + 1));
   await a.screenshot({ path: `${evidence}/resources-phone-light.png` });
   await a.setViewportSize({ width: 1600, height: 1000 }); await a.evaluate(() => document.documentElement.dataset.theme = "dark");
@@ -213,7 +228,7 @@ try {
   await expect(panelA.getByRole("textbox", { name: "广播内容", exact: true })).toHaveValue("侧边独立草稿");
   await expect(panelA.locator(".communicationMessage")).toContainText("主会话通过工具发送到侧边");
   const finalState = await state(); assert.equal(finalState.starts.length, 2, "only the two explicit simulated user messages start turns"); assert.deepEqual(errors, []);
-  const report = { isolatedDatabase: true, realRestAndWebsocket: true, resourceSamplingAboutTwoSeconds: intervals, hiddenPageStopsPolling: true, resourceRefreshPreservesCaret: true, failuresPreserveLastResourceData: true, mountPathsOnHover: true, pingInSameRow: true, manualPingOnly: true, pingLatencyAndFailureOutput: true, pingOutputRemainsSelectable: true, topicDeliveryAndReload: true, concurrentServicesRemainIndependent: true, serviceErrorsCorrelated: true, actionFeedbackAndCancelAck: true, mainSideIdentityAndDraftIsolation: true, realMcpWithSocketResumeAndForkCredentials: true, mainSideTopicAndServiceToolCalls: true, unsubscribedMainReceivesNoTopic: true, toolStatusFailureKeepsInbox: true, toolStatusNotPolled: true, phoneNoHorizontalOverflow: true, communicationNeverStartsModelTurns: true, simulatedUserTurns: 2, errors };
+  const report = { isolatedDatabase: true, realRestAndWebsocket: true, resourceSamplingAboutTenSeconds: intervals, hiddenPageStopsPolling: true, resourceRefreshPreservesCaret: true, failuresPreserveLastResourceData: true, mountPathsOnHover: true, pingInSameRow: true, manualPingOnly: true, inlinePingSummaryRetainedEightSeconds: true, pingLatencyAndFailureOutput: true, resourcePanelDesktopAndPhoneScroll: true, pingOutputRemainsSelectable: true, topicDeliveryAndReload: true, concurrentServicesRemainIndependent: true, serviceErrorsCorrelated: true, actionFeedbackAndCancelAck: true, mainSideIdentityAndDraftIsolation: true, realMcpWithSocketResumeAndForkCredentials: true, mainSideTopicAndServiceToolCalls: true, unsubscribedMainReceivesNoTopic: true, toolStatusFailureKeepsInbox: true, toolStatusNotPolled: true, phoneNoHorizontalOverflow: true, communicationNeverStartsModelTurns: true, simulatedUserTurns: 2, errors };
   await fs.writeFile(`${evidence}/results.json`, JSON.stringify(report, null, 2) + "\n"); console.log(JSON.stringify(report, null, 2));
 } catch (error) {
   for (const [index, page] of (browser?.contexts().flatMap(context => context.pages()) ?? []).entries()) {

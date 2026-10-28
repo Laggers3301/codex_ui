@@ -118,7 +118,7 @@ let resourceReads = 0, resourceFailure = false, networkProbes = 0, networkFailur
 let releaseNetwork: (() => void) | null = null;
 registerHostResourceRoutes(app, { read: async () => {
   resourceReads++; if (resourceFailure) throw new Error('fixture resource failure');
-  return { sampledAt: new Date().toISOString(), intervalMs: 2000, hostname: "fixture-host", platform: "linux",
+  return { sampledAt: new Date().toISOString(), intervalMs: 10_000, hostname: "fixture-host", platform: "linux",
     cpu: { cores: 8, model: "Fixture CPU", usagePercent: 12.5, loadAverage: [1, .8, .6] },
     memory: { totalBytes: 8 * 1024 ** 3, usedBytes: 6 * 1024 ** 3, availableBytes: 2 * 1024 ** 3, usagePercent: 75, swapTotalBytes: 2 * 1024 ** 3, swapUsedBytes: 1024 ** 3 },
     volumes: [{ labels: ["系统", "数据目录", "工作目录"], paths: [{ label: "系统", path: "/" }, { label: "数据目录", path: "/fixture/data" }, { label: "工作目录", path: "/fixture/workspaces" }], mountPoints: ["/"], totalBytes: 100 * 1024 ** 3, usedBytes: 40 * 1024 ** 3, availableBytes: 60 * 1024 ** 3, usagePercent: 40 }],
