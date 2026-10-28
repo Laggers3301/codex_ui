@@ -22,6 +22,9 @@ it('serves installed pool catalogs even when the default account is stale or the
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'pool-models-'));
   const homes=['old','new'].map(id=>{const home=path.join(directory,id);fs.mkdirSync(home);return home;});
   const model=(slug:string)=>({slug,display_name:slug,visibility:'list',shell_type:'unified_exec',priority:3,supported_reasoning_levels:[{effort:'low'},{effort:'max'}]});
+  const providerCatalog=path.join(directory,'provider-models.json');
+  const providerText=JSON.stringify({models:[model('provider-kept-by-ui')]});
+  fs.writeFileSync(providerCatalog,providerText);
   for(let i=0;i<homes.length;i++)fs.writeFileSync(path.join(homes[i],'model-catalog-gpt-5.6-sol-long-context.json'),JSON.stringify({models:[model('gpt-6.1-sol'),...(i?[model('gpt-6.1-terra')]:[])]}));
   let nativeRequests=0;
   class Fixture extends EventEmitter {
@@ -31,7 +34,8 @@ it('serves installed pool catalogs even when the default account is stale or the
   }
   const pool=new AccountPoolBridge({accounts:homes.map((codexHome,i)=>({id:i?'new':'old',label:i?'new':'old',codexHome})),stateFile:'pool.json'},directory,()=>new Fixture() as unknown as CodexBridge);
   const app=Fastify();
-  vi.stubEnv('CODEX_WEB_EXTRA_MODEL_CATALOGS','');invalidateModelCatalogCache();
+  vi.stubEnv('CODEX_WEB_EXTRA_MODEL_CATALOGS',providerCatalog);
+  vi.stubEnv('CODEX_WEB_CODEX_MODEL_DISCOVERY','native');invalidateModelCatalogCache();
   registerRoutes(app,pool as unknown as CodexBridge,{} as ProjectStore,{backgroundIndexing:false,browserTools:false});
   try {
     for(const offline of [false,true]){
@@ -41,6 +45,7 @@ it('serves installed pool catalogs even when the default account is stale or the
       expect(response.statusCode).toBe(200);
       const data=response.json().data;
       expect(data.filter((m:{model:string})=>m.model==='gpt-6.1-terra')).toHaveLength(2);
+      expect(data.filter((m:{model:string})=>m.model==='provider-kept-by-ui')).toHaveLength(2);
       expect(data.filter((m:{runtime?:string})=>m.runtime==='claude-code')).toHaveLength(3);
       expect(data.filter((m:{runtime?:string})=>m.runtime==='claude-code').every((m:{availability:string})=>m.availability==='not-connected')).toBe(true);
       expect(new Set(data.map((m:{id:string})=>m.id)).size).toBe(data.length);
@@ -50,6 +55,11 @@ it('serves installed pool catalogs even when the default account is stale or the
     await expect(pool.startThreadOnAccount("old", {model:"reclaude-sonnet"})).rejects.toMatchObject({code:"runtime_not_connected"});
     await expect(pool.forkThreadOnAccount("old", {model:"reclaude-opus"})).rejects.toMatchObject({code:"runtime_not_connected"});
     expect(nativeRequests).toBe(0);
+    expect(pool.modelCatalogTargets()).toHaveLength(2);
+    expect(pool.automaticModelCatalogTargets()).toEqual([]);
+    vi.stubEnv('CODEX_WEB_CODEX_MODEL_DISCOVERY','legacy');
+    expect(pool.automaticModelCatalogTargets()).toHaveLength(2);
+    expect(fs.readFileSync(providerCatalog,'utf8')).toBe(providerText);
   } finally {
     await app.close();pool.stop();vi.unstubAllEnvs();invalidateModelCatalogCache();
     fs.rmSync(directory,{recursive:true,force:true});

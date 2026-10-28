@@ -19,6 +19,7 @@ import { authFailureCodes as AUTH_FAILURE_CODES, permanentAuthCode, credentialTi
 import {authDiagnostic, type AuthDiagnostic, type AuthPhase} from "./authDiagnostics.js";
 import { ProviderTurnProtocol } from "./providerProtocol.js";
 import { validateModelRequest } from "./modelRequestValidation.js";
+import { nativeModelDiscoveryEnabled } from "./nativeModelDiscovery.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -237,12 +238,12 @@ function processIdFromParams(params: unknown): string | null {
   return typeof value === "string" && value ? value : null;
 }
 
-export function accountAppServerArgs(codexHome: string): string[] {
+export function accountAppServerArgs(codexHome: string, kind: "codex-account" | "api-provider" = "codex-account"): string[] {
   ensureDefaultAgentLanguage(codexHome);
   installSubagentHistoryGuard(codexHome);
   const modelCatalogPath = path.join(codexHome, MODEL_CATALOG_FILENAME);
   const args = ["app-server", "--listen", "stdio://"];
-  if (fs.existsSync(modelCatalogPath)) {
+  if (!nativeModelDiscoveryEnabled(codexHome, kind) && fs.existsSync(modelCatalogPath)) {
     args.push("-c", `model_catalog_json=${JSON.stringify(responsesCompatibleModelCatalog(modelCatalogPath))}`);
   }
   return args;
@@ -264,7 +265,7 @@ function accountSupportedModels(codexHome: string): Set<string> | null {
   }
 }
 
-function createAccountBridge(codexHome: string, accountId: string, adoptCandidate = false): CodexBridge {
+function createAccountBridge(codexHome: string, accountId: string, adoptCandidate = false, kind: "codex-account" | "api-provider" = "codex-account"): CodexBridge {
   prepareVerifiedProviderCatalog(codexHome, accountId);
   const scope = process.env.CODEX_WEB_ISOLATE_AGENT_SCOPES === "1" ? {
     unitPrefix: `codex-agent-${accountId.replace(/[^A-Za-z0-9-]/g, "-")}`,
@@ -285,8 +286,9 @@ function createAccountBridge(codexHome: string, accountId: string, adoptCandidat
     args: ["--exclusive", "--nonblock", "--no-fork", "--conflict-exit-code", "75",
       path.join(codexHome, ".web-runtime.lock"), process.execPath,
       fileURLToPath(new URL("../scripts/run-account-runtime.mjs", import.meta.url)),
-      serverConfig.codexBin, ...accountAppServerArgs(codexHome)],
+      serverConfig.codexBin, ...accountAppServerArgs(codexHome, kind)],
     env: { ...process.env, CODEX_HOME: codexHome, CODEX_WEB_RUNTIME_ADOPT_CANDIDATE: adoptCandidate ? "1" : "0" },
+    ...(nativeModelDiscoveryEnabled(codexHome, kind) ? { nativeModelDiscoveryHome: codexHome } : {}),
     scope
   });
 }
@@ -556,17 +558,19 @@ export class AccountPoolBridge extends EventEmitter {
     return new AccountPoolBridge(parsed, path.dirname(absolute), (home, id) => {
       const coldStart = !launchedHomes.has(home);
       launchedHomes.add(home);
-      return createAccountBridge(home, id, coldStart && process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE === "1");
+      const kind = parsed.accounts.find(entry => entry.id === id)?.kind ?? "codex-account";
+      return createAccountBridge(home, id, coldStart && process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE === "1", kind);
     });
   }
 
   constructor(
     config: AccountPoolFile,
     configDirectory = process.cwd(),
-    bridgeFactory: (codexHome: string, accountId: string) => CodexBridge = createAccountBridge
+    bridgeFactory?: (codexHome: string, accountId: string) => CodexBridge
   ) {
     super();
-    this.bridgeFactory = bridgeFactory;
+    this.bridgeFactory = bridgeFactory ?? ((home, id) => createAccountBridge(home, id, false,
+      config.accounts.find(entry => entry.id === id)?.kind ?? "codex-account"));
     const enabled = config.accounts.filter((entry) => entry.enabled !== false);
     if (!enabled.length) {
       throw new Error("The Codex account pool has no enabled accounts.");
@@ -955,6 +959,12 @@ export class AccountPoolBridge extends EventEmitter {
         codexHome: account.codexHome,
         catalogPath: path.join(account.codexHome, MODEL_CATALOG_FILENAME)
       }));
+  }
+
+  /** Native Codex owns its remote discovery/cache; UI catalog sources stay
+   * independent and are still returned by modelCatalogTargets(). */
+  automaticModelCatalogTargets(): ModelCatalogTarget[] {
+    return this.modelCatalogTargets().filter(target => !nativeModelDiscoveryEnabled(target.codexHome));
   }
 
   /**

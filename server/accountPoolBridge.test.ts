@@ -589,7 +589,8 @@ describe("account-pool routing policy", () => {
 
       const catalogPath = path.join(temporary, "model-catalog-gpt-5.6-sol-long-context.json");
       fs.writeFileSync(catalogPath, '{"models":[]}');
-      expect(accountAppServerArgs(temporary)).toEqual([
+      expect(accountAppServerArgs(temporary)).toEqual(["app-server", "--listen", "stdio://"]);
+      expect(accountAppServerArgs(temporary, "api-provider")).toEqual([
         "app-server",
         "--listen",
         "stdio://",

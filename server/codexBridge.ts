@@ -9,6 +9,7 @@ import { serverConfig } from "./config.js";
 import type { RpcEnvelope } from "./types.js";
 import { AppError } from "./appErrors.js";
 import {authDiagnostic} from "./authDiagnostics.js";
+import { nativeModelDiscoveryArgs, nativeModelDiscoveryEnabled, prepareNativeModelDiscovery } from "./nativeModelDiscovery.js";
 
 /**
  * The process used as the JSON-RPC transport for a Codex app-server.
@@ -21,6 +22,8 @@ export interface CodexBridgeLaunchOptions {
   command: string;
   args: readonly string[];
   env?: NodeJS.ProcessEnv;
+  /** A service-owned CODEX_HOME; third-party provider bridges leave this unset. */
+  nativeModelDiscoveryHome?: string;
   scope?: {
     unitPrefix: string;
     slice: string;
@@ -65,6 +68,16 @@ interface ServerRequestRecord {
   receivedAt: string;
 }
 
+function defaultLaunchOptions(): CodexBridgeLaunchOptions {
+  const home = process.env.CODEX_HOME?.trim();
+  return {
+    command: serverConfig.codexBin,
+    args: ["app-server", "--listen", "stdio://"],
+    env: process.env,
+    ...(home && nativeModelDiscoveryEnabled(home) ? { nativeModelDiscoveryHome: home } : {})
+  };
+}
+
 export function classifyRpcEnvelope(message: RpcEnvelope): "response" | "serverRequest" | "notification" {
   if (message.id !== undefined && !message.method) {
     return "response";
@@ -96,11 +109,7 @@ export class CodexBridge extends EventEmitter {
   private pressureReported = false;
   private lowMemorySince: number | null = null;
 
-  constructor(private readonly launch: CodexBridgeLaunchOptions = {
-    command: serverConfig.codexBin,
-    args: ["app-server", "--listen", "stdio://"],
-    env: process.env
-  }) {
+  constructor(private readonly launch: CodexBridgeLaunchOptions = defaultLaunchOptions()) {
     super();
   }
 
@@ -204,13 +213,18 @@ export class CodexBridge extends EventEmitter {
   }
 
   private async spawnServer(): Promise<void> {
-    const command = codexProcessCommand(this.launch);
     const runtimeEnvironment = { ...(this.launch.env ?? process.env) };
+    const nativeHome = this.launch.nativeModelDiscoveryHome;
+    if (nativeHome) prepareNativeModelDiscovery(nativeHome);
+    const command = codexProcessCommand(nativeHome ? {
+      ...this.launch, args: [...this.launch.args, ...nativeModelDiscoveryArgs(runtimeEnvironment)]
+    } : this.launch);
     // OAuth app credentials belong to the web backend, never to agent shells.
     for (const key of Object.keys(runtimeEnvironment)) if (key.startsWith("FEISHU_")) delete runtimeEnvironment[key];
     this.proc = spawn(command.command, command.args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: runtimeEnvironment,
+      ...(nativeHome ? { cwd: nativeHome } : {}),
       shell: false
     });
 

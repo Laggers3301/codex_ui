@@ -164,7 +164,7 @@ export class ModelCatalogAutoUpdater {
     let refreshFailed = false;
     if (Date.now() >= this.nextRefreshAt) {
       const version = await this.version();
-      for (const target of this.pool.modelCatalogTargets()) {
+      for (const target of this.pool.automaticModelCatalogTargets()) {
         try {
           const result = await fetchCatalog(target, version, this.etags.get(target.id));
           if (result.etag) this.etags.set(target.id, result.etag);

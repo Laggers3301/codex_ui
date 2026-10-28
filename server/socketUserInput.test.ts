@@ -159,7 +159,7 @@ describe("native question answers over the socket", () => {
       expect(store.answeredQuestionItemIds("thread-a", "admin")).toEqual([]);
       first.send({ ...answer, requestId: "accepted" });
       expect((await first.wait(m => m.requestId === "accepted")).ok).toBe(true);
-      expect((await tab.wait(m => m.type === "question.answered")).data).toEqual({ threadId: "thread-a", itemId: "question-a" });
+      expect((await tab.wait(m => m.type === "question.answered")).data).toEqual({ threadId: "thread-a", itemId: "question-a", answer: ["A"] });
       expect(store.answeredQuestionItemIds("thread-a", "admin")).toEqual(["question-a"]);
       const params = bridge.parameters.filter(row => row.method === "turn/start").at(-1)!.params;
       expect(params.input).toEqual([]);
