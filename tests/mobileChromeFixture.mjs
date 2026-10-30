@@ -27,6 +27,7 @@ export async function installMobileChromeFixture(context, user) {
     else if(path==='/api/threads/mobile-thread')json={thread,history:{totalItems:2,returnedItems:2,before:0,hasOlder:false}};
     else if(path.endsWith('/execution-settings'))json={data:{sandbox:'danger-full-access',approvalPolicy:'never'}};
     else if(path.endsWith('/context')||path.endsWith('/side-chat'))json={data:null};
+    else if(path.endsWith('/browser'))json={data:null};
     else if(path.endsWith('/subagents'))json={data:[],page:{total:0,activeCount:0,historyCount:0,hasMore:false}};
     else if(path==='/api/pets')json={pets:[],activePetId:null,visible:false,position:null};
     else if(path==='/api/codex/account-pool')json={data:{strategy:'highest-remaining-sticky-thread',accounts:Array.from({length:4},(_,index)=>({id:`fixture-${index}`,label:`Account ${index+1}`,health:'ready',selectedForNewThreads:index===0,assignedThreadCount:0,activeRequests:0,lastError:null,lastCheckedAt:null,quota})),updatedAt:new Date().toISOString()}};

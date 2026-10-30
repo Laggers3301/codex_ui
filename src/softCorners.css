@@ -40,7 +40,6 @@
 :root .threadList .v2WorkspaceThreads {row-gap:2px!important;}
 :root .threadList .v2WorkspaceThreads .threadRow {margin-block:0!important;border-width:0!important;box-shadow:none!important;}
 :root[data-theme] .threadList .v2WorkspaceThreads .threadRow.pinned:not(.selected) {background:rgba(238,196,95,.13)!important;}
-:root .threadList .v2WorkspaceThreads .threadRow:is(.running,.opening) {box-shadow:inset 0 0 0 1px rgba(150,160,150,.14)!important;}
 :root .threadList .v2WorkspaceThreads .threadRow .threadSelectButton {border-radius:inherit!important;background:transparent!important;}
 /* Align actual glyph boxes across the brand, project header and folder rows. */
 :root .threadList :is(.v2ThemeToggle,.listHeaderActions button,.projectNewThreadButton,.projectRenameButton,.projectDeleteButton) > svg {width:17px!important;height:17px!important;}

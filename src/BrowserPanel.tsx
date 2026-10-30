@@ -449,7 +449,7 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, onClose
         <button className="browserPanelClose" type="button" onClick={closePanel} title="隐藏浏览器" aria-label="关闭"><X size={17} /></button>
       </span>
     </header>
-    <div className="browserTabBar">
+    <div className="browserTabBar" data-empty={!state?.tabs?.length}>
       <div className="browserTabs" ref={tabList} role="tablist" aria-label="网页标签">
         {state?.tabs?.map((tab, index) => <div key={tab.id} className={`browserTab${tab.id === state.activeTabId ? " selected" : ""}${closingTabs.includes(tab.id) ? " closing" : ""}`}>
           <button type="button" role="tab" aria-selected={tab.id === state.activeTabId} tabIndex={tab.id === state.activeTabId ? 0 : -1} title={tab.url === "about:blank" ? "新标签页" : `${tab.title}\n${tab.url}`} onClick={() => void switchTab(tab.id)} onKeyDown={event => {
@@ -467,6 +467,7 @@ export function BrowserPanel({ projectId, threadId, visible, navigation, onClose
       <button type="button" title="刷新" aria-label="刷新" disabled={!state} onClick={() => void sendAction("reload")}><RotateCw size={14} /></button>
       <input ref={addressRef} aria-label="网址" value={url} onChange={event => { addressVersion.current++; addressDirty.current = true; setUrl(event.target.value); }} placeholder="输入网址…" dir="ltr" />
       <button type="submit" className="browserGo" disabled={loading || !threadId}>{loading ? <LoaderCircle className="browserSpin" size={15} /> : "打开"}</button>
+      {!state?.tabs?.length && <button type="button" className="browserNewTab browserNewTabInline" title="新建网页标签" aria-label="新建网页标签" disabled={busy || loading || !threadId} onClick={() => void navigate(undefined, "", true)}><Plus size={15} /></button>}
     </form>
     {state?.pendingApproval && <section className="browserApproval" role="alert"><strong>需要授权</strong><span>{state.pendingApproval.message}{state.pendingApproval.url ? ` · ${state.pendingApproval.url}` : ""}</span><div><button type="button" onClick={() => void approval(false)}>拒绝</button><button type="button" onClick={() => void approval(true)}><Check size={14} />允许</button></div></section>}
     <div className={`browserViewport${agentCue ? " agentActive" : ""}${manual ? " manual" : ""}`} onWheel={queueWheel}>
