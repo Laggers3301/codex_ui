@@ -39,7 +39,10 @@ try {
     await page.getByText('检查手机左栏、正文和右栏。',{exact:true}).waitFor();
     if(mobile){
       const sidebar=page.locator('.threadList');
-      if(!await sidebar.evaluate(e=>e.classList.contains('collapsed')))await sidebar.locator('.v2SidebarToggle').click();
+      // The route can auto-close it between two Playwright actions. Keep the
+      // state check and fixture-only dismissal atomic instead of clicking a
+      // now-hidden toggle after waiting for its collapse animation.
+      await sidebar.evaluate(e=>{if(!e.classList.contains('collapsed'))e.querySelector('.v2SidebarToggle')?.click();});
       await page.waitForFunction(()=>document.querySelector('.threadList').classList.contains('collapsed'));
     }
     await page.evaluate(mode=>{document.documentElement.dataset.theme=mode;},theme);

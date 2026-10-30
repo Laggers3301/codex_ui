@@ -168,7 +168,9 @@
             }
           }
           const listLabel = document.querySelector(".threadList .listHeader > span:first-child");
-          if (listLabel) listLabel.textContent = "项目";
+          // Setting identical text still replaces its text node and triggers
+          // our childList observer. Never turn this bridge into a RAF loop.
+          if (listLabel && listLabel.textContent !== "项目") listLabel.textContent = "项目";
           const conversationTitle = document.querySelector(".conversationHeader h2");
           if (conversationTitle?.textContent?.trim() === "New Thread") conversationTitle.textContent = "新对话";
           const emptyState = document.querySelector(".conversation .emptyState");
@@ -253,7 +255,13 @@
         });
 
         let scheduled = false;
-        const observer = new MutationObserver(() => {
+        const observer = new MutationObserver((records) => {
+          // Message deltas do not create shell controls. Inspecting the full
+          // sidebar/composer for each streamed span forces needless layout.
+          if (records.every((record) => {
+            const target = record.target instanceof Element ? record.target : record.target.parentElement;
+            return target?.closest(".messages");
+          })) return;
           if (scheduled) return;
           scheduled = true;
           requestAnimationFrame(() => {
