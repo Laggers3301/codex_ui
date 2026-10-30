@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Cpu, Globe, HardDrive, MemoryStick, RefreshCcw } from "lucide-react";
 import { checkHostNetwork, readHostResources } from "./api";
 import type { HostNetworkProbeResult, HostResources } from "../shared/hostResources";
@@ -125,12 +125,30 @@ function NetworkProbeResult() {
 }
 export function HostResourceSummary({ onOpen }: { onOpen: () => void }) {
   const state = useResources();
+  const dock = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const element = dock.current, sidebar = element?.closest('.threadList');
+    if (!element || !sidebar) return;
+    const anchor = sidebar.querySelector('.v2WorkspaceFolderButton') ?? sidebar.querySelector('.v2ProjectDock');
+    if (!anchor) return;
+    const align = () => {
+      if (sidebar.classList.contains('collapsed')) { element.style.removeProperty('--resource-dock-width'); element.style.removeProperty('--resource-dock-offset'); return; }
+      const target = (sidebar.querySelector('.v2WorkspaceFolderButton') ?? anchor).getBoundingClientRect(), parent = element.parentElement!.getBoundingClientRect();
+      const inset = parseFloat(getComputedStyle(element.parentElement!).paddingLeft) || 0;
+      if (target.width <= 0) return;
+      element.style.setProperty('--resource-dock-width', `${target.width}px`);
+      element.style.setProperty('--resource-dock-offset', `${target.left - parent.left - inset}px`);
+    };
+    const observer = new ResizeObserver(align); observer.observe(sidebar); observer.observe(anchor); observer.observe(element.parentElement!); align();
+    const contents = new MutationObserver(align); contents.observe(sidebar, {childList:true,subtree:true});
+    return () => { observer.disconnect(); contents.disconnect(); };
+  }, []);
   const data = state.data, disk = data?.volumes[0]?.usagePercent;
-  return <div className="hostResourceDock"><button type="button" className={`hostResourceSummary${state.error ? " stale" : ""}`} onClick={onOpen} aria-label="查看主机资源" title={state.error ? "资源状态更新失败，点击查看" : "服务主机的 CPU、内存、磁盘状态"}>
-    <span><Cpu size={12} /><small>CPU</small><b>{percentage(data?.cpu.usagePercent)}</b></span>
-    <span><MemoryStick size={12} /><small>内存</small><b>{percentage(data?.memory.usagePercent)}</b></span>
-    <span className="hostResourceDisk" title={data?.volumes.map(volumeTitle).join("\n\n") || "正在读取挂载信息"}><HardDrive size={12} /><small>磁盘</small><b>{percentage(disk)}</b></span>
-  </button><NetworkProbeButton compact onOpen={onOpen} /></div>;
+  return <div ref={dock} className="hostResourceDock"><div className={`hostResourceSummary${state.error ? " stale" : ""}`}>
+    <button type="button" className="hostResourceTile" onClick={onOpen} aria-label="查看主机资源"><span><Cpu size={12} /><small>CPU</small></span><b>{percentage(data?.cpu.usagePercent)}</b></button>
+    <button type="button" className="hostResourceTile" onClick={onOpen} aria-label="查看内存资源"><span><MemoryStick size={12} /><small>内存</small></span><b>{percentage(data?.memory.usagePercent)}</b></button>
+    <button type="button" className="hostResourceTile hostResourceDisk" onClick={onOpen} aria-label="查看磁盘资源" title={data?.volumes.map(volumeTitle).join("\n\n") || "正在读取挂载信息"}><span><HardDrive size={12} /><small>磁盘</small></span><b>{percentage(disk)}</b></button>
+  </div><NetworkProbeButton compact onOpen={onOpen} /></div>;
 }
 export function HostResourcePanel() {
   const state = useResources();

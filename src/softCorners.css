@@ -1,22 +1,43 @@
 /* A shared shape scale, not a blanket radius on every element.
    Do not reshape circular controls, tiny status dots, code blocks or docked panels. */
 :root {
-  --ui-radius-control: 10px;
-  --ui-radius-menu: 18px;
-  --ui-radius-card: 20px;
-  --ui-radius-dialog: 24px;
+  --ui-radius-control: 14px;
+  --ui-radius-menu: 22px;
+  --ui-radius-card: 22px;
+  --ui-radius-dialog: 26px;
   --ui-radius-composer: 26px;
 }
 :root .conversation > .composer { border-radius: var(--ui-radius-composer); }
+/* Match the composer's pill controls without reshaping menus or the sidebar toggle. */
+:root .topbar .controls :is(.trackedQuotaButton,.v2QuotaTopButton,.topbarPolicySelect .polishedSelectTrigger) {
+  border-radius: 999px !important;
+  corner-shape: round;
+  display:flex;align-items:center;justify-content:center;text-align:center;
+  padding-top:0!important;padding-bottom:2px!important;
+}
+:root .topbar .controls .topbarPolicySelect .polishedSelectTrigger {padding-inline:22px!important;gap:0;}
+:root .topbar .controls .topbarPolicySelect .polishedSelectTrigger > span:first-child {text-align:center;}
+:root .topbar .controls .topbarPolicySelect .polishedSelectChevron {position:absolute;right:7px;top:50%;margin-top:-8px;transform:none;}
+@media(max-width:720px) { :root .topbar .controls .topbarPolicySelect .polishedSelectTrigger {padding-inline:18px!important;} }
 :root :is(.uiGlassPopover, .polishedSelectMenu, .groupedModelMenu, .skillPickerPopover, .v2PlusMenu, .accountPoolPopover, .quotaPopover) { border-radius: var(--ui-radius-menu); }
 :root :is(.modalDialog, .renameThreadDialog, .directoryDialog, .settingsDialog, .leaderboardDialog, .temporaryCloseDialog, .globalSearchDialog) { border-radius: var(--ui-radius-dialog); }
 :root :is(.rightWorkspaceOverviewCard, .toolQuestionCard) { border-radius: var(--ui-radius-card); }
+/* The shared scale covers application chrome, not rendered document content.
+   Avoid a blanket button/input rule: radios, switches, lenses and terminal
+   controls have deliberate geometry and must keep it. */
+:root :is(.threadContextMenu,.v2AccountMenu,.composerSlashMenu,.imageViewerActionMenu,.petPicker) {border-radius:var(--ui-radius-menu);}
+:root :is(.feishuDialog:not(.feishuDocked),.taskNotificationDialog,.imageViewerPanel,.documentViewerPanel) {border-radius:var(--ui-radius-dialog);}
+:root :is(.hostResourcesPanel article,.communicationMessage,.threadScheduleEditor,.feishuCapabilityCard,.petChoice) {border-radius:var(--ui-radius-card);}
+:root :is(.v2WorkspaceFolderButton,.threadRow,.threadSearch,.v2PrimaryNav button,.hostResourceTile,.hostResourceDock .hostNetworkButton,.threadScheduleCard,.subagentDirectorySearch,.petSearch,.communicationToolStatus) {border-radius:var(--ui-radius-control);}
+:root :is(.communicationPanel,.feishuDialog,.threadScheduleEditor,.directoryCreateForm) :is(button,input:not([type="checkbox"],[type="radio"],[type="range"]),select,textarea) {border-radius:var(--ui-radius-control);}
 /* Native progressive enhancement: no SVG masks, resize JS, layout transforms or extra paints. */
 @supports (corner-shape: superellipse(1.25)) {
   :root :is(.conversation > .composer, .uiGlassPopover, .polishedSelectMenu, .groupedModelMenu,
     .skillPickerPopover, .v2PlusMenu, .accountPoolPopover, .quotaPopover, .modalDialog,
     .renameThreadDialog, .directoryDialog, .settingsDialog, .leaderboardDialog,
-    .temporaryCloseDialog, .globalSearchDialog, .rightWorkspaceOverviewCard, .toolQuestionCard) {
+    .temporaryCloseDialog, .globalSearchDialog, .rightWorkspaceOverviewCard, .toolQuestionCard,
+    .threadContextMenu,.v2AccountMenu,.composerSlashMenu,.petPicker,
+    .feishuDialog:not(.feishuDocked),.taskNotificationDialog,.hostResourcesPanel article,.communicationMessage) {
     corner-shape: superellipse(1.25);
   }
   /* The composer's backdrop is a separate layer; both edges must use the same geometry. */

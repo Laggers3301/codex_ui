@@ -1,0 +1,50 @@
+/* Shared chrome typography; document pages, source editors and terminal grids
+   retain their own font metrics and zoom. */
+:root { --panel-text-size:14px; --panel-meta-size:12px; --panel-title-size:15px; --panel-control-height:38px; --panel-control-radius:var(--ui-radius-control,14px); }
+:root :is(.rightWorkspace,.documentViewer,.imageViewer) { font-family:var(--pool-ui-font); }
+:root .rightWorkspace :is(.hostResourcesPanel,.communicationPanel,.rightWorkspaceOverview,.rightWorkspaceList,.rightWorkspaceGoal,.rightPaneSubagents,.browserPanel,.webTerminalPanel) { font-size:var(--panel-text-size); }
+:root .rightWorkspace :is(button,label,summary,select,input,textarea):not(.xterm-helper-textarea) {
+  font-family:var(--pool-ui-font)!important;font-size:var(--panel-text-size)!important;
+}
+:root .rightWorkspace :is(.hostResourcesPanel,.communicationPanel) :is(p,li,dt,dd,pre,code,strong,span,label) { font-size:var(--panel-text-size)!important; }
+:root .rightWorkspace :is(.hostResourcesPanel,.communicationPanel,.rightWorkspaceList,.rightWorkspaceGoal,.subagentPanelHeader) :is(h1,h2) {font-size:var(--panel-title-size)!important;font-weight:500;}
+:root .rightWorkspace :is(h3,h4,.rightWorkspaceEntry strong) {font-size:var(--panel-text-size)!important;font-weight:500;}
+:root .rightWorkspace :is(small,.communicationState,.communicationIdentifier,.hostResourceUpdate,.subagentRecordModel,.subagentState,.browserPanelStatus,.rightWorkspaceEntry em,.rightWorkspaceOverview h3) {font-size:var(--panel-meta-size)!important;}
+:root .rightWorkspace :is(.communicationIdentifier,.communicationState) :is(span,code) {font-size:var(--panel-meta-size)!important;}
+:root :is(.documentViewer,.imageViewer) :is(.imageViewerHeader,.imageViewerActionMenu,.imageViewerZoomControls,.documentArchive,.documentArchiveNavigation,.documentPreviewStatus,.fileBinaryPreview) {font-family:var(--pool-ui-font);font-size:var(--panel-text-size)!important;}
+:root :is(.documentViewer,.imageViewer) :is(.imageViewerTitle strong,.documentArchive button,.documentArchive th,.documentArchive td,.documentArchive p,.documentArchiveNavigation button,.imageViewerActionMenu button,.imageViewerZoomControls button) {font-family:var(--pool-ui-font);font-size:var(--panel-text-size)!important;}
+:root :is(.documentViewer,.imageViewer) .imageViewerTitle span {font-size:var(--panel-meta-size)!important;}
+/* Standard form fields share one hit area; terminal grids and document
+   editors keep their own metrics, as do compact icon-only toolbar controls. */
+:root .rightWorkspace :is(.communicationPanel,.threadScheduleEditor,.directoryCreateForm,.subagentDirectorySearch,.remoteComputerLabel) :is(input:not([type="checkbox"],[type="radio"],[type="range"],[type="hidden"],[type="file"]),select) {
+  box-sizing:border-box;height:var(--panel-control-height);min-height:var(--panel-control-height);padding:6px 10px;line-height:1.5;border-radius:var(--panel-control-radius);
+}
+:root .rightWorkspace :is(.communicationPanel,.threadScheduleEditor,.directoryCreateForm) textarea {padding:8px 10px;border-radius:var(--panel-control-radius);}
+:root .rightWorkspace :is(.communicationPanel button,.threadScheduleSave,.threadScheduleCancel,.threadScheduleConfirm button,.directoryCreateForm button) {
+  box-sizing:border-box;min-height:var(--panel-control-height);padding:7px 10px;line-height:1.5;border-radius:var(--panel-control-radius);
+}
+.communicationPanel [role="tablist"] {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;}
+.communicationPanel [role="tab"] {min-width:0;white-space:nowrap;}
+@media (max-width:720px) {
+  /* iOS focus zoom requires actual editable controls to remain at 16px. */
+  :root .rightWorkspace :is(input,textarea,[contenteditable="true"]):not(.xterm-helper-textarea) {font-size:16px!important;}
+}
+@keyframes panelContentArrive {from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+/* A newly mounted active window has no prior style to transition from. */
+@starting-style {
+  .rightWorkspacePane.active {opacity:0;transform:translateY(8px) scale(.995);}
+}
+.hostResourcesPanel article,.communicationPanel :is([role="tabpanel"],.sessionTasks),.communicationMessage {animation:panelContentArrive .3s cubic-bezier(.22,1,.36,1) both;}
+.communicationPanel :is(button,select,input,textarea),.hostResourcesPanel button {transition:background-color .22s ease,border-color .22s ease,box-shadow .22s ease,color .22s ease;}
+.communicationPanel details[open] > :not(summary),.hostResourcesPanel details[open] > :not(summary) {animation:panelContentArrive .24s ease both;}
+@supports selector(details::details-content) {
+  .communicationPanel details,.hostResourcesPanel details {interpolate-size:allow-keywords;}
+  .communicationPanel details::details-content,.hostResourcesPanel details::details-content {
+    block-size:0;opacity:0;overflow:hidden;transition:block-size .28s cubic-bezier(.22,1,.36,1),opacity .22s ease,content-visibility .28s allow-discrete;
+  }
+  .communicationPanel details[open]::details-content,.hostResourcesPanel details[open]::details-content {block-size:auto;opacity:1;}
+}
+@media (prefers-reduced-motion:reduce) {
+  .hostResourcesPanel article,.communicationPanel :is([role="tabpanel"],.sessionTasks),.communicationMessage,.communicationPanel details[open] > :not(summary),.hostResourcesPanel details[open] > :not(summary) {animation:none;}
+  .communicationPanel details::details-content,.hostResourcesPanel details::details-content {transition:none;}
+}

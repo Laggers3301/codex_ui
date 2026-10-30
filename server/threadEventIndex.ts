@@ -522,7 +522,7 @@ async function serializedHistoryRead<T>(read: () => Promise<T>): Promise<T> {
 export function readIndexedThreadPage(
   filePath: string,
   threadId: string,
-  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean }
+  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number }
 ) {
   return serializedHistoryRead(() => readIndexedThreadPageUnlocked(filePath, threadId, options));
 }
@@ -530,7 +530,7 @@ export function readIndexedThreadPage(
 async function readIndexedThreadPageUnlocked(
   filePath: string,
   threadId: string,
-  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean }
+  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number }
 ) {
   const state = fileState(threadId);
   const boundaryMatches = !state || await indexedRecordBoundaryMatches(filePath, threadId);
@@ -543,8 +543,10 @@ async function readIndexedThreadPageUnlocked(
   }
   const collaborationMode = await indexedCollaborationMode(filePath, threadId);
   const withMode = (thread: JsonRecord) => collaborationMode ? { ...thread, collaborationMode } : thread;
-  const totalRow = db.prepare("SELECT COUNT(*) AS value, COALESCE(MAX(ordinal), 0) AS max_ordinal FROM thread_records WHERE thread_id = ?")
-    .get(threadId) as { value?: number; max_ordinal?: number };
+  const maxEndOffset = options.maxEndOffset ?? Number.MAX_SAFE_INTEGER;
+  if (!Number.isSafeInteger(maxEndOffset) || maxEndOffset < 0) throw new Error("Invalid inherited history boundary");
+  const totalRow = db.prepare("SELECT COUNT(*) AS value, COALESCE(MAX(ordinal), 0) AS max_ordinal FROM thread_records WHERE thread_id = ? AND end_offset <= ?")
+    .get(threadId, maxEndOffset) as { value?: number; max_ordinal?: number };
   const totalItems = Number(totalRow.value ?? 0);
   const maxOrdinal = Number(totalRow.max_ordinal ?? 0);
   if (!totalItems) {
@@ -559,8 +561,8 @@ async function readIndexedThreadPageUnlocked(
   const upperExclusive = cursorOrdinal ?? Math.max(1, maxOrdinal - legacyBefore + 1);
   let rows = (db.prepare(`
     SELECT ordinal, record_id, turn_id, start_offset, end_offset, search_text
-    FROM thread_records WHERE thread_id = ? AND ordinal < ? ORDER BY ordinal DESC LIMIT ?
-  `).all(threadId, upperExclusive, Math.max(1, options.limit)) as Array<Record<string, unknown>>)
+    FROM thread_records WHERE thread_id = ? AND ordinal < ? AND end_offset <= ? ORDER BY ordinal DESC LIMIT ?
+  `).all(threadId, upperExclusive, maxEndOffset, Math.max(1, options.limit)) as Array<Record<string, unknown>>)
     .map((row): IndexedRecord => ({
       ordinal: Number(row.ordinal), recordId: String(row.record_id), turnId: String(row.turn_id),
       startOffset: Number(row.start_offset), endOffset: Number(row.end_offset), searchText: String(row.search_text ?? "")
@@ -596,7 +598,7 @@ async function readIndexedThreadPageUnlocked(
     ? undefined
     : db.prepare("SELECT end_offset FROM thread_turns WHERE thread_id = ? AND turn_id = ?")
       .get(threadId, last.turnId) as { end_offset?: number } | undefined;
-  const possibleTurnEnd = Math.max(rangeEnd, Number(turnEnd?.end_offset ?? 0));
+  const possibleTurnEnd = Math.min(maxEndOffset, Math.max(rangeEnd, Number(turnEnd?.end_offset ?? 0)));
   const endOffset = possibleTurnEnd - first.startOffset <= Math.max(THREAD_PAGE_BYTE_BUDGET, rangeEnd - first.startOffset)
     ? possibleTurnEnd : rangeEnd;
   const parsed = await readThreadFromJsonl(filePath, threadId, undefined, {
@@ -633,16 +635,16 @@ export function locateIndexedThreadItem(threadId: string, itemId: string) {
   return row?.ordinal ? { ordinal: Number(row.ordinal), turnId: String(row.turn_id), cursor: encodeCursor(threadId, Number(row.ordinal) + 1) } : null;
 }
 
-export function readIndexedThreadItem(filePath: string, threadId: string, itemId: string, options: { preferCall?: boolean } = {}): Promise<JsonRecord | null> {
+export function readIndexedThreadItem(filePath: string, threadId: string, itemId: string, options: { preferCall?: boolean; maxEndOffset?: number } = {}): Promise<JsonRecord | null> {
   return serializedHistoryRead(() => readIndexedThreadItemUnlocked(filePath, threadId, itemId, options));
 }
 
-async function readIndexedThreadItemUnlocked(filePath: string, threadId: string, itemId: string, options: { preferCall?: boolean }): Promise<JsonRecord | null> {
+async function readIndexedThreadItemUnlocked(filePath: string, threadId: string, itemId: string, options: { preferCall?: boolean; maxEndOffset?: number }): Promise<JsonRecord | null> {
   await warmThreadIndex(filePath, threadId);
   const row = db.prepare(`
     SELECT turn_id, start_offset, end_offset FROM thread_records
-    WHERE thread_id = ? AND (record_id = ? OR call_id = ?) LIMIT 1
-  `).get(threadId, itemId, itemId) as { turn_id?: string; start_offset?: number; end_offset?: number } | undefined;
+    WHERE thread_id = ? AND (record_id = ? OR call_id = ?) AND end_offset <= ? LIMIT 1
+  `).get(threadId, itemId, itemId, options.maxEndOffset ?? Number.MAX_SAFE_INTEGER) as { turn_id?: string; start_offset?: number; end_offset?: number } | undefined;
   if (!row?.turn_id || row.start_offset === undefined || row.end_offset === undefined) return null;
   if (Number(row.end_offset) - Number(row.start_offset) > MAX_SINGLE_RECORD_BYTES) {
     throw new Error("Single history record exceeds safe preview size; original history is preserved.");

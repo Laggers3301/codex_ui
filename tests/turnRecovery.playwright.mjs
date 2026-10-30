@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import { chromium, expect } from "@playwright/test";
+import { setContentViewport } from "./contentViewport.mjs";
 
 const children = [], errors = [], recoveryEvents=[];
 let browser, page;
@@ -74,9 +75,10 @@ try {
   await expect(notice.locator(".turnRecoveryMeta")).toContainText("来源未确认");
   const layouts = [];
   for (const mobile of [false, true]) for (const theme of ["dark", "light"]) {
-    await page.setViewportSize(mobile ? { width: 393, height: 852 } : { width: 1600, height: 1000 });
+    await setContentViewport(page, mobile ? { width: 393, height: 852 } : { width: 1600, height: 1000 });
     const collapse=page.getByRole('button',{name:'折叠侧边栏',exact:true});
     if(mobile && await collapse.isVisible())await collapse.click();
+    await page.evaluate(() => Promise.all(document.getAnimations().filter(animation => animation.effect?.getTiming().iterations !== Infinity).map(animation => animation.finished.catch(() => {}))));
     await page.evaluate(theme => document.documentElement.dataset.theme = theme, theme);
     await notice.evaluate(element => Promise.all(element.getAnimations().map(animation => animation.finished.catch(() => {}))));
     const box = await notice.boundingBox(), viewport = page.viewportSize();

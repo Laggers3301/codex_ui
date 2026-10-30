@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { readCommunication, readThreadMcpStatus, sendCommunication } from "./api";
 import { communicationStateLabels, type CommunicationCommand, type CommunicationKind, type CommunicationMessage, type CommunicationOperation, type CommunicationSnapshot } from "../shared/sessionCommunication";
 import "./sessionCommunication.css";
@@ -58,6 +58,34 @@ function ThreadCommunication({ userId, projectId, threadId, threadName, visible 
   const scope = `${userId}:${threadId ?? ""}`;
   const draftKey = `communication-draft:${scope}`;
   const [mode, setMode] = useState<CommunicationKind | "task">("topic");
+  const modePanel = useRef<HTMLDivElement>(null);
+  const modeSwitch = useRef(0);
+  useLayoutEffect(() => {
+    const panel = modePanel.current;
+    if (!panel?.animate || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const animation = panel.animate(
+      [{ opacity: 0, transform: "translateY(5px)" }, { opacity: 1, transform: "none" }],
+      { duration: 240, easing: "cubic-bezier(.22,1,.36,1)" },
+    );
+    return () => animation.cancel();
+  }, [mode]);
+  useEffect(() => () => {
+    ++modeSwitch.current;
+    modePanel.current?.getAnimations?.().forEach(animation => animation.cancel());
+  }, []);
+  const switchMode = (next: CommunicationKind | "task") => {
+    const revision = ++modeSwitch.current, panel = modePanel.current;
+    panel?.getAnimations?.().forEach(animation => animation.cancel());
+    if (next === mode) return;
+    const select = () => {
+      if (modeSwitch.current === revision) { setMode(next); setNotice(""); }
+    };
+    if (!panel?.animate || matchMedia("(prefers-reduced-motion: reduce)").matches) { select(); return; }
+    void panel.animate(
+      [{ opacity: 1, transform: "none" }, { opacity: 0, transform: "translateY(3px)" }],
+      { duration: 120, easing: "ease-out", fill: "forwards" },
+    ).finished.then(select).catch(() => {});
+  };
   const [draft, setDraft] = useState(() => stored(draftKey, { name: "/updates", message: "", timeout: 120 }));
   const [data, setData] = useState<CommunicationSnapshot | null>(null);
   const [error, setError] = useState("");
@@ -155,9 +183,10 @@ function ThreadCommunication({ userId, projectId, threadId, threadName, visible 
     {!threadId ? <p>请先打开一个会话，再订阅话题或注册服务。</p> : <>
       <CommunicationToolStatus projectId={projectId} threadId={threadId} visible={visible} />
       <p>模型通过 session_communication 工具主动读取和回复。Topic 仅投递给明确订阅的会话，消息正文不会自动注入提示词；普通通信不自动运行模型，“直接任务”会自动执行并可回传结果。</p>
-      <div role="tablist" aria-label="通信方式">{(["topic", "service", "action", "task"] as const).map(kind => <button role="tab" aria-selected={mode === kind} key={kind} type="button" onClick={() => { setMode(kind); setNotice(""); }}>{labels[kind]}</button>)}</div>
+      <div role="tablist" aria-label="通信方式">{(["topic", "service", "action", "task"] as const).map(kind => <button role="tab" aria-selected={mode === kind} key={kind} type="button" onClick={() => switchMode(kind)}>{labels[kind]}</button>)}</div>
+      <div ref={modePanel} className="communicationModeContent" key={mode}>
       {mode === "task" ? <SessionTasks userId={userId} threadId={threadId} tasks={data?.tasks ?? []} perform={perform} busy={busy} visible={visible} /> : <>
-      <div role="tabpanel" aria-label={labels[mode]}><p>{descriptions[mode]}</p>
+      <div role="tabpanel" key={mode} aria-label={labels[mode]}><p>{descriptions[mode]}</p>
         <label>{mode === "topic" ? "话题名称" : mode === "service" ? "服务名称" : "任务名称"}<input value={draft.name} maxLength={120} onChange={event => setDraft(current => ({ ...current, name: event.target.value }))} /></label>
         <button type="button" disabled={busy || !draft.name.trim() || !data} onClick={() => void perform({ operation: registration, name: draft.name })}>{registrationLabel}</button>
         <div className="communicationDirectory" aria-label="已注册通信端点">{data?.directory.filter(binding => binding.kind === mode).map(binding => <button type="button" key={`${binding.name}:${binding.threadId}`} onClick={() => setDraft(current => ({ ...current, name: binding.name }))}>{binding.name} · {binding.threadName}</button>)}</div>
@@ -175,6 +204,7 @@ function ThreadCommunication({ userId, projectId, threadId, threadName, visible 
       {mode === "task" && error ? <p role="alert" className="communicationError">{error}</p> : null}
       {mode === "task" && readError ? <p role="status" className="communicationError">读取失败，保留上次任务记录：{readError}</p> : null}
       {mode === "task" && notice ? <p role="status">{notice}</p> : null}
+      </div>
     </>}
   </>;
 }

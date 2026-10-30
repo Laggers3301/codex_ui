@@ -65,3 +65,18 @@ it('serves installed pool catalogs even when the default account is stale or the
     fs.rmSync(directory,{recursive:true,force:true});
   }
 });
+
+it('routes explicit ordinary Ark API aliases separately from Coding Plan models', () => {
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'pool-ark-route-'));
+  const homes=['coding','pay'].map(id=>{const home=path.join(directory,id);fs.mkdirSync(home);return home;});
+  const model=(slug:string)=>({slug,visibility:'list',shell_type:'unified_exec'});
+  fs.writeFileSync(path.join(homes[0],'model-catalog-gpt-5.6-sol-long-context.json'),JSON.stringify({models:[model('deepseek-v4-1-flash-261017')]}));
+  fs.writeFileSync(path.join(homes[1],'model-catalog-gpt-5.6-sol-long-context.json'),JSON.stringify({models:[model('deepseek-v4-1-flash-261017-ark-api')]}));
+  class Fixture extends EventEmitter {getPendingServerRequests(){return [];} stop(){}}
+  const pool=new AccountPoolBridge({accounts:homes.map((codexHome,i)=>({id:i?'ark-pay':'ark-coding',label:i?'pay':'coding',kind:'api-provider',codexHome})),stateFile:'pool.json'},directory,()=>new Fixture() as unknown as CodexBridge);
+  try {
+    expect(pool.getBranchRoutingDecision('fixture-thread','deepseek-v4-1-flash-261017-ark-api').targetAccount.id).toBe('ark-pay');
+    expect(pool.getBranchRoutingDecision('fixture-thread','deepseek-v4-1-flash-261017').targetAccount.id).toBe('ark-coding');
+    expect(pool.getBranchRoutingDecision('fixture-thread').targetAccount.id).toBe('ark-coding');
+  } finally { pool.stop();fs.rmSync(directory,{recursive:true,force:true}); }
+});

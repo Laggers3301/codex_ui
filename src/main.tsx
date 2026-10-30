@@ -4,6 +4,13 @@ import { App } from "./App";
 import "./styles.css";
 import "./softCorners.css";
 import "./mobileSidebar.css";
+import "./panelTypography.css";
+
+// Installation is independent of opting into notifications. The existing
+// push subscription flow reuses this same root-scoped worker.
+if ("serviceWorker" in navigator && window.isSecureContext) {
+  window.addEventListener("load", () => { void navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => {}); }, { once: true });
+}
 
 class AppErrorBoundary extends React.Component<React.PropsWithChildren, { error: Error | null }> {
   state: { error: Error | null } = { error: null };

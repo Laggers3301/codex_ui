@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProjectStore } from "./db.js";
-import { TurnRetryQueue, type TurnRecoveryState } from "./turnRetry.js";
+import { RetryDeferredError, TurnRetryQueue, type TurnRecoveryState } from "./turnRetry.js";
 import { AppError } from "./appErrors.js";
 
 const fixtures: Array<{ store: ProjectStore; queue: TurnRetryQueue; root: string }> = [];
@@ -21,6 +21,50 @@ function fixture(maxAttempts = 10) {
 }
 
 describe("persistent overload retries", () => {
+  it("recovers terminal stream failures with bounded backoff and ignores duplicate failures", async () => {
+    const { queue, store, start } = fixture(); const clock = vi.spyOn(Date, "now").mockReturnValue(100_000);
+    const disconnected = { codexErrorInfo: "ResponseStreamDisconnected" };
+    queue.failed("admin", "thread", "failed", disconnected, true);
+    expect(store.getTurnRecoveryState("thread")?.job?.nextRetryAt).toBe(105_000);
+    const jobId = store.getTurnRecoveryState("thread")?.job?.id;
+    clock.mockReturnValue(104_000); queue.failed("admin", "thread", "failed", disconnected, true);
+    expect(store.getTurnRecoveryState("thread")?.job).toMatchObject({ id: jobId, nextRetryAt: 105_000 });
+    clock.mockReturnValue(105_000); await queue.drain();
+    queue.failed("admin", "thread", "failed", disconnected, true);
+    expect(store.getTurnRecoveryState("thread")?.job?.status).toBe("running");
+    queue.failed("admin", "thread", "retry-turn", disconnected, true);
+    expect(store.getTurnRecoveryState("thread")?.job?.nextRetryAt).toBe(115_000);
+    clock.mockReturnValue(115_000); await queue.drain(); expect(start).toHaveBeenCalledTimes(2);
+  });
+  it("defers uncertain preflight without sending or consuming attempts", async () => {
+    const { queue, store, start } = fixture(); const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    start.mockRejectedValueOnce(new RetryDeferredError());
+    queue.failed("admin", "thread", "failed", overloaded, true);
+    clock.mockReturnValue(60_000); await queue.drain();
+    expect(store.getTurnRecoveryState("thread")?.job).toMatchObject({ status: "waiting", attempts: 0, nextRetryAt: 120_000 });
+    clock.mockReturnValue(120_000); await queue.drain(); expect(start).toHaveBeenCalledTimes(2);
+    expect(store.getTurnRecoveryState("thread")?.job).toMatchObject({ status: "running", attempts: 1 });
+  });
+  it("does not resend an accepted recovery when its start RPC reply is lost", async () => {
+    const { queue, store, start } = fixture(); const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    start.mockImplementationOnce(async () => {
+      queue.started("thread", "accepted-retry");
+      throw new Error("Timed out waiting for Codex response to turn/start.");
+    });
+    queue.failed("admin", "thread", "failed", overloaded, true);
+    clock.mockReturnValue(60_000); await queue.drain();
+    expect(store.getTurnRecoveryState("thread")?.job).toMatchObject({ status: "running", activeTurnId: "accepted-retry" });
+    clock.mockReturnValue(360_000); await queue.drain(); expect(start).toHaveBeenCalledOnce();
+    queue.completed("thread", "accepted-retry"); expect(queue.snapshot("admin")).toEqual([]);
+  });
+  it("does not blindly resend when neither acceptance nor a native rejection can be confirmed", async () => {
+    const { queue, store, start } = fixture(); const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    start.mockRejectedValueOnce(new Error("Timed out waiting for Codex response to turn/start."));
+    queue.failed("admin", "thread", "failed", overloaded, true);
+    clock.mockReturnValue(60_000); await queue.drain();
+    expect(store.getTurnRecoveryState("thread")?.job).toBeNull();
+    clock.mockReturnValue(360_000); await queue.drain(); expect(start).toHaveBeenCalledOnce();
+  });
   it("waits exactly 60 seconds, preserves the original model/mode, and isolates private state", async () => {
     const { queue, start } = fixture(); const clock = vi.spyOn(Date, "now").mockReturnValue(100_000);
     queue.failed("admin", "thread", "failed-turn", overloaded, true);

@@ -427,7 +427,7 @@ function PolishedSelect<T extends string>({
       const trigger = triggerRef.current, menu = menuRef.current;
       if (!trigger || !menu) return;
       const viewport = window.visualViewport;
-      const next = selectMenuPosition(trigger.getBoundingClientRect(), className.includes("topbarPolicySelect") ? 245 : 230,
+      const next = selectMenuPosition(trigger.getBoundingClientRect(), className.includes("topbarPolicySelect") ? 188 : 230,
         menu.scrollHeight + menu.offsetHeight - menu.clientHeight,
         { width: viewport?.width ?? innerWidth, height: viewport?.height ?? innerHeight, left: viewport?.offsetLeft, top: viewport?.offsetTop });
       setMenuPosition(current => current && current.left === next.left && current.top === next.top && current.width === next.width && current.maxHeight === next.maxHeight ? current : next);
@@ -519,6 +519,15 @@ const domesticModelGroups: Array<{ key: ModelPickerSection; label: string }> = [
   { key: "domestic", label: "Other" }
 ];
 
+// Hide exhausted Coding Plan choices without removing their catalog or
+// invalidating existing conversations. Ordinary Ark API aliases remain visible.
+const hiddenArkCodingModels = new Set([
+  'doubao-seed-evolving', 'doubao-seed-2.1-pro', 'doubao-seed-2.1-lite', 'doubao-seed-2.0-mini',
+  'minimax-m3', 'glm-5.3', 'glm-5.3-flash', 'deepseek-v4-1-flash-261017',
+  'deepseek-v4-flash', 'deepseek-v4-pro', 'kimi-k2.7-code', 'kimi-k2.8-preview', 'kimi-k3',
+  'deepseek-v4-1-flash-economy-261017', 'ark-code-latest'
+]);
+
 function modelPickerGroup(model: string): ModelPickerSection {
   if (isReclaudeModel(model)) return "claude";
   if (model.startsWith("gpt-")) return "gpt";
@@ -529,6 +538,10 @@ function modelPickerGroup(model: string): ModelPickerSection {
   if (model.startsWith("glm-")) return "glm";
   if (model.startsWith("minimax-")) return "minimax";
   return "domestic";
+}
+
+function modelPickerLabel(profile: ModelProfile): string {
+  return profile.model.endsWith('-ark-api') ? profile.label.replace(' · Ark API 按量', '') : profile.label;
 }
 
 function MobileModelPage({ active, children }: { active: boolean; children: ReactNode }) {
@@ -575,8 +588,8 @@ export function ModelGroupedSelect({
     window.addEventListener("resize", update);
     return () => window.removeEventListener("resize", update);
   }, [mobile, menuPresence.present]);
-  const visibleProfiles = profiles.filter((profile) => !isUltraModelProfile(profile));
-  const selected = visibleProfiles.find((profile) => profile.id === value) ?? visibleProfiles[0];
+  const visibleProfiles = profiles.filter((profile) => !isUltraModelProfile(profile) && !hiddenArkCodingModels.has(profile.model));
+  const selected = profiles.find((profile) => profile.id === value) ?? visibleProfiles[0];
   const modelNames = [...new Set(visibleProfiles.map((profile) => profile.model))];
   const groupCount = (group: ModelPickerSection) => modelNames.filter((model) => modelPickerGroup(model) === group).length;
   const selectBranch = (next: "gpt" | "claude" | "domestic") => {
@@ -595,7 +608,7 @@ export function ModelGroupedSelect({
       type="button" role="option" aria-selected={profile.id === value} key={profile.id}
       disabled={!modelIsAvailable(profile)} title={profile.unavailableReason}
       onClick={() => { if (modelIsAvailable(profile)) { onChange(profile.id); setOpen(false); } }}>
-      <span><strong>{profile.label}</strong>{!modelIsAvailable(profile) ? <small className="groupedModelConnectionStatus">待连接</small> : null}</span>
+      <span><strong>{modelPickerLabel(profile)}</strong>{!modelIsAvailable(profile) ? <small className="groupedModelConnectionStatus">待连接</small> : null}</span>
       <span className="polishedSelectCheck" aria-hidden="true">{profile.id === value ? "✓" : ""}</span>
     </button>
   ));
@@ -606,7 +619,7 @@ export function ModelGroupedSelect({
       <button className="polishedSelectTrigger" type="button" disabled={disabled} title={title}
         aria-haspopup="dialog" aria-expanded={open}
         onClick={() => { if (!open) { setBranch(null); setProvider(null); } setOpen((current) => !current); }}>
-        <span>{selected?.label ?? "选择模型"}</span>
+        <span>{selected ? modelPickerLabel(selected) : "选择模型"}</span>
         <span className="polishedSelectChevron" aria-hidden="true" />
       </button>
       {menuPresence.present ? (
@@ -2493,7 +2506,7 @@ export const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
     contentType: "markdown",
     editable: !disabled,
     editorProps: {
-      attributes: { class: "composerRichInput", "data-placeholder": placeholder, "aria-label": placeholder, spellcheck: "false" },
+      attributes: { class: "composerRichInput", "data-placeholder": placeholder, "aria-label": placeholder, "aria-multiline": "true", enterkeyhint: "enter", spellcheck: "false" },
       handleTextInput: (view, from, to, text) => {
         // IMEs can insert sh/ch/zh in one event. Let ProseMirror observe the
         // native DOM change instead of dispatching another insertion into it.
@@ -2513,6 +2526,11 @@ export const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
         return true;
       },
       handleKeyDown: (_view, event) => {
+        // Android may synthesize Enter from a native DOM/IME change. Let
+        // ProseMirror handle mobile paragraphs instead of submitting a turn.
+        const mobileKeyboard = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+          || (navigator.maxTouchPoints > 0 && window.matchMedia("(pointer: coarse) and (max-width: 720px)").matches);
+        if (event.key === "Enter" && mobileKeyboard && !slashOpenRef.current) return false;
         if (compositionEndFrameRef.current !== null && event.key === "Enter" && !_view.composing && !event.isComposing) {
           event.preventDefault();
           return true;

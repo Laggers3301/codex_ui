@@ -1,8 +1,8 @@
-.communicationPanel { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px; color: var(--ui-content); font-size: 12px; overflow-wrap: anywhere; }
+.communicationPanel { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px; color: var(--ui-content); font:400 14px/1.5 var(--pool-ui-font),sans-serif; overflow-wrap: anywhere; }
 .communicationPanel .sessionTaskReturn { display: flex; align-items: center; gap: 8px; }
 .communicationPanel .sessionTaskReturn input { width: auto; }
 .communicationPanel > header,.communicationMessage > header { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
-.communicationPanel h2 { margin: 0; font-size: 17px; }.communicationPanel h3 { margin: 20px 0 8px; font-size: 13px; }
+.communicationPanel h2 { margin: 0; font-size: 14px; font-weight:500; }.communicationPanel h3 { margin: 20px 0 8px; font-size: 14px; font-weight:500; }
 .communicationPanel p { margin: 8px 0; line-height: 1.6; color: var(--ui-content-muted); }
 .communicationPanel [role="tablist"] { display: flex; flex-wrap: wrap; gap: 4px; margin: 14px 0; }
 .communicationPanel button { padding: 7px 10px; border: 0; border-radius: 8px; color: var(--ui-content); background: var(--ui-hover); cursor: pointer; font: inherit; }
@@ -10,6 +10,8 @@
 .communicationPanel [role="tab"][aria-selected="true"],.communicationPanel .communicationSend { color: var(--ui-surface); background: var(--ui-contrast); }
 .communicationPanel label { display: grid; gap: 6px; margin: 10px 0; }
 .communicationPanel input,.communicationPanel textarea,.communicationPanel select { width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--ui-divider); border-radius: 8px; background: var(--ui-surface-raised); color: var(--ui-content); box-sizing: border-box; font: inherit; }
+.communicationPanel input:not([type="checkbox"]),.communicationPanel select { height:auto;min-height:36px;line-height:1.5; }
+.communicationPanel .sessionTaskReturn input { flex:none;width:15px;height:15px;padding:0; }
 .communicationThreadHeader { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
 .communicationToolStatus { padding: 8px; border: 1px solid var(--ui-divider); border-radius: 8px; }
 .communicationToolStatus pre { max-height: 140px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }

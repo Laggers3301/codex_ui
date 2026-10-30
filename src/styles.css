@@ -4447,14 +4447,17 @@ pre,
   flex-direction: column;
   gap: 2px;
   overflow-y: auto;
-  padding-right: 2px;
-  scrollbar-width: thin;
+  padding-right: 0;
+  /* Keep folder rows and the resource dock on symmetric sidebar insets.
+     Native reserved gutters consumed another 10px on the right even idle. */
+  scrollbar-width: none;
   scrollbar-color: #454744 transparent;
-  scrollbar-gutter: stable;
+  scrollbar-gutter: auto;
 }
 
 .v2WorkspaceTree::-webkit-scrollbar {
-  width: 6px;
+  width: 0;
+  display: none;
 }
 
 .v2WorkspaceTree::-webkit-scrollbar-track {
@@ -6465,8 +6468,8 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
 
 /* Policy menus inherit the model menu's single-surface list treatment. */
 .topbarPolicySelect .polishedSelectMenu {
-  width: 245px;
-  padding: 6px;
+  width: 188px;
+  padding: 4px;
 }
 
 .topbarPolicySelect .polishedSelectTrigger,
@@ -6484,8 +6487,10 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
 
 .topbarPolicySelect .polishedSelectOption,
 .topbar .controls .topbarPolicySelect .polishedSelectOption {
-  min-height: 38px;
-  padding: 5px 8px;
+  min-height: 36px;
+  padding: 4px 6px;
+  grid-template-columns: minmax(0, 1fr) 14px;
+  gap: 6px;
   border: 0 !important;
   border-radius: 8px !important;
   background: transparent !important;
@@ -7927,6 +7932,21 @@ body:has(.globalSearchScrim) .v2AccountDock {
 
 .topbarPolicySelect.approvalSelect {
   width: 145px;
+}
+
+@media (min-width: 721px) {
+  .topbar .controls .topbarPolicySelect,
+  .topbar .controls .topbarPolicySelect.approvalSelect {
+    width: max-content;
+    min-width: 0;
+    flex: 0 0 auto;
+  }
+  .topbar .controls .topbarPolicySelect .polishedSelectTrigger {
+    width: auto;
+    grid-template-columns: auto 12px;
+    gap: 6px;
+    padding-inline: 10px;
+  }
 }
 
 .v2ModelPicker {

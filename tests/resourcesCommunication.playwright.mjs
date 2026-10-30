@@ -45,6 +45,10 @@ try {
   await expect(resourcePanel).toContainText("fixture-host"); await expect(resourcePanel).toContainText("每 10 秒更新");
   await expect(resourcePanel.getByRole("meter", { name: "CPU 使用率", exact: true })).toHaveAttribute("aria-valuenow", "13");
   await expect(resourcePanel).toContainText("6.0 GiB"); await expect(resourcePanel).toContainText("读取 2.0 MiB/s");
+  const panelTypography = await resourcePanel.locator('p:not(.hostResourceUpdate), dt, dd, button').evaluateAll(elements => elements.map(element => getComputedStyle(element).fontSize));
+  assert.ok(panelTypography.length && panelTypography.every(size => size === '14px'), 'resource UI uses the shared 14px text size');
+  const headerPills = await a.locator('.topbar :is(.trackedQuotaButton,.v2QuotaTopButton,.topbarPolicySelect .polishedSelectTrigger)').evaluateAll(elements => elements.map(element => ({ radius: getComputedStyle(element).borderTopLeftRadius, overflow: element.scrollWidth > element.clientWidth + 1 })));
+  assert.equal(headerPills.length, 4); assert.ok(headerPills.every(item => item.radius === '999px' && !item.overflow), 'four compact header controls use composer-style pills');
   const diskTip = a.locator('.hostResourceSummary .hostResourceDisk');
   await diskTip.hover(); await expect(diskTip).toHaveAttribute("title", /挂载路径：\/\n系统：\/\n数据目录：\/fixture\/data/);
   await expect(resourcePanel.getByText("vda", { exact: true })).toHaveAttribute("title", "挂载路径（含分区）：/、/boot");
@@ -112,6 +116,33 @@ try {
     await expect(panel.getByRole("button", { name: /^(订阅话题|取消订阅|注册服务提供者|注册任务提供者|注销提供者)$/ })).toBeEnabled(); return panel;
   };
   const b = await create("main-b"), panelA = await openCommunication(a);
+  await a.evaluate(() => Promise.all(document.getAnimations().filter(animation => animation.effect?.getTiming().iterations !== Infinity).map(animation => animation.finished.catch(() => {}))));
+  const tabGeometry = await panelA.getByRole('tab').evaluateAll(elements => elements.map(element => ({ width: element.getBoundingClientRect().width, height: element.getBoundingClientRect().height })));
+  assert.equal(tabGeometry.length, 4); assert.ok(tabGeometry.every(item => item.height === 38 && Math.abs(item.width - tabGeometry[0].width) < 1), 'communication modes use four equal-sized controls');
+  const modeTransition = await panelA.evaluate(panel => {
+    [...panel.querySelectorAll('[role="tab"]')].find(button => button.textContent === 'Service 服务').click();
+    return panel.querySelector('.communicationModeContent').getAnimations().map(animation => ({ duration: animation.effect.getTiming().duration, keyframes: animation.effect.getKeyframes().map(frame => frame.opacity) }));
+  });
+  assert.ok(modeTransition.some(animation => animation.duration === 120 && animation.keyframes.join(',') === '1,0'), 'communication mode fades out before replacement');
+  await expect(panelA.getByRole('tab', { name: 'Service 服务', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await expect.poll(() => panelA.locator('.communicationModeContent').evaluate(panel => panel.getAnimations().some(animation => animation.effect.getTiming().duration === 240))).toBe(true);
+  await panelA.getByRole('tab', { name: 'Topic 话题', exact: true }).click();
+  await expect(panelA.getByLabel('话题名称', { exact: true })).toBeVisible();
+  const communicationTypography = await panelA.locator('h2,p,label,button').evaluateAll(elements => elements.map(element => ({ tag: element.tagName, size: getComputedStyle(element).fontSize })));
+  assert.ok(communicationTypography.every(item => item.size === (item.tag === 'H2' ? '15px' : '14px')), 'communication UI shares the same typography scale');
+  await panelA.evaluate(panel => {
+    panel.querySelector('[role="tab"]:nth-child(2)').click();
+    panel.querySelector('[role="tab"]:nth-child(3)').click();
+  });
+  await expect(panelA.getByLabel('任务名称', { exact: true })).toBeVisible();
+  await panelA.getByRole('tab', { name: 'Topic 话题', exact: true }).click();
+  await expect(panelA.getByLabel('话题名称', { exact: true })).toBeVisible();
+  await a.emulateMedia({ reducedMotion: 'reduce' });
+  await panelA.getByRole('tab', { name: 'Service 服务', exact: true }).click();
+  await expect(panelA.getByLabel('服务名称', { exact: true })).toBeVisible();
+  assert.equal(await panelA.locator('.communicationModeContent').evaluate(panel => panel.getAnimations().length), 0, 'reduced motion disables panel animation');
+  await panelA.getByRole('tab', { name: 'Topic 话题', exact: true }).click();
+  await a.emulateMedia({ reducedMotion: 'no-preference' });
   let panelB = await openCommunication(b);
   await panelB.getByLabel("话题名称", { exact: true }).fill("/status"); await panelB.getByRole("button", { name: "订阅话题", exact: true }).click();
   await expect(panelB.getByRole("button", { name: "取消订阅", exact: true })).toBeVisible();
@@ -219,6 +250,11 @@ try {
   await a.screenshot({ path: `${evidence}/communication-main-side.png` });
   await setContentViewport(a, { width: 393, height: 852 });
   assert.ok(await panelA.evaluate(element => element.scrollWidth <= element.clientWidth + 1));
+  await a.evaluate(() => document.documentElement.dataset.theme = 'light');
+  assert.equal(await panelA.locator('textarea').first().evaluate(element => getComputedStyle(element).fontSize), '16px', 'mobile editable text retains iOS-safe sizing');
+  assert.ok(await panelA.getByLabel('话题名称', { exact: true }).evaluate(element => element.clientHeight >= 34), 'mobile text input must not inherit the global checkbox height');
+  await a.screenshot({ path: `${evidence}/communication-phone-light.png` });
+  await a.evaluate(() => document.documentElement.dataset.theme = 'dark');
   await setContentViewport(a, { width: 1600, height: 1000 });
   await a.locator('[data-thread-id="main-b"] .threadSelectButton').click(); await openCommunication(a);
   await expect(panelA.getByLabel("通信身份", { exact: true })).toHaveValue("main");

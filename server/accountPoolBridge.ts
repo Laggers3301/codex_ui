@@ -267,6 +267,18 @@ function accountSupportedModels(codexHome: string): Set<string> | null {
 
 function createAccountBridge(codexHome: string, accountId: string, adoptCandidate = false, kind: "codex-account" | "api-provider" = "codex-account"): CodexBridge {
   prepareVerifiedProviderCatalog(codexHome, accountId);
+  // Keep the pay-as-you-go credential out of other account runtimes. The
+  // provider's shell policy also excludes it from agent tool environments.
+  const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: codexHome, CODEX_WEB_RUNTIME_ADOPT_CANDIDATE: adoptCandidate ? "1" : "0" };
+  delete env.ARK_PAY_API_KEY;
+  if (accountId === "ark-pay") {
+    const keyFile = process.env.CODEX_WEB_ARK_PAY_KEY_FILE ?? path.join(serverConfig.dataDir, "providers", "ark-pay", "credential.env");
+    const stat = fs.statSync(keyFile);
+    if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error("Ark API credential file must be private");
+    const key = fs.readFileSync(keyFile, "utf8").match(/^ARK_PAY_API_KEY=([^\r\n]+)$/m)?.[1];
+    if (!key) throw new Error("Ark API credential unavailable");
+    env.ARK_PAY_API_KEY = key;
+  }
   const scope = process.env.CODEX_WEB_ISOLATE_AGENT_SCOPES === "1" ? {
     unitPrefix: `codex-agent-${accountId.replace(/[^A-Za-z0-9-]/g, "-")}`,
     slice: "codex-workers.slice",
@@ -287,7 +299,7 @@ function createAccountBridge(codexHome: string, accountId: string, adoptCandidat
       path.join(codexHome, ".web-runtime.lock"), process.execPath,
       fileURLToPath(new URL("../scripts/run-account-runtime.mjs", import.meta.url)),
       serverConfig.codexBin, ...accountAppServerArgs(codexHome, kind)],
-    env: { ...process.env, CODEX_HOME: codexHome, CODEX_WEB_RUNTIME_ADOPT_CANDIDATE: adoptCandidate ? "1" : "0" },
+    env,
     ...(nativeModelDiscoveryEnabled(codexHome, kind) ? { nativeModelDiscoveryHome: codexHome } : {}),
     scope
   });
@@ -1326,7 +1338,9 @@ export class AccountPoolBridge extends EventEmitter {
   private chooseAccount(model?: string): AccountRuntime {
     const compatibleAccounts = model
       ? this.accounts.filter((account) => account.supportedModels === null || account.supportedModels.has(model))
-      : this.accounts;
+      // A pay-as-you-go provider must only be chosen explicitly by model;
+      // it must not become the implicit default when quota data is absent.
+      : this.accounts.filter((account) => account.id !== "ark-pay");
     if (!compatibleAccounts.length) {
       throw new Error(`No configured Codex account supports model ${model}.`);
     }

@@ -7,6 +7,7 @@ import type { IncomingHttpHeaders } from "node:http";
 import type { Server as HttpServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
+import { serverConfig } from "./config.js";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
@@ -50,7 +51,6 @@ import {
 } from "./threadContext.js";
 import type { Project, RpcEnvelope, SocketClientMessage, SocketServerMessage } from "./types.js";
 import { sendUserPush } from "./webPush.js";
-import { serverConfig } from "./config.js";
 import { questionNotificationIdentity } from "./pushProtocol.js";
 import { parseQuestionTool, readLiveQuestionNotification } from "../src/questionTool.js";
 import { meaningfulTurnProgressMethod, phaseFromProbe, TurnWatchdog, type WatchdogProbeClaim, type WatchdogTurn } from "./turnWatchdog.js";
@@ -580,8 +580,11 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         await bridge.request("thread/resume", { threadId: state.threadId, excludeTurns: true, cwd: state.template.cwd, model: state.template.model,
           config: state.template.config, sandbox: execution?.sandbox, approvalPolicy: execution?.approvalPolicy }, 30_000);
         if (!retries.isCurrent(state) || guards.activeTurnsByThread.has(state.threadId)) return null;
+        const recoveryPrompt = state.error?.code === "stream_disconnected"
+          ? "上一轮因模型连接中断而结束。"
+          : "上一轮因模型服务暂时受限而结束。";
         const result = await bridge.request("turn/start", { ...state.template, threadId: state.threadId,
-          input: state.job?.resumeOriginal ? state.template.input : textInput(`<codex_internal_retry>上一轮因${state.error?.code === "stream_disconnected" ? "模型连接中断" : "模型服务暂时受限"}而结束。请在当前会话继续尚未完成的原任务，沿用原始指令、授权范围和已完成步骤。先核对已有结果，避免重复执行成功的操作；不要重新开始整个任务，也不要更换模型。</codex_internal_retry>`) });
+          input: state.job?.resumeOriginal ? state.template.input : textInput(`<codex_internal_retry>${recoveryPrompt}请在当前会话继续尚未完成的原任务，沿用原始指令、授权范围和已完成步骤。先核对已有结果，避免重复执行成功的操作；不要重新开始整个任务，也不要更换模型。</codex_internal_retry>`) });
         rememberAcceptedTurn(guards, state.threadId, `retry:${state.job!.id}`, result);
         store.touchThreadOwner(state.threadId);
         return turnIdFromStartResult(result);
@@ -749,6 +752,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
 
     const turnId = notificationTurnId(message);
     if (turnId && message.method === "turn/completed") {
+      // Ignore duplicate terminal delivery, including late failure events from
+      // the old stream after a replacement turn has already started.
       if (guards.settledTurnIds.has(turnId)) return;
       guards.settledTurnIds.add(turnId);
       if (guards.settledTurnIds.size > 2048) guards.settledTurnIds.delete(guards.settledTurnIds.values().next().value!);
@@ -803,6 +808,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
     if (turnId && threadIdForWatchdog && message.method === "turn/started") {
       retries.started(threadIdForWatchdog, turnId);
+      if (guards.startingThreads.has(threadIdForWatchdog) && store.getTurnRecoveryState(threadIdForWatchdog)?.cancelled === false) {
+        guards.recoverableTurnIds.add(turnId);
+      }
       turnWatchdog.start(owner, accountId, threadIdForWatchdog, turnId);
     }
     const progressMethod = meaningfulTurnProgressMethod(message);

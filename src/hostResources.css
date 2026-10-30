@@ -1,29 +1,41 @@
-.hostResourceDock { display: flex; align-items: center; gap: 4px; width: 100%; min-width: 0; }
-.hostResourceSummary { display: flex; flex: 1; justify-content: space-between; align-items: center; gap: 6px; min-width: 0; min-height: 38px; padding: 6px 4px; border: 0; border-radius: 8px; background: transparent; color: var(--ui-content-muted); cursor: pointer; }
-.hostResourceSummary:hover { background: var(--ui-hover); }
-.hostResourceSummary > span { display: grid; grid-template-columns: 12px auto; align-items: center; gap: 2px 4px; min-width: 0; }
-.hostResourceSummary small { font-size: 10px; }
-.hostResourceSummary b { grid-column: 1 / -1; font-size: 11px; font-weight: 500; text-align: center; font-variant-numeric: tabular-nums; }
+.hostResourceDock { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); align-items: stretch; gap: 6px; width: var(--resource-dock-width,100%); margin-left:var(--resource-dock-offset,0px); min-width: 0; }
+.hostResourceSummary { display: contents; }
+.hostResourceTile > span { display: flex; align-items:center;justify-content:center;gap:4px;min-width:0; }
+.hostResourceDock { font: 400 13px/1.4 var(--pool-ui-font), sans-serif; }
+.v2AccountDock .hostResourceDock button { font: inherit !important; }
+.hostResourceSummary small { font: inherit; white-space: nowrap; }
+.hostResourceSummary b { grid-column: 1 / -1; font: inherit; text-align: center; font-variant-numeric: tabular-nums; }
 .hostResourceSummary.stale b { opacity: .55; }
 .hostResourceDisk { cursor: help; text-decoration: underline dotted; text-underline-offset: 3px; }
 .hostNetworkButton { display: inline-flex; flex: none; align-items: center; justify-content: center; gap: 5px; min-height: 38px; padding: 6px 8px; border: 0; border-radius: 8px; background: var(--ui-hover); color: var(--ui-content-muted); font: inherit; font-size: 11px; cursor: pointer; }
 .hostNetworkButton:disabled { opacity: .6; cursor: wait; }
-.hostNetworkButton small { display: block; font-size: 10px; }
-.hostNetworkButton.compact { min-width: 90px; font-variant-numeric: tabular-nums; }
+.hostNetworkButton small { display: block; font: inherit; }
+.hostNetworkButton.compact { box-sizing: border-box; min-width: 78px; padding:6px 4px; font-variant-numeric: tabular-nums; }
+.v2AccountDock .hostResourceTile,.v2AccountDock .hostNetworkButton.compact {
+  position:relative;isolation:isolate;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:3px;min-width:0;min-height:48px;padding:6px 2px;border:1px solid rgba(255,255,255,.085);border-radius:12px;
+  color:var(--ui-content-muted);background:linear-gradient(145deg,rgba(255,255,255,.065),rgba(255,255,255,.025));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.07),0 2px 5px rgba(0,0,0,.07);backdrop-filter:blur(10px) saturate(1.12);-webkit-backdrop-filter:blur(10px) saturate(1.12);
+  cursor:pointer;transition:background .24s ease,border-color .24s ease,box-shadow .24s ease;overflow:hidden;text-decoration:none;
+}
+.v2AccountDock .hostResourceTile:hover,.v2AccountDock .hostNetworkButton.compact:hover { border-color:rgba(255,255,255,.17);background:linear-gradient(145deg,rgba(255,255,255,.10),rgba(255,255,255,.04)); }
+.hostResourceDock .hostNetworkButton.compact > svg { display:none; }
+.hostResourceDock .hostNetworkButton.compact > span { display:flex;flex-direction:column;gap:3px;white-space:nowrap; }
+:root[data-theme="light"] .hostResourceDock button { border-color:rgba(45,55,46,.10);background:linear-gradient(145deg,rgba(255,255,255,.68),rgba(255,255,255,.28));box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 2px 5px rgba(40,50,40,.035); }
+.hostResourceDock button:focus-visible { outline:2px solid var(--ui-content-muted);outline-offset:2px; }
 .hostNetworkButton[data-status="reachable"] { color: #53816a; }
 .workspace > .threadList:has(.hostResourceSummary) { padding-bottom: calc(112px + env(safe-area-inset-bottom, 0px)) !important; }
-.hostResourcesPanel { flex: 1; min-height: 0; min-width: 0; padding: 18px; overflow-y: auto; overscroll-behavior: contain; box-sizing: border-box; color: var(--ui-content); font-size: 12px; overflow-wrap: anywhere; }
+.hostResourcesPanel { flex: 1; min-height: 0; min-width: 0; padding: 18px; overflow-y: auto; overscroll-behavior: contain; box-sizing: border-box; color: var(--ui-content); font:400 14px/1.5 var(--pool-ui-font),sans-serif; overflow-wrap: anywhere; }
 .hostResourcesPanel > header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
 .hostResourcesPanel > header > div:first-child { min-width: 0; }
 .hostResourceActions { display: flex; flex: none; align-items: center; gap: 5px; }
-.hostResourcesPanel h2 { margin: 0; font-size: 17px; }
+.hostResourcesPanel h2 { margin: 0; font-size: 14px; font-weight: 500; }
 .hostResourcesPanel p { margin: 6px 0; color: var(--ui-content-muted); line-height: 1.6; }
 .hostResourcesPanel button { display: grid; place-items: center; border: 0; border-radius: 8px; padding: 8px; background: var(--ui-hover); color: var(--ui-content); cursor: pointer; }
 .hostResourcesPanel button:disabled { opacity: .5; cursor: default; }
 .hostResourcesPanel .hostNetworkButton { display: inline-flex; padding: 8px; }
 .hostResourcesPanel article { margin-top: 16px; padding: 14px; border: 1px solid var(--ui-divider); border-radius: 12px; background: var(--ui-surface-raised); }
-.hostResourcesPanel h3,.hostResourcesPanel h4 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 13px; font-weight: 500; }
-.hostResourcesPanel h4 { margin-top: 10px; font-size: 12px; }
+.hostResourcesPanel h3,.hostResourcesPanel h4 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 14px; font-weight: 500; }
+.hostResourcesPanel h4 { margin-top: 10px; }
 .hostResourcesPanel strong { margin-left: auto; font-variant-numeric: tabular-nums; }
 .hostResourceMeter { height: 5px; border-radius: 8px; background: var(--ui-hover); overflow: hidden; }
 .hostResourceMeter > span { display: block; height: 100%; border-radius: inherit; background: #5d9bb5; transition: width .25s ease; }
@@ -32,5 +44,5 @@
 .hostResourcesPanel .hostResourceWarning { padding: 8px; border: 1px solid var(--ui-divider); border-radius: 8px; }
 .hostNetworkResult summary { cursor: pointer; color: var(--ui-content-muted); }
 .hostNetworkResult pre { margin: 8px 0 0; max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; line-height: 1.6; user-select: text; }
-@media (min-width: 901px) { .threadList.collapsed .hostNetworkButton { display: none; }.threadList.collapsed .hostResourceSummary { justify-content: center; }.threadList.collapsed .hostResourceSummary > span:not(:first-child),.threadList.collapsed .hostResourceSummary small { display: none; }.threadList.collapsed .hostResourceSummary > span { grid-template-columns: 1fr; justify-items: center; } }
+@media (min-width: 901px) { .threadList.collapsed .hostResourceDock {grid-template-columns:1fr}.threadList.collapsed .hostNetworkButton,.threadList.collapsed .hostResourceTile:not(:first-child) { display: none; } }
 @media (prefers-reduced-motion: reduce) { .hostResourceMeter > span { transition: none; } }

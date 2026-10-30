@@ -21,6 +21,7 @@ import { ComposerPredictions } from "./composerPredictions.js";
 import { LegacyRollbackConflictError } from "./legacyRollback.js";
 import {readableRolloutPath, rolloutLogicalStat, rolloutReadStream, MAX_FULL_HISTORY_BYTES, HistoryMemoryLimitError} from './rolloutStorage.js';
 import { inheritedBillingTurnIds } from "./leaderboardForkUsage.js";
+import { billingLines } from "./billingLines.js";
 import { authenticatedUserFromHeaders } from "./auth.js";
 import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
 import { registerScheduledTaskMcp } from "./scheduledTaskMcp.js";
@@ -41,6 +42,7 @@ import {readArchivedThreadIndex} from "./archivedThreadIndex.js";
 import { isProjectLocalHook, listHooksForProject } from "./hookTrust.js";
 import { assertRepositoryWithinProject, createManagedWorktree, discoverGitRepositories, removeManagedWorktree } from "./worktree.js";
 import { locateIndexedThreadItem, readIndexedThreadItem, readIndexedThreadPage, warmThreadIndex } from "./threadEventIndex.js";
+import { readBranchHistoryItem, readBranchHistoryPage } from "./branchHistory.js";
 import { searchChatThreadHits, searchChatThreads, startChatSearch } from "./chatSearch.js";
 import { listAllCodexThreads, THREAD_LIST_PAGE_SIZE } from "./threadList.js";
 import {
@@ -222,6 +224,7 @@ const threadBranchSchema = z.object({
   turnId: z.string().trim().min(1).max(256),
   prompt: z.string().trim().max(24_000).optional().default(""),
   targetProjectId: z.string().uuid().optional(),
+  model: z.string().trim().min(1).max(256).optional(),
   archiveToolOutputs: z.boolean().optional().default(false)
 });
 
@@ -1337,7 +1340,7 @@ export async function summarizeLeaderboardFile(
   resolveSessionOwner: (sessionId: string) => string | null,
   preciseTimestamps = false
 ): Promise<LeaderboardFileSummary> {
-  const stat = await rolloutLogicalStat(filePath);
+  const stat = await fs.promises.stat(filePath).catch(()=>fs.promises.stat(filePath+'.zst'));
   const usageByKey = new Map<string, LeaderboardFileUsage>();
   let sessionId = path.basename(filePath, ".jsonl");
   let userId: string | null = null;
@@ -1353,11 +1356,14 @@ export async function summarizeLeaderboardFile(
     if (!knownUsers.has(id)) knownUsers.set(id, store.getUser(id) !== null);
     return knownUsers.get(id)!;
   };
-  const input = await rolloutReadStream(filePath, { encoding: "utf8", highWaterMark: 256 * 1024 });
-  const lines = createInterface({ input, crlfDelay: Infinity });
+  const lines = billingLines(filePath);
 
   for await (const line of lines) {
     if (!line.trim()) continue;
+    // Tool results and compressed context can be megabytes each. Billing
+    // needs only metadata, turn identity and native token counters.
+    if (!line.includes('"session_meta"') && !line.includes('"turn_context"')
+      && !line.includes('"token_count"') && !line.includes('"task_started"')) continue;
     let record: Record<string, unknown>;
     try {
       record = JSON.parse(line) as Record<string, unknown>;
@@ -1432,7 +1438,8 @@ async function readCodexLeaderboard(
   source: LeaderboardAccountSource,
   store: ProjectStore,
   apiCycleWindow?: LeaderboardCycleWindow,
-  requireDailyBreakdown = false
+  requireDailyBreakdown = false,
+  cachedOnly = false
 ): Promise<PublicCodexLeaderboard> {
   loadLeaderboardFileCache();
   const files = walkJsonlFiles(source.sessionsRoot);
@@ -1470,9 +1477,11 @@ async function readCodexLeaderboard(
   const liveFiles = new Set(files);
   for (const filePath of files) {
     try {
-      const stat = await rolloutLogicalStat(filePath);
+      if(cachedOnly&&!leaderboardFileCache.has(filePath)){errors.push('部分会话统计正在后台更新');continue;}
+      const cachedSummary=leaderboardFileCache.get(filePath);
+      const stat = cachedOnly&&cachedSummary?{size:cachedSummary.size,mtimeMs:cachedSummary.mtimeMs}:await fs.promises.stat(filePath).catch(()=>fs.promises.stat(filePath+'.zst'));
       let summary = leaderboardFileCache.get(filePath);
-      if (summary && summary.billingVersion !== 2 && !sessionMetadataFromFileStart(await readableRolloutPath(filePath))?.forked_from_id) {
+      if (!cachedOnly && summary && summary.billingVersion !== 2 && fs.existsSync(filePath) && !sessionMetadataFromFileStart(filePath)?.forked_from_id) {
         // Existing non-fork summaries remain valid: avoid reparsing the full
         // historical corpus merely to correct copied fork records.
         summary.billingVersion = 2;
@@ -1486,12 +1495,14 @@ async function readCodexLeaderboard(
       );
       const needsEventTimestamps = source.kind === "api-provider" && summary?.granularity !== "event";
       const needsProviderUsage = source.kind === "api-provider" && summary?.providerUsageVersion !== 1;
-      if (!summary || summary.billingVersion !== 2 || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs || needsCurrentCycleDailyBreakdown || needsEventTimestamps || needsProviderUsage) {
+      if (!cachedOnly&&(!summary || summary.billingVersion !== 2 || summary.size !== stat.size || summary.mtimeMs !== stat.mtimeMs || needsCurrentCycleDailyBreakdown || needsEventTimestamps || needsProviderUsage)) {
+        console.info("leaderboard.scan", { accountId: source.id, file: path.basename(filePath), bytes: stat.size });
         summary = await summarizeLeaderboardFile(filePath, store, resolveSessionOwner, source.kind === "api-provider");
         leaderboardFileCache.set(filePath, summary);
         cacheChanged = true;
       }
-      if (summary.usage.some((entry) => entry.userId === "unknown")) {
+      if(!summary)continue;
+      if (!cachedOnly&&fs.existsSync(filePath)&&summary.usage.some((entry) => entry.userId === "unknown")) {
         const cwdUser = userIdFromSessionCwd(sessionCwdFromFileStart(await readableRolloutPath(filePath)), (id) => store.getUser(id) !== null);
         if (cwdUser) {
           for (const entry of summary.usage) {
@@ -1537,7 +1548,7 @@ async function readCodexLeaderboard(
       startAt: lifetimeStartAt
     }),
     updatedAt: new Date().toISOString(),
-    errors
+    errors: [...new Set(errors)]
   };
 }
 
@@ -1634,6 +1645,9 @@ async function buildTrackedQuotaUsage(
   const dayAccounts = new Map<string, PublicTrackedQuotaDayAccount[]>();
   const errors: string[] = [];
   const ledgerAccounts = readTrackedQuotaLedger();
+  // Share the single background billing scan with the leaderboard. Quota
+  // viewers must not each replay the same multi-gigabyte corpus in parallel.
+  void readCachedCodexLeaderboard(sources,store,false,false).catch(error=>console.warn('trackedQuota.background',error instanceof Error?error.message:String(error)));
   const previousDisplay = trackedQuotaCache?.data ?? (() => {
     try {
       return JSON.parse(fs.readFileSync(trackedQuotaCachePath, "utf8")) as PublicTrackedQuotaUsage;
@@ -1643,7 +1657,7 @@ async function buildTrackedQuotaUsage(
   })();
 
   for (const source of sources) {
-    const board = await readCodexLeaderboard(source, store, undefined, true);
+    const board = await readCodexLeaderboard(source, store, undefined, true, true);
     errors.push(...board.errors.map((error) => `${source.label}: ${error}`));
     const cycle = board.currentCycle;
     const accountUsedPercent = cycle.quotaUsedPercent;
@@ -3235,7 +3249,16 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       // Never merge peer boards into the normal endpoint. A peer can expose
       // historical JSONL records for the same login, which is useful for an
       // audit but misleading as a current-service quota view.
-      return { data: await readCachedCodexLeaderboard(sources, store, forceRefresh, false) };
+      const refresh=readCachedCodexLeaderboard(sources, store, forceRefresh, false);
+      let timer:ReturnType<typeof setTimeout>|undefined;
+      const data=await Promise.race([refresh,new Promise<null>(resolve=>{timer=setTimeout(()=>resolve(null),2000);})]).finally(()=>{if(timer)clearTimeout(timer);});
+      if(data)return {data};
+      const window=apiLeaderboardCycleWindow(sources.filter(s=>s.kind!=="api-provider").map(s=>({resetAt:s.quota.rateLimits?.primary?.resetsAt??null,resetWindowMins:s.quota.rateLimits?.primary?.windowDurationMins??null})),Math.floor(Date.now()/1000));
+      const boards=[];
+      for(const source of sources)boards.push(await readCodexLeaderboard(source,store,window,false,true));
+      const cached=mergeAccountLeaderboards(boards,sources);
+      cached.errors=[...new Set([...cached.errors,"完整统计正在后台更新，当前显示已缓存用量"] )];
+      return {data:cached};
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -4235,7 +4258,10 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         ?? defaultThreadContextConfig(request.params.threadId);
       const sourceContextUsage = await readThreadContextUsage(request.params.threadId, sourceContextConfig);
       const presentation = store.getThreadPresentation(userId, [request.params.threadId]).get(request.params.threadId);
-      const model = presentation?.model ?? owner?.modelOverride ?? project.defaultModel;
+      const model = input.model ?? presentation?.model ?? owner?.modelOverride ?? project.defaultModel;
+      if (input.model && !availableModelProfiles().some(profile => profile.model === input.model)) {
+        return reply.code(400).send({ error: "Selected branch model is not available." });
+      }
       const reasoningEffort = presentation?.reasoningEffort ?? owner?.reasoningEffortOverride ?? project.defaultReasoningEffort;
       const contextConfig = threadContextConfigOverrides(
         sourceContextConfig,
@@ -4318,10 +4344,10 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         } else if (nativeFork) {
           started = await poolBridge.forkThreadOnAccount(routing.targetAccount.id, forkParams, 60_000);
         } else {
-          const sourcePath = stringOrNull(sourceThread.path) ?? stringOrNull(sourceThread.rolloutPath);
+          const sourcePath = persistedSourcePath ?? stringOrNull(sourceThread.path) ?? stringOrNull(sourceThread.rolloutPath);
           const sourceSessionsRoot = sourcePath
             ? routing.sourceAccount
-              ? path.join(routing.sourceAccount.codexHome, "sessions")
+              ? threadJsonlSessionsRoot(sourcePath)
               : threadJsonlSessionsRoot(sourcePath)
             : null;
           if (!sourcePath || !sourceSessionsRoot) {
@@ -4666,12 +4692,12 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       // app-server queue. Prefer it for every existing session, not only huge ones.
       const fallbackPath = await findThreadJsonlPathById(request.params.threadId);
       if (fallbackPath) {
-        const indexedPage = await readIndexedThreadPage(fallbackPath, request.params.threadId, {
+        const indexedPage = await readBranchHistoryPage(fallbackPath, request.params.threadId, {
           before: input.before,
           cursor: input.cursor,
           limit: input.limit,
           backgroundRefresh: !input.fresh && input.before === 0 && !input.cursor
-        });
+        }, parentId => store.getThreadOwner(parentId)?.userId === userId);
         result = { thread: overlayJournal(indexedPage.thread as Record<string, unknown>, (turnId) => store.readTimelineItems(request.params.threadId, turnId), input.before === 0 && !input.cursor) };
         result = sanitizeThreadPayloadForClient(result);
         const clientThread = asRecord(result).thread;
@@ -4730,7 +4756,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
       }
       const filePath = await findThreadJsonlPathById(request.params.threadId);
-      const indexedItem = filePath ? await readIndexedThreadItem(filePath, request.params.threadId, request.params.itemId) : null;
+      const indexedItem = filePath ? await readBranchHistoryItem(filePath, request.params.threadId, request.params.itemId, parentId => store.getThreadOwner(parentId)?.userId === userId) : null;
       const item = indexedItem ?? store.readTimelineItem(request.params.threadId, request.params.itemId);
       if (!item) return reply.code(404).send({ error: "Tool output was not found in the thread index." });
       const output = typeof item.aggregatedOutput === "string"

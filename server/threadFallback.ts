@@ -3,6 +3,7 @@ import { createReadStream, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { createZstdDecompress } from "node:zlib";
 import { accountHistoryRoots } from "./sessionReadRoots.js";
 import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { AppError } from "./appErrors.js";
@@ -57,8 +58,8 @@ const sessionPathIndexTtlMs = 60_000;
 export function threadHistoryRuntimeHomes(): string[] {
   return [...new Set(configuredCodexSessionRoots.map(root=>path.dirname(root)))];
 }
-const cachedSessionPathIndexes = new Map<string, { expiresAt: number; paths: Map<string, string> }>();
-const buildingSessionPathIndexes = new Map<string, Promise<Map<string, string>>>();
+const cachedSessionPathIndexes = new Map<string, { expiresAt: number; paths: Map<string, string[]> }>();
+const buildingSessionPathIndexes = new Map<string, Promise<Map<string, string[]>>>();
 
 function secondsFromIso(value: unknown): number | null {
   if (typeof value !== "string") {
@@ -305,32 +306,63 @@ function sessionIdFromJsonlFilename(name: string): string | null {
   return match?.[1] ?? null;
 }
 
-async function buildSessionPathIndex(sessionsRoot: string): Promise<Map<string, string>> {
-  const paths = new Map<string, string>();
-  async function walk(directory: string): Promise<void> {
-    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
-    try {
-      entries = await fs.readdir(directory, { withFileTypes: true }) as unknown as Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
-    } catch {
-      return;
-    }
-    await Promise.all(entries.map(async (entry) => {
-      const target = path.join(directory, entry.name);
-      if (entry.isDirectory()) {
-        await walk(target);
-      } else if (entry.isFile() && /\.jsonl(?:\.zst)?$/.test(entry.name) && isSafeCodexSessionPath(target.replace(/\.zst$/, ''), sessionsRoot)) {
-        const sessionId = sessionIdFromJsonlFilename(entry.name.replace(/\.zst$/, ''));
-        if (sessionId) {
-          paths.set(sessionId, target.replace(/\.zst$/, ''));
-        }
+/** Rotated rollouts can carry logical_id_native_id in their filename. Only
+ * session metadata may decide which logical conversation such a file belongs to.
+ * Read a bounded header, never hydrate a rollout while discovering its path. */
+async function logicalSessionIdFromFilename(file: string, name: string): Promise<string | null> {
+  const ids: string[] = name.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? [];
+  if (ids.length < 2) return sessionIdFromJsonlFilename(name.replace(/\.zst$/, ""));
+  const input = createReadStream(file, { highWaterMark: 8192 });
+  const stream = file.endsWith(".zst") ? input.pipe(createZstdDecompress()) : input;
+  const chunks: Buffer[] = []; let bytes = 0;
+  try {
+    for await (const value of stream) {
+      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      const newline = chunk.indexOf(10);
+      const part = chunk.subarray(0, newline < 0 ? chunk.length : newline);
+      bytes += part.length;
+      if (bytes > 64 * 1024) return null;
+      chunks.push(part);
+      if (newline >= 0) {
+        const row = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8"));
+        const id = row?.payload?.id ?? row?.payload?.session_id;
+        return row?.type === "session_meta" && typeof id === "string" && ids.includes(id) ? id : null;
       }
-    }));
-  }
-  await walk(sessionsRoot);
-  return paths;
+    }
+    return null;
+  } catch { return null; }
+  finally { stream.destroy(); input.destroy(); }
 }
 
-async function getSessionPathIndex(sessionsRoot: string): Promise<Map<string, string>> {
+async function buildSessionPathIndex(sessionsRoot: string): Promise<Map<string, string[]>> {
+  const candidates = new Map<string, Map<string, number>>();
+  async function walk(directory: string): Promise<void> {
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try { entries = await fs.readdir(directory, { withFileTypes: true }) as unknown as typeof entries; }
+    catch { return; }
+    // Bound file descriptors and metadata buffers when a runtime owns many files.
+    for (const entry of entries) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) await walk(target);
+      else if (entry.isFile() && /\.jsonl(?:\.zst)?$/.test(entry.name) && isSafeCodexSessionPath(target.replace(/\.zst$/, ""), sessionsRoot)) {
+        const id = await logicalSessionIdFromFilename(target, entry.name);
+        if (!id) continue;
+        const stat = await fs.stat(target).catch(() => null);
+        if (!stat) continue;
+        const canonical = target.replace(/\.zst$/, "");
+        const paths = candidates.get(id) ?? new Map<string, number>();
+        paths.set(canonical, Math.max(paths.get(canonical) ?? 0, stat.mtimeMs));
+        candidates.set(id, paths);
+      }
+    }
+  }
+  await walk(sessionsRoot);
+  return new Map([...candidates].map(([id, paths]) => [id,
+    [...paths].sort((a,b) => b[1]-a[1] || b[0].localeCompare(a[0])).map(([file]) => file)
+  ]));
+}
+
+async function getSessionPathIndex(sessionsRoot: string): Promise<Map<string, string[]>> {
   const root = path.resolve(sessionsRoot);
   const cached = cachedSessionPathIndexes.get(root);
   if (cached && cached.expiresAt > Date.now()) {
@@ -420,7 +452,7 @@ export function threadJsonlPathFromError(error: unknown, sessionsRoot?: string):
   return isSafeCodexSessionPath(filePath, sessionsRoot) ? filePath : null;
 }
 
-export async function findThreadJsonlPathById(threadId: string, sessionsRoot?: string): Promise<string | null> {
+export async function findThreadJsonlPathById(threadId: string, sessionsRoot?: string, options: { beforeFile?: string } = {}): Promise<string | null> {
   const cleanThreadId = threadId.trim();
   if (!cleanThreadId || !/^[a-zA-Z0-9_-]+$/.test(cleanThreadId)) {
     return null;
@@ -428,11 +460,16 @@ export async function findThreadJsonlPathById(threadId: string, sessionsRoot?: s
 
   const roots = sessionRoots(sessionsRoot);
   for (const root of roots) {
-    const indexedPath = (await getSessionPathIndex(root)).get(cleanThreadId);
-    if (indexedPath && isSafeCodexSessionPath(indexedPath, root)) {
-      return indexedPath;
-    }
+    const candidates = (await getSessionPathIndex(root)).get(cleanThreadId) ?? [];
+    const position = options.beforeFile ? candidates.indexOf(path.resolve(options.beforeFile)) : -1;
+    if (options.beforeFile && position < 0) continue;
+    const indexedPath = candidates[position + 1];
+    if (indexedPath && isSafeCodexSessionPath(indexedPath, root)) return indexedPath;
   }
+
+  // A self-referencing continuation must move strictly to an older physical
+  // source; falling back to the latest file here would create a history cycle.
+  if (options.beforeFile) return null;
 
   async function walk(directory: string): Promise<string | null> {
     let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
@@ -450,6 +487,8 @@ export async function findThreadJsonlPathById(threadId: string, sessionsRoot?: s
           return found;
         }
       } else if (entry.isFile() && (entry.name.endsWith(`${cleanThreadId}.jsonl`) || entry.name.endsWith(`${cleanThreadId}.jsonl.zst`)) && isSafeCodexSessionPath(target.replace(/\.zst$/, ''), sessionsRoot)) {
+        const ids = entry.name.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? [];
+        if (ids.length > 1 && await logicalSessionIdFromFilename(target, entry.name) !== cleanThreadId) continue;
         return target.replace(/\.zst$/, '');
       }
     }

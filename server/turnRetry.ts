@@ -15,12 +15,17 @@ export interface TurnRecoveryState {
 export const publicRecovery = (state: TurnRecoveryState): TurnRecoveryView => ({ threadId: state.threadId, error: state.error, job: state.job ? { status: state.job.status, attempts: state.job.attempts, maxAttempts: state.job.maxAttempts, nextRetryAt: state.job.nextRetryAt } : null,
   ...(state.interruption ? { interruption: state.interruption } : {}), ...(state.dismissedTurnId ? { dismissedTurnId: state.dismissedTurnId } : {}) });
 
-/** A read-only preflight can be retried without resending a generation. */
-export class RetryDeferredError extends Error {}
+/** Only for preflight checks, before any turn/start has been dispatched. */
+export class RetryDeferredError extends Error {
+  constructor() { super("原生会话状态尚未确认，稍后自动复查；不会重复发送任务。"); }
+}
+
 function retryDelay(state: TurnRecoveryState, intervalMs?: number): number {
   return intervalMs ?? (state.error?.code === "stream_disconnected"
-    ? Math.min(5_000 * 2 ** Math.min(state.job?.attempts ?? 0, 4), 60_000) : 60_000);
+    ? Math.min(5_000 * 2 ** Math.min(state.job?.attempts ?? 0, 4), 60_000)
+    : 60_000);
 }
+
 export class TurnRetryQueue {
   private timer: ReturnType<typeof setInterval>;
   private draining = false;
@@ -157,12 +162,21 @@ export class TurnRetryQueue {
           if (!this.isCurrent(state)) continue;
           const current = this.store.getTurnRecoveryState(state.threadId)!;
           if (error instanceof RetryDeferredError) {
-            current.job!.status = "waiting"; current.job!.attempts -= 1;
+            current.job!.status = "waiting";
+            current.job!.attempts -= 1;
             current.job!.nextRetryAt = Date.now() + Math.max(5_000, retryDelay(current, this.options.intervalMs));
             this.save(current);
           } else if (current.job!.activeTurnId) {
-            current.error = AppError.from(error).toPublic(); this.save(current);
-          } else this.failed(state.userId, state.threadId, `pending:${state.job.id}:${state.job.attempts}`, error, true, false);
+            // turn/started is authoritative even if the start RPC's reply was
+            // lost. Keep following this turn; never resend its original input.
+            current.error = AppError.from(error).toPublic();
+            this.save(current);
+          } else {
+            // A start failure is a separate attempt, not a duplicate terminal
+            // notification for the old turn. Unknown transport failures are
+            // non-retryable unless the native server explicitly rejected it.
+            this.failed(state.userId, state.threadId, `pending:${state.job.id}:${state.job.attempts}`, error, true, false);
+          }
         }
       }
     } finally { this.draining = false; }
