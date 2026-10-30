@@ -1,0 +1,8 @@
+/* Switching images is a crossfade, not a geometry transition. Both images
+   share one centered canvas so landscape/portrait loads cannot drift diagonally. */
+.imageViewerCanvas {display:grid;place-items:center;}
+.imageViewerImage {grid-area:1/1;margin:0;align-self:center;justify-self:center;}
+.imageViewerImage.ready {animation:imageViewerCrossfade .28s ease both;transform:none;}
+.imageViewer:has(.imageViewerPrevious) .imageViewerImage {transition:opacity .28s ease;}
+@keyframes imageViewerCrossfade {from{opacity:0}to{opacity:1}}
+@media(prefers-reduced-motion:reduce) {.imageViewerImage.ready {animation:none;}}

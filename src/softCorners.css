@@ -13,12 +13,13 @@
   border-radius: 999px !important;
   corner-shape: round;
   display:flex;align-items:center;justify-content:center;text-align:center;
+  height:32px!important;min-height:32px!important;box-sizing:border-box;
   padding-top:0!important;padding-bottom:2px!important;
 }
-:root .topbar .controls .topbarPolicySelect .polishedSelectTrigger {padding-inline:22px!important;gap:0;}
+:root .topbar .controls .topbarPolicySelect .polishedSelectTrigger {padding-inline:10px!important;gap:6px;}
 :root .topbar .controls .topbarPolicySelect .polishedSelectTrigger > span:first-child {text-align:center;}
-:root .topbar .controls .topbarPolicySelect .polishedSelectChevron {position:absolute;right:7px;top:50%;margin-top:-8px;transform:none;}
-@media(max-width:720px) { :root .topbar .controls .topbarPolicySelect .polishedSelectTrigger {padding-inline:18px!important;} }
+:root .topbar .controls .topbarPolicySelect .polishedSelectChevron {position:static;flex:none;width:12px;height:14px;margin:0;transform:none;}
+@media(max-width:720px) { :root .topbar .controls .topbarPolicySelect .polishedSelectTrigger {padding-inline:6px!important;gap:3px;} }
 :root :is(.uiGlassPopover, .polishedSelectMenu, .groupedModelMenu, .skillPickerPopover, .v2PlusMenu, .accountPoolPopover, .quotaPopover) { border-radius: var(--ui-radius-menu); }
 :root :is(.modalDialog, .renameThreadDialog, .directoryDialog, .settingsDialog, .leaderboardDialog, .temporaryCloseDialog, .globalSearchDialog) { border-radius: var(--ui-radius-dialog); }
 :root :is(.rightWorkspaceOverviewCard, .toolQuestionCard) { border-radius: var(--ui-radius-card); }
@@ -28,8 +29,27 @@
 :root :is(.threadContextMenu,.v2AccountMenu,.composerSlashMenu,.imageViewerActionMenu,.petPicker) {border-radius:var(--ui-radius-menu);}
 :root :is(.feishuDialog:not(.feishuDocked),.taskNotificationDialog,.imageViewerPanel,.documentViewerPanel) {border-radius:var(--ui-radius-dialog);}
 :root :is(.hostResourcesPanel article,.communicationMessage,.threadScheduleEditor,.feishuCapabilityCard,.petChoice) {border-radius:var(--ui-radius-card);}
+:root :is(.trackedQuotaSummary,.trackedQuotaAccount,.trackedQuotaDays > article) {border-radius:var(--ui-radius-card);}
+:root .trackedQuotaMetrics > div {border-radius:var(--ui-radius-control);}
 :root :is(.v2WorkspaceFolderButton,.threadRow,.threadSearch,.v2PrimaryNav button,.hostResourceTile,.hostResourceDock .hostNetworkButton,.threadScheduleCard,.subagentDirectorySearch,.petSearch,.communicationToolStatus) {border-radius:var(--ui-radius-control);}
 :root :is(.communicationPanel,.feishuDialog,.threadScheduleEditor,.directoryCreateForm) :is(button,input:not([type="checkbox"],[type="radio"],[type="range"]),select,textarea) {border-radius:var(--ui-radius-control);}
+:root :is(.hostResourcesPanel,.communicationPanel,.threadSchedulesPanel,.feishuDialog,.directoryCreateForm,.remoteFolderSidebar) button:not(.imageViewerRoundButton):not([role="switch"]) {border-radius:var(--ui-radius-control)!important;}
+:root .rightWorkspace :is(.rightWorkspaceTabGroup,.rightWorkspaceEntry,.rightWorkspaceMore,.subagentDirectorySearch,.communicationToolStatus) {border-radius:var(--ui-radius-control);}
+:root :is(.polishedSelectOption,.v2PlusMenu button,.v2AccountMenu button) {border-radius:var(--ui-radius-control)!important;}
+:root .threadList .v2WorkspaceThreads .threadRow {border-radius:var(--ui-radius-control)!important;}
+:root .threadList .v2WorkspaceThreads {row-gap:2px!important;}
+:root .threadList .v2WorkspaceThreads .threadRow {margin-block:0!important;border-width:0!important;box-shadow:none!important;}
+:root[data-theme] .threadList .v2WorkspaceThreads .threadRow.pinned:not(.selected) {background:rgba(238,196,95,.13)!important;}
+:root .threadList .v2WorkspaceThreads .threadRow:is(.running,.opening) {box-shadow:inset 0 0 0 1px rgba(150,160,150,.14)!important;}
+:root .threadList .v2WorkspaceThreads .threadRow .threadSelectButton {border-radius:inherit!important;background:transparent!important;}
+/* Align actual glyph boxes across the brand, project header and folder rows. */
+:root .threadList :is(.v2ThemeToggle,.listHeaderActions button,.projectNewThreadButton,.projectRenameButton,.projectDeleteButton) > svg {width:17px!important;height:17px!important;}
+:root .threadList .v2SidebarToggle > svg {width:19px;height:19px;}
+:root .threadList .listHeader {padding-inline:8px;}
+:root .threadList .listHeaderActions {gap:8px;margin-right:0;translate:none;}
+:root .threadList .listHeaderActions button {width:26px;min-width:26px;height:29px;padding:0;display:grid;place-items:center;}
+:root .threadList:not(.collapsed) .v2BrandRow > .v2ThemeToggle {right:41px;translate:none;}
+:root .threadList:not(.collapsed) .v2BrandRow > .v2SidebarToggle {position:absolute;top:50%;right:7px;transform:translateY(-50%);translate:none;}
 /* Native progressive enhancement: no SVG masks, resize JS, layout transforms or extra paints. */
 @supports (corner-shape: superellipse(1.25)) {
   :root :is(.conversation > .composer, .uiGlassPopover, .polishedSelectMenu, .groupedModelMenu,

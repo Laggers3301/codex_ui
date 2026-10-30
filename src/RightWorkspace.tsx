@@ -24,9 +24,9 @@ export function WorkspaceOverview({ sections }: { sections: WorkspaceSection[] }
   </div></div>;
 }
 
-export function RightWorkspace({ scope, open, active, width, tabs, overview, onSelect, onHide, onResize }: {
+export function RightWorkspace({ scope, open, active, width, tabs, overview, mobileSummary, onSelect, onHide, onResize }: {
   scope: string;
-  open: boolean; active: string; width: number; tabs: WorkspaceTab[]; overview: ReactNode;
+  open: boolean; active: string; width: number; tabs: WorkspaceTab[]; overview: ReactNode; mobileSummary?: ReactNode;
   onSelect: (id: string) => void; onHide: () => void; onResize: (event: MouseEvent<HTMLDivElement>) => void;
 }) {
   const tabList = useRef<HTMLDivElement>(null);
@@ -76,6 +76,7 @@ export function RightWorkspace({ scope, open, active, width, tabs, overview, onS
       <button type="button" className="rightWorkspaceControl" title="打开窗口" aria-label="打开右栏窗口" onClick={() => onSelect("overview")}><WorkspaceIcon name="plus" /></button>
       <button type="button" className="rightWorkspaceControl" title="隐藏右栏（Ctrl+Shift+B）" aria-label="隐藏右栏" onClick={onHide}><WorkspaceIcon name="panel" /></button>
     </header>
+    {mobileSummary ? <div className="mobileRightResourceDock">{mobileSummary}</div> : null}
     <div className="rightWorkspaceStage">
       <section className={`rightWorkspacePane${active === "overview" ? " active" : ""}`} id="right-pane-overview" role="tabpanel" aria-labelledby="right-tab-overview" aria-hidden={active !== "overview"} inert={active !== "overview"}>{overview}</section>
       {tabs.map(tab => <section className={`rightWorkspacePane${active === tab.id ? " active" : ""}${tab.closing || closing.includes(tab.id) ? " closing" : ""}`} key={tab.id} id={`right-pane-${tab.id}`} role="tabpanel" aria-labelledby={`right-tab-${tab.id}`} aria-hidden={active !== tab.id} inert={active !== tab.id}>{tab.content}</section>)}

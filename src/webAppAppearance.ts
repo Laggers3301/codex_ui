@@ -11,5 +11,7 @@ export function syncWebAppAppearance(theme: 'dark'|'light', doc:Document=documen
     element.content=content;
   };
   meta('theme-color',color);
-  meta('apple-mobile-web-app-status-bar-style',theme==='light'?'default':'black');
+  // Preserve dark, readable system glyphs in light mode. Where supported,
+  // the dark Home Screen app lets its actual surface continue under the notch.
+  meta('apple-mobile-web-app-status-bar-style',theme==='light'?'default':'black-translucent');
 }

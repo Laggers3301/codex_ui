@@ -1,8 +1,9 @@
 /* Shared chrome typography; document pages, source editors and terminal grids
    retain their own font metrics and zoom. */
-:root { --panel-text-size:14px; --panel-meta-size:12px; --panel-title-size:15px; --panel-control-height:38px; --panel-control-radius:var(--ui-radius-control,14px); }
+:root { --panel-text-size:13px; --panel-meta-size:12px; --panel-title-size:14px; --panel-control-height:38px; --panel-control-radius:var(--ui-radius-control,14px); }
 :root :is(.rightWorkspace,.documentViewer,.imageViewer) { font-family:var(--pool-ui-font); }
 :root .rightWorkspace :is(.hostResourcesPanel,.communicationPanel,.rightWorkspaceOverview,.rightWorkspaceList,.rightWorkspaceGoal,.rightPaneSubagents,.browserPanel,.webTerminalPanel) { font-size:var(--panel-text-size); }
+:root .rightWorkspace :is(.feishuDialog,.threadSchedulesPanel,.remoteFolderSidebar,.subagentPanelHeader) {font-size:var(--panel-text-size)!important;}
 :root .rightWorkspace :is(button,label,summary,select,input,textarea):not(.xterm-helper-textarea) {
   font-family:var(--pool-ui-font)!important;font-size:var(--panel-text-size)!important;
 }
@@ -14,6 +15,11 @@
 :root :is(.documentViewer,.imageViewer) :is(.imageViewerHeader,.imageViewerActionMenu,.imageViewerZoomControls,.documentArchive,.documentArchiveNavigation,.documentPreviewStatus,.fileBinaryPreview) {font-family:var(--pool-ui-font);font-size:var(--panel-text-size)!important;}
 :root :is(.documentViewer,.imageViewer) :is(.imageViewerTitle strong,.documentArchive button,.documentArchive th,.documentArchive td,.documentArchive p,.documentArchiveNavigation button,.imageViewerActionMenu button,.imageViewerZoomControls button) {font-family:var(--pool-ui-font);font-size:var(--panel-text-size)!important;}
 :root :is(.documentViewer,.imageViewer) .imageViewerTitle span {font-size:var(--panel-meta-size)!important;}
+:root .trackedQuotaDialog {font-family:var(--pool-ui-font);font-size:13px;}
+:root .trackedQuotaDialog :is(p,span,em,label,button,.trackedQuotaDays strong,.trackedQuotaUpdated) {font-size:13px!important;}
+:root .trackedQuotaDialog :is(small,.trackedQuotaFootnote,.trackedQuotaAccount > p,.trackedQuotaDialog .dialogHeader p) {font-size:12px!important;}
+:root .trackedQuotaDialog .dialogHeader h2 {font-size:15px!important;font-weight:500;}
+:root .trackedQuotaDialog :is(.trackedQuotaSummary strong,.trackedQuotaMetrics strong,.trackedQuotaAccount > header strong) {font-size:14px!important;font-weight:500;line-height:1.5;}
 /* Standard form fields share one hit area; terminal grids and document
    editors keep their own metrics, as do compact icon-only toolbar controls. */
 :root .rightWorkspace :is(.communicationPanel,.threadScheduleEditor,.directoryCreateForm,.subagentDirectorySearch,.remoteComputerLabel) :is(input:not([type="checkbox"],[type="radio"],[type="range"],[type="hidden"],[type="file"]),select) {

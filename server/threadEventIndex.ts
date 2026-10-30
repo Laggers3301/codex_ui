@@ -454,7 +454,11 @@ export function warmThreadIndex(filePath: string, threadId: string): Promise<voi
       // Do not inflate the entire cold corpus during background index scans.
       if (!await fs.stat(filePath).catch(()=>null)) {
         const logical=await rolloutLogicalStat(filePath);
-        if(state.filePath===filePath&&state.size===logical.size&&state.indexedOffset===logical.size&&state.mtimeMs===logical.mtimeMs) return;
+        // fs.utimes stores the decompressed cache timestamp at microsecond
+        // precision; stat of the immutable archive can retain sub-microseconds.
+        // Exact float equality missed by 0.000488ms in production, causing a
+        // full index rebuild every time an LRU-evicted cache file got a new ino.
+        if(state.filePath===filePath&&state.size===logical.size&&state.indexedOffset===logical.size&&Math.abs(state.mtimeMs-logical.mtimeMs)<=0.001) return;
       }
       const stat = await rolloutStat(filePath);
       if (state.filePath === filePath && state.inode === Number(stat.ino)

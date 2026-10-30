@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { Cpu, Globe, HardDrive, MemoryStick, RefreshCcw } from "lucide-react";
 import { checkHostNetwork, readHostResources } from "./api";
+import { ComposerGlassMaterial } from "./ComposerGlassMaterial";
 import type { HostNetworkProbeResult, HostResources } from "../shared/hostResources";
 import "./hostResources.css";
 
@@ -21,6 +22,9 @@ export function useHostResources(userId: string) {
       const request = new AbortController(); controller = request; setFetching(true);
       try {
         const result = await readHostResources(request.signal);
+        if (!result.data || !Array.isArray(result.data.volumes) || !Array.isArray(result.data.disks) || !result.data.cpu || !result.data.memory) {
+          throw new Error("Malformed host resource response");
+        }
         if (active && controller === request && !request.signal.aborted) { setData(result.data); setError(false); }
       } catch {
         if (active && controller === request && !request.signal.aborted) setError(true);
@@ -106,6 +110,7 @@ function NetworkProbeButton({ compact = false, onOpen }: { compact?: boolean; on
     data-status={result?.status} title={network.checking ? "正在通过服务代理检测 Google HTTPS…" : network.error ? `${network.error} 点击重新检测。` : result ? `${result.message}${result.status === "reachable" ? ` 请求总耗时 ${result.durationMs} ms。` : ""} 点击重新检测。` : "通过服务配置的代理检测 www.google.com 的 HTTPS 连通性。"}
     onClick={() => { onOpen?.(); void network.check(); }}>
     <Globe size={14} />{compact ? <span aria-live="polite" aria-atomic="true">{network.checking ? "检测中" : network.showSummary ? summary : "HTTPS"}<small>Google</small></span> : <span>{network.checking ? "检测中…" : "检测 Google HTTPS"}</span>}
+    {compact ? <ComposerGlassMaterial variant="topbar" /> : null}
   </button>;
 }
 function NetworkProbeResult() {
@@ -145,9 +150,9 @@ export function HostResourceSummary({ onOpen }: { onOpen: () => void }) {
   }, []);
   const data = state.data, disk = data?.volumes[0]?.usagePercent;
   return <div ref={dock} className="hostResourceDock"><div className={`hostResourceSummary${state.error ? " stale" : ""}`}>
-    <button type="button" className="hostResourceTile" onClick={onOpen} aria-label="查看主机资源"><span><Cpu size={12} /><small>CPU</small></span><b>{percentage(data?.cpu.usagePercent)}</b></button>
-    <button type="button" className="hostResourceTile" onClick={onOpen} aria-label="查看内存资源"><span><MemoryStick size={12} /><small>内存</small></span><b>{percentage(data?.memory.usagePercent)}</b></button>
-    <button type="button" className="hostResourceTile hostResourceDisk" onClick={onOpen} aria-label="查看磁盘资源" title={data?.volumes.map(volumeTitle).join("\n\n") || "正在读取挂载信息"}><span><HardDrive size={12} /><small>磁盘</small></span><b>{percentage(disk)}</b></button>
+    <button type="button" className="hostResourceTile" onClick={onOpen} aria-label="查看主机资源"><span><Cpu size={12} /><small>CPU</small></span><b>{percentage(data?.cpu.usagePercent)}</b><ComposerGlassMaterial variant="topbar" /></button>
+    <button type="button" className="hostResourceTile" onClick={onOpen} aria-label="查看内存资源"><span><MemoryStick size={12} /><small>内存</small></span><b>{percentage(data?.memory.usagePercent)}</b><ComposerGlassMaterial variant="topbar" /></button>
+    <button type="button" className="hostResourceTile hostResourceDisk" onClick={onOpen} aria-label="查看磁盘资源" title={data?.volumes.map(volumeTitle).join("\n\n") || "正在读取挂载信息"}><span><HardDrive size={12} /><small>磁盘</small></span><b>{percentage(disk)}</b><ComposerGlassMaterial variant="topbar" /></button>
   </div><NetworkProbeButton compact onOpen={onOpen} /></div>;
 }
 export function HostResourcePanel() {

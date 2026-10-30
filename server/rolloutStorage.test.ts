@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {zstdCompressSync} from 'node:zlib';
 import {it,expect,vi} from 'vitest';
+import {DatabaseSync} from 'node:sqlite';
 import {readableRolloutPath,rolloutLogicalStat} from './rolloutStorage.js';
 
 it('losslessly reads compressed histories with a private deduplicated cache and original logical size',async()=>{
@@ -30,6 +31,45 @@ it('rejects corrupt compressed bytes without publishing a partial cache or chang
     expect(await fs.readFile(file+'.zst')).toEqual(raw);
     expect(await fs.readdir(path.join(root,'cache'))).toHaveLength(0);
   } finally {await fs.rm(root,{recursive:true,force:true});}
+});
+
+it('does not rebuild an unchanged compressed index after cache eviction and sub-microsecond timestamp rounding',async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'storage-index-rounding-'));
+  vi.stubEnv('CODEX_THREAD_INDEX_DB',path.join(root,'index.sqlite'));
+  vi.stubEnv('CODEX_WEB_CODEX_SESSION_ROOTS',root);vi.resetModules();
+  let cachePath:string|undefined,openSpy:{mockRestore():void}|undefined;
+  try{
+    const file=path.join(root,'rollout-thread.jsonl');
+    const row=(text:string)=>Buffer.from([
+      {type:'session_meta',payload:{id:'rounding-thread'}},
+      {type:'turn_context',payload:{turn_id:'turn'}},
+      {type:'response_item',payload:{type:'message',id:'answer',role:'assistant',content:[{type:'output_text',text}]}}
+    ].map(value=>JSON.stringify(value)).join('\n')+'\n');
+    await fs.writeFile(file+'.zst',zstdCompressSync(row('answer-a')));
+    const index=await import('./threadEventIndex.js');
+    await index.readIndexedThreadPage(file,'rounding-thread',{limit:1});
+    const database=new DatabaseSync(path.join(root,'index.sqlite'),{readOnly:true});
+    const state=()=>database.prepare('SELECT inode,mtime_ms,index_generation FROM thread_files WHERE thread_id=?').get('rounding-thread') as {inode:number;mtime_ms:number;index_generation:number};
+    const before=state();cachePath=await readableRolloutPath(file);await fs.unlink(cachePath);
+    const originalOpen=fs.open.bind(fs);
+    openSpy=vi.spyOn(fs,'open').mockImplementation(async(...args:Parameters<typeof fs.open>)=>{
+      const handle=await originalOpen(...args);
+      if(String(args[0])===file+'.zst'){
+        const stat=handle.stat.bind(handle);
+        handle.stat=(async()=>{const value=await stat();value.mtimeMs=before.mtime_ms+0.00048828125;return value;}) as typeof handle.stat;
+      }
+      return handle;
+    });
+    expect(JSON.stringify(await index.readIndexedThreadPage(file,'rounding-thread',{limit:1}))).toContain('answer-a');
+    expect(state()).toEqual(before);
+    openSpy?.mockRestore();openSpy=undefined;
+    const archiveStat=await fs.stat(file+'.zst');
+    await fs.writeFile(file+'.zst',zstdCompressSync(row('answer-b')));
+    await fs.utimes(file+'.zst',new Date(),new Date(archiveStat.mtimeMs+2000));
+    expect(JSON.stringify(await index.readIndexedThreadPage(file,'rounding-thread',{limit:1}))).toContain('answer-b');
+    expect(state().index_generation).toBeGreaterThan(before.index_generation);
+    database.close();
+  }finally{openSpy?.mockRestore();vi.unstubAllEnvs();if(cachePath)await fs.unlink(cachePath).catch(()=>{});await fs.rm(root,{recursive:true,force:true});}
 });
 
 it('discovers, pages, searches and forks a compressed legacy history without changing its source',async()=>{

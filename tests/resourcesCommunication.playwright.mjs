@@ -46,7 +46,7 @@ try {
   await expect(resourcePanel.getByRole("meter", { name: "CPU 使用率", exact: true })).toHaveAttribute("aria-valuenow", "13");
   await expect(resourcePanel).toContainText("6.0 GiB"); await expect(resourcePanel).toContainText("读取 2.0 MiB/s");
   const panelTypography = await resourcePanel.locator('p:not(.hostResourceUpdate), dt, dd, button').evaluateAll(elements => elements.map(element => getComputedStyle(element).fontSize));
-  assert.ok(panelTypography.length && panelTypography.every(size => size === '14px'), 'resource UI uses the shared 14px text size');
+  assert.ok(panelTypography.length && panelTypography.every(size => size === '13px'), 'resource UI uses the shared compact 13px text size');
   const headerPills = await a.locator('.topbar :is(.trackedQuotaButton,.v2QuotaTopButton,.topbarPolicySelect .polishedSelectTrigger)').evaluateAll(elements => elements.map(element => ({ radius: getComputedStyle(element).borderTopLeftRadius, overflow: element.scrollWidth > element.clientWidth + 1 })));
   assert.equal(headerPills.length, 4); assert.ok(headerPills.every(item => item.radius === '999px' && !item.overflow), 'four compact header controls use composer-style pills');
   const diskTip = a.locator('.hostResourceSummary .hostResourceDisk');
@@ -109,7 +109,7 @@ try {
   await setContentViewport(a, { width: 1600, height: 1000 }); await a.evaluate(() => document.documentElement.dataset.theme = "dark");
 
   const openCommunication = async page => {
-    if (!await page.locator(".rightWorkspace.isOpen").isVisible()) await page.locator(".topbar .rightWorkspaceToggle").click();
+    if (!await page.locator(".rightWorkspace.isOpen").isVisible()) await page.locator(".topbar .rightWorkspaceToggle:visible").click();
     await page.locator(".rightWorkspaceHome").click();
     await page.locator(".rightWorkspaceOverview").getByRole("button", { name: "会话通信", exact: true }).click();
     const panel = page.getByRole("region", { name: "会话通信", exact: true });
@@ -129,7 +129,7 @@ try {
   await panelA.getByRole('tab', { name: 'Topic 话题', exact: true }).click();
   await expect(panelA.getByLabel('话题名称', { exact: true })).toBeVisible();
   const communicationTypography = await panelA.locator('h2,p,label,button').evaluateAll(elements => elements.map(element => ({ tag: element.tagName, size: getComputedStyle(element).fontSize })));
-  assert.ok(communicationTypography.every(item => item.size === (item.tag === 'H2' ? '15px' : '14px')), 'communication UI shares the same typography scale');
+  assert.ok(communicationTypography.every(item => item.size === (item.tag === 'H2' ? '14px' : '13px')), 'communication UI shares the same typography scale');
   await panelA.evaluate(panel => {
     panel.querySelector('[role="tab"]:nth-child(2)').click();
     panel.querySelector('[role="tab"]:nth-child(3)').click();
@@ -264,6 +264,42 @@ try {
   await openCommunication(a); await panelA.getByLabel("通信身份", { exact: true }).selectOption("side");
   await expect(panelA.getByRole("textbox", { name: "广播内容", exact: true })).toHaveValue("侧边独立草稿");
   await expect(panelA.locator(".communicationMessage")).toContainText("主会话通过工具发送到侧边");
+  // Mobile idle/editing geometry and the borderless material are UI-only.
+  // No message is sent while exercising focus, multiline input or drawer links.
+  await setContentViewport(a, { width: 393, height: 852 });
+  await a.locator('.rightWorkspace.isOpen').getByRole('button', { name: '隐藏右栏', exact: true }).click();
+  const composer = a.locator('.conversation > .composer');
+  await editor.fill(''); await a.locator('.projectTitle').click();
+  await expect.poll(async () => (await composer.boundingBox()).height).toBeLessThanOrEqual(56);
+  for (const theme of ['light', 'dark']) {
+    await a.evaluate(value => document.documentElement.dataset.theme = value, theme);
+    await a.locator('.mobileHeaderTitle').click();
+    await expect(a.locator('#conversation-header-controls')).toBeVisible();
+    const material = await composer.evaluate(element => {
+      const style = getComputedStyle(element);
+      return { border: style.borderTopWidth, shadow: style.boxShadow, font: getComputedStyle(element.querySelector('[contenteditable="true"]')).fontSize };
+    });
+    assert.equal(material.border, '0px'); assert.doesNotMatch(material.shadow, /inset/); assert.equal(material.font, '16px');
+    const header = await a.evaluate(() => {
+      const toggle = document.querySelector('.topbar .mobileRightWorkspaceToggle').getBoundingClientRect();
+      const first = document.querySelector('.topbar .trackedQuotaButton').getBoundingClientRect();
+      return { gap: first.top - toggle.bottom, width: toggle.width };
+    });
+    assert.ok(header.gap >= 3 && header.width <= 28, 'small right drawer toggle stays in the title row');
+  }
+  await editor.click(); await expect.poll(async () => (await composer.boundingBox()).height).toBeGreaterThan(70);
+  await editor.fill('保留多行草稿\n第二行'); await a.locator('.projectTitle').click();
+  assert.ok((await composer.boundingBox()).height > 70, 'nonempty draft stays expanded after blur');
+  await editor.fill(''); await a.locator('.projectTitle').click();
+  await expect.poll(async () => (await composer.boundingBox()).height).toBeLessThanOrEqual(56);
+  await a.locator('.mobileSidebarToggle').click();
+  assert.equal(await a.locator('.threadList .hostResourceDock').evaluate(element => getComputedStyle(element).display), 'none');
+  await a.locator('.threadList .v2SidebarToggle').click();
+  await expect(a.locator('.threadList')).toHaveClass(/collapsed/);
+  await a.locator('.mobileRightWorkspaceToggle').click();
+  await a.locator('.mobileRightResourceDock').getByRole('button', { name: '查看主机资源', exact: true }).click();
+  await expect(a.locator('.threadList')).toHaveClass(/collapsed/);
+  await expect(a.getByRole('region', { name: '主机资源', exact: true })).toBeVisible();
   const finalState = await state(); assert.equal(finalState.starts.length, 2, "only the two explicit simulated user messages start turns"); assert.deepEqual(errors, []);
   const report = { isolatedDatabase: true, realRestAndWebsocket: true, resourceSamplingAboutTenSeconds: intervals, hiddenPageStopsPolling: true, resourceRefreshPreservesCaret: true, failuresPreserveLastResourceData: true, mountPathsOnHover: true, httpsInSameRow: true, manualHttpsOnly: true, inlineHttpsSummaryRetainedEightSeconds: true, httpsTimingAndFailureOutput: true, resourcePanelDesktopAndPhoneScroll: true, httpsOutputRemainsSelectable: true, topicDeliveryAndReload: true, concurrentServicesRemainIndependent: true, serviceErrorsCorrelated: true, actionFeedbackAndCancelAck: true, mainSideIdentityAndDraftIsolation: true, realMcpWithSocketResumeAndForkCredentials: true, mainSideTopicAndServiceToolCalls: true, unsubscribedMainReceivesNoTopic: true, toolStatusFailureKeepsInbox: true, toolStatusNotPolled: true, phoneNoHorizontalOverflow: true, communicationNeverStartsModelTurns: true, simulatedUserTurns: 2, errors };
   await fs.writeFile(`${evidence}/results.json`, JSON.stringify(report, null, 2) + "\n"); console.log(JSON.stringify(report, null, 2));

@@ -9,7 +9,9 @@ it('updates document and browser chrome together when toggling explicit themes',
  expect(doc.documentElement.style.backgroundColor).toBe('rgb(250, 250, 248)');
  expect(doc.querySelector('meta[name="theme-color"]')?.getAttribute('content')).toBe('#fafaf8');
  expect(doc.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')?.getAttribute('content')).toBe('default');
- syncWebAppAppearance('dark',doc);syncWebAppAppearance('light',doc);
+ syncWebAppAppearance('dark',doc);
+ expect(doc.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')?.getAttribute('content')).toBe('black-translucent');
+ syncWebAppAppearance('light',doc);
  expect(doc.querySelectorAll('meta[name="theme-color"]')).toHaveLength(1);
  expect(doc.querySelectorAll('meta[name="apple-mobile-web-app-status-bar-style"]')).toHaveLength(1);
  expect(doc.documentElement.style.backgroundColor).toBe('rgb(250, 250, 248)');
@@ -25,4 +27,10 @@ it('paints saved light appearance before the application bundle loads',()=>{
  expect(doc.documentElement.style.backgroundColor).toBe('rgb(250, 250, 248)');
  const manifest=JSON.parse(readFileSync('public/manifest.webmanifest','utf8'));
  expect(manifest).not.toHaveProperty('theme_color');expect(manifest.display).toBe('standalone');
+ for (const [size,purpose] of [['192x192','any'],['512x512','any'],['512x512','maskable']]) {
+  const icon=manifest.icons.find((value:{sizes:string;purpose:string})=>value.sizes===size&&value.purpose===purpose);
+  expect(icon?.type).toBe('image/png');
+  const png=readFileSync(`public${icon.src}`); expect(png.subarray(0,8).toString('hex')).toBe('89504e470d0a1a0a');
+  expect(png.readUInt32BE(16)).toBe(Number(size.split('x')[0]));expect(png.readUInt32BE(20)).toBe(Number(size.split('x')[1]));
+ }
 });

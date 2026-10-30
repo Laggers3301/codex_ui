@@ -14,10 +14,15 @@ import { ComposerAmbientGlow } from "./ambient/ComposerAmbientGlow";
 import { selectMenuPosition } from "./selectMenuPosition";
 import { resolvePromptTopAnchor } from "./promptTopAnchor";
 import { useComposerPrediction } from "./useComposerPrediction";
+import { usePopoverEscape } from "./usePopoverEscape";
+import { useMobileHeaderControls } from "./useMobileHeaderControls";
+import { installMobileClickHaptics } from "./mobileHaptics";
+import { useMobileComposerMotion } from "./useMobileComposerMotion";
+import { isUsableThreadPage } from "./threadPageCache";
 import { applyLiveAgentUpdate, type AgentWireUpdate } from "./liveAgentUpdates";
 import { recoverAgentStreams } from "./agentStreamRecovery";
 import {BranchToolArchive} from "./BranchToolArchive";
-import { X as PanelClose, FileText as PanelFile, ChevronDown as PanelDown, MoreHorizontal as PanelMore, Copy as ActionCopy, Branch as ActionBranch, Trash as ActionTrash } from "./PanelIcons";
+import { X as PanelClose, FileText as PanelFile, ChevronDown as PanelDown, MoreHorizontal as PanelMore, Copy as ActionCopy, Branch as ActionBranch, Trash as ActionTrash, Plus as WorkspaceCreateIcon } from "./PanelIcons";
 import { RemoteFolderSidebar, fileReferenceText } from "./RemoteFolderSidebar";
 import { readThreadExecutionSettings, updateThreadExecutionSettings, transferRemoteFolderDraft } from "./api";
 const DocumentPreview = lazy(() => import("./DocumentPreview"));
@@ -456,6 +461,10 @@ function PolishedSelect<T extends string>({
     document.addEventListener("pointerdown", dismiss, true);
     return () => document.removeEventListener("pointerdown", dismiss, true);
   }, [open]);
+  usePopoverEscape(menuPresence.present, () => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  });
   return (
     <div
       ref={rootRef}
@@ -463,7 +472,6 @@ function PolishedSelect<T extends string>({
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget as Node | null) && !menuRef.current?.contains(event.relatedTarget as Node | null)) setOpen(false);
       }}
-      onKeyDown={event => { if (event.key === "Escape") { setOpen(false); triggerRef.current?.focus(); } }}
     >
       <button
         ref={triggerRef}
@@ -575,6 +583,10 @@ export function ModelGroupedSelect({
   const [provider, setProvider] = useState<ModelPickerSection | null>(null);
   const [lastProvider, setLastProvider] = useState<ModelPickerSection>("doubao");
   const menuPresence = useExitPresence(open);
+  usePopoverEscape(menuPresence.present, () => {
+    setOpen(false);
+    pickerRef.current?.querySelector<HTMLButtonElement>(".polishedSelectTrigger")?.focus();
+  });
   useLayoutEffect(() => {
     if (!mobile || !menuPresence.present) return;
     const update = () => {
@@ -4460,6 +4472,7 @@ export function App() {
   const composerRef = useRef<HTMLDivElement | null>(null);
   const [messagesElement,setMessagesElement]=useState<HTMLDivElement|null>(null);
   const [composerElement,setComposerElement]=useState<HTMLDivElement|null>(null);
+  useMobileComposerMotion(composerElement);
   const bindMessagesElement=useCallback((element:HTMLDivElement|null)=>{
     messagesRef.current=element;setMessagesElement(element);
   },[]);
@@ -4636,6 +4649,8 @@ export function App() {
   }, [threads, selectedProjectId]);
   const [savingThreadOrder, setSavingThreadOrder] = useState(false);
   const [selectedThread, setSelectedThread] = useState<ThreadSummary | null>(null);
+  const mobileHeader = useMobileHeaderControls(selectedThread?.id ?? "new");
+  useEffect(installMobileClickHaptics, []);
   const threadGoal = useThreadGoal(selectedThread?.id ?? null, selectedUserId);
   const threadSchedules = useThreadSchedules(selectedProjectId, selectedThread?.id ?? "");
   const [scheduleEditor, setScheduleEditor] = useState<{ id: string | null; key: number }>({ id: null, key: 0 });
@@ -4711,6 +4726,11 @@ export function App() {
   const [terminalProjectId, setTerminalProjectId] = useState<string | null>(null);
   const [terminalVisible, setTerminalVisible] = useState(false);
   const [rightWorkspaceOpen, setRightWorkspaceOpen] = useState(false);
+  const mobileSidebarController = useRef(setMobileSidebarOpen);
+  mobileSidebarController.current = setMobileSidebarOpen;
+  useEffect(() => {
+    if (rightWorkspaceOpen && window.matchMedia("(max-width: 720px)").matches) mobileSidebarController.current(false);
+  }, [rightWorkspaceOpen]);
   const setMobileRightWorkspaceOpen = useMobileSidebar(!rightWorkspaceOpen, collapsed => setRightWorkspaceOpen(!collapsed), "right");
   const [rightWorkspaceTab, setRightWorkspaceTab] = useState("overview");
   const rightWorkspaceOpenRef = useRef(rightWorkspaceOpen);
@@ -4729,6 +4749,7 @@ export function App() {
   const [previewDocked, setPreviewDocked] = useState(true);
   const [previewMount, setPreviewMount] = useState<HTMLDivElement | null>(null);
   const showRightWindow = useCallback((id: string) => {
+    if (window.matchMedia("(max-width: 720px)").matches) mobileSidebarController.current(false);
     setRightWorkspaceTab(id);
     setRightWorkspaceOpen(true);
     if (["remote", "goal", "schedules", "outputs", "sources", "feishu", "resources", "communication"].includes(id)) setRightUtilityTabs(current => current.includes(id) ? current : [...current, id]);
@@ -5479,39 +5500,6 @@ export function App() {
       conversation.style.removeProperty("--messages-viewport-height");
     };
   }, [messagesElement,composerElement]);
-
-  useLayoutEffect(() => {
-    const sidebar = document.querySelector<HTMLElement>(".threadList");
-    const tree = sidebar?.querySelector<HTMLElement>(".v2WorkspaceTree");
-    if (!sidebar || !tree) return;
-    // scrollbar-gutter: stable reserves a different width in each browser.
-    const alignActions = () => {
-      sidebar.style.setProperty("--workspace-action-gutter", `${Math.max(0, tree.offsetWidth - tree.clientWidth)}px`);
-      if (!window.matchMedia("(max-width: 720px)").matches) return;
-      const alignIcon = (variable: string, targetSelector: string, controlSelector: string) => {
-        const target = tree.querySelector<SVGElement>(targetSelector)?.getBoundingClientRect();
-        const control = sidebar.querySelector<SVGElement>(controlSelector)?.getBoundingClientRect();
-        if (!target || !control) return;
-        const delta = target.left + target.width / 2 - control.left - control.width / 2;
-        if (Math.abs(delta) < 0.25) return;
-        const current = Number.parseFloat(sidebar.style.getPropertyValue(variable)) || 0;
-        sidebar.style.setProperty(variable, `${current + delta}px`);
-      };
-      alignIcon("--workspace-mobile-theme-shift", ".projectRenameButton svg", ".v2ThemeToggle svg");
-      alignIcon("--workspace-mobile-toggle-shift", ".projectDeleteButton svg", ".v2SidebarToggle svg");
-      alignIcon("--workspace-mobile-header-shift", ".projectRenameButton svg", ".v2SidebarSearchButton svg");
-    };
-    const observer = new ResizeObserver(alignActions);
-    observer.observe(tree);
-    alignActions();
-    return () => {
-      observer.disconnect();
-      sidebar.style.removeProperty("--workspace-action-gutter");
-      sidebar.style.removeProperty("--workspace-mobile-theme-shift");
-      sidebar.style.removeProperty("--workspace-mobile-toggle-shift");
-      sidebar.style.removeProperty("--workspace-mobile-header-shift");
-    };
-  }, [projects.length]);
 
   useLayoutEffect(() => {
     const content = messagesRef.current?.querySelector<HTMLElement>(".virtualConversationFlow, .virtualConversationSizer");
@@ -7631,10 +7619,7 @@ export function App() {
     if (!options.appendOlder && !options.skipCache) {
       const cached = threadPageCacheRef.current.get(`${projectId}:${threadId}`);
       const cachedHistoryIsUsable = Boolean(
-        cached
-        && cached.history.totalItems > 0
-        && (cached.history.returnedItems >= 128 || !cached.history.hasOlder)
-        && (!cached.history.hasOlder || Boolean(cached.history.nextCursor || cached.history.nextBefore > 0))
+        cached && isUsableThreadPage(cached.history)
       );
       if (cached && !cachedHistoryIsUsable) {
         threadPageCacheRef.current.delete(`${projectId}:${threadId}`);
@@ -12533,14 +12518,15 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       ) : null}
 
       <section className="threadColumn">
-        <header className="topbar">
+        <header className="topbar" data-mobile-controls={mobileHeader.revealed ? "visible" : "hidden"}>
           <button className="mobileSidebarToggle" type="button" aria-label={threadListCollapsed ? "展开侧边栏" : "收起侧边栏"} aria-expanded={!threadListCollapsed} aria-controls="conversation-sidebar" onClick={() => setMobileSidebarOpen(threadListCollapsed)}><IconParkSmallArrow direction="left" /></button>
           <div className="projectTitle">
-            <h1>{selectedThread?.name || selectedThread?.preview || "新对话"}</h1>
+            <h1><span className="desktopHeaderTitle">{selectedThread?.name || selectedThread?.preview || "新对话"}</span><button className="mobileHeaderTitle" type="button" aria-label={`会话设置：${selectedThread?.name || selectedThread?.preview || "新对话"}`} aria-expanded={mobileHeader.revealed} aria-controls="conversation-header-controls" onClick={mobileHeader.reveal}>{selectedThread?.name || selectedThread?.preview || "新对话"}</button></h1>
             <p>{selectedProject?.rootPath ?? projectRoot}</p>
             {selectedProject ? <span className="recordMapping">记录来源：cwd 匹配该目录的 Codex threads</span> : null}
           </div>
-          <div className="controls trackedQuotaVisible">
+          <button className="mobileRightWorkspaceToggle rightWorkspaceToggle" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} aria-expanded={rightWorkspaceOpen} onClick={() => setMobileRightWorkspaceOpen(!rightWorkspaceOpen)}><WorkspaceIcon name="panel" /></button>
+          <div id="conversation-header-controls" ref={mobileHeader.controls} className="controls trackedQuotaVisible" aria-hidden={mobileHeader.mobile && !mobileHeader.revealed} inert={mobileHeader.mobile && !mobileHeader.revealed} onPointerDownCapture={mobileHeader.arm} onFocusCapture={mobileHeader.arm}>
             <button className="iconTextButton v2SettingsBridge v2MovedIntoPlus" type="button" onClick={() => void openSettingsDialog()} title="设置当前访问设备 SSH 发送路径" aria-hidden="true" tabIndex={-1}>
               <Settings2 size={17} />
               设置
@@ -12656,7 +12642,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
         <div className={`workspace${rightWorkspaceOpen ? " diffPanelOpen" : ""}${diffPanelResizing ? " diffPanelResizing" : ""}`} style={{ gridTemplateColumns: `${threadListCollapsed ? 56 : threadListWidth}px 0px minmax(0, 1fr) auto` }}>
           {!threadListCollapsed ? <button className="mobileSidebarBackdrop" type="button" aria-label="收起侧边栏" onClick={() => setMobileSidebarOpen(false)} /> : null}
-          <nav id="conversation-sidebar" className={`threadList ${threadListCollapsed ? "collapsed" : ""}`}>
+          <nav id="conversation-sidebar" className={`threadList ${threadListCollapsed ? "collapsed" : ""}`} onClickCapture={event => {
+            if (!window.matchMedia("(max-width: 720px)").matches || !(event.target instanceof Element)) return;
+            if (event.target.closest(".v2PrimaryNav button,.v2AccountMenu button,.listHeaderActions button,.projectNewThreadButton,.projectRenameButton,.projectDeleteButton")) setMobileSidebarOpen(false);
+          }}>
             <div className="v2ProjectDock">
               <div className="v2BrandRow">
                 <strong>Codex</strong>
@@ -12697,6 +12686,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <div className="listHeader">
               <span>项目</span>
               <span className="listHeaderActions">
+                <button className="iconButton mobileWorkspaceCreate" type="button" onClick={() => void chooseDirectory()} disabled={selectingDirectory} title="新建工作区" aria-label="新建工作区"><WorkspaceCreateIcon size={17} /></button>
                 <button className="iconButton v2SidebarSearchButton" type="button" onClick={() => setGlobalSearchOpen(true)} title="搜索会话和消息" aria-label="搜索会话和消息">
                   <Search size={17} strokeWidth={2.2} />
                 </button>
@@ -13651,6 +13641,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <div
               ref={bindComposerElement}
               className={`composer composerLiquidGlass ${draggingUpload ? "draggingUpload" : ""}`}
+              data-mobile-idle={!composerHasDraft && !editingPromptDraft && !documentReference && !selectedSkills.length && !planMode}
               data-has-thread={Boolean(selectedThread)}
               data-plan-mode={planMode}
               onDragOver={handleUploadDragOver}
@@ -13695,6 +13686,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       )}
                     </div>;
                   })()}
+                  <ComposerGlassMaterial variant="topbar" />
                   {queuedMenuOpen && queuedSubmissions.length ? <div className="queuedSubmissionMenu">
                     <button type="button" onClick={() => { setQueuedEditText(queuedSubmissionText(queuedSubmissions[0])); setEditingQueuedId(queuedSubmissions[0].id); setQueuedMenuOpen(false); }}>编辑消息</button>
                     <button type="button" onClick={() => { openTemporaryAsk(queuedSubmissionText(queuedSubmissions[0]), window.innerWidth / 2, window.innerHeight / 2); setQueuedMenuOpen(false); }}>在侧边聊天中打开</button>
@@ -13900,6 +13892,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <button className={`iconButton sendButton ${composerShowsStop ? "stopMode" : "primary"}`} type="button"
                     onClick={() => {
                       if (composerShowsStop && requestInterruptSelectedConversation()) return;
+                      if (window.matchMedia("(max-width: 720px)").matches) (document.activeElement as HTMLElement | null)?.blur();
                       void sendPrompt("queue",undefined,mobilePredictedPrompt??undefined);
                     }}
                     disabled={composerShowsStop ? composerStopBusy : uploadingFiles || editingLastPrompt || !selectedProject || (!composerHasDraft&&!mobilePredictedPrompt)}
@@ -13972,6 +13965,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </section>
           </div>
           <RightWorkspace scope={`${selectedUserId}:${selectedThread?.id ?? "new"}`} open={rightWorkspaceOpen} active={rightWorkspaceTab} width={diffPanelWidth} tabs={rightTabs}
+            mobileSummary={<HostResourceSummary onOpen={() => showRightWindow("resources")} />}
             overview={<WorkspaceOverview sections={workspaceSections} />} onSelect={setRightWorkspaceTab} onHide={() => setMobileRightWorkspaceOpen(false)}
             onResize={event => {
               setDiffPanelResizing(true);

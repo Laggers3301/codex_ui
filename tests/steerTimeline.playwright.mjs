@@ -2,12 +2,13 @@ import {chromium} from '@playwright/test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import {createHmac} from 'node:crypto';
-const origin='http://127.0.0.1:4574';
-const secret=(await fs.readFile(new URL('../data/auth/session-secret',import.meta.url),'utf8')).trim();
-const payload=Buffer.from(JSON.stringify({u:'qa-user',exp:Date.now()+300000})).toString('base64url');
+const origin=process.env.STEER_TEST_ORIGIN??'http://127.0.0.1:4574';
+const fixtureUser=process.env.QA_USER_ID??'qa';
+const secret=(await fs.readFile(process.env.QA_SESSION_SECRET_FILE??new URL('../data/auth/session-secret',import.meta.url),'utf8')).trim();
+const payload=Buffer.from(JSON.stringify({u:fixtureUser,exp:Date.now()+300000})).toString('base64url');
 const cookie=payload+'.'+createHmac('sha256',secret).update(payload).digest('base64url');
 const evidence='./output/qa/steer-timeline-20261025';await fs.mkdir(evidence,{recursive:true,mode:0o700});
-const project={id:'steer-project',name:'引导排序隔离验收',rootPath:'/fixture',userId:'qa',defaultModel:'gpt-6.1-sol',defaultReasoningEffort:'medium',defaultSandbox:'danger-full-access',defaultApprovalPolicy:'never'};
+const project={id:'steer-project',name:'引导排序隔离验收',rootPath:'/fixture',userId:fixtureUser,defaultModel:'gpt-6.1-sol',defaultReasoningEffort:'medium',defaultSandbox:'danger-full-access',defaultApprovalPolicy:'never'};
 const baseItems=[{id:'original-user',type:'userMessage',text:'最初的问题',timelineAt:'2020-01-01T00:00:00Z'},{id:'original-answer',type:'agentMessage',text:'引导之前已经显示的回答',timelineAt:'2020-01-01T00:00:01Z',completed:true}];
 const browser=await chromium.launch({headless:true});const results=[],errors=[];let writes=0;
 try {
@@ -15,9 +16,11 @@ try {
     let persisted=false;
     const page=await browser.newPage({viewport:mobile?{width:393,height:852}:{width:1280,height:900}});
     page.on('pageerror',e=>errors.push(e.message));
+    page.on('console',async message=>{if(message.type()==='error')for(const argument of message.args()){const stack=await argument.evaluate(value=>value instanceof Error?value.stack:null).catch(()=>null);if(stack)console.log(stack);}});
     await page.context().addCookies([{name:'codex_remote_session_4575',value:cookie,url:origin,httpOnly:true,sameSite:'Lax'}]);
-    await page.addInitScript(()=>{
-      localStorage.setItem('codex-web-user-id','qa');localStorage.setItem('codex-v2-project-qa','steer-project');localStorage.setItem('codex-v2-expanded-projects-qa','["steer-project"]');
+    await page.addInitScript(user=>{
+      window.fixtureClicks=[];document.addEventListener('click',event=>window.fixtureClicks.push({target:event.target?.className,button:event.target?.closest?.('button')?.className}),true);
+      localStorage.setItem('codex-web-user-id',user);localStorage.setItem(`codex-v2-project-${user}`,'steer-project');localStorage.setItem(`codex-v2-expanded-projects-${user}`,'["steer-project"]');
       class Socket extends EventTarget {
         static OPEN=1;static CONNECTING=0;static CLOSED=3;readyState=0;requests=[];
         queue=[{id:'queued-1',input:[{type:'text',text:'现在补充的引导问题'}]},{id:'queued-2',input:[{type:'text',text:'保留到下轮的排队问题'}]}];
@@ -41,12 +44,12 @@ try {
         }
         close(){this.readyState=3;this.dispatchEvent(new Event('close'))}
       }window.WebSocket=Socket;
-    });
+    },fixtureUser);
     await page.route('**/api/**',async route=>{
       if(!['GET','HEAD'].includes(route.request().method()))writes++;
       const p=new URL(route.request().url()).pathname;let json={data:[]};
       const thread={id:'steer-thread',name:'引导实时排序验收',cwd:'/fixture',createdAt:1,updatedAt:persisted?2:1,status:'active',configuredModel:'gpt-6.1-sol',turns:[{id:'steer-turn',status:'running',items:persisted?[...baseItems,{id:'native-steer',type:'userMessage',text:'现在补充的引导问题',timelineAt:'2020-01-01T00:00:04Z'},{id:'steer-answer',type:'agentMessage',text:'引导后的新回答',timelineAt:'2020-01-01T00:00:07Z'}]:baseItems}]};
-      if(p==='/api/users')json={data:[{id:'qa',name:'qa'}],defaultUserId:'qa'};
+      if(p==='/api/users')json={data:[{id:fixtureUser,name:'qa'}],defaultUserId:fixtureUser};
       else if(p==='/api/projects')json={data:[project],projectRoot:'/fixture'};
       else if(p==='/api/projects/steer-project/threads')json={data:[thread]};
       else if(p==='/api/threads/steer-thread')json={thread,history:{totalItems:thread.turns[0].items.length,returnedItems:thread.turns[0].items.length,before:0,hasOlder:false}};
@@ -60,7 +63,24 @@ try {
       await route.fulfill({json});
     });
     await page.goto(origin+'/?project=steer-project&thread=steer-thread');await page.getByText('最初的问题',{exact:true}).waitFor();await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme);
+    if(mobile)await page.locator('.mobileHeaderTitle').click();
+    // Closing a policy popover must not fall through to the global Escape
+    // shortcut that deliberately interrupts the selected running turn.
+    const policy=page.locator('.topbarPolicySelect .polishedSelectTrigger').first();
+    await policy.click();await page.locator('.polishedSelectMenu[role="listbox"]').waitFor();
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(250);
+    assert.equal(await page.evaluate(()=>window.steerSocket.requests.filter(type=>type==='turn.interrupt').length),0,'Escape closes the menu without stopping the conversation');
+    assert.equal(await policy.getAttribute('aria-expanded'),'false');
+    await policy.click();
+    await page.evaluate(()=>document.activeElement?.blur());
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(250);
+    assert.equal(await policy.getAttribute('aria-expanded'),'false');
+    assert.equal(await page.evaluate(()=>window.steerSocket.requests.filter(type=>type==='turn.interrupt').length),0,'an open popover owns Escape even when its focus was lost');
     await page.getByRole('button',{name:'调整方向',exact:true}).waitFor();
+    await page.waitForFunction(()=>document.querySelector('.queuedSubmissionStrip')?.getAttribute('data-glass-backdrop')==='svg-backdrop');
+    assert.match(await page.locator('.queuedSubmissionStrip').evaluate(element=>getComputedStyle(element).backdropFilter),/url\(.*blur\(12px\)/,'queue previews blur and refract their real backdrop');
     assert.equal(await page.locator('.conversationTurnRow .kind-user').count(),1,'ordinary queued text stays outside the current turn');
     assert.equal(await page.evaluate(()=>window.steerSocket.queue.length),2);
     await page.getByRole('button',{name:'调整方向',exact:true}).click();
@@ -82,7 +102,9 @@ try {
     try{await page.getByText('引导后的新回答',{exact:true}).waitFor({timeout:5000})}catch(error){await page.screenshot({path:`${evidence}/refresh-failure.png`});console.log(JSON.stringify({fixtureBody:(await page.locator('body').innerText()).slice(-4000),errors}));throw error;}
     assert.equal(await page.locator('.conversationTurnRow .kind-user').count(),2,'refresh has exactly the two native user messages');
     const refresh=await page.locator('.conversationTurnRow').innerText();assert.ok(refresh.indexOf('现在补充的引导问题')<refresh.indexOf('引导后的新回答'));
-    results.push({mobile,theme,early,afterAck,oneTurn:true,remainingQueued:1,refreshOrdered:true});await page.close();
+    await page.locator('.projectTitle').click();await page.keyboard.press('Escape');
+    assert.equal(await page.evaluate(()=>window.steerSocket.requests.filter(type=>type==='turn.interrupt').length),1,'deliberate Escape without a popover still stops the fixture turn once');
+    results.push({mobile,theme,early,afterAck,oneTurn:true,remainingQueued:1,refreshOrdered:true,menuEscapeNeverInterrupts:true,explicitStopPreserved:true});await page.close();
   }
   assert.deepEqual(errors,[]);assert.equal(writes,0);await fs.writeFile(`${evidence}/results.json`,JSON.stringify({at:new Date().toISOString(),results,errors,conversationWrites:writes},null,2),{mode:0o600});console.log(JSON.stringify({cases:results.length,errors,writes}));
-}finally{await browser.close()}
+}catch(error){for(const page of browser.contexts().flatMap(context=>context.pages()))console.log(JSON.stringify({url:page.url(),socket:await page.evaluate(()=>({requests:window.steerSocket?.requests,queue:window.steerSocket?.queue,clicks:window.fixtureClicks})),fixtureBody:(await page.locator('body').innerText()).slice(-2000),errors}));throw error;}finally{await browser.close()}

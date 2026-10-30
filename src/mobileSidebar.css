@@ -1,4 +1,5 @@
 .mobileSidebarToggle, .mobileSidebarBackdrop { display: none; }
+.threadList .mobileWorkspaceCreate {display:none!important;}
 .messages:has(.newConversationWelcome) { position: relative; }
 .messages:has(.newConversationWelcome) :is(.virtualConversationFlow,.virtualConversationFlowRow,.virtualConversationSizer,.virtualConversationRow,.conversationLiveTail) { position: static !important; contain: none !important; }
 .messages .newConversationWelcome {
@@ -26,35 +27,35 @@
   }
 }
 @keyframes welcomeShimmer { 0%,15% { background-position: 160% 0; } 75%,100% { background-position: -60% 0; } }
-/* Scroll changes the sampled backdrop every frame. Keep the translucent,
-   blurred material but avoid the SVG displacement pass until scrolling ends. */
-html[data-glass-scrolling] .conversation > .composer.composerLiquidGlass {
-  --composer-backdrop-optics: blur(8px) saturate(1.12) !important;
-}
+/* The composer retains the same single-pass refraction while scrolling.
+   The smaller topbar controls still suspend their displacement while moving. */
 html[data-glass-scrolling] .topbar .controls button.topbarGlassControl {
   --topbar-backdrop-optics: blur(6px) saturate(1.12) !important;
 }
 @keyframes welcomeDrift { 0%,100% { opacity: .85; transform: translateY(0); } 45% { opacity: 1; transform: translateY(-2px); } 70% { opacity: .9; transform: translateY(1px); } }
 @media (max-width: 720px) {
-  .topbar { grid-template-columns: 32px minmax(0, 1fr) 32px !important; grid-template-rows: 32px 30px; gap: 2px 6px; min-height: 72px; padding-top: max(4px, env(safe-area-inset-top)); padding-bottom: 4px; }
+  .topbar { grid-template-columns: 28px minmax(0, 1fr) 28px !important; grid-template-rows: 28px 32px; gap: 4px 2px; min-height:72px; padding-top: max(4px, env(safe-area-inset-top)); padding-bottom:4px; }
   .mobileSidebarToggle { display: grid; grid-column: 1; grid-row: 1; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; background: transparent; border-radius: 10px; color: var(--ui-heading); transition: background .2s ease; }
   .mobileSidebarToggle:hover { background: var(--ui-composer-block-bg); }
+  .mobileSidebarToggle {width:28px;height:28px;justify-items:center;}
   .mobileSidebarToggle svg { width: 18px; height: 18px; }
-  .topbar .controls > .rightWorkspaceToggle { top: max(4px, env(safe-area-inset-top)); width: 32px; min-width: 32px; max-width: 32px; height: 32px; min-height: 32px; }
-  .topbar .controls > .rightWorkspaceToggle > svg { width: 18px; height: 18px; }
-  .topbar > .projectTitle { grid-column: 2; grid-row: 1; padding-left: 0 !important; }
-  .topbar > .projectTitle h1 { margin: 0; font-family: inherit !important; font-size: 14px !important; font-weight: 400 !important; line-height: 20px !important; }
-  .topbar > .controls { grid-column: 1 / -1; grid-row: 2; }
+  .topbar .controls > .rightWorkspaceToggle {position:absolute!important;top:max(4px,env(safe-area-inset-top));right:max(10px,env(safe-area-inset-right));width:26px;min-width:26px;max-width:26px;height:26px;min-height:26px;}
+  .topbar .controls > .rightWorkspaceToggle > svg {width:16px;height:16px;}
+  .topbar > .projectTitle { grid-column: 2; grid-row: 1; padding-inline:0!important; }
+  .topbar > .projectTitle h1 { margin: 0; font-family: inherit !important; font-size: var(--mobile-text-size,14px) !important; font-weight: 400 !important; line-height: 20px !important; }
+  .topbar > .controls {grid-column:1 / -1;grid-row:2;position:static;}
+  .topbar .controls.trackedQuotaVisible {grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr) minmax(0,1.2fr) minmax(0,1fr)!important;}
+  .topbar .controls:not(.trackedQuotaVisible) {grid-template-columns:repeat(3,minmax(0,1fr))!important;}
   .topbar { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   .topbar .controls.trackedQuotaVisible :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) {
-    font-family: var(--pool-ui-font) !important; font-size: 13px !important; font-weight: 400 !important;
+    font-family: var(--pool-ui-font) !important; font-size: var(--mobile-text-size,13px) !important; font-weight: 400 !important;
     line-height: 18px !important; letter-spacing: normal !important;
     height: 30px !important; min-height: 30px !important;
   }
-  .topbar .controls :is(button, .polishedSelectTrigger, .polishedSelectTrigger span) { font-family: inherit !important; font-size: 13px !important; font-weight: 400 !important; }
+  .topbar .controls :is(button, .polishedSelectTrigger, .polishedSelectTrigger span) { font-family: inherit !important; font-size: var(--mobile-text-size,13px) !important; font-weight: 400 !important; }
   .topbar .controls.trackedQuotaVisible > .topbarPolicySelect > button.polishedSelectTrigger,
-  .topbar .controls.trackedQuotaVisible > .topbarPolicySelect > button.polishedSelectTrigger > span:first-child { font-family: inherit !important; font-size: 13px !important; font-weight: 400 !important; line-height: 18px !important; }
-  .topbar .controls :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) > :is(span,strong) { font-family: inherit !important; font-size: 13px !important; font-weight: 400 !important; line-height: 18px !important; }
+  .topbar .controls.trackedQuotaVisible > .topbarPolicySelect > button.polishedSelectTrigger > span:first-child { font-family: inherit !important; font-size: var(--mobile-text-size,13px) !important; font-weight: 400 !important; line-height: 18px !important; }
+  .topbar .controls :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) > :is(span,strong) { font-family: inherit !important; font-size: var(--mobile-text-size,13px) !important; font-weight: 400 !important; line-height: 18px !important; }
   .threadListRestoreButton { display: none !important; }
   /* Anchor above the entire dock, including the iPhone home-indicator inset.
      A fixed 58px offset puts the final menu row underneath the account button. */
@@ -62,8 +63,33 @@ html[data-glass-scrolling] .topbar .controls button.topbarGlassControl {
     bottom: calc(100% + 6px); left: 10px; right: 10px;
     max-height: calc(var(--phone-viewport-height, 100dvh) - 110px); overflow-y: auto;
   }
-  .workspace > .threadList:not(.collapsed) { z-index: 900 !important; width: min(360px, 88dvw) !important; max-width: 88dvw !important; transform: translate3d(var(--mobile-sidebar-offset, 0px),0,0); transition: transform .28s cubic-bezier(.22,1,.36,1); border-radius: 0 20px 20px 0; box-shadow: 12px 0 35px rgb(0 0 0 / .15); }
+  /* Both poses must have the same width. The legacy collapsed 100dvw/-105%
+     pose otherwise reveals the right edge again and starts a second exit. */
+  .workspace > .threadList:not(.collapsed),
+  body:has(.threadList.collapsed) .workspace > .threadList.collapsed {
+    z-index: 900 !important; width: min(380px, 92dvw) !important; max-width: 92dvw !important;
+    transform: translate3d(var(--mobile-sidebar-offset, 0px),0,0);
+    transition: transform .28s cubic-bezier(.22,1,.36,1);
+    border-radius: 0 20px 20px 0; box-shadow: 12px 0 35px rgb(0 0 0 / .15);
+  }
+  body:has(.threadList.collapsed) .workspace > .threadList.collapsed {
+    transform: translate3d(-100%,0,0); opacity: 0; visibility: hidden;
+    pointer-events: none; transition: none;
+  }
   .workspace > .threadList:not(.collapsed) :is(.v2ProjectDock,.v2AccountDock) { width: 100% !important; max-width: 100% !important; }
+  .threadList .v2PrimaryNav {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-block:8px 14px;}
+  .threadList .v2PrimaryNav > button {min-height:40px;padding-block:8px;}
+  .threadList .listHeader {min-height:36px;margin-bottom:6px;}
+  .threadList .v2WorkspaceGroup {margin-bottom:4px;}
+  .threadList .v2WorkspaceFolderButton {min-height:40px;}
+  .threadList .v2PrimaryNav > button:nth-child(3) {display:none!important;}
+  .threadList .mobileWorkspaceCreate {display:grid!important;}
+  .threadList .v2WorkspaceThreads {padding:4px 0 8px 10px;gap:4px;}
+  .threadList .v2WorkspaceThreads :is(.threadRow,.threadSelectButton) {min-height:40px;}
+  :root[data-theme] .threadList .v2WorkspaceThreads .threadRow {box-shadow:none!important;}
+  .threadList .v2WorkspaceThreads .threadSearchBox {display:none;}
+  .threadList .hostResourceDock {line-height:1.3;}
+  .threadList .hostResourceDock :is(.hostResourceTile,.hostNetworkButton.compact) {min-height:44px;padding-block:4px;gap:2px;}
   .mobileSidebarBackdrop { display: block; position: fixed; inset: 0; z-index: 890; border: 0; padding: 0; background: #000; opacity: calc(var(--mobile-sidebar-progress, 1) * .3); transition: opacity .28s cubic-bezier(.22,1,.36,1); }
   html[data-sidebar-dragging] .workspace > .threadList:not(.collapsed), html[data-sidebar-dragging] .mobileSidebarBackdrop { transition: none; }
   .workspace.diffPanelOpen > .rightWorkspace.diffReviewPanel { transform: translate3d(var(--mobile-right-panel-offset,0px),0,0); transition: transform .28s cubic-bezier(.22,1,.36,1), opacity .25s ease; }

@@ -1,4 +1,7 @@
 .hostResourceDock { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); align-items: stretch; gap: 6px; width: var(--resource-dock-width,100%); margin-left:var(--resource-dock-offset,0px); min-width: 0; }
+:root .v2AccountDock {border-top:0!important;}
+:root .v2AccountDock .v2AccountTrigger {position:relative;margin-top:4px;}
+:root .v2AccountDock .v2AccountTrigger::before {content:"";position:absolute;top:-2px;left:0;right:0;height:1px;background:var(--ui-divider);pointer-events:none;}
 .hostResourceSummary { display: contents; }
 .hostResourceTile > span { display: flex; align-items:center;justify-content:center;gap:4px;min-width:0; }
 .hostResourceDock { font: 400 13px/1.4 var(--pool-ui-font), sans-serif; }
@@ -20,8 +23,12 @@
 .v2AccountDock .hostResourceTile:hover,.v2AccountDock .hostNetworkButton.compact:hover { border-color:rgba(255,255,255,.17);background:linear-gradient(145deg,rgba(255,255,255,.10),rgba(255,255,255,.04)); }
 .hostResourceDock .hostNetworkButton.compact > svg { display:none; }
 .hostResourceDock .hostNetworkButton.compact > span { display:flex;flex-direction:column;gap:3px;white-space:nowrap; }
-:root[data-theme="light"] .hostResourceDock button { border-color:rgba(45,55,46,.10);background:linear-gradient(145deg,rgba(255,255,255,.68),rgba(255,255,255,.28));box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 2px 5px rgba(40,50,40,.035); }
+:root[data-theme="light"] .hostResourceDock button { border-color:rgba(45,55,46,.12);background:linear-gradient(145deg,rgba(242,244,241,.92),rgba(229,234,228,.74));box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 2px 7px rgba(40,50,40,.045); }
 .hostResourceDock button:focus-visible { outline:2px solid var(--ui-content-muted);outline-offset:2px; }
+.hostResourceDock button {position:relative;isolation:isolate;overflow:hidden;--resource-glass-fill:linear-gradient(145deg,rgba(65,70,65,.5),rgba(38,43,38,.62));background:transparent!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important;}
+.hostResourceDock button::before {content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;border-radius:inherit;background:var(--resource-glass-fill);-webkit-backdrop-filter:var(--topbar-backdrop-optics,blur(8px) saturate(1.12));backdrop-filter:var(--topbar-backdrop-optics,blur(8px) saturate(1.12));}
+.hostResourceDock .topbarFastDefs {position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
+:root[data-theme="light"] .hostResourceDock button {--resource-glass-fill:linear-gradient(145deg,rgba(255,255,253,.72),rgba(245,248,243,.68));}
 .hostNetworkButton[data-status="reachable"] { color: #53816a; }
 .workspace > .threadList:has(.hostResourceSummary) { padding-bottom: calc(112px + env(safe-area-inset-bottom, 0px)) !important; }
 .hostResourcesPanel { flex: 1; min-height: 0; min-width: 0; padding: 18px; overflow-y: auto; overscroll-behavior: contain; box-sizing: border-box; color: var(--ui-content); font:400 14px/1.5 var(--pool-ui-font),sans-serif; overflow-wrap: anywhere; }

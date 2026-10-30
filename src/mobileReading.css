@@ -1,0 +1,65 @@
+/* One mobile reading scale across the three columns; geometry remains owned
+   by each layout. Source/terminal grids and document pages keep their metrics. */
+.mobileHeaderTitle,.mobileRightWorkspaceToggle,.mobileRightResourceDock {display:none;}
+:root .messageItem.kind-tool:not(.toolBundleEntry) {padding-left:0!important;margin-left:0!important;}
+@property --mobile-composer-motion-height {syntax:"<length>";inherits:false;initial-value:52px;}
+@keyframes mobileComposerControlsArrive {from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+@media(max-width:720px) {
+  :root[data-theme] .conversation>.composer.composerLiquidGlass[data-mobile-idle][data-mobile-composer-motion] {height:var(--mobile-composer-motion-height)!important;min-height:0!important;max-height:none!important;}
+  .composer[data-mobile-composer-motion]>.composerBody {overflow:clip;}
+  .composer[data-mobile-composer-motion="expand"] .composerTools {animation:mobileComposerControlsArrive .26s ease both;}
+  :root {--mobile-text-size:15px;--mobile-meta-size:13px;--panel-text-size:15px;--panel-meta-size:13px;--panel-title-size:15px;--pool-ui-font:-apple-system,BlinkMacSystemFont,"PingFang SC",Roboto,"Noto Sans SC",PoolSansUi,PoolSansCommon,PoolSansFull,sans-serif;}
+  :root body {font-family:var(--pool-ui-font);font-size:var(--mobile-text-size);font-weight:400;font-synthesis:none;}
+  :root :is(.threadList,.threadColumn,.rightWorkspace) {font-size:var(--mobile-text-size);}
+  :root .threadList :is(.v2PrimaryNav button,.listHeader,.v2WorkspaceFolderButton strong,.threadSelectButton strong,.v2AccountTrigger strong,.v2AccountMenu button) {font-size:var(--mobile-text-size)!important;font-weight:400;}
+  :root[data-theme] .threadList .v2PrimaryNav button> :is(span,strong),:root[data-theme] .threadList .v2WorkspaceFolderButton strong,:root[data-theme] .threadList .threadSelectButton strong {font-family:var(--pool-ui-font)!important;font-size:var(--mobile-text-size)!important;font-weight:400!important;line-height:20px!important;}
+  :root[data-theme] :is(.threadList,.threadColumn,.rightWorkspace) {font-family:var(--pool-ui-font);font-synthesis:none;}
+  :root .threadList :is(small,.v2AccountTrigger small,.threadRowMeta) {font-size:var(--mobile-meta-size)!important;}
+  :root .messageMarkdown,:root .messageMarkdown :is(p,li,a,blockquote,table,th,td),:root :is(.reasoningSummaryPreview,.reasoningLabel,.v2ThinkingLine,.toolClusterSummary,.toolClusterItem,.toolBundleSummary,.queuedSubmissionText) {font-size:var(--mobile-text-size)!important;}
+  :root .messageMarkdown {font-family:var(--pool-ui-font);font-weight:400;}
+  :root[data-theme] .messageItem:is(.kind-agent,.kind-user) .messageMarkdown,:root[data-theme] .messageItem:is(.kind-agent,.kind-user) .messageMarkdown :is(p,li,td,th,blockquote) {font-size:var(--mobile-text-size)!important;}
+  :root .conversation>.composer .composerControlRow :is(.v2FastModeButton,.polishedSelectTrigger),:root .conversation>.composer .composerControlRow .polishedSelectTrigger>span {font-size:13px!important;line-height:18px!important;}
+  :root .conversation>.composer .composerControlRow :is(.v2FastModeButton,.polishedSelectTrigger) {min-height:28px!important;height:28px!important;padding-inline:6px!important;}
+  :root .rightWorkspace :is(h1,h2,h3,h4,button,label,summary,.rightWorkspaceEntryText) {font-size:var(--panel-text-size)!important;}
+  :root .rightWorkspace :is(h1,h2,h3,h4,button,label,summary,.rightWorkspaceEntry strong) {font-weight:400!important;}
+  :root .rightWorkspace :is(small,.communicationState,.communicationIdentifier,.hostResourceUpdate,.subagentState,.rightWorkspaceEntry em) {font-size:var(--mobile-meta-size)!important;}
+  :root :is(.messageTimestamp,.messageMeta,.messageActions,.toolCallMeta) {font-size:var(--mobile-meta-size)!important;}
+  :root .topbar :is(.projectTitle h1,.projectTitle button,.controls button,.controls button span,.controls button strong) {font-size:var(--mobile-text-size)!important;font-weight:400!important;}
+  .mobileHeaderTitle {display:block;max-width:100%;margin:0;padding:0;border:0;background:none;color:inherit;font:inherit;line-height:inherit;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left;cursor:pointer;}
+  .desktopHeaderTitle {display:none;}
+  .mobileHeaderTitle:focus-visible {outline:2px solid var(--ui-content-muted);outline-offset:3px;border-radius:4px;}
+  :root .threadColumn>.topbar {grid-template-rows:28px 0px;row-gap:0;min-height:40px;transition:grid-template-rows .3s cubic-bezier(.22,1,.36,1),min-height .3s cubic-bezier(.22,1,.36,1),row-gap .3s ease;}
+  :root[data-theme] .threadColumn>.topbar {background:var(--bg)!important;--topbar-fade-color:var(--bg);}
+  :root[data-theme] body {background:var(--bg);}
+  :root .topbar[data-mobile-controls="visible"] {grid-template-rows:28px 32px;row-gap:4px;min-height:72px;}
+  :root .topbar .controls.trackedQuotaVisible {grid-template-columns:minmax(0,.9fr) minmax(0,1.25fr) minmax(0,1.15fr) minmax(0,.9fr)!important;}
+  :root .topbar .controls .topbarPolicySelect .polishedSelectTrigger {padding-inline:4px!important;}
+  :root .topbar .controls.trackedQuotaVisible :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) {height:34px!important;min-height:34px!important;line-height:20px!important;}
+  :root .topbar[data-mobile-controls="visible"] {grid-template-rows:28px 34px;min-height:74px;}
+  :root[data-theme] :is(.v2PlusMenu,.composerSlashMenu) :is(button,strong,span:not(.v2MenuIcon):not(.composerSlashGlyph)) {font-family:var(--pool-ui-font)!important;font-size:var(--mobile-text-size)!important;font-weight:400!important;line-height:1.45!important;}
+  :root[data-theme] :is(.v2PlusMenu,.composerSlashMenu) small {font-size:var(--mobile-meta-size)!important;font-weight:400!important;}
+  :root[data-theme] :is(.toolBundle,.toolCluster,.messageItem.kind-tool) :is(summary,button,.toolBundleEntryLabel,.toolBundleEntrySummary,.toolBundleTitle,.toolBundleCount,.messageMeta,.toolName,.toolSummary) {font-family:var(--pool-ui-font)!important;font-size:var(--mobile-text-size)!important;font-weight:400!important;}
+  :root[data-theme] .toolBundle .toolBundleTitleLabel {font-size:var(--mobile-text-size)!important;font-weight:400!important;}
+  :root .topbar>.controls {min-height:0;opacity:0;transform:translateY(-5px);visibility:hidden;pointer-events:none;transition:opacity .22s ease,transform .3s cubic-bezier(.22,1,.36,1),visibility .3s;}
+  :root .topbar[data-mobile-controls="visible"]>.controls {opacity:1;transform:none;visibility:visible;pointer-events:auto;}
+  :root .topbar .controls>.rightWorkspaceToggle {display:none!important;}
+  :root .topbar>.mobileRightWorkspaceToggle {display:grid;position:absolute;top:max(4px,env(safe-area-inset-top));right:max(10px,env(safe-area-inset-right));width:28px;height:28px;min-width:28px;padding:0;border:0;background:transparent;}
+  .mobileRightWorkspaceToggle :is(svg,.rightWorkspaceIcon) {width:18px;height:18px;}
+  :root .threadList .hostResourceDock {display:none!important;}
+  :root .workspace>.threadList:has(.hostResourceSummary) {padding-bottom:calc(66px + env(safe-area-inset-bottom,0px))!important;}
+  :root .mobileRightResourceDock {display:block;flex:0 0 auto;padding:8px 14px 10px;}
+  :root .mobileRightResourceDock .hostResourceDock {width:100%;margin:0;font:400 var(--mobile-text-size)/1.15 var(--pool-ui-font);}
+  :root .mobileRightResourceDock .hostResourceDock :is(button,small,b,span) {font:inherit!important;}
+  :root .mobileRightResourceDock .hostResourceDock button {display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;min-width:0;min-height:44px;padding:4px 2px;border:0;border-radius:var(--ui-radius-control,14px);color:var(--ui-content);}
+  :root .mobileRightResourceDock .hostResourceTile>span svg {width:15px;height:15px;}
+  :root .trackedQuotaDialog :is(h2,strong,span,small,p,button,em,label) {font-size:var(--mobile-text-size)!important;}
+  :root .trackedQuotaDialog :is(small,.trackedQuotaFootnote,.trackedQuotaUpdated) {font-size:var(--mobile-meta-size)!important;}
+  @media(prefers-reduced-motion:reduce) {
+    :root .threadColumn>.topbar,:root .topbar>.controls {transition:none;}
+    .composer[data-mobile-composer-motion="expand"] .composerTools {animation:none;}
+  }
+}
+@media(max-width:360px) {
+  :root .topbar .controls.trackedQuotaVisible {grid-template-columns:repeat(2,minmax(0,1fr))!important;}
+  :root .topbar[data-mobile-controls="visible"] {grid-template-rows:28px 72px;min-height:112px;}
+}

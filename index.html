@@ -10,7 +10,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="Codex" />
     <meta name="theme-color" content="#151615" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <title>Codex Web Console</title>
     <script>
       (() => {
@@ -20,7 +20,7 @@
         const color = theme === "light" ? "#fafaf8" : "#151615";
         document.documentElement.style.backgroundColor = color;
         document.querySelector('meta[name="theme-color"]').content = color;
-        document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]').content = theme === "light" ? "default" : "black";
+        document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]').content = theme === "light" ? "default" : "black-translucent";
         const platform = navigator.userAgentData?.platform || navigator.platform || navigator.userAgent;
         if (/Win/i.test(platform)) document.documentElement.dataset.platform = "windows";
         else if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)) document.documentElement.dataset.platform = "mobile";

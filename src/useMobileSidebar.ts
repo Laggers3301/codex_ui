@@ -1,4 +1,5 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
+import { mobileHaptic } from "./mobileHaptics";
 
 export function sidebarSwipeIntent(dx: number, dy: number, open: boolean): "wait" | "ignore" | "drag" {
   if (Math.max(Math.abs(dx), Math.abs(dy)) < 7) return "wait";
@@ -21,11 +22,16 @@ export function useMobileSidebar(collapsed: boolean, change: (collapsed: boolean
     root.style.removeProperty(offsetKey);
     root.style.removeProperty(progressKey);
   };
-  const width = () => side === "left" ? Math.min(360, window.innerWidth * .88) : window.innerWidth;
+  // Keep the off-screen pose until React has committed the closed class.
+  // Clearing it inside the timer exposes the still-open drawer for a frame.
+  useLayoutEffect(() => { if (collapsed) reset(); }, [collapsed]);
+  // Keep this in sync with the mobileSidebar.css drawer width in both poses.
+  const width = () => side === "left" ? Math.min(380, window.innerWidth * .92) : window.innerWidth;
   const setOpen = (open: boolean) => {
     if (timer.current) clearTimeout(timer.current);
     const version = ++generation.current;
     if (!window.matchMedia("(max-width: 720px)").matches) { reset(); state.current.change(!open); return; }
+    mobileHaptic();
     const root = document.documentElement;
     if (open) {
       root.dataset[draggingKey] = "true";
@@ -42,7 +48,11 @@ export function useMobileSidebar(collapsed: boolean, change: (collapsed: boolean
       delete root.dataset[draggingKey];
       root.style.setProperty(offsetKey, `${-sign * width()}px`);
       root.style.setProperty(progressKey, "0");
-      timer.current = setTimeout(() => { state.current.change(true); reset(); }, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 280);
+      timer.current = setTimeout(() => {
+        if (version !== generation.current) return;
+        timer.current = null;
+        state.current.change(true);
+      }, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 280);
     }
   };
   useEffect(() => {
