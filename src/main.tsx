@@ -7,6 +7,7 @@ import "./mobileSidebar.css";
 import "./panelTypography.css";
 import "./mobileReading.css";
 import "./imageViewerMotion.css";
+import "./readingScale.css";
 
 // Installation is independent of opting into notifications. The existing
 // push subscription flow reuses this same root-scoped worker.

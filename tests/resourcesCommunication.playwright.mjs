@@ -46,7 +46,7 @@ try {
   await expect(resourcePanel.getByRole("meter", { name: "CPU 使用率", exact: true })).toHaveAttribute("aria-valuenow", "13");
   await expect(resourcePanel).toContainText("6.0 GiB"); await expect(resourcePanel).toContainText("读取 2.0 MiB/s");
   const panelTypography = await resourcePanel.locator('p:not(.hostResourceUpdate), dt, dd, button').evaluateAll(elements => elements.map(element => getComputedStyle(element).fontSize));
-  assert.ok(panelTypography.length && panelTypography.every(size => size === '13px'), 'resource UI uses the shared compact 13px text size');
+  assert.ok(panelTypography.length && panelTypography.every(size => size === '13px'), 'desktop resource UI keeps the original compact text size');
   const headerPills = await a.locator('.topbar :is(.trackedQuotaButton,.v2QuotaTopButton,.topbarPolicySelect .polishedSelectTrigger)').evaluateAll(elements => elements.map(element => ({ radius: getComputedStyle(element).borderTopLeftRadius, overflow: element.scrollWidth > element.clientWidth + 1 })));
   assert.equal(headerPills.length, 4); assert.ok(headerPills.every(item => item.radius === '999px' && !item.overflow), 'four compact header controls use composer-style pills');
   const diskTip = a.locator('.hostResourceSummary .hostResourceDisk');
@@ -129,7 +129,7 @@ try {
   await panelA.getByRole('tab', { name: 'Topic 话题', exact: true }).click();
   await expect(panelA.getByLabel('话题名称', { exact: true })).toBeVisible();
   const communicationTypography = await panelA.locator('h2,p,label,button').evaluateAll(elements => elements.map(element => ({ tag: element.tagName, size: getComputedStyle(element).fontSize })));
-  assert.ok(communicationTypography.every(item => item.size === (item.tag === 'H2' ? '14px' : '13px')), 'communication UI shares the same typography scale');
+  assert.ok(communicationTypography.every(item => item.size === (item.tag === 'H2' ? '14px' : '13px')), 'desktop communication UI retains its original typography');
   await panelA.evaluate(panel => {
     panel.querySelector('[role="tab"]:nth-child(2)').click();
     panel.querySelector('[role="tab"]:nth-child(3)').click();
