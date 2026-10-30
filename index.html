@@ -90,6 +90,7 @@
         const plusMenu = document.getElementById("v2PlusMenu");
         let plusCloseTimer = 0;
         let plusPositionFrame = 0;
+        let mobilePlusComposer = null;
         const positionPlusMenu = () => {
           plusPositionFrame = 0;
           if (plusMenu.hidden || plusMenu.classList.contains("uiClosing")) return;
@@ -127,6 +128,8 @@
           plusCloseTimer = window.setTimeout(() => {
             plusMenu.hidden = true;
             plusMenu.classList.remove("uiClosing");
+            mobilePlusComposer?.removeAttribute("data-mobile-plus-menu-open");
+            mobilePlusComposer = null;
           }, window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : 200);
         };
         const iconOptions = { theme: "outline", size: 18, fill: "currentColor", strokeWidth: 4, strokeLinecap: "round", strokeLinejoin: "round" };
@@ -194,9 +197,19 @@
             const opening = plusMenu.hidden || plusMenu.classList.contains("uiClosing");
             if (opening) {
               clearTimeout(plusCloseTimer);
+              mobilePlusComposer?.removeAttribute("data-mobile-plus-menu-open");
+              mobilePlusComposer = null;
+              if (window.matchMedia("(max-width: 720px)").matches) {
+                mobilePlusComposer = plus.closest(".composer");
+                // This menu lives outside the composer, so :has(menu) cannot
+                // protect its anchor when an iOS keyboard loses focus.
+                mobilePlusComposer?.setAttribute("data-mobile-plus-menu-open", "true");
+              }
               plusMenu.classList.remove("uiClosing");
               plusMenu.hidden = false;
               plus.setAttribute("aria-expanded", "true");
+              const focused = document.activeElement;
+              if (mobilePlusComposer?.contains(focused) && focused instanceof HTMLElement && focused.isContentEditable) focused.blur();
               const goalButton = plusMenu.querySelector('[data-action="goal"]');
               goalButton.disabled = document.querySelector('.composer[data-has-thread="true"]') === null;
               goalButton.title = goalButton.disabled ? "请先开始一个会话，再设定持续目标" : "";

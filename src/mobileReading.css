@@ -71,6 +71,10 @@
   :root .topbar[data-mobile-controls="visible"] {grid-template-rows:28px 32px;min-height:72px;}
   :root[data-theme] :is(.v2PlusMenu,.composerSlashMenu) :is(button,strong,span:not(.v2MenuIcon):not(.composerSlashGlyph)) {font-family:var(--pool-ui-font)!important;font-size:var(--mobile-text-size)!important;font-weight:400!important;line-height:1.45!important;}
   :root[data-theme] :is(.v2PlusMenu,.composerSlashMenu) small {font-size:var(--mobile-meta-size)!important;font-weight:400!important;}
+  :root[data-theme] .groupedModelMenu :is(.groupedModelRow,.groupedModelBack,.groupedModelProfile,.groupedModelProfile strong) {font-family:var(--pool-ui-font)!important;font-size:var(--mobile-text-size)!important;font-weight:400!important;line-height:22px!important;letter-spacing:normal;}
+  :root[data-theme] .groupedModelMenu :is(.groupedModelRow,.groupedModelBack,.groupedModelProfile) {min-height:40px;}
+  :root[data-theme] .groupedModelMenu .groupedModelProfile strong {white-space:normal;overflow-wrap:anywhere;}
+  :root[data-theme] .groupedModelMenu :is(.groupedModelHeading,.groupedModelConnectionNote,.groupedModelConnectionStatus,small) {font-family:var(--pool-ui-font)!important;font-size:var(--mobile-meta-size)!important;font-weight:400!important;line-height:1.45!important;}
   :root[data-theme] :is(.toolBundle,.toolCluster,.messageItem.kind-tool) :is(summary,button,.toolBundleEntryLabel,.toolBundleEntrySummary,.toolBundleTitle,.toolBundleCount,.messageMeta,.toolName,.toolSummary) {font-family:var(--pool-ui-font)!important;font-size:var(--mobile-text-size)!important;font-weight:400!important;}
   :root[data-theme] .toolBundle .toolBundleTitleLabel {font-size:var(--mobile-text-size)!important;font-weight:400!important;}
   /* Expanded entries used to inherit .messageMeta's .02em tracking. Keep the
@@ -93,7 +97,7 @@
   :root .mobileRightResourceDock .hostResourceDock :is(button,small,b,span) {font:inherit!important;}
   :root .mobileRightResourceDock .hostResourceDock button {display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;min-width:0;min-height:44px;padding:4px 2px;border:0;border-radius:var(--ui-radius-control,14px);color:var(--ui-content);}
   :root .mobileRightResourceDock .hostResourceTile>span svg {width:15px;height:15px;}
-  .composer:is([data-mobile-control-interaction],:has(.polishedSelect.open,.groupedModelMenu,.v2PlusMenu))>.composerBody {overflow:visible;}
+  .composer:is([data-mobile-control-interaction],[data-mobile-plus-menu-open],:has(.polishedSelect.open,.groupedModelMenu,.v2PlusMenu))>.composerBody {overflow:visible;}
   :root .trackedQuotaDialog :is(h2,strong,span,small,p,button,em,label) {font-size:var(--mobile-text-size)!important;}
   :root .trackedQuotaDialog :is(small,.trackedQuotaFootnote,.trackedQuotaUpdated) {font-size:var(--mobile-meta-size)!important;}
   @media(prefers-reduced-motion:reduce) {
