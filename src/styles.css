@@ -6026,6 +6026,10 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
   height: 25px;
 }
 
+/* Reserve the action row plus breathing room before the next reply/tool.
+   Absolute actions otherwise sit only a few pixels above the next summary. */
+:root .messageItem.kind-user:has(> .v2UserMessageActions) { margin-bottom: 44px; }
+
 .messageItem.kind-user,
 .messageItem.kind-agent {
   overflow: visible;
@@ -7463,8 +7467,9 @@ body:has(.globalSearchScrim) .v2AccountDock {
   overflow: hidden;
 }
 
-/* A bundle participates in the same 4px vertical rhythm as its child tool rows. */
-.messageItem:has(+ .toolBundle),
+/* Compact assistant/tool lead-ins only. User bubbles need their own action
+   clearance; including them here overwrote it with 4px !important. */
+.messageItem:not(.kind-user):has(+ .toolBundle),
 .messageItem:is(.kind-agent, .kind-system):has(+ .messageItem.kind-reasoning) {
   margin-bottom: 4px !important;
 }
@@ -12543,6 +12548,7 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
     border-radius: 9px;
     color: #b3b8b1;
   }
+  :root .messageItem.kind-user:has(> .v2UserMessageActions) { margin-bottom: 56px; }
   .v2AgentMessageActions svg,
   .messageItem.kind-user .v2UserMessageActions svg { width: 17px; height: 17px; }
   :root[data-theme="light"] .v2AgentMessageActions button,

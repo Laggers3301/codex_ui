@@ -53,7 +53,9 @@
 :root .queuedSubmissionStrip {
   --queue-material-fill:linear-gradient(150deg,rgba(47,51,47,.72),rgba(29,33,30,.84));
   isolation:isolate;border-radius:var(--ui-radius-card,22px);background:transparent!important;
-  -webkit-backdrop-filter:var(--topbar-backdrop-optics,none) blur(12px) saturate(1.12)!important;backdrop-filter:var(--topbar-backdrop-optics,none) blur(12px) saturate(1.12)!important;
+  /* `none blur(...)` is invalid. WebKit/Gecko intentionally omit SVG optics,
+     so their fallback must be a filter function, not the `none` keyword. */
+  -webkit-backdrop-filter:var(--topbar-backdrop-optics,blur(0px)) blur(12px) saturate(1.12)!important;backdrop-filter:var(--topbar-backdrop-optics,blur(0px)) blur(12px) saturate(1.12)!important;
   box-shadow:inset 0 0 0 .65px rgba(255,255,255,.08),0 8px 24px rgba(0,0,0,.14);
 }
 :root .queuedSubmissionStrip::before {content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;border-radius:inherit;background:var(--queue-material-fill);-webkit-backdrop-filter:none;backdrop-filter:none;}

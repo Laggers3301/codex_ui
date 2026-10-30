@@ -44,18 +44,18 @@ html[data-glass-scrolling] .topbar .controls button.topbarGlassControl {
   .topbar > .projectTitle { grid-column: 2; grid-row: 1; padding-inline:0!important; }
   .topbar > .projectTitle h1 { margin: 0; font-family: inherit !important; font-size: var(--mobile-text-size,14px) !important; font-weight: 400 !important; line-height: 20px !important; }
   .topbar > .controls {grid-column:1 / -1;grid-row:2;position:static;}
-  .topbar .controls.trackedQuotaVisible {grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr) minmax(0,1.2fr) minmax(0,1fr)!important;}
+  .topbar .controls.trackedQuotaVisible {grid-template-columns:repeat(4,minmax(0,1fr))!important;}
   .topbar .controls:not(.trackedQuotaVisible) {grid-template-columns:repeat(3,minmax(0,1fr))!important;}
   .topbar { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   .topbar .controls.trackedQuotaVisible :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) {
     font-family: var(--pool-ui-font) !important; font-size: var(--mobile-control-size,13px) !important; font-weight: 400 !important;
-    line-height: 18px !important; letter-spacing: normal !important;
-    height: 30px !important; min-height: 30px !important;
+    line-height: 20px !important; letter-spacing: normal !important;
+    height: 32px !important; min-height: 32px !important;
   }
   .topbar .controls :is(button, .polishedSelectTrigger, .polishedSelectTrigger span) { font-family: inherit !important; font-size: var(--mobile-control-size,13px) !important; font-weight: 400 !important; }
   .topbar .controls.trackedQuotaVisible > .topbarPolicySelect > button.polishedSelectTrigger,
-  .topbar .controls.trackedQuotaVisible > .topbarPolicySelect > button.polishedSelectTrigger > span:first-child { font-family: inherit !important; font-size: var(--mobile-control-size,13px) !important; font-weight: 400 !important; line-height: 18px !important; }
-  .topbar .controls :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) > :is(span,strong) { font-family: inherit !important; font-size: var(--mobile-control-size,13px) !important; font-weight: 400 !important; line-height: 18px !important; }
+  .topbar .controls.trackedQuotaVisible > .topbarPolicySelect > button.polishedSelectTrigger > span:first-child { font-family: inherit !important; font-size: var(--mobile-control-size,13px) !important; font-weight: 400 !important; line-height: 20px !important; }
+  .topbar .controls :is(.trackedQuotaButton,.v2QuotaTopButton,.polishedSelectTrigger) > :is(span,strong) { font-family: inherit !important; font-size: var(--mobile-control-size,13px) !important; font-weight: 400 !important; line-height: 20px !important; }
   .threadListRestoreButton { display: none !important; }
   /* Anchor above the entire dock, including the iPhone home-indicator inset.
      A fixed 58px offset puts the final menu row underneath the account button. */
