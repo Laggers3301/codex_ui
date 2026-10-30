@@ -6,7 +6,7 @@
 :root body {font-size:var(--ui-reading-size);}
 :root .messageItem:is(.kind-agent,.kind-user) .messageMarkdown,
 :root .messageItem:is(.kind-agent,.kind-user) .messageMarkdown :is(p,li,td,th,blockquote) {font-size:var(--ui-reading-size)!important;}
-:root .threadList :is(.v2PrimaryNav button,.v2PrimaryNav button>strong,.v2PrimaryNav button>span,.v2WorkspaceFolderButton strong,.threadSelectButton strong,.v2AccountTrigger strong,.v2AccountMenu button) {font-size:var(--mobile-sidebar-text-size,15px)!important;}
+:root .threadList :is(.v2PrimaryNav button,.v2PrimaryNav button>strong,.v2PrimaryNav button>span,.v2WorkspaceFolderButton strong,.threadSelectButton strong,.v2AccountTrigger strong,.v2AccountMenu button) {font-size:var(--mobile-sidebar-text-size,16px)!important;}
 :root :is(.toolBundle,.messageItem.kind-tool) :is(.messageMeta,.toolBundleTitleLabel,.toolBundleEntryLabel,.toolBundleEntrySummary) {font-size:var(--ui-reading-size)!important;}
 :root :is(.v2PlusMenu,.composerSlashMenu) :is(button,strong) {font-size:var(--ui-reading-size)!important;}
 :root :is(.v2PlusMenu,.composerSlashMenu) small {font-size:var(--ui-detail-size)!important;}

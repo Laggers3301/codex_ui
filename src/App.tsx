@@ -18,6 +18,7 @@ import { usePopoverEscape } from "./usePopoverEscape";
 import { useMobileHeaderControls } from "./useMobileHeaderControls";
 import { installMobileClickHaptics } from "./mobileHaptics";
 import { useMobileComposerMotion } from "./useMobileComposerMotion";
+import { useMobileComposerControls } from "./useMobileComposerControls";
 import { isUsableThreadPage } from "./threadPageCache";
 import { applyLiveAgentUpdate, type AgentWireUpdate } from "./liveAgentUpdates";
 import { recoverAgentStreams } from "./agentStreamRecovery";
@@ -587,8 +588,18 @@ export function ModelGroupedSelect({
     setOpen(false);
     pickerRef.current?.querySelector<HTMLButtonElement>(".polishedSelectTrigger")?.focus();
   });
+  useEffect(() => {
+    if (!open) return;
+    const dismiss = (event: PointerEvent) => {
+      if (!pickerRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", dismiss, true);
+    return () => document.removeEventListener("pointerdown", dismiss, true);
+  }, [open]);
   useLayoutEffect(() => {
     if (!mobile || !menuPresence.present) return;
+    const focused = document.activeElement;
+    if (focused instanceof HTMLElement && focused.isContentEditable && focused.closest(".composer")) focused.blur();
     const update = () => {
       const rect = pickerRef.current?.getBoundingClientRect();
       if (!rect) return;
@@ -597,8 +608,16 @@ export function ModelGroupedSelect({
       setMobileMenuLeft(left - rect.left);
     };
     update();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    if (pickerRef.current) observer?.observe(pickerRef.current);
     window.addEventListener("resize", update);
-    return () => window.removeEventListener("resize", update);
+    window.visualViewport?.addEventListener("resize", update);
+    window.visualViewport?.addEventListener("scroll", update);
+    return () => {
+      observer?.disconnect(); window.removeEventListener("resize", update);
+      window.visualViewport?.removeEventListener("resize", update);
+      window.visualViewport?.removeEventListener("scroll", update);
+    };
   }, [mobile, menuPresence.present]);
   const visibleProfiles = profiles.filter((profile) => !isUltraModelProfile(profile) && !hiddenArkCodingModels.has(profile.model));
   const selected = profiles.find((profile) => profile.id === value) ?? visibleProfiles[0];
@@ -627,7 +646,7 @@ export function ModelGroupedSelect({
   return (
     <div ref={pickerRef} className={`polishedSelect v2ModelPicker groupedModelPicker ${open ? "open" : ""}`}
       style={mobile ? { "--mobile-model-menu-left": `${mobileMenuLeft}px` } as CSSProperties : undefined}
-      onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false); }}>
+      onBlur={(event) => { if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget as Node)) setOpen(false); }}>
       <button className="polishedSelectTrigger" type="button" disabled={disabled} title={title}
         aria-haspopup="dialog" aria-expanded={open}
         onClick={() => { if (!open) { setBranch(null); setProvider(null); } setOpen((current) => !current); }}>
@@ -4473,6 +4492,7 @@ export function App() {
   const [messagesElement,setMessagesElement]=useState<HTMLDivElement|null>(null);
   const [composerElement,setComposerElement]=useState<HTMLDivElement|null>(null);
   useMobileComposerMotion(composerElement);
+  useMobileComposerControls(composerElement);
   const bindMessagesElement=useCallback((element:HTMLDivElement|null)=>{
     messagesRef.current=element;setMessagesElement(element);
   },[]);

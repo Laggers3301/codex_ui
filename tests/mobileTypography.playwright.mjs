@@ -54,7 +54,7 @@ try {
       assert.equal(report.emptyTabRow, 'none');
       assert.notEqual(report.inlineNewTab, 'none');
       for (const name of ['sidebar', 'workspace']) {
-        assert.equal(report[name].size, '15px');
+        assert.equal(report[name].size, '16px');
         assert.equal(report[name].weight, '450');
       }
       assert.equal(report.brand.size, '17px');

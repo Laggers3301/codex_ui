@@ -8,7 +8,7 @@
   :root[data-theme] .conversation>.composer.composerLiquidGlass[data-mobile-idle][data-mobile-composer-motion] {height:var(--mobile-composer-motion-height)!important;min-height:0!important;max-height:none!important;}
   .composer[data-mobile-composer-motion]>.composerBody {overflow:clip;}
   .composer[data-mobile-composer-motion="expand"] .composerTools {animation:mobileComposerControlsArrive .26s ease both;}
-  :root {--mobile-text-size:15px;--mobile-sidebar-text-size:15px;--mobile-meta-size:13px;--mobile-control-size:13px;--panel-text-size:15px;--panel-meta-size:13px;--panel-title-size:15px;--pool-ui-font:-apple-system,BlinkMacSystemFont,"PingFang SC",Roboto,"Noto Sans SC",PoolSansUi,PoolSansCommon,PoolSansFull,sans-serif;}
+  :root {--mobile-text-size:15px;--mobile-sidebar-text-size:16px;--mobile-meta-size:13px;--mobile-control-size:13px;--panel-text-size:15px;--panel-meta-size:13px;--panel-title-size:15px;--pool-ui-font:-apple-system,BlinkMacSystemFont,"PingFang SC",Roboto,"Noto Sans SC",PoolSansUi,PoolSansCommon,PoolSansFull,sans-serif;}
   :root body {font-family:var(--pool-ui-font);font-size:var(--mobile-text-size);font-weight:400;font-synthesis:none;}
   :root :is(.messageMarkdown,.messageMeta,.toolBundleTitleLabel,.reasoningLabel,.v2ThinkingLine) {-webkit-text-size-adjust:100%;text-size-adjust:100%;}
   :root {--mobile-sidebar-surface:#1b1c1b;}
@@ -24,6 +24,8 @@
   :root .threadList :is(.threadRenameButton>svg,.threadDeleteButton>svg,.v2AccountMenu button svg) {width:20px!important;height:20px!important;}
   :root .threadList .v2PrimaryNav>button {min-height:44px!important;}
   :root .threadList .v2PrimaryNav {grid-template-columns:minmax(0,1fr);gap:4px;margin-block:8px 4px;}
+  :root .threadList .v2PrimaryNav>button:nth-child(3) {display:grid!important;}
+  :root .threadList .mobileWorkspaceCreate {display:none!important;}
   :root .threadList .listHeader {min-height:36px;margin:0 0 4px;padding-block:0;}
   :root .threadList .v2WorkspaceGroup {margin-bottom:8px;}
   :root .workspace>.threadList {gap:4px;}
@@ -91,6 +93,7 @@
   :root .mobileRightResourceDock .hostResourceDock :is(button,small,b,span) {font:inherit!important;}
   :root .mobileRightResourceDock .hostResourceDock button {display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;min-width:0;min-height:44px;padding:4px 2px;border:0;border-radius:var(--ui-radius-control,14px);color:var(--ui-content);}
   :root .mobileRightResourceDock .hostResourceTile>span svg {width:15px;height:15px;}
+  .composer:is([data-mobile-control-interaction],:has(.polishedSelect.open,.groupedModelMenu,.v2PlusMenu))>.composerBody {overflow:visible;}
   :root .trackedQuotaDialog :is(h2,strong,span,small,p,button,em,label) {font-size:var(--mobile-text-size)!important;}
   :root .trackedQuotaDialog :is(small,.trackedQuotaFootnote,.trackedQuotaUpdated) {font-size:var(--mobile-meta-size)!important;}
   @media(prefers-reduced-motion:reduce) {
