@@ -14,6 +14,7 @@ export interface WatchdogTurn {
   probeToken: number | null;
   lastProbeState: string | null;
   activeFlags: string[];
+  revision: number;
 }
 
 export interface WatchdogProbeClaim {
@@ -67,7 +68,8 @@ export class TurnWatchdog {
       lastProbeAt: null,
       probeToken: null,
       lastProbeState: null,
-      activeFlags: []
+      activeFlags: [],
+      revision: 0
     };
     // Replacing the map value invalidates any outstanding probe for an older turn.
     this.turns.set(key, turn);
@@ -85,6 +87,7 @@ export class TurnWatchdog {
     // Invalidate an outstanding read snapshot even when it belongs to this
     // same turn: its older phase must not overwrite this newer progress.
     turn.probeToken = null;
+    turn.revision++;
     turn.lastProgressAt = now;
     turn.lastProgressMethod = method;
     turn.phase = "running";
@@ -95,6 +98,7 @@ export class TurnWatchdog {
   setPhase(userId: string, accountId: string | null, threadId: string, turnId: string | null, phase: TurnWatchdogPhase, activeFlags?: string[]): WatchdogTurn | null {
     const turn = this.get(userId, accountId, threadId);
     if (!turn || (turnId && turn.turnId !== turnId)) return null;
+    if (turn.phase !== phase || activeFlags) { turn.probeToken = null; turn.revision++; }
     turn.phase = phase;
     if (activeFlags) turn.activeFlags = [...activeFlags].slice(0, 16);
     return turn;
@@ -119,15 +123,15 @@ export class TurnWatchdog {
     const turn = this.get(userId, accountId, threadId);
     if (!turn || turn.turnId !== turnId || turn.probeToken !== token) return null;
     const flags = Array.isArray(activeFlags) ? activeFlags.map((flag) => String(flag)).slice(0, 16) : [];
-    const nextPhase = Array.isArray(activeFlags) && activeFlags.length === 0
-      && (turn.phase === "waiting_approval" || turn.phase === "waiting_user_input" || turn.phase === "waiting_subagents")
-      ? turn.phase
-      : phaseFromProbe(activeFlags);
+    // A fresh explicit snapshot supersedes an old wait flag. The socket layer
+    // separately overlays requests that are actually still pending.
+    const nextPhase = phaseFromProbe(activeFlags);
     const nextState = `${status}:${flags.join(",")}`;
     const changed = turn.phase !== nextPhase || turn.lastProbeState !== nextState;
     turn.phase = nextPhase;
     turn.activeFlags = flags;
     turn.lastProbeState = nextState;
+    turn.revision++;
     turn.probeToken = null;
     return { turn, changed };
   }
@@ -149,6 +153,10 @@ export class TurnWatchdog {
 
   activeForAccount(accountId?: string | null): WatchdogTurn[] {
     return [...this.turns.values()].filter((turn) => accountId ? turn.accountId === accountId : turn.accountId === "default");
+  }
+
+  forThread(userId: string, threadId: string): WatchdogTurn | null {
+    return [...this.turns.values()].find(turn => turn.userId === userId && turn.threadId === threadId) ?? null;
   }
 
   diagnosedForUser(userId: string): WatchdogTurn[] {

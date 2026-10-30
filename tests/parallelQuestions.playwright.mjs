@@ -73,7 +73,7 @@ try {
       else if (pathname === "/api/threads/questions-thread") json = { thread, history: { totalItems: 3, returnedItems: 3, before: 0, hasOlder: false } };
       else if (pathname === "/api/projects/questions-project/threads") json = { data: [thread] };
       else if (pathname.endsWith("/execution-settings")) json = { data: { sandbox: "read-only", approvalPolicy: "never" } };
-      else if (pathname.endsWith("/context")) json = { data: null };
+      else if (pathname.endsWith("/context") || pathname.endsWith("/side-chat") || pathname === "/api/system/resources") json = { data: null };
       else if (pathname.endsWith("/subagents")) json = { data: [], page: { total: 0, activeCount: 0, historyCount: 0, hasMore: false } };
       else if (pathname === "/api/codex/account-pool") json = { data: { strategy: "single-account", accounts: [] } };
       else if (pathname === "/api/models") json = { data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }] };

@@ -1,0 +1,26 @@
+.communicationPanel { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px; color: var(--ui-content); font-size: 12px; overflow-wrap: anywhere; }
+.communicationPanel .sessionTaskReturn { display: flex; align-items: center; gap: 8px; }
+.communicationPanel .sessionTaskReturn input { width: auto; }
+.communicationPanel > header,.communicationMessage > header { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.communicationPanel h2 { margin: 0; font-size: 17px; }.communicationPanel h3 { margin: 20px 0 8px; font-size: 13px; }
+.communicationPanel p { margin: 8px 0; line-height: 1.6; color: var(--ui-content-muted); }
+.communicationPanel [role="tablist"] { display: flex; flex-wrap: wrap; gap: 4px; margin: 14px 0; }
+.communicationPanel button { padding: 7px 10px; border: 0; border-radius: 8px; color: var(--ui-content); background: var(--ui-hover); cursor: pointer; font: inherit; }
+.communicationPanel button:disabled { opacity: .45; cursor: default; }
+.communicationPanel [role="tab"][aria-selected="true"],.communicationPanel .communicationSend { color: var(--ui-surface); background: var(--ui-contrast); }
+.communicationPanel label { display: grid; gap: 6px; margin: 10px 0; }
+.communicationPanel input,.communicationPanel textarea,.communicationPanel select { width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--ui-divider); border-radius: 8px; background: var(--ui-surface-raised); color: var(--ui-content); box-sizing: border-box; font: inherit; }
+.communicationThreadHeader { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.communicationToolStatus { padding: 8px; border: 1px solid var(--ui-divider); border-radius: 8px; }
+.communicationToolStatus pre { max-height: 140px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.communicationPanel textarea { min-height: 82px; resize: vertical; line-height: 1.6; }
+.communicationDirectory { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; max-height: 120px; overflow-y: auto; }
+.communicationDirectory button { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.communicationMessage { padding: 12px; margin: 8px 0; border: 1px solid var(--ui-divider); border-radius: 10px; background: var(--ui-surface-raised); }
+.communicationMessage > header { flex-wrap: wrap; }.communicationMessage > header strong { min-width: 0; }
+.communicationMessage pre { margin: 8px 0; padding: 8px; max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; background: var(--ui-hover); border-radius: 8px; }
+.communicationState { color: var(--ui-content-muted); font-size: 11px; }
+.communicationProgress { display: flex; align-items: center; gap: 8px; }.communicationProgress progress { width: 100%; accent-color: #5d9bb5; }
+.communicationActions { display: flex; flex-wrap: wrap; gap: 6px; }.communicationResult { margin-top: 10px; }
+.communicationIdentifier { margin-top: 10px; font-size: 11px; color: var(--ui-content-muted); }.communicationIdentifier code { display: block; padding-top: 6px; user-select: all; }
+.communicationPanel .communicationError { color: var(--red); }.communicationPanel details { margin-top: 10px; }.communicationPanel summary { cursor: pointer; }

@@ -1,3 +1,4 @@
+import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import fs, { type FileHandle } from "node:fs/promises";
@@ -12,9 +13,11 @@ import { authenticatedUserFromHeaders } from "./auth.js";
 import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
 import { LiveStateStore } from "./liveState.js";
 import { isUserInputRequest, validateUserInputResponse } from "./userInput.js";
+import { approvalResponse, isApprovalRequest, type ApprovalRequest } from "../shared/approvals.js";
 import { questionToolOutput } from "./questionAnswers.js";
 import { AppError } from "./appErrors.js";
-import { TurnRetryQueue, publicRecovery } from "./turnRetry.js";
+import { RetryDeferredError, TurnRetryQueue, publicRecovery } from "./turnRetry.js";
+import { runTurnRecovery } from "./turnRecovery.js";
 import { notificationIsContextCompaction, RawCompactFilter } from "./rawNotificationFilter.js";
 import { journalItem } from "./timelineJournal.js";
 import { RequestDeduper } from "./requestDeduper.js";
@@ -50,12 +53,13 @@ import { sendUserPush } from "./webPush.js";
 import { serverConfig } from "./config.js";
 import { questionNotificationIdentity } from "./pushProtocol.js";
 import { parseQuestionTool, readLiveQuestionNotification } from "../src/questionTool.js";
-import { meaningfulTurnProgressMethod, TurnWatchdog, type WatchdogProbeClaim, type WatchdogTurn } from "./turnWatchdog.js";
+import { meaningfulTurnProgressMethod, phaseFromProbe, TurnWatchdog, type WatchdogProbeClaim, type WatchdogTurn } from "./turnWatchdog.js";
 import { LatestTaskQueue } from "./streamBatch.js";
 import { requestedServiceTier, requestedTurnServiceTier } from "./serviceTier.js";
 import type { LiveAgentMessage } from "./liveState.js";
 import { reconcileSideChat, settleClosedSideChat, SideChatError } from "./sideChats.js";
 import { forkSideChatContext } from "./sideChatFork.js";
+import { SessionTaskRunner } from "./sessionTaskRunner.js";
 
 const commandSchema = z.array(z.string()).min(1);
 const threadStartContextConfigSchema = z.object({
@@ -97,6 +101,8 @@ type SocketRequestGuards = {
   /** Turns created for a real user task, as opposed to maintenance compaction. */
   recoverableTurnIds: Set<string>;
   disconnectedThreads: Set<string>;
+  completedTurnsByThread: Map<string, string>;
+  settledTurnIds: Set<string>;
   retries?: TurnRetryQueue;
 };
 
@@ -420,6 +426,14 @@ function watchdogState(turn: WatchdogTurn): string {
   return turn.phase === "waiting_approval" || turn.phase === "waiting_user_input" || turn.phase === "waiting_subagents" ? turn.phase : "no_progress";
 }
 
+function pendingRequestPhase(requests: ReturnType<CodexBridge["getPendingServerRequests"]>, threadId: string, turnId: string | null) {
+  const pending = requests.filter(request => notificationThreadId(request as RpcEnvelope) === threadId
+    && (!turnId || !notificationTurnId(request as RpcEnvelope) || notificationTurnId(request as RpcEnvelope) === turnId));
+  if (pending.some(request => isApprovalRequest(request.method))) return "waiting_approval" as const;
+  if (pending.some(request => isUserInputRequest(request.method) && asRecord(request.params).isBlocking !== false)) return "waiting_user_input" as const;
+  return null;
+}
+
 function changesFromTurnDiff(diff: string): Array<{ path: string; kind: string; diff: string }> {
   return diff.split(/(?=^diff --git )/m).filter((block) => block.trim()).map((block) => ({
     path: block.match(/^diff --git a\/.*? b\/(.+)$/m)?.[1]
@@ -473,8 +487,9 @@ function rememberAcceptedTurn(guards: SocketRequestGuards, threadId: string, req
   // Keeping a placeholder closes the race where a second prompt lands after
   // the RPC response but before the notification reaches this server.
   const turnId = turnIdFromStartResult(result);
+  if (turnId && (guards.settledTurnIds.has(turnId) || guards.completedTurnsByThread.get(threadId) === turnId)) return;
   guards.activeTurnsByThread.set(threadId, turnId ?? `pending:${requestId}`);
-  if (turnId) guards.recoverableTurnIds.add(turnId);
+  if (turnId) { guards.recoverableTurnIds.add(turnId); guards.retries?.started(threadId, turnId); }
 }
 
 function runDedupedPrompt<T>(
@@ -497,6 +512,9 @@ function runDedupedPrompt<T>(
 
 export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, store: ProjectStore, browserService?: BrowserService): WebSocketServer {
   const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  const communicationChanged = (change: { userId: string; threadIds: string[] }) => sendToUser(wss, change.userId, { type: "communication.changed", data: { threadIds: change.threadIds } });
+  store.communication.on("change", communicationChanged);
+  wss.on("close", () => store.communication.off("change", communicationChanged));
   const unsubscribeSideChats = store.sideChats.subscribe(change => sendToUser(wss, change.userId, { type: "side.chat", data: change }));
   wss.on("close", unsubscribeSideChats);
   // Canonical native rollouts retain every delta. The UI journal checkpoints
@@ -524,7 +542,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     activeTurnsByThread: new Map(),
     startingThreads: new Set(),
     recoverableTurnIds: new Set(),
-    disconnectedThreads: new Set()
+    disconnectedThreads: new Set(),
+    completedTurnsByThread: new Map(),
+    settledTurnIds: new Set()
   };
   const turnWatchdog = new TurnWatchdog();
   const resourceStops = new Map<string, AppError>();
@@ -547,15 +567,21 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       if (!state.template || guards.activeTurnsByThread.has(state.threadId)) return null;
       guards.startingThreads.add(state.threadId);
       try {
-        const native = await bridge.request("thread/read", { threadId: state.threadId, includeTurns: false }) as { thread?: { status?: { type?: string } } };
-        if (!["idle", "systemError", "notLoaded"].includes(String(native.thread?.status?.type))) throw new AppError("retry_state_unknown", "会话仍在运行或等待输入，自动重试已暂停。");
+        let native: { thread?: { status?: { type?: string } } };
+        try { native = await bridge.request("thread/read", { threadId: state.threadId, includeTurns: false }, 10_000) as typeof native; }
+        catch (error) {
+          if (["authentication_failed", "quota_exceeded", "runtime_terminated"].includes(AppError.from(error).code)) throw error;
+          throw new RetryDeferredError();
+        }
+        if (!["idle", "systemError", "notLoaded"].includes(String(native.thread?.status?.type))) throw new RetryDeferredError();
+        if (!retries.isCurrent(state)) return null;
         await assertTrackedUserQuotaAvailable(bridge, store, state.userId, state.threadId);
         const execution = store.getThreadExecutionSettings(state.threadId, state.userId);
-        await bridge.request("thread/resume", { threadId: state.threadId, cwd: state.template.cwd, model: state.template.model,
+        await bridge.request("thread/resume", { threadId: state.threadId, excludeTurns: true, cwd: state.template.cwd, model: state.template.model,
           config: state.template.config, sandbox: execution?.sandbox, approvalPolicy: execution?.approvalPolicy }, 30_000);
         if (!retries.isCurrent(state) || guards.activeTurnsByThread.has(state.threadId)) return null;
         const result = await bridge.request("turn/start", { ...state.template, threadId: state.threadId,
-          input: state.job?.resumeOriginal ? state.template.input : textInput("<codex_internal_retry>上一轮因模型服务过载而结束。请在当前会话继续尚未完成的原任务，沿用原始指令、授权范围和已完成步骤。先核对已有结果，避免重复执行成功的操作；不要重新开始整个任务，也不要更换模型。</codex_internal_retry>") });
+          input: state.job?.resumeOriginal ? state.template.input : textInput(`<codex_internal_retry>上一轮因${state.error?.code === "stream_disconnected" ? "模型连接中断" : "模型服务暂时受限"}而结束。请在当前会话继续尚未完成的原任务，沿用原始指令、授权范围和已完成步骤。先核对已有结果，避免重复执行成功的操作；不要重新开始整个任务，也不要更换模型。</codex_internal_retry>`) });
         rememberAcceptedTurn(guards, state.threadId, `retry:${state.job!.id}`, result);
         store.touchThreadOwner(state.threadId);
         return turnIdFromStartResult(result);
@@ -722,6 +748,11 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
 
     const turnId = notificationTurnId(message);
+    if (turnId && message.method === "turn/completed") {
+      if (guards.settledTurnIds.has(turnId)) return;
+      guards.settledTurnIds.add(turnId);
+      if (guards.settledTurnIds.size > 2048) guards.settledTurnIds.delete(guards.settledTurnIds.values().next().value!);
+    }
     if (turnId && ["turn/completed", "turn/started"].includes(message.method ?? "")) {
       streamJournal.flushPrefix(JSON.stringify([owner,turnId]).slice(0,-1)+",");
     }
@@ -751,10 +782,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         if (pending) {
           const progress = turnWatchdog.progress(pending.userId, pending.accountId, pending.threadId, pending.turnId ?? "", "serverRequest/resolved");
           if (progress) {
-            const waiting = bridge.getPendingServerRequests().some(request => isUserInputRequest(request.method)
-              && asRecord(request.params).threadId === pending.threadId && asRecord(request.params).isBlocking !== false);
-            if (waiting) turnWatchdog.setPhase(owner, pending.accountId, pending.threadId, pending.turnId, "waiting_user_input");
-            sendTurnProgress(progress.turn, waiting ? "waiting_user_input" : "active");
+            const phase = pendingRequestPhase(bridge.getPendingServerRequests(), pending.threadId, pending.turnId);
+            if (phase) turnWatchdog.setPhase(owner, pending.accountId, pending.threadId, pending.turnId, phase);
+            sendTurnProgress(progress.turn, phase ?? "active");
           }
         }
       }
@@ -778,7 +808,21 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     const progressMethod = meaningfulTurnProgressMethod(message);
     if (turnId && threadIdForWatchdog && progressMethod) {
       const progress = turnWatchdog.progress(owner, accountId, threadIdForWatchdog, turnId, progressMethod);
-      if (progress?.resumed) sendTurnProgress(progress.turn, "active");
+      const pendingPhase = pendingRequestPhase(bridge.getPendingServerRequests(), threadIdForWatchdog, turnId);
+      if (pendingPhase) turnWatchdog.setPhase(owner, accountId, threadIdForWatchdog, turnId, pendingPhase);
+      if (progress?.resumed) sendTurnProgress(progress.turn, pendingPhase ?? "active");
+    }
+    if (message.method === "thread/status/changed" && threadIdForWatchdog) {
+      const tracked = turnWatchdog.get(owner, accountId, threadIdForWatchdog);
+      const status = asRecord(asRecord(message.params).status);
+      if (tracked && status.type === "active") {
+        const phase = pendingRequestPhase(bridge.getPendingServerRequests(), threadIdForWatchdog, tracked.turnId)
+          ?? phaseFromProbe(status.activeFlags);
+        const previous = tracked.phase;
+        turnWatchdog.setPhase(owner, accountId, threadIdForWatchdog, tracked.turnId, phase,
+          Array.isArray(status.activeFlags) ? status.activeFlags.map(String) : undefined);
+        if (previous !== phase) sendTurnProgress(tracked, phase === "running" ? (tracked.diagnosed ? "no_progress" : "active") : watchdogState(tracked));
+      }
     }
     if (message.method === "turn/diff/updated" && turnId) {
       const threadId = notificationThreadId(message)
@@ -823,10 +867,13 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       sendToUser(wss, owner, { type: "live.agent", data: item });
     }
     if (liveUpdate?.kind === "tool" && liveUpdate.item.threadId && liveUpdate.item.turnId) {
+      if (!liveUpdate.item.internal && (message.method === "item/started" || message.method === "item/completed")) {
+        retries.toolProgress(liveUpdate.item.threadId, liveUpdate.item.turnId, liveUpdate.item.itemId, liveUpdate.item.completed);
+      }
       const label = liveUpdate.item.tool.toLowerCase();
-      const phase = liveUpdate.item.completed
+      const phase = pendingRequestPhase(bridge.getPendingServerRequests(), liveUpdate.item.threadId, liveUpdate.item.turnId) ?? (liveUpdate.item.completed
         ? "running"
-        : label.includes("collab") || label.includes("agent") ? "waiting_subagents" : "tool_running";
+        : label.includes("collab") || label.includes("agent") ? "waiting_subagents" : "tool_running");
       turnWatchdog.setPhase(owner, accountId, liveUpdate.item.threadId, liveUpdate.item.turnId, phase);
     }
     const recovery = turnId ? contextRecoveryByTurn.get(turnId) : undefined;
@@ -913,6 +960,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const latestAgentText = latestAgent?.text ?? "";
       const needsFallbackRecovery = Boolean(completedRecovery && isGenericContextLossReply(latestAgentText));
       const completedThreadId = notificationThreadId(message);
+      if (completedThreadId) guards.completedTurnsByThread.set(completedThreadId, turnId);
       const completedItems = completedThreadId ? store.readTimelineItems(completedThreadId, turnId) : [];
       const latestAgentItem = [...completedItems].reverse().find((item) => item.type === "agentMessage" && item.streamState !== "superseded");
       const latestAgentOrder = Number(latestAgentItem?.timelineOrder ?? latestAgent?.sequence);
@@ -928,10 +976,12 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const runtimeExited = asRecord(message.params).runtimeExited === true;
       const nativeError = resourceStops.get(turnId) ?? asRecord(asRecord(message.params).turn).error;
       resourceStops.delete(turnId);
-      if (completedThreadId && nativeError) retries.failed(owner, completedThreadId, turnId, nativeError,
+      if (completedThreadId && turnStatus === "interrupted") retries.interrupted(owner, completedThreadId, turnId, nativeError);
+      else if (completedThreadId && nativeError) retries.failed(owner, completedThreadId, turnId, nativeError,
         guards.recoverableTurnIds.has(turnId) || retries.pending(completedThreadId));
       else if (completedThreadId && turnStatus === "completed") retries.completed(completedThreadId, turnId);
-      else if (completedThreadId && turnStatus === "interrupted") retries.cancel(owner, completedThreadId);
+      else if (completedThreadId && turnStatus === "failed") retries.failed(owner, completedThreadId, turnId,
+        new AppError("request_failed", "本轮处理失败，运行时未提供具体错误原因。"), false);
       const needsRecovery = !runtimeExited && (needsFallbackRecovery || needsPlanContinuation);
       if (completedThreadId) {
         for (const item of completedItems) {
@@ -990,6 +1040,19 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
   };
   bridge.on("notification", processBridgeNotification);
+  const sessionTasks = new SessionTaskRunner(bridge, store, {
+    registry: guards,
+    beforeStart: (userId, threadId) => assertTrackedUserQuotaAvailable(bridge, store, userId, threadId),
+    retryPending: threadId => retries.pending(threadId),
+    accepted: (threadId, requestId, result, autonomous) => {
+      rememberAcceptedTurn(guards, threadId, requestId, result);
+      // An ambiguous delegated operation must not replay an older user's turn
+      // template. Its durable task record exposes the result for inspection.
+      const turnId = turnIdFromStartResult(result);
+      if (autonomous && turnId) guards.recoverableTurnIds.delete(turnId);
+    }
+  });
+  wss.on("close", () => sessionTasks.close());
 
   const runWatchdogProbe = async (claim: WatchdogProbeClaim): Promise<void> => {
     const turn = claim.turn;
@@ -1021,10 +1084,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const flags = flagsRaw.map((flag) => typeof flag === "string" ? flag : pickString(asRecord(flag).type ?? asRecord(flag).name ?? asRecord(flag).flag)).filter(Boolean);
       const resolved = turnWatchdog.resolveProbe(turn.userId, turn.accountId, turn.threadId, turn.turnId, claim.token, statusName, flags);
       if (!resolved) return; // A newer turn replaced this probe while it was in flight.
-      if (bridge.getPendingServerRequests().some(request => isUserInputRequest(request.method)
-        && notificationThreadId(request as RpcEnvelope) === turn.threadId && notificationTurnId(request as RpcEnvelope) === turn.turnId)) {
-        turnWatchdog.setPhase(turn.userId, turn.accountId, turn.threadId, turn.turnId, "waiting_user_input");
-      }
+      const pendingPhase = pendingRequestPhase(bridge.getPendingServerRequests(), turn.threadId, turn.turnId);
+      if (pendingPhase) turnWatchdog.setPhase(turn.userId, turn.accountId, turn.threadId, turn.turnId, pendingPhase);
       const liveTurn = liveStateFor(turn.userId).snapshot().toolItems
         .find((item) => item.threadId === turn.threadId && item.turnId === turn.turnId && !item.completed);
       if (liveTurn && resolved.turn.phase === "running") {
@@ -1032,7 +1093,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         turnWatchdog.setPhase(turn.userId, turn.accountId, turn.threadId, turn.turnId,
           label.includes("collab") || label.includes("agent") ? "waiting_subagents" : "tool_running");
       }
-      if (resolved.changed) sendTurnProgress(turn, resolved.turn.phase, statusName);
+      sendTurnProgress(turn, watchdogState(turn), statusName);
     } catch (error) {
       const probeStillCurrent = turnWatchdog.failProbe(turn.userId, turn.accountId, turn.threadId, turn.turnId, claim.token);
       if (!probeStillCurrent) return;
@@ -1055,7 +1116,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   bridge.on("serverRequest", (request) => {
     const owner = ownerForEnvelope(request as RpcEnvelope);
     if (owner) {
-      if (request.id !== undefined && (isUserInputRequest(request.method) || request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")) {
+      if (request.id !== undefined && (isUserInputRequest(request.method) || isApprovalRequest(request.method))) {
         pendingApprovalOwners.set(request.id, owner);
         const threadId = notificationThreadId(request as RpcEnvelope);
         if (threadId) {
@@ -1144,7 +1205,17 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       type: "hello",
       ok: true,
       data: {
-        pendingServerRequests: bridge.getPendingServerRequests().filter((pending) => pendingApprovalOwners.get(pending.id) === sessionUserId),
+        pendingServerRequests: bridge.getPendingServerRequests().filter((pending) => {
+          if (!isUserInputRequest(pending.method) && !isApprovalRequest(pending.method)) return false;
+          const owner = ownerForEnvelope(pending as RpcEnvelope);
+          if (owner !== sessionUserId) return false;
+          pendingApprovalOwners.set(pending.id, owner);
+          if (!pendingApprovalTurns.has(pending.id)) pendingApprovalTurns.set(pending.id, {
+            userId: owner, accountId: notificationAccountId(pending as RpcEnvelope),
+            threadId: notificationThreadId(pending as RpcEnvelope)!, turnId: notificationTurnId(pending as RpcEnvelope)
+          });
+          return true;
+        }),
         liveState: liveStateFor(sessionUserId).snapshot(),
         turnRecoveries: retries.snapshot(sessionUserId),
         turnProgress: turnWatchdog.diagnosedForUser(sessionUserId)
@@ -1158,7 +1229,34 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         if (pending) processBridgeNotification({ method: "serverRequest/resolved", accountId: pending.accountId, params: { threadId: pending.threadId, requestId } } as RpcEnvelope);
       }, browserService, (threadId, itemId) => sendToUser(wss, sessionUserId, {
         type: "question.answered", data: { threadId, itemId, answer: store.getQuestionAnswer(threadId, itemId, sessionUserId) }
-      }));
+      }), async (threadId, expectedTurnId) => {
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        const before = turnWatchdog.forThread(sessionUserId, threadId);
+        const revision = before?.revision;
+        if (expectedTurnId && before && before.turnId !== expectedTurnId) throw new Error("当前轮次已变化，请重新核对批准请求。");
+        const result = await bridge.request("thread/read", { threadId, includeTurns: false }, 10_000);
+        const status = asRecord(asRecord(asRecord(result).thread).status);
+        const requests = bridge.getPendingServerRequests().filter(pending => notificationThreadId(pending as RpcEnvelope) === threadId
+          && ownerForEnvelope(pending as RpcEnvelope) === sessionUserId
+          && (isApprovalRequest(pending.method) || isUserInputRequest(pending.method)));
+        for (const pending of requests) {
+          pendingApprovalOwners.set(pending.id, sessionUserId);
+          pendingApprovalTurns.set(pending.id, { userId: sessionUserId,
+            accountId: notificationAccountId(pending as RpcEnvelope) ?? before?.accountId ?? null,
+            threadId, turnId: notificationTurnId(pending as RpcEnvelope) });
+        }
+        const tracked = turnWatchdog.forThread(sessionUserId, threadId);
+        if (tracked !== before || tracked?.revision !== revision) throw new Error("核对期间轮次或运行状态已变化，请重新核对批准请求。");
+        if (tracked && status.type) {
+          const phase = pendingRequestPhase(requests, threadId, tracked.turnId) ?? phaseFromProbe(status.activeFlags);
+          turnWatchdog.setPhase(sessionUserId, tracked.accountId, threadId, tracked.turnId, phase);
+          sendTurnProgress(tracked, watchdogState(tracked), String(status.type));
+        }
+        return { threadId, turnId: tracked?.turnId ?? expectedTurnId, pendingServerRequests: requests,
+          message: requests.some(pending => isApprovalRequest(pending.method)) ? "已重新取得待批准操作。"
+            : phaseFromProbe(status.activeFlags) === "waiting_approval" ? "运行时仍报告等待批准，但未返回可操作的批准请求。不能据此判断或批准具体操作。"
+            : status.type ? "当前未发现待批准操作，已更新运行状态。" : "暂时无法确认运行状态，请稍后重新核对。" };
+      });
     });
     ws.on("close", () => {
       for (const [processId, socket] of processSockets) {
@@ -1191,7 +1289,8 @@ async function handleClientMessage(
   steerQueuedSubmission: (owner: string, threadId: string, expectedTurnId: string, queuedSubmissionId: string) => Promise<unknown>,
   onServerRequestResolved: (requestId: number | string) => void,
   browserService?: BrowserService,
-  onQuestionAnswered?: (threadId: string, itemId: string) => void
+  onQuestionAnswered?: (threadId: string, itemId: string) => void,
+  onApprovalSync?: (threadId: string, turnId: string | null) => Promise<unknown>
 ): Promise<void> {
   let message: SocketClientMessage;
   try {
@@ -1204,13 +1303,35 @@ async function handleClientMessage(
   const requestId = message.requestId ?? randomUUID();
   try {
     switch (message.type) {
+      case "approval.sync": {
+        const threadId = pickString(message.threadId);
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        if (!onApprovalSync) throw new Error("批准核对服务尚未就绪。");
+        const data = await onApprovalSync(threadId, stringOrNull(message.turnId));
+        send(ws, { type: "ack", requestId, ok: true, data });
+        break;
+      }
+      case "turn.recovery.check":
+      case "turn.recovery.continue": {
+        const threadId = pickString(message.threadId);
+        assertThreadOwnedBy(store, threadId, sessionUserId);
+        if (!guards.retries) throw new AppError("recovery_unavailable", "恢复服务尚未就绪。");
+        const data = await runTurnRecovery({ bridge, store, retries: guards.retries, guards, userId: sessionUserId,
+          threadId, turnId: pickString(message.turnId), errorAt: typeof message.errorAt === "string" ? message.errorAt : undefined,
+          historicalError: message.historicalError,
+          requestId, action: message.type === "turn.recovery.check" ? "check" : "continue", toolsReviewed: message.toolsReviewed === true,
+          beforeContinue: () => assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, threadId),
+          accepted: value => rememberAcceptedTurn(guards, threadId, requestId, value) });
+        send(ws, { type: "ack", requestId, ok: true, data });
+        break;
+      }
       case "turn.retry.cancel":
       case "turn.retry.now":
       case "turn.error.dismiss": {
         const threadId = pickString(message.threadId);
         assertThreadOwnedBy(store, threadId, sessionUserId);
         if (message.type === "turn.retry.now") guards.retries?.retryNow(sessionUserId, threadId);
-        else guards.retries?.cancel(sessionUserId, threadId, message.type === "turn.error.dismiss");
+        else guards.retries?.cancel(sessionUserId, threadId, message.type === "turn.error.dismiss", pickString(message.turnId) || undefined);
         send(ws, { type: "ack", requestId, ok: true });
         if (message.type === "turn.retry.cancel") setTimeout(() => void startNextQueuedTurn(sessionUserId, threadId), 0);
         break;
@@ -1226,6 +1347,7 @@ async function handleClientMessage(
 
       case "thread.start": {
         const project = getProjectOrThrow(store, message.projectId, sessionUserId);
+        assertCodexModelRequest({ model: message.model ?? project.defaultModel });
         const question = pickString(message.prompt).trim();
         const sideChatId = pickString(message.sideChatId);
         const storedSide = sideChatId ? store.sideChats.byId(sideChatId, sessionUserId) : null;
@@ -1630,6 +1752,7 @@ async function handleClientMessage(
               // Goal support is optional. A goal lookup failure must never stop
               // the user from interrupting the currently running turn.
             }
+            guards.retries?.requestStop(sessionUserId, threadId, turnId);
             const interrupt = await bridge.request("turn/interrupt", { threadId, turnId });
             return { interrupt, goalPaused };
           },
@@ -1651,6 +1774,7 @@ async function handleClientMessage(
             const activeTurnId = guards.activeTurnsByThread.get(threadId);
             if (activeTurnId && !activeTurnId.startsWith("pending:")) {
               try {
+                guards.retries?.requestStop(sessionUserId, threadId, activeTurnId);
                 await bridge.request("turn/interrupt", { threadId, turnId: activeTurnId });
               } catch {
                 // Clearing the goal is the safety-critical action. Continue if
@@ -1900,7 +2024,12 @@ async function handleClientMessage(
         if (message.type === "userInput.respond" && message.threadId !== notificationThreadId(pending as RpcEnvelope)) {
           throw new Error("答案与当前会话不匹配，请刷新会话。");
         }
-        const result = message.type === "userInput.respond" ? validateUserInputResponse(pending.params, message.result) : message.result;
+        if (message.type === "approval.respond" && (!isApprovalRequest(pending.method)
+          || (message.threadId !== undefined && message.threadId !== notificationThreadId(pending as RpcEnvelope)))) {
+          throw new Error("批准请求与当前会话不匹配，请重新核对批准请求。");
+        }
+        const result = message.type === "userInput.respond" ? validateUserInputResponse(pending.params, message.result)
+          : approvalResponse({ ...pending, params: asRecord(pending.params) } as ApprovalRequest, message.result);
         bridge.respondToServerRequest(responseId, result);
         if (message.type === "userInput.respond") {
           const params = asRecord(pending.params);

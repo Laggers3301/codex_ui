@@ -8328,7 +8328,6 @@ body:has(.globalSearchScrim) .v2AccountDock {
 .temporaryAskComposer .composerBody { display:flex; min-width:0; flex:1; flex-direction:column; padding:0; }
 .temporaryAskComposer textarea { width:100%; min-height:48px; max-height:150px; padding:4px 2px; resize:none; border:0; outline:0; background:transparent; color:#e8ebe5; font:inherit; font-size:14px; line-height:1.5; }
 .temporaryAskComposer .temporaryAskComposerTools { display:flex; min-width:0; align-items:center; gap:7px; padding-top:7px; overflow:visible; }
-.temporarySelectionCount { display:inline-flex; min-width:0; align-items:center; gap:5px; padding:5px 8px; border:1px solid #3b3d3a; border-radius:9px; background:#242524; color:#cdd1ca; font-size:11px; white-space:nowrap; }
 .temporaryAskComposer .polishedSelectTrigger { border-color:#3b3d3a; background:#242524; color:#e4e6e1; }
 .temporaryAskComposer .polishedSelectTrigger:hover,
 .temporaryAskComposer .polishedSelect.open .polishedSelectTrigger { border-color:#555853; background:#2b2c2b; }
@@ -8869,7 +8868,6 @@ pre,
 
 .skillPickerSearch,
 .selectedSkillChip,
-.temporarySelectionCount,
 .temporaryAskHeaderButton,
 .temporaryAskPanel .temporaryAskHeaderText {
   border: 0 !important;
@@ -11635,8 +11633,7 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
 :root[data-theme="light"] .temporaryAskHeader small,
 :root[data-theme="light"] .temporaryAskStatus { color: var(--ui-content-muted) !important; }
 :root[data-theme="light"] .temporaryAskMessages .temporaryAskQuote,
-:root[data-theme="light"] .temporaryAskMessages .temporaryAskUser,
-:root[data-theme="light"] .temporarySelectionCount { background: #edf1eb !important; color: var(--ui-code-content) !important; border-color: var(--ui-divider) !important; }
+:root[data-theme="light"] .temporaryAskMessages .temporaryAskUser { background: #edf1eb !important; color: var(--ui-code-content) !important; border-color: var(--ui-divider) !important; }
 :root[data-theme="light"] .temporaryAskComposer.composer { background: linear-gradient(145deg,rgba(255,255,255,.84),rgba(246,248,245,.88)) !important; box-shadow: 0 12px 34px rgba(39,46,38,.12) !important; }
 :root[data-theme="light"] .temporaryAskComposer textarea { color: var(--ui-content) !important; }
 :root[data-theme="light"] .temporaryAskHeaderButton { background: var(--ui-control-hover) !important; color: #465248 !important; }
@@ -11712,8 +11709,13 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
   animation: codexApprovalEnter .32s cubic-bezier(.22, 1, .36, 1) both;
 }
 .codexApprovalCard strong { font-size: 13px; }
+.codexApprovalRequests { position: absolute; inset-inline: 0; bottom: calc(100% + 10px); z-index: 1; min-width: 0; max-height: min(420px, 45dvh, max(100px, calc(var(--phone-viewport-height, 100dvh) - var(--composer-height, 240px) - 108px))); overflow: auto; overscroll-behavior: contain; padding: 10px; border-radius: 14px; background: var(--ui-surface-raised); box-shadow: 0 12px 32px rgba(0,0,0,.14); color: var(--ui-content); font-size: 12px; overflow-wrap: anywhere; }
+.codexApprovalRequests p { margin: 4px 0; }
+.codexApprovalCard pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 160px; overflow: auto; margin: 0; font-size: 12px; }
+.codexApprovalRefresh { border: 0; border-radius: 8px; padding: 6px 12px; background: var(--ui-control-hover); color: var(--ui-content); cursor: pointer; }
+.codexApprovalRequests button:disabled { opacity: .55; cursor: default; }
 .codexApprovalCard code { overflow-wrap: anywhere; max-height: 90px; overflow: auto; font-size: 12px; color: var(--ui-content-muted); }
-.codexApprovalCard > div { display: flex; justify-content: flex-end; gap: 8px; }
+.codexApprovalActions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
 .codexApprovalCard button { border: 0; border-radius: 8px; padding: 6px 12px; background: var(--ui-control-hover); color: var(--ui-content); cursor: pointer; }
 .codexApprovalCard button:last-child { background: var(--ui-contrast); color: var(--ui-surface); }
 :root[data-theme="light"] .codexApprovalCard button:last-child { color: #fff; }
@@ -12767,7 +12769,7 @@ body:has(.directoryPickerScrim) :is(.threadList, .v2ProjectDock, .v2AccountDock)
   animation: groupedModelCascadeRise .36s cubic-bezier(.16,1,.3,1) backwards;
 }
 .groupedModelSecond { width: min(158px, calc(100dvw - 20px)); }
-.groupedModelSecond[data-branch="gpt"] { width: min(252px, calc(100dvw - 20px)); }
+.groupedModelSecond[data-branch="gpt"], .groupedModelSecond[data-branch="claude"] { width: min(252px, calc(100dvw - 20px)); }
 .groupedModelThird { width: min(252px, calc(100dvw - 20px)); z-index: 2; }
 @keyframes groupedModelCascadeRise {
   from { opacity: 0; transform: translateY(13px) scale(.985); clip-path: inset(100% 0 0 0 round 15px); }
@@ -12953,3 +12955,8 @@ body:has(.directoryPickerScrim) :is(.threadList, .v2ProjectDock, .v2AccountDock)
     white-space: nowrap;
   }
 }
+
+/* Unconnected native runtimes remain visible without implying model access. */
+.groupedModelConnectionNote { margin: 6px 8px 10px; color: var(--ui-content-muted); font-size: 12px; line-height: 1.6; max-width: 250px; }
+.groupedModelConnectionStatus { display: block; margin-top: 2px; color: var(--ui-content-muted); font-size: 11px; line-height: 1.5; }
+.groupedModelPicker .groupedModelProfile:disabled { cursor: not-allowed; opacity: .65; background: transparent; }

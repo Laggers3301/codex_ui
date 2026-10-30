@@ -30,6 +30,11 @@ export function isQuestionToolName(value: unknown): value is string {
   return typeof value === "string" && /(?:^|\.)request_user_input(?:_async)?$/.test(value.trim());
 }
 
+/** Native history has an fc_* display id and a separate call_* reply id. */
+export function questionItemId(item: { id?: unknown; callId?: unknown; call_id?: unknown }): string | null {
+  return [item.callId, item.call_id, item.id].find((value): value is string => typeof value === "string" && Boolean(value.trim())) ?? null;
+}
+
 export function parseQuestionTool(toolName: string, input: unknown): ToolQuestion[] | null {
   if (!isQuestionToolName(toolName)) return null;
   let root: Record<string, unknown>;

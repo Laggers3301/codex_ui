@@ -32,7 +32,7 @@ describe("gpt-6.1-sol Responses compatibility", () => {
     expect(JSON.parse(fs.readFileSync(compatible, "utf8"))).toEqual(expected);
     expect(fs.readFileSync(file, "utf8")).toBe(before);
     expect(fs.statSync(compatible).mode & 0o777).toBe(0o600);
-    expect(accountAppServerArgs(directory)).toContain(`model_catalog_json=${JSON.stringify(compatible)}`);
+    expect(accountAppServerArgs(directory, "api-provider")).toContain(`model_catalog_json=${JSON.stringify(compatible)}`);
   });
   it("regenerates compatibility from a refreshed source catalog", () => {
     const { file } = fixture({ models: [{ slug: "gpt-6.1-sol", use_responses_lite: true, revision: 1 }] });

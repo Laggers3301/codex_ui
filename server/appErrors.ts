@@ -1,16 +1,17 @@
 import { modelErrorDetails, modelErrorSummary, redactModelError } from "../shared/modelError.js";
-export interface PublicAppError { code: string; message: string; originalMessage: string; retryable: boolean; at: string }
+import { errorSource, type ErrorSource, type PublicAppError } from "../shared/turnRecovery.js";
+export type { PublicAppError } from "../shared/turnRecovery.js";
 
 function safeMessage(value: unknown): string {
   return redactModelError(typeof value === "string" ? value : modelErrorDetails(value).message);
 }
 
 export class AppError extends Error {
-  constructor(public code: string, message: string, public originalMessage = message, public retryable = false) { super(message); this.name = "AppError"; }
+  constructor(public code: string, message: string, public originalMessage = message, public retryable = false, public source: ErrorSource = errorSource(code)) { super(message); this.name = "AppError"; }
   toPublic(): PublicAppError {
     const detail = modelErrorSummary(this.originalMessage);
     const message = detail && detail !== this.message && detail !== "未知错误" ? `${this.message} 具体原因：${detail}` : this.message;
-    return { code: this.code, message, originalMessage: safeMessage(this.originalMessage), retryable: this.retryable, at: new Date().toISOString() };
+    return { code: this.code, message, originalMessage: safeMessage(this.originalMessage), retryable: this.retryable, at: new Date().toISOString(), source: this.source };
   }
   static from(value: unknown): AppError {
     if (value instanceof AppError) return value;
@@ -28,7 +29,7 @@ export class AppError extends Error {
     if (/usage_?limit|quota|credits|rate limit/i.test(signature)) return new AppError("quota_or_rate_limit", "服务额度或请求频率受限，请查看错误详情。", original);
     if (/401\b/i.test(signature)) return new AppError("authentication_failed", "账号认证失败，请查看错误详情。", original);
     if (/context.*(exhaust|exceed|full)|CONTEXT_EXHAUSTED/i.test(signature)) return new AppError("context_exhausted", "会话上下文已满，请使用续接会话。", original);
-    if (/stream[_ ]disconnected|stream.*before completion|peer closed connection/i.test(signature)) return new AppError("stream_disconnected", "模型连接意外中断，正在按重试策略尝试恢复；已完成的步骤会保留。", original, true);
+    if (/response[_ ]?stream[_ ]?(?:disconnected|connection[_ ]?failed)|stream[_ ]disconnected|stream.*before completion|stream closed before response\.completed|peer closed connection/i.test(signature)) return new AppError("stream_disconnected", "模型连接意外中断，正在按重试策略尝试恢复；已完成的步骤会保留。", original, true);
     return new AppError(nativeCode || "request_failed", "本轮处理失败，请查看错误详情。", original);
   }
 }

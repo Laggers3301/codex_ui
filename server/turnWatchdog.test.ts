@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import { meaningfulTurnProgressMethod, phaseFromProbe, TurnWatchdog } from "./turnWatchdog.js";
 
 describe("TurnWatchdog", () => {
-  it("keeps a long user-input wait distinct from a stalled turn, then invalidates old probes after the answer", () => {
+  it("replaces old wait flags with fresh snapshots and ignores probes after newer progress", () => {
     const watchdog = new TurnWatchdog();
     const turn = watchdog.start("user-a", "account-a", "thread-a", "turn-a", 0);
     expect(phaseFromProbe(["waitingOnUserInput"])).toBe("waiting_user_input");
     watchdog.setPhase("user-a", "account-a", "thread-a", "turn-a", "waiting_user_input");
     const probe = watchdog.claimDueProbes(30 * 60_000)[0]!;
     watchdog.resolveProbe("user-a", "account-a", "thread-a", "turn-a", probe.token, "active", []);
-    expect(turn.phase).toBe("waiting_user_input");
+    expect(turn.phase).toBe("running");
     expect(turn.lastProgressAt).toBe(0);
     const oldProbe = watchdog.claimDueProbes(31 * 60_000)[0]!;
     watchdog.progress("user-a", "account-a", "thread-a", "turn-a", "serverRequest/resolved", 31 * 60_000 + 1);
@@ -36,6 +36,14 @@ describe("TurnWatchdog", () => {
     expect(watchdog.claimDueProbes(start + 250_000)[0]?.shouldDiagnose).toBe(true);
   });
 
+  it("invalidates an older probe when a new approval phase arrives without advancing tool progress", () => {
+    const watchdog = new TurnWatchdog(), turn = watchdog.start("user-a", "account-a", "thread-a", "turn-a", 0);
+    const claim = watchdog.claimDueProbes(120_000)[0]!;
+    watchdog.setPhase("user-a", "account-a", "thread-a", "turn-a", "waiting_approval", ["waitingOnApproval"]);
+    expect(watchdog.resolveProbe("user-a", "account-a", "thread-a", "turn-a", claim.token, "active", [])).toBeNull();
+    expect(turn.phase).toBe("waiting_approval"); expect(turn.lastProgressAt).toBe(0);
+  });
+
   it("ignores an in-flight probe when fresh progress arrives on the same turn", () => {
     const watchdog = new TurnWatchdog();
     const start = 2_000_000;
@@ -56,7 +64,7 @@ describe("TurnWatchdog", () => {
     watchdog.setPhase("user-a", "account-a", "thread-a", "turn-a", "waiting_approval");
     expect(watchdog.claimDueProbes(125_000)[0]?.turn.phase).toBe("waiting_approval");
     watchdog.resolveProbe("user-a", "account-a", "thread-a", "turn-a", turn.probeToken!, "active", []);
-    expect(turn.phase).toBe("waiting_approval");
+    expect(turn.phase).toBe("running");
 
     watchdog.progress("user-a", "account-a", "thread-a", "turn-a", "item/commandExecution/started", 130_000);
     watchdog.setPhase("user-a", "account-a", "thread-a", "turn-a", "tool_running");

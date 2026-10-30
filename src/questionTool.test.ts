@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { questionAnswerValues } from "./questionTool";
+import { questionAnswerValues, questionItemId } from "./questionTool";
+
+it("uses the native call id to correlate history questions with pending requests", () => {
+  expect(questionItemId({ id: "fc-display", callId: "call-reply" })).toBe("call-reply");
+  expect(questionItemId({ id: "fc-display", call_id: "call-reply" })).toBe("call-reply");
+  expect(questionItemId({ id: "fc-display", callId: " ", call_id: "call-reply" })).toBe("call-reply");
+  expect(questionItemId({ id: "legacy-question" })).toBe("legacy-question");
+  expect(questionItemId({ id: 42 })).toBeNull();
+});
 
 it("decodes displayed answers without treating accepted receipts or partial input as a reply", () => {
   const questions = [{ id: "scope", title: "选择范围", options: ["A"] }, { id: "note", title: "补充说明", options: [] }];

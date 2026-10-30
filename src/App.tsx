@@ -1,8 +1,10 @@
+import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
 import { Children, cloneElement, Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { lazy, Suspense } from "react";
 import { PreviewZoom } from "./PreviewZoom";
 import { SourceTextPreview } from "./SourceTextPreview";
+import { SideChatMessages } from "./SideChatMessages";
 import {defaultHtmlPreview,isHtmlPreviewFile} from "./htmlFilePreview";
 const HtmlSourcePreview = lazy(() => import("./HtmlSourcePreview"));
 import { VoiceInput } from "./VoiceInput";
@@ -47,6 +49,8 @@ import "./sideChatDock.css";
 import { downloadBrowserFile, shareBrowserFile } from "./browserFileActions";
 import { PreviewFileTransferActions, type BrowserFileAction } from "./PreviewFileTransferActions";
 import { readTurnProgress, turnProgressText, updateTurnProgress, type TurnProgress } from "./turnProgress";
+import { isApprovalRequest, type ApprovalDecision, type ApprovalRequest } from "../shared/approvals";
+import { ApprovalRequests } from "./ApprovalRequests";
 import { exhaustedAccountSuggestion, type ExhaustedAccountSuggestion } from "./accountExhaustion";
 import "katex/dist/katex.min.css";
 import {
@@ -102,7 +106,7 @@ import { SelectionAskAction, type SelectionAskActionHandle } from "./SelectionAs
 import { PetBuddy } from "./PetBuddy";
 import { AccountUpdateIndicator } from "./AccountUpdateIndicator";
 import { useConversationPlanMode } from "./useConversationPlanMode";
-import { TurnRecoveryNotice, historicalRecovery,isFreshRecoveryNotice, type TurnRecoveryView } from "./TurnRecoveryNotice";
+import { TurnRecoveryNotice, historicalRecovery, hasRecoveryNotice, type TurnRecoveryView } from "./TurnRecoveryNotice";
 import { FeishuOffice } from "./FeishuOffice";
 import { useFeishuAttention, needsFeishuAuthorization } from "./useFeishuAttention";
 import { FeatureUpdateNotice } from "./FeatureUpdateNotice";
@@ -113,7 +117,7 @@ import { useBoundSideChats } from "./useBoundSideChats";
 import type { TemporaryAsk } from "./sideChats";
 import type { SideChatChange } from "./types";
 import {setSidebarThreadHidden,sidebarVisibilityVersion,visibleSidebarThreads,reconcileSidebarVisibility} from "./sidebarVisibility";
-import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, questionAnswerValues, type ToolQuestion, type UserInputRequest } from "./questionTool";
+import { parseQuestionTool, parseQuestionToolItem, questionHasAnswer, questionIsGenerating, readUserInputRequest, userInputAnswerResult, synchronousQuestionHasResult, readLiveQuestionNotification, isQuestionToolName, questionItemId, questionAnswerValues, type ToolQuestion, type UserInputRequest } from "./questionTool";
 import { ToolQuestionCard, ToolQuestionMessage } from "./ToolQuestionCard";
 import rehypeKatex from "rehype-katex";
 import remarkBreaks from "remark-breaks";
@@ -181,6 +185,8 @@ import { accountQuotaStatus } from "./accountQuotaStatus";
 import { TerminalPanel } from "./TerminalPanel";
 import { BrowserPanel } from "./BrowserPanel";
 import { RightWorkspace, WorkspaceOverview, WorkspaceIcon, type WorkspaceTab, type WorkspaceSection } from "./RightWorkspace";
+import { HostResourcePanel, HostResourceProvider, HostResourceSummary } from "./HostResources";
+import { SessionCommunication } from "./SessionCommunication";
 import { normalizeGfmTableBoundaries, normalizeMathMarkdown, stripInterruptArtifacts } from "./markdown";
 import { createRevealPass, emptyRevealSnapshot, StreamRevealSpan } from "./streamReveal";
 import { rehypeLatinApostrophes } from "./proseTypography";
@@ -502,7 +508,7 @@ function PolishedSelect<T extends string>({
   );
 }
 
-type ModelPickerSection = "root" | "gpt" | "domestic" | "doubao" | "deepseek" | "kimi" | "mimo" | "glm" | "minimax";
+type ModelPickerSection = "root" | "gpt" | "claude" | "domestic" | "doubao" | "deepseek" | "kimi" | "mimo" | "glm" | "minimax";
 const domesticModelGroups: Array<{ key: ModelPickerSection; label: string }> = [
   { key: "doubao", label: "Doubao" },
   { key: "deepseek", label: "DeepSeek" },
@@ -514,6 +520,7 @@ const domesticModelGroups: Array<{ key: ModelPickerSection; label: string }> = [
 ];
 
 function modelPickerGroup(model: string): ModelPickerSection {
+  if (isReclaudeModel(model)) return "claude";
   if (model.startsWith("gpt-")) return "gpt";
   if (model.startsWith("doubao-") || model === "ark-code-latest") return "doubao";
   if (model.startsWith("deepseek-")) return "deepseek";
@@ -531,7 +538,7 @@ function MobileModelPage({ active, children }: { active: boolean; children: Reac
     aria-hidden={!active} inert={!active}>{children}</div>;
 }
 
-function ModelGroupedSelect({
+export function ModelGroupedSelect({
   value, profiles, onChange, disabled = false, title
 }: {
   value: string;
@@ -550,8 +557,8 @@ function ModelGroupedSelect({
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
   }, []);
-  const [branch, setBranch] = useState<"gpt" | "domestic" | null>(null);
-  const [lastBranch, setLastBranch] = useState<"gpt" | "domestic">("domestic");
+  const [branch, setBranch] = useState<"gpt" | "claude" | "domestic" | null>(null);
+  const [lastBranch, setLastBranch] = useState<"gpt" | "claude" | "domestic">("domestic");
   const [provider, setProvider] = useState<ModelPickerSection | null>(null);
   const [lastProvider, setLastProvider] = useState<ModelPickerSection>("doubao");
   const menuPresence = useExitPresence(open);
@@ -572,7 +579,7 @@ function ModelGroupedSelect({
   const selected = visibleProfiles.find((profile) => profile.id === value) ?? visibleProfiles[0];
   const modelNames = [...new Set(visibleProfiles.map((profile) => profile.model))];
   const groupCount = (group: ModelPickerSection) => modelNames.filter((model) => modelPickerGroup(model) === group).length;
-  const selectBranch = (next: "gpt" | "domestic") => {
+  const selectBranch = (next: "gpt" | "claude" | "domestic") => {
     setLastBranch(next);
     setBranch(next);
     setProvider(null);
@@ -581,11 +588,14 @@ function ModelGroupedSelect({
     setLastProvider(next);
     setProvider(next);
   };
+  const branchTitle = lastBranch === "gpt" ? "GPT" : lastBranch === "claude" ? "Claude" : "国产模型";
+  const claudeNotice = lastBranch === "claude" ? <p className="groupedModelConnectionNote" role="status">尚未连接 ReClaude。以下为模型系列预览，可用型号将在账号连接后验证。</p> : null;
   const profileOptions = (group: ModelPickerSection) => visibleProfiles.filter((profile) => modelPickerGroup(profile.model) === group).map((profile) => (
     <button className={`polishedSelectOption groupedModelProfile${profile.id === value ? " selected" : ""}`}
       type="button" role="option" aria-selected={profile.id === value} key={profile.id}
-      onClick={() => { onChange(profile.id); setOpen(false); }}>
-      <span><strong>{profile.label}</strong></span>
+      disabled={!modelIsAvailable(profile)} title={profile.unavailableReason}
+      onClick={() => { if (modelIsAvailable(profile)) { onChange(profile.id); setOpen(false); } }}>
+      <span><strong>{profile.label}</strong>{!modelIsAvailable(profile) ? <small className="groupedModelConnectionStatus">待连接</small> : null}</span>
       <span className="polishedSelectCheck" aria-hidden="true">{profile.id === value ? "✓" : ""}</span>
     </button>
   ));
@@ -608,15 +618,17 @@ function ModelGroupedSelect({
               <div className="groupedModelHeading">选择模型</div>
               <div className="groupedModelRows">
                 <button className="groupedModelRow" type="button" onClick={() => selectBranch("gpt")}><span>GPT</span><ChevronRight size={15} /></button>
+                <button className="groupedModelRow" type="button" onClick={() => selectBranch("claude")}><span>Claude</span><ChevronRight size={15} /></button>
                 <button className="groupedModelRow" type="button" onClick={() => selectBranch("domestic")}><span>国产模型</span><ChevronRight size={15} /></button>
               </div>
             </MobileModelPage>
             <MobileModelPage active={Boolean(branch) && !provider}>
               <button className="groupedModelBack" type="button" onClick={() => { setProvider(null); setBranch(null); }} aria-label="返回模型分类">
-                <ChevronLeft size={16} /><span>{lastBranch === "gpt" ? "GPT" : "国产模型"}</span>
+                <ChevronLeft size={16} /><span>{branchTitle}</span>
               </button>
-              <div className="groupedModelRows" role={lastBranch === "gpt" ? "listbox" : undefined}>
-                {lastBranch === "gpt" ? profileOptions("gpt") : domesticModelGroups.filter(group => groupCount(group.key) > 0).map(group => (
+              {claudeNotice}
+              <div className="groupedModelRows" role={lastBranch !== "domestic" ? "listbox" : undefined}>
+                {lastBranch !== "domestic" ? profileOptions(lastBranch) : domesticModelGroups.filter(group => groupCount(group.key) > 0).map(group => (
                   <button className="groupedModelRow" type="button" key={group.key} onClick={() => selectProvider(group.key)}>
                     <span>{group.label}</span><ChevronRight size={15} />
                   </button>
@@ -633,14 +645,16 @@ function ModelGroupedSelect({
           <div className="groupedModelHeading">选择模型</div>
           <div className="groupedModelRows">
             <button className={`groupedModelRow${branch === "gpt" ? " active" : ""}`} type="button" aria-expanded={branch === "gpt"} onClick={() => selectBranch("gpt")}><span>GPT</span><ChevronRight size={15} /></button>
+            <button className={`groupedModelRow${branch === "claude" ? " active" : ""}`} type="button" aria-expanded={branch === "claude"} onClick={() => selectBranch("claude")}><span>Claude</span><ChevronRight size={15} /></button>
             <button className={`groupedModelRow${branch === "domestic" ? " active" : ""}`} type="button" aria-expanded={branch === "domestic"} onClick={() => selectBranch("domestic")}><span>国产模型</span><ChevronRight size={15} /></button>
           </div>
           <div className="groupedModelCascade groupedModelSecond" data-branch={lastBranch} data-visible={Boolean(branch)} aria-hidden={!branch} inert={!branch}>
             <button className="groupedModelBack" type="button" onClick={() => { setProvider(null); setBranch(null); }} aria-label="收起子目录">
-              <ChevronLeft size={16} /><span>{lastBranch === "gpt" ? "GPT" : "国产模型"}</span>
+              <ChevronLeft size={16} /><span>{branchTitle}</span>
             </button>
-            <div className="groupedModelRows" role={lastBranch === "gpt" ? "listbox" : undefined}>
-              {lastBranch === "gpt" ? profileOptions("gpt") : domesticModelGroups.filter((group) => groupCount(group.key) > 0).map((group) => (
+            {claudeNotice}
+              <div className="groupedModelRows" role={lastBranch !== "domestic" ? "listbox" : undefined}>
+              {lastBranch !== "domestic" ? profileOptions(lastBranch) : domesticModelGroups.filter((group) => groupCount(group.key) > 0).map((group) => (
                 <button className={`groupedModelRow${provider === group.key ? " active" : ""}`} type="button" key={group.key}
                   aria-expanded={provider === group.key} onClick={() => selectProvider(group.key)}>
                   <span>{group.label}</span><ChevronRight size={15} />
@@ -688,6 +702,8 @@ interface PendingUserMessage {
   turnId?: string | null;
   viewToken: number;
   text: string;
+  // Upload captions differ from the actual message saved by the runtime.
+  submittedText?: string;
   keepAtBottomUntil: number;
   attachments?: ComposerUpload[];
   steerBoundary?: SteerTimelineBoundary;
@@ -1667,9 +1683,10 @@ function threadHasUserText(thread: ThreadSummary, text: string): boolean {
 }
 
 function threadHasPendingUserText(thread: ThreadSummary, entry: PendingUserMessage): boolean {
-  if (!entry.steerBoundary) return threadHasUserText(thread, entry.text);
+  const text = entry.submittedText ?? entry.text;
+  if (!entry.steerBoundary) return threadHasUserText(thread, text);
   const old = new Set(entry.steerBoundary.beforeItemIds);
-  return (thread.turns.find(turn => turn.id === entry.turnId)?.items ?? []).some(item => itemKind(item) === "user" && !old.has(item.id) && userTextsMatch(itemText(item), entry.text));
+  return (thread.turns.find(turn => turn.id === entry.turnId)?.items ?? []).some(item => itemKind(item) === "user" && !old.has(item.id) && userTextsMatch(itemText(item), text));
 }
 
 function threadItemKey(item: ThreadItem, fallbackIndex: number): string {
@@ -1838,7 +1855,8 @@ const fallbackModelProfiles: ModelProfile[] = [
   { id: "gpt-5.6-luna:xhigh", label: "GPT-5.6-Luna xhigh", model: "gpt-5.6-luna", effort: "xhigh" },
   { id: "gpt-5.6-luna:high", label: "GPT-5.6-Luna high", model: "gpt-5.6-luna", effort: "high" },
   { id: "gpt-5.6-luna:medium", label: "GPT-5.6-Luna medium", model: "gpt-5.6-luna", effort: "medium" },
-  { id: "gpt-5.6-luna:low", label: "GPT-5.6-Luna low", model: "gpt-5.6-luna", effort: "low" }
+  { id: "gpt-5.6-luna:low", label: "GPT-5.6-Luna low", model: "gpt-5.6-luna", effort: "low" },
+  ...claudePendingProfiles(),
 ];
 
 const defaultModelProfileId = "gpt-6.1-sol:xhigh";
@@ -3497,11 +3515,12 @@ function persistedUserAttachmentsFromText(text: string): PersistedUserAttachment
 
 function threadHasPendingAttachments(thread: ThreadSummary, entry: PendingUserMessage): boolean {
   if (!entry.attachments?.length) return true;
+  const text = entry.submittedText ?? entry.text;
   const turn = entry.turnId
     ? thread.turns?.find((candidate) => candidate.id === entry.turnId)
     : thread.turns?.find((candidate) => (
-      (candidate.items ?? []).some((item) => itemKind(item) === "user" && userTextsMatch(itemText(item), entry.text))
-      || (!turnHasUserItem(candidate) && userTextsMatch(turnUserText(candidate), entry.text))
+      (candidate.items ?? []).some((item) => itemKind(item) === "user" && userTextsMatch(itemText(item), text))
+      || (!turnHasUserItem(candidate) && userTextsMatch(turnUserText(candidate), text))
     ));
   if (!turn) return false;
   const userText = [
@@ -4432,7 +4451,6 @@ export function App() {
   const conversationVirtualRef = useRef<VirtualConversationHandle | null>(null);
   const toolRevealCleanupRef = useRef<(() => void) | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  const temporaryMessagesEndRef = useRef<HTMLDivElement | null>(null);
   const promptNavigationFrameRef = useRef<number | null>(null);
   const promptPreviewSwitchTimerRef = useRef<number | null>(null);
   const lastPromptPreviewRef = useRef<{ item: PromptNavigationItem; index: number; threadId: string | null; userId: string } | null>(null);
@@ -4695,7 +4713,7 @@ export function App() {
   const showRightWindow = useCallback((id: string) => {
     setRightWorkspaceTab(id);
     setRightWorkspaceOpen(true);
-    if (["remote", "goal", "schedules", "outputs", "sources", "feishu"].includes(id)) setRightUtilityTabs(current => current.includes(id) ? current : [...current, id]);
+    if (["remote", "goal", "schedules", "outputs", "sources", "feishu", "resources", "communication"].includes(id)) setRightUtilityTabs(current => current.includes(id) ? current : [...current, id]);
   }, []);
   const openFeishuWindow = useCallback(() => showRightWindow("feishu"), [showRightWindow]);
   const feishuPendingCount = useFeishuAttention(selectedUserId, selectedThread?.id, openFeishuWindow);
@@ -4836,8 +4854,11 @@ export function App() {
   const [pushTestStatus, setPushTestStatus] = useState("");
   const [pushSaving, setPushSaving] = useState(false);
   const [nativeFeaturesReady, setNativeFeaturesReady] = useState(false);
-  const [pendingApprovals, setPendingApprovals] = useState<Record<string, { id: string | number; method: string; params: Record<string, unknown> }>>({});
-  const approvalResponseRequestsRef = useRef(new Map<string, { id: string | number; method: string; params: Record<string, unknown> }>());
+  const [pendingApprovals, setPendingApprovals] = useState<Record<string, ApprovalRequest>>({});
+  const approvalResponseRequestsRef = useRef(new Map<string, ApprovalRequest>());
+  const [answeringApprovals, setAnsweringApprovals] = useState<Record<string, boolean>>({});
+  const [approvalChecks, setApprovalChecks] = useState<Record<string, { checking: boolean; message?: string }>>({});
+  const approvalSyncRequestsRef = useRef(new Map<string, { threadId: string; turnId?: string }>());
   const [localSendSettings, setLocalSendSettings] = useState<LocalSendSettings>(defaultLocalSendSettings);
   const localSendSettingsRef = useRef<LocalSendSettings>(defaultLocalSendSettings);
   const [detectedClientHost, setDetectedClientHost] = useState("");
@@ -4978,6 +4999,9 @@ export function App() {
   const temporaryThread = boundSideChats.session?.thread ?? null;
   const temporaryPrompt = boundSideChats.session?.draft ?? "";
   const temporaryModelProfileId = boundSideChats.session?.modelProfileId ?? defaultModelProfileId;
+  const temporaryShowsStop = Boolean(temporaryAsk && ["starting", "running"].includes(temporaryAsk.status));
+  const temporaryStopBusy = Boolean(temporaryAsk && (queuedInterruptPrompts[temporaryAsk.requestId]
+    || (temporaryAsk.turnId && interruptingTurns[temporaryAsk.turnId])));
   const setTemporaryPrompt = useCallback((text: string) => {
     if (selectedThread?.id) sideChatController.setDraft(selectedUserId, selectedThread.id, text);
   }, [sideChatController, selectedUserId, selectedThread?.id]);
@@ -5234,6 +5258,17 @@ export function App() {
     }
   }
 
+  function requestInterruptTemporaryConversation() {
+    const current = temporaryAskRef.current;
+    if (!current || !["starting", "running"].includes(current.status)
+      || queuedInterruptPromptRequestIdsRef.current.has(current.requestId)) return;
+    if (current.threadId && current.turnId) {
+      interruptCurrentTurn(current.threadId, current.turnId, current.projectId);
+    } else {
+      queueInterruptAfterTurnStarts(current.requestId);
+    }
+  }
+
   async function promoteTemporaryTurn(threadId: string, projectId: string, turnId: string | null): Promise<void> {
     const retryDelays = [0, 160, 320, 640, 1_000, 1_600, 2_400];
     for (const delay of retryDelays) {
@@ -5258,6 +5293,9 @@ export function App() {
           ))));
           setLiveTools((items) => Object.fromEntries(Object.entries(items).filter(([, item]) => (
             item.threadId !== threadId || (turnId !== null && item.turnId !== turnId)
+            || (isQuestionToolName(item.tool) && parseQuestionTool(item.tool, item.input)
+              && !questionIsAnswered(item.itemId, item.turnId ?? undefined, undefined, threadId)
+              && !persistedThread.turns.some(turn => turn.items.some(persisted => questionItemId(persisted) === item.itemId)))
           ))));
           return;
         }
@@ -7084,7 +7122,7 @@ export function App() {
       const nextProfiles = visibleProfiles.length ? visibleProfiles : fallbackModelProfiles;
       setModelProfiles(nextProfiles);
       setNewThreadModelProfileId((current) => (
-        nextProfiles.some((profile) => profile.id === current)
+        nextProfiles.some((profile) => profile.id === current && modelIsAvailable(profile))
           ? current
           : modelProfileIdFor(response.defaultModel, response.defaultReasoningEffort, nextProfiles)
       ));
@@ -7834,6 +7872,7 @@ export function App() {
     const profile = thread
       ? modelProfileById(nextProfileId, selectableModelProfiles)
       : modelProfileById(nextProfileId, modelProfiles);
+    if (!modelIsAvailable(profile)) { setError(profile.unavailableReason ?? CLAUDE_NOT_CONNECTED); return; }
     const isCatalogProfile = modelProfiles.some((item) => item.id === profile.id);
     if (!thread?.id) {
       setNewThreadModelProfileId(profile.id);
@@ -8431,20 +8470,50 @@ export function App() {
     window.location.assign("/logout");
   }
 
-  function answerApproval(id: string | number, decision: "accept" | "decline") {
+  function answerApproval(id: string | number, decision: ApprovalDecision) {
     try {
       const requestId = `approval-${requestToken()}`;
       const pending = pendingApprovals[String(id)];
-      if (pending) approvalResponseRequestsRef.current.set(requestId, pending);
-      codexSocket.send({ type: "approval.respond", requestId, codexRequestId: id, result: { decision } });
-      setPendingApprovals((current) => {
-        const next = { ...current };
-        delete next[String(id)];
-        return next;
-      });
+      if (!pending || answeringApprovals[String(id)]) return;
+      approvalResponseRequestsRef.current.set(requestId, pending);
+      codexSocket.send({ type: "approval.respond", requestId, codexRequestId: id, threadId: pending.params.threadId, result: { decision } });
+      setAnsweringApprovals(current => ({ ...current, [String(id)]: true }));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     }
+  }
+
+  function refreshApprovalRequests(threadId: string) {
+    const requestId = `approval-sync-${requestToken()}`;
+    try {
+      const turnId = activeTurnsByThreadRef.current[threadId];
+      approvalSyncRequestsRef.current.set(requestId, { threadId, turnId });
+      codexSocket.send({ type: "approval.sync", requestId, threadId, turnId });
+      setApprovalChecks(current => ({ ...current, [threadId]: { checking: true } }));
+    } catch (caught) {
+      approvalSyncRequestsRef.current.delete(requestId);
+      setApprovalChecks(current => ({ ...current, [threadId]: { checking: false, message: caught instanceof Error ? caught.message : String(caught) } }));
+    }
+  }
+
+  function renderApprovalRequests(threadId: string | null | undefined) {
+    if (!threadId) return null;
+    const progress = turnProgress[`${selectedUserId}:${threadId}`];
+    return <ApprovalRequests requests={Object.values(pendingApprovals).filter(request => request.params.threadId === threadId)}
+      waiting={progress?.state === "waiting_approval" && progress.turnId === activeTurnsByThread[threadId]}
+      checking={approvalChecks[threadId]?.checking ?? false} message={approvalChecks[threadId]?.message}
+      answering={answeringApprovals} onRefresh={() => refreshApprovalRequests(threadId)}
+      operation={request => {
+        if (typeof request.params.command === "string") return request.params.command;
+        const itemId = String(request.params.itemId ?? "");
+        const live = liveTools[itemId];
+        if (live?.threadId === threadId && live.input) return live.input;
+        const thread = selectedThread?.id === threadId ? selectedThread : temporaryThread?.id === threadId ? temporaryThread : null;
+        const item = thread?.turns.flatMap(turn => turn.items).find(item => item.id === itemId);
+        const detail = item?.command ?? item?.input ?? item?.changes;
+        return typeof detail === "string" ? detail : detail ? JSON.stringify(detail, null, 2) : "";
+      }}
+      onAnswer={(request, decision) => { answerApproval(request.id, decision); if (decision === "accept" || decision === "acceptForSession") window.dispatchEvent(new CustomEvent("codex:pet-action", { detail: "approved" })); }} />;
   }
 
   function updateLocalSendSetting<K extends keyof LocalSendSettings>(key: K, value: LocalSendSettings[K]) {
@@ -9042,6 +9111,10 @@ export function App() {
   }
 
   async function sendPrompt(mode: "queue" | "steer" = "queue", questionAnswer?: string, predictedPrompt?: string): Promise<boolean> {
+    if (!modelIsAvailable(selectedModelProfile) || isReclaudeModel(selectedModelProfile.model)) {
+      setError(selectedModelProfile.unavailableReason ?? CLAUDE_NOT_CONNECTED);
+      return false;
+    }
     const isQuestionAnswer = questionAnswer !== undefined;
     const isEditedPrompt = Boolean(editingPromptDraft);
     const promptText = (questionAnswer ?? predictedPrompt ?? prompt).trim();
@@ -9237,7 +9310,11 @@ export function App() {
           threadId: selectedThread?.id ?? null,
           viewToken: requestViewToken,
           text: visibleText,
-          ...(payload.type === "turn.steer" ? {turnId: payload.expectedTurnId, steerBoundary: captureSteerBoundary(`user-${requestId}`, visibleText, payload.expectedTurnId!)} : {}),
+          submittedText: sentPromptText,
+          ...(payload.type === "turn.steer" ? {
+            turnId: payload.expectedTurnId,
+            steerBoundary: { ...captureSteerBoundary(`user-${requestId}`, visibleText, payload.expectedTurnId!), submittedText: sentPromptText }
+          } : {}),
           keepAtBottomUntil,
           attachments: promptUploads
         }
@@ -9269,25 +9346,38 @@ export function App() {
     }
   }
 
-  function displayedQuestionAnswers(itemId: string, questions: ToolQuestion[], output?: unknown): string[] | null {
-    const threadId = selectedThread?.id;
-    return questionAnswerValues(questions, threadId ? questionAnswersByItem[`${threadId}:${itemId}`] ?? selectedThread?.questionAnswers?.[itemId] : null)
+  function questionThreadForId(threadId: string | undefined): ThreadSummary | null {
+    if (!threadId) return null;
+    return selectedThread?.id === threadId ? selectedThread : sideChatController.forThread(threadId)?.thread ?? null;
+  }
+
+  function questionIdentityInThread(itemId: string, threadId: string | undefined): string {
+    const item = questionThreadForId(threadId)?.turns.flatMap(turn => turn.items ?? [])
+      .find(item => item.id === itemId || questionItemId(item) === itemId);
+    return item ? questionItemId(item) ?? itemId : itemId;
+  }
+
+  function displayedQuestionAnswers(itemId: string, questions: ToolQuestion[], output?: unknown, threadId = selectedThread?.id): string[] | null {
+    itemId = questionIdentityInThread(itemId, threadId);
+    const thread = questionThreadForId(threadId);
+    return questionAnswerValues(questions, threadId ? questionAnswersByItem[`${threadId}:${itemId}`] ?? thread?.questionAnswers?.[itemId] : null)
       ?? questionAnswerValues(questions, output);
   }
 
-  function questionIsAnswered(itemId: string, turnId?: string, visibleItems?: ThreadItem[]): boolean {
-    const threadId = selectedThread?.id;
+  function questionIsAnswered(itemId: string, turnId?: string, visibleItems?: ThreadItem[], threadId = selectedThread?.id): boolean {
     if (!threadId) return false;
+    itemId = questionIdentityInThread(itemId, threadId);
+    const thread = questionThreadForId(threadId);
     if ([...pendingUserInputsRef.current.values()].some(request => request.params.threadId === threadId && request.params.itemId === itemId)) return false;
     if (answeredQuestionItems[`${threadId}:${itemId}`]) return true;
-    if (selectedThread.answeredQuestionItemIds?.includes(itemId)) return true;
+    if (thread?.answeredQuestionItemIds?.includes(itemId)) return true;
     const liveItem = liveTools[itemId];
     if (liveItem?.threadId === threadId && synchronousQuestionHasResult(liveItem)) return true;
     if (visibleItems && questionHasAnswer(visibleItems, itemId)) return true;
-    const turns = selectedThread.turns;
-    const turnIndex = turns.findIndex((turn) => turn.id === turnId || (turn.items ?? []).some((item) => item.id === itemId));
+    const turns = thread?.turns ?? [];
+    const turnIndex = turns.findIndex((turn) => turn.id === turnId || (turn.items ?? []).some((item) => questionItemId(item) === itemId));
     if (turnIndex < 0) return false;
-    if (synchronousQuestionHasResult((turns[turnIndex].items ?? []).find(item => item.id === itemId) ?? {})) return true;
+    if (synchronousQuestionHasResult(coalesceToolOutputs(turns[turnIndex].items ?? [], true).find(item => questionItemId(item) === itemId) ?? {})) return true;
     return questionHasAnswer(turns.flatMap(turn => turn.items ?? []), itemId);
   }
 
@@ -9360,11 +9450,11 @@ export function App() {
     setLiveTools(current => current[itemId] ? { ...current, [itemId]: { ...current[itemId], completed: true } } : current);
   }
 
-  async function chooseToolQuestion(itemId: string, answer: string, answers: string[]): Promise<boolean> {
-    const threadId = selectedThread?.id;
-    if (!threadId || !selectedProject || !answer.trim()) return false;
+  async function chooseToolQuestion(itemId: string, answer: string, answers: string[], threadId = selectedThread?.id, projectId = selectedProject?.id): Promise<boolean> {
+    if (!threadId || !projectId || !answer.trim()) return false;
+    itemId = questionIdentityInThread(itemId, threadId);
     const key = `${threadId}:${itemId}`;
-    if (submittingQuestionItemsRef.current.has(key) || questionIsAnswered(itemId)) return false;
+    if (submittingQuestionItemsRef.current.has(key) || questionIsAnswered(itemId, undefined, undefined, threadId)) return false;
     submittingQuestionItemsRef.current.add(key);
     try {
       const request = [...pendingUserInputsRef.current.values()].find(request => request.params.threadId === threadId && request.params.itemId === itemId);
@@ -9382,7 +9472,8 @@ export function App() {
         if (delivered) setQuestionAnswersByItem(current => ({ ...current, [key]: answers }));
         return delivered;
       }
-      const item = liveTools[itemId] ?? selectedThread?.turns.flatMap(turn => turn.items ?? []).find(item => item.id === itemId);
+      const item = (liveTools[itemId]?.threadId === threadId ? liveTools[itemId] : undefined)
+        ?? questionThreadForId(threadId)?.turns.flatMap(turn => turn.items ?? []).find(item => questionItemId(item) === itemId);
       if (item && typeof item.tool === "string" && /(?:^|\.)request_user_input$/.test(item.tool)) {
         setError("该提问的待回答请求尚未同步，请刷新会话后再回答。");
         return false;
@@ -9390,7 +9481,7 @@ export function App() {
       const requestId = `question-answer-${requestToken()}`;
       const acceptedPromise = waitForQuestionAnswerAck(requestId);
       try {
-        codexSocket.send({ type: "question.respond", requestId, projectId: selectedProject.id, threadId, itemId, answers });
+        codexSocket.send({ type: "question.respond", requestId, projectId, threadId, itemId, answers });
       } catch (caught) {
         finishQuestionAnswerAck(requestId, false);
         throw caught;
@@ -9461,6 +9552,7 @@ export function App() {
           threadId: null,
           viewToken: requestViewToken,
           text: continuation.visibleText,
+          submittedText: continuation.sentPromptText,
           keepAtBottomUntil
         }
       ]);
@@ -9481,7 +9573,8 @@ export function App() {
     const requestId = `interrupt-${requestToken()}`;
     interruptRequestContextsRef.current.set(requestId, { threadId, turnId, projectId });
     interruptRequestedTurnIdsRef.current.add(turnId);
-    setLastStoppedTurnForEdit({ threadId, turnId });
+    const side = sideChatController.forThread(threadId);
+    if (!side) setLastStoppedTurnForEdit({ threadId, turnId });
     setInterruptingTurns((current) => ({ ...current, [turnId]: true }));
     setActiveTurnsByThread((current) => {
       if (current[threadId] !== turnId) {
@@ -9515,12 +9608,15 @@ export function App() {
         ))
       }
     )));
-    setLiveDeltas((current) => Object.fromEntries(
-      Object.entries(current).filter(([, entry]) => entry.threadId !== threadId || entry.turnId !== turnId)
-    ));
-    setLiveTools((current) => Object.fromEntries(
-      Object.entries(current).filter(([, entry]) => entry.threadId !== threadId || entry.turnId !== turnId)
-    ));
+    // Keep a side chat's partial answer until its interrupted turn is persisted.
+    if (!side) {
+      setLiveDeltas((current) => Object.fromEntries(
+        Object.entries(current).filter(([, entry]) => entry.threadId !== threadId || entry.turnId !== turnId)
+      ));
+      setLiveTools((current) => Object.fromEntries(
+        Object.entries(current).filter(([, entry]) => entry.threadId !== threadId || entry.turnId !== turnId)
+      ));
+    }
     setError("");
     const timeoutId = window.setTimeout(() => {
       interruptRequestedTurnIdsRef.current.delete(turnId);
@@ -9779,6 +9875,10 @@ export function App() {
       }
       return;
     }
+    if (message.type === "communication.changed") {
+      window.dispatchEvent(new CustomEvent("codex:communication", { detail: message.data }));
+      return;
+    }
     if (message.type === "hello") {
       const data = message.data as { liveState?: LiveStateSnapshot; turnProgress?: unknown[]; turnRecoveries?: TurnRecoveryView[]; pendingServerRequests?: Array<{ id: string | number; method: string; params: Record<string, unknown> }> } | undefined;
       setTurnRecoveries(current => ({ ...Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${selectedUserId}:`))),
@@ -9794,8 +9894,12 @@ export function App() {
         return next;
       });
       setPendingApprovals(Object.fromEntries((data?.pendingServerRequests ?? [])
-        .filter((request) => request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")
+        .filter((request) => isApprovalRequest(request.method))
         .map((request) => [String(request.id), request])));
+      setAnsweringApprovals({});
+      setApprovalChecks({});
+      approvalResponseRequestsRef.current.clear();
+      approvalSyncRequestsRef.current.clear();
       pendingUserInputsRef.current.clear();
       for (const request of data?.pendingServerRequests ?? []) receiveUserInputRequest(request);
       if (selectedThreadRef.current?.id && selectedProjectIdRef.current) {
@@ -9833,7 +9937,7 @@ export function App() {
 
     if (message.type === "codex.serverRequest") {
       const request = message.data as { id?: string | number; method?: string; params?: Record<string, unknown> } | undefined;
-      if (request?.id !== undefined && (request.method === "item/commandExecution/requestApproval" || request.method === "item/fileChange/requestApproval")) {
+      if (request?.id !== undefined && isApprovalRequest(request.method)) {
         setPendingApprovals((current) => ({ ...current, [String(request.id!)]: {
           id: request.id!, method: request.method!, params: request.params ?? {}
         } }));
@@ -9922,11 +10026,28 @@ export function App() {
       if (message.requestId?.startsWith("term-")) return;
       // The thread-scoped Goal controller owns its confirmation and errors.
       if (message.requestId?.startsWith("goal-")) return;
+      if (message.requestId?.startsWith("approval-sync-")) {
+        const check = approvalSyncRequestsRef.current.get(message.requestId);
+        approvalSyncRequestsRef.current.delete(message.requestId);
+        if (!check) return;
+        const data = message.data as { threadId?: string; turnId?: string; pendingServerRequests?: ApprovalRequest[]; message?: string } | undefined;
+        setApprovalChecks(current => ({ ...current, [check.threadId]: { checking: false, message: message.ok ? data?.message : `核对失败：${message.error ?? "请重试"}` } }));
+        if (!message.ok || data?.threadId !== check.threadId || (check.turnId && activeTurnsByThreadRef.current[check.threadId] !== check.turnId)) return;
+        setPendingApprovals(current => ({
+          ...Object.fromEntries(Object.entries(current).filter(([, pending]) => pending.params.threadId !== check.threadId)),
+          ...Object.fromEntries((data.pendingServerRequests ?? []).filter(request => isApprovalRequest(request.method) && request.params.threadId === check.threadId).map(request => [String(request.id), request]))
+        }));
+        for (const request of data.pendingServerRequests ?? []) receiveUserInputRequest(request);
+        return;
+      }
       if (message.requestId?.startsWith("approval-")) {
         const pending = approvalResponseRequestsRef.current.get(message.requestId);
         approvalResponseRequestsRef.current.delete(message.requestId);
+        if (pending) {
+          setAnsweringApprovals(current => { const next = { ...current }; delete next[String(pending.id)]; return next; });
+          if (message.ok) setPendingApprovals(current => { const next = { ...current }; delete next[String(pending.id)]; return next; });
+        }
         if (!message.ok) {
-          if (pending) setPendingApprovals((current) => ({ ...current, [String(pending.id)]: pending }));
           setError(`批准操作失败：${message.error ?? "请重试"}`);
         }
         return;
@@ -9987,11 +10108,14 @@ export function App() {
         return;
       }
       if (message.requestId?.startsWith("temp-")) {
+        const interruptQueued = queuedInterruptPromptRequestIdsRef.current.has(message.requestId);
         const temporary = sideChatController.forRequest(message.requestId)?.ask;
         if (!temporary || temporary.requestId !== message.requestId) {
+          if (interruptQueued) clearQueuedInterrupt(message.requestId);
           return;
         }
         if (!message.ok) {
+          if (interruptQueued) clearQueuedInterrupt(message.requestId);
           const failed = { ...temporary, status: "error" as const };
           sideChatController.updateAsk(failed);
           if (temporary.parentThreadId === selectedThreadRef.current?.id && temporary.userId === selectedUserId) setError(`侧边提问失败：${message.error ?? "Codex 未接受请求。"}`);
@@ -10019,10 +10143,17 @@ export function App() {
           activeTurnsByThreadRef.current = { ...activeTurnsByThreadRef.current, [threadId]: turnId };
           setActiveTurnsByThread((current) => ({ ...current, [threadId]: turnId }));
         }
+        if (interruptQueued) {
+          clearQueuedInterrupt(message.requestId);
+          if (turnId && threadId && next.status === "running") {
+            interruptCurrentTurn(threadId, turnId, temporary.projectId);
+          }
+        }
         return;
       }
     const interruptContext = message.requestId ? interruptRequestContextsRef.current.get(message.requestId) : undefined;
       if (interruptContext) {
+        const side = sideChatController.forThread(interruptContext.threadId);
         if (message.requestId) {
           interruptRequestContextsRef.current.delete(message.requestId);
         }
@@ -10042,7 +10173,9 @@ export function App() {
           // The turn may have finished just before the interrupt reached Codex.
           // Keep the user's stop intent so the latest prompt does not briefly
           // show an edit action and then lose it on the next thread refresh.
-          setError(`终止请求未生效：${message.error ?? "回答可能已结束。"} 可编辑这条提问；发送修改时会再次核对会话状态。`);
+          setError(side
+            ? `侧边会话停止失败：${message.error ?? "回答可能已结束。"} 可以重试停止。`
+            : `终止请求未生效：${message.error ?? "回答可能已结束。"} 可编辑这条提问；发送修改时会再次核对会话状态。`);
           return;
         }
         setActiveTurnsByThread((current) => {
@@ -10053,9 +10186,13 @@ export function App() {
           delete next[interruptContext.threadId];
           return next;
         });
-        setLiveDeltas((current) => Object.fromEntries(
-          Object.entries(current).filter(([, entry]) => entry.turnId !== interruptContext.turnId)
-        ));
+        if (side) {
+          void sideChatController.load(side.record.userId, side.record.projectId, side.record.parentThreadId);
+        } else {
+          setLiveDeltas((current) => Object.fromEntries(
+            Object.entries(current).filter(([, entry]) => entry.turnId !== interruptContext.turnId)
+          ));
+        }
         if (selectedThreadRef.current?.id === interruptContext.threadId) {
           const viewToken = threadViewTokenRef.current;
           window.setTimeout(() => void openThread(interruptContext.threadId, interruptContext.projectId, viewToken), 350);
@@ -10468,7 +10605,7 @@ export function App() {
         if (!wasInterrupted && completedStatus === "completed" && threadProjectId && !isTemporaryThread) {
           scheduleAutoSendGeneratedFiles(threadId, threadProjectId, turnId);
         }
-        if (isTemporaryThread && !wasInterrupted) {
+        if (isTemporaryThread) {
           const temporary = sideChatController.forThread(threadId)?.ask;
           if (temporary) {
             const completed = { ...temporary, status: "complete" as const };
@@ -10694,7 +10831,7 @@ export function App() {
     const inputText = safeText(call.input) || safeText(call.command);
     const agentOperation = parseAgentOperation(call);
     const questions = parseQuestionToolItem(call);
-    if (questions && !historyContext?.readOnly && questionIsAnswered(call.id, contextTurnId)) return null;
+    if (questions && !historyContext?.readOnly && questionIsAnswered(call.id, contextTurnId, undefined, contextThreadId)) return null;
     const toolSummary = agentOperation?.agents.map(agent => agent.name.replace(/^\/root\//, "")).join(" · ") || questions?.map((question) => question.title).join(" · ") || skillReadSummary(call) || (agentOperation ? "" : [
       ...(Array.isArray(call.summary) ? call.summary.map(safeText) : []),
       safeText(call.command),
@@ -10737,7 +10874,7 @@ export function App() {
       >
         <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
         <ToolReveal open={expanded}>
-        {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer, answers) => chooseToolQuestion(call.id, answer, answers)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
+        {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer, answers) => chooseToolQuestion(call.id, answer, answers, contextThreadId, contextProjectId)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
         <MessageImagePreviews item={call} projectId={contextProjectId} onOpenFileLink={openFilePreview} />
         {hasChanges ? <button className="openDiffReviewButton" type="button" onClick={(event) => { event.stopPropagation(); openDiffReview(call.changes ?? [], "本轮文件变更", contextTurnId, call.id, contextThreadId); }}><FileText size={14} /> 查看变更 · {call.changes?.length ?? 0} 个文件</button> : null}
         {!agentOperation && (!questions || historyContext?.readOnly) && (outputText || deferredOutputItem) ? <DeferredToolOutput text={displayOutputText(outputText)} deferred={Boolean(deferredOutputItem)} threadId={contextThreadId} itemId={String(deferredOutputItem?.outputItemId ?? deferredOutputItem?.id ?? call.id)} projectId={contextProjectId} loadOutput={historyContext?.loadOutput} /> : null}
@@ -10938,6 +11075,33 @@ export function App() {
   const temporaryPersistedItemIds = new Set((temporaryThread?.turns ?? [])
     .flatMap((turn) => turn.items ?? [])
     .map((item) => item.id));
+  // Keep question cards in one stable list while live items become history.
+  // Moving a card between transcript parents would discard another answer draft.
+  const temporaryQuestions = new Map<string, { item: ThreadItem; turnId?: string }>();
+  for (const turn of temporaryThread?.turns ?? []) {
+    for (const item of coalesceToolOutputs(turn.items ?? [], true)) {
+      if (parseQuestionToolItem(item) || isQuestionToolName(item.tool)) {
+        const id = questionItemId(item) ?? item.id;
+        temporaryQuestions.set(id, { item: { ...item, id }, turnId: turn.id });
+      }
+    }
+  }
+  for (const live of Object.values(liveTools)) {
+    if (!temporaryAsk?.threadId || live.threadId !== temporaryAsk.threadId || !isQuestionToolName(live.tool)) continue;
+    const previous = temporaryQuestions.get(live.itemId);
+    temporaryQuestions.set(live.itemId, { turnId: live.turnId ?? previous?.turnId, item: {
+      ...previous?.item, id: live.itemId, type: "toolCall", tool: live.tool,
+      input: live.input?.trim() ? live.input : previous?.item.input ?? previous?.item.arguments,
+      output: live.output || previous?.item.output, completed: live.completed
+    } });
+  }
+  for (const request of pendingUserInputsRef.current.values()) {
+    if (!temporaryAsk?.threadId || request.params.threadId !== temporaryAsk.threadId) continue;
+    const { itemId, turnId, questions } = request.params;
+    temporaryQuestions.set(itemId, { turnId, item: { id: itemId, type: "toolCall",
+      tool: request.params.isBlocking === false ? "request_user_input_async" : "request_user_input",
+      input: JSON.stringify({ questions }), completed: false } });
+  }
   const temporaryLiveTimeline = temporaryAsk?.threadId ? [
     ...Object.values(liveReasoning).filter(item => item.threadId === temporaryAsk.threadId).map(item => ({ id: item.itemId, kind: "reasoning" as const, ...item })),
     ...Object.entries(liveDeltas)
@@ -10947,6 +11111,7 @@ export function App() {
       .filter((item) => item.threadId === temporaryAsk.threadId)
       .map((item) => ({ id: item.itemId, kind: "tool" as const, sequence: liveTimelineSequence("tool", item.itemId), ...item }))
   ]
+    .filter((entry) => entry.kind !== "tool" || !isQuestionToolName(entry.tool))
     .filter((entry) => !temporaryCompletedTurnIds.has(entry.turnId ?? ""))
     .filter((entry) => !temporaryPersistedItemIds.has(entry.kind === "agent" ? entry.sourceItemId ?? entry.id : entry.id))
     .sort((left, right) => left.sequence - right.sequence || left.startedAt.localeCompare(right.startedAt)) : [];
@@ -10994,6 +11159,7 @@ export function App() {
     };
     for (const item of turn.items ?? []) {
       if (isInternalRuntimeUserMessage(item)) continue;
+      if (parseQuestionToolItem(item) || isQuestionToolName(item.tool)) { flushTools(); continue; }
       const kind = itemKind(item);
       if (kind === "user") continue;
       if (kind === "tool" || kind === "reasoning") {
@@ -11133,7 +11299,7 @@ export function App() {
       const candidates = (syntheticUserItem ? [syntheticUserItem, ...(turn.items ?? [])] : turn.items ?? [])
         .filter((item) => itemKind(item) === "user" && itemText(item).trim());
       for (const heldEntry of heldEntries) {
-        const candidateIndex = candidates.findIndex((item) => userTextsMatch(itemText(item), heldEntry.text));
+        const candidateIndex = candidates.findIndex((item) => userTextsMatch(itemText(item), heldEntry.submittedText ?? heldEntry.text));
         const candidate = candidateIndex >= 0 ? candidates[candidateIndex] : candidates.length === 1 ? candidates[0] : null;
         if (!candidate) {
           continue;
@@ -11341,14 +11507,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
   );
 
   useEffect(() => {
-    if (!temporaryAsk) return;
-    const frame = window.requestAnimationFrame(() => {
-      temporaryMessagesEndRef.current?.scrollIntoView({ block: "end", inline: "nearest" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [temporaryAsk, temporaryThread, temporaryLiveTimeline.length, liveDeltas, liveTools]);
-
-  useEffect(() => {
     if (promptNavigationItems.length === 0) {
       setActivePromptNavigationKey(null);
       setHoveredPromptNavigationKey(null);
@@ -11488,6 +11646,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       { id: "schedule-new", title: "新建定时任务", icon: "plus", disabled: !selectedThread, onOpen: () => { setScheduleEditor(current => ({ id: null, key: current.key + 1 })); showRightWindow("schedules"); } }
     ], more: threadSchedules.schedules.length > 4 ? { label: "查看全部定时任务", onOpen: () => showRightWindow("schedules") } : undefined },
     { title: "工作窗口", entries: [
+      { id: "resources", title: "主机资源", icon: "resources", onOpen: () => showRightWindow("resources") },
+      { id: "communication", title: "会话通信", icon: "communication", onOpen: () => showRightWindow("communication"), disabled: !selectedThread },
       ...(temporaryAsk ? [{ id: "side-chat", title: "侧边聊天", icon: "chat" as const, onOpen: () => showRightWindow("side-chat") }] : []),
       { id: "remote", title: "远程文件", icon: "remote", onOpen: () => showRightWindow("remote") },
       { id: "browser", title: "浏览器", icon: "browser", onOpen: () => launchWorkspaceAction("browser"), disabled: !selectedProject },
@@ -11527,8 +11687,15 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390);
   }, content: <TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={false} onClose={() => { setTerminalVisible(false); terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390); }} /> });
   for (const id of rightUtilityTabs) {
-    const title = ({ remote: "远程文件", goal: "持续目标", schedules: "定时任务", outputs: "输出内容", sources: "来源", feishu: "飞书办公" })[id] ?? id;
-    rightTabs.push({ id, title, icon: id as "remote" | "goal" | "schedules" | "outputs" | "sources" | "feishu", attention: id === "feishu" && feishuPendingCount > 0, onClose: () => closeUtilityWindow(id), content:
+    const title = ({ remote: "远程文件", goal: "持续目标", schedules: "定时任务", outputs: "输出内容", sources: "来源", feishu: "飞书办公", resources: "主机资源", communication: "会话通信" })[id] ?? id;
+    rightTabs.push({ id, title, icon: id as "remote" | "goal" | "schedules" | "outputs" | "sources" | "feishu" | "resources" | "communication", attention: id === "feishu" && feishuPendingCount > 0, onClose: () => closeUtilityWindow(id), content:
+      id === "resources" ? <HostResourcePanel /> :
+      id === "communication" ? <SessionCommunication key={`${selectedUserId}:${selectedThread?.id}`}
+        userId={selectedUserId} projectId={selectedProject?.id} threadId={selectedThread?.id}
+        threadName={selectedThread?.name ?? selectedThread?.preview}
+        sideChat={temporaryAsk && temporaryAsk.parentThreadId === selectedThread?.id
+          ? { threadId: temporaryAsk.threadId ?? undefined, name: `${selectedThread?.name || "当前主会话"}的侧边会话` } : undefined}
+        visible={rightWorkspaceOpen && rightWorkspaceTab === "communication"} /> :
       id === "feishu" ? <FeishuOffice userId={selectedUserId} threadId={selectedThread?.id} inline visible={rightWorkspaceOpen && rightWorkspaceTab === "feishu"} onClose={() => setRightWorkspaceOpen(false)} /> :
       id === "remote" ? <RemoteFolderSidebar key={`remote-folders-${selectedUserId}-${selectedThread?.id ?? openingThreadId ?? remoteDraftId}`} userId={selectedUserId} threadId={selectedThread?.id ?? openingThreadId ?? remoteDraftId} isDraft={!selectedThread && !openingThreadId} visible={rightWorkspaceOpen && rightWorkspaceTab === "remote"} onClose={() => setRightWorkspaceOpen(false)}
         onBusyChange={busy => { const scope = selectedThread?.id ?? openingThreadId ?? remoteDraftId; if (busy) remoteConnectionsInProgress.current.add(scope); else remoteConnectionsInProgress.current.delete(scope); }}
@@ -11544,6 +11711,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
   return (
     <RunnablePreviewContext.Provider value={preview => { setRunnablePreview(preview); setPreviewDocked(true); showRightWindow("preview"); }}>
+    <HostResourceProvider userId={selectedUserId}>
     <FeatureUpdateNotice key={`notice:${selectedUserId}`} userId={selectedUserId} />
     <main
       className="appShell"
@@ -12450,7 +12618,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </div>
         ) : null}
 
-        {providerFailurePresence.present && providerFailure && !isFreshRecoveryNotice(selectedThread?turnRecoveries[`${selectedUserId}:${selectedThread.id}`]:undefined) ? (
+        {providerFailurePresence.present && providerFailure && !hasRecoveryNotice(selectedThread ? turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1)) : undefined) ? (
           <div className={`errorBanner providerErrorBanner${providerFailurePresence.closing ? " uiClosing" : ""}`}
             role="alert" aria-label="模型请求失败" aria-hidden={providerFailurePresence.closing} inert={providerFailurePresence.closing}>
             <div className="errorBannerMessage">
@@ -12789,6 +12957,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 }
               }}
             >
+              <HostResourceSummary onOpen={() => showRightWindow("resources")} />
               <div className={`v2AccountMenu${accountMenuPresence.closing ? " uiClosing" : ""}`} hidden={!accountMenuPresence.present} aria-hidden={!accountMenuOpen} inert={!accountMenuOpen}>
                 <button type="button" onClick={() => { setAccountMenuOpen(false); setPushError(""); setPushTestStatus(""); setNotificationSettingsOpen(true); }}>
                   <span className="v2MenuIcon"><NotificationBell size={14} /></span><span>任务通知</span>
@@ -12872,7 +13041,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     : `仅影响${selectedThread ? "当前会话后续轮次" : "这次新会话"}：${selectedModelProfile.model} / ${selectedModelProfile.effort}`}
                 >
                   {selectableModelProfiles.filter((profile) => !isUltraModelProfile(profile)).map((profile) => (
-                    <option key={profile.id} value={profile.id}>
+                    <option key={profile.id} value={profile.id} disabled={!modelIsAvailable(profile)}>
                       {profile.label}
                     </option>
                   ))}
@@ -13093,7 +13262,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         <div className="temporaryAskHeaderText">
                           <span className="temporaryAskHeaderTitle">侧边聊天</span>
                           <span className={`temporaryAskHeaderState ${temporaryAsk.status}`}>
-                            {temporaryAsk.status === "closing" ? "正在关闭" : temporaryAsk.status === "running"
+                            {temporaryAsk.status === "closing" ? "正在关闭" : temporaryStopBusy ? "正在停止" : temporaryAsk.status === "running"
                               ? "实时处理中"
                               : temporaryAsk.status === "starting"
                                 ? "启动中"
@@ -13106,9 +13275,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       </div>
                       <button className="iconButton temporaryAskHeaderButton" type="button" onClick={closeTemporaryAsk} disabled={temporaryAsk.status === "closing"} title="关闭并删除临时对话" aria-label="关闭并删除临时对话"><X size={16} /></button>
                     </header>
-                    <div className="temporaryAskMessages messages">
+                    <SideChatMessages conversationId={temporaryAsk.id} requestId={temporaryAsk.requestId}>
                       <article className="messageItem kind-user type-userMessage temporaryAskQuote">
-                        <div className="messageMeta">已选文本片段</div>
+                        <div className="messageMeta">引用的文本片段</div>
                         <CollapsibleUserMessage text={temporaryAsk.selectedText} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} />
                       </article>
                       {(temporaryThread?.turns ?? []).map(renderTemporaryPersistedTurn)}
@@ -13131,12 +13300,28 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                             {entry.output ? <pre className="outputBlock">{displayOutputText(entry.output)}</pre> : entry.completed ? null : <div className="messageBody">正在执行...</div>}
                           </article>
                         ))}
-                      {temporaryAsk.status === "starting" ? <div className="v2ThinkingLine">正在建立临时会话</div> : null}
-                      {temporaryAsk.status === "running" ? <div className="v2ThinkingLine">正在思考</div> : null}
+                      {temporaryQuestions.size ? <div className="temporaryAskQuestions" role="region" aria-label="侧边会话提问">
+                        {[...temporaryQuestions.values()].map(({ item, turnId }) => {
+                          const questions = parseQuestionToolItem(item);
+                          const threadId = temporaryAsk.threadId ?? undefined;
+                          if (questions) return <div key={`${threadId}:${item.id}`} data-question-item-id={item.id}>
+                            <ToolQuestionMessage
+                            open={!questionIsAnswered(item.id, turnId, undefined, threadId)} questions={questions}
+                            answers={displayedQuestionAnswers(item.id, questions, item.aggregatedOutput ?? item.output, threadId)}
+                            onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers, threadId, temporaryAsk.projectId)} />
+                          </div>;
+                          return !questionIsAnswered(item.id, turnId, undefined, threadId) && questionIsGenerating(item)
+                            ? <div className="v2ThinkingLine" role="status" key={`${threadId}:${item.id}`}>正在生成问题…</div> : null;
+                        })}
+                      </div> : null}
+                      {temporaryStopBusy ? <div className="v2ThinkingLine">正在停止侧边对话</div>
+                        : temporaryAsk.status === "starting" ? <div className="v2ThinkingLine">正在建立临时会话</div>
+                        : temporaryAsk.status === "running" ? <div className="v2ThinkingLine">正在思考</div> : null}
                       {temporaryAsk.error ? <div className="v2ThinkingLine" role="alert">{temporaryAsk.error}</div> : temporaryAsk.status === "error" ? <div className="v2ThinkingLine">本轮发送失败，可以修改后重试</div> : null}
-                      <div ref={temporaryMessagesEndRef} className="messagesEnd" aria-hidden="true" />
-                    </div>
+                      <div className="messagesEnd" aria-hidden="true" />
+                    </SideChatMessages>
                     <div className="composer temporaryAskComposer">
+                      {renderApprovalRequests(temporaryAsk.threadId)}
                       <div className="composerBody">
                         <MarkdownComposerEditor
                           value={temporaryPrompt}
@@ -13145,7 +13330,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           placeholder="随心输入"
                           disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
                         />
-                        <div className="temporarySelectionRow"><span className="temporarySelectionCount"><MessageSquare size={13} />1 个已选文本片段</span></div>
                         <div className="composerTools temporaryAskComposerTools">
                           <PolishedSelect<SandboxMode>
                             className="temporaryPolicySelect"
@@ -13159,7 +13343,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                             disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
                             profiles={modelProfiles}
                           />
-                          <button className="iconButton sendButton primary" type="button" onClick={sendTemporaryPrompt} disabled={!temporaryPrompt.trim() || ["starting", "running", "closing"].includes(temporaryAsk.status)} title="发送临时提问"><Send size={16} /></button>
+                          <button className={`iconButton sendButton ${temporaryShowsStop ? "stopMode" : "primary"}`} type="button"
+                            onClick={temporaryShowsStop ? requestInterruptTemporaryConversation : sendTemporaryPrompt}
+                            disabled={temporaryShowsStop ? temporaryStopBusy : !temporaryPrompt.trim() || temporaryAsk.status === "closing"}
+                            aria-label={temporaryShowsStop ? "终止侧边对话" : "发送临时提问"}
+                            title={temporaryShowsStop ? (temporaryStopBusy ? "正在停止侧边对话" : "终止侧边对话") : "发送临时提问"}>
+                            {temporaryShowsStop ? <Square size={16} fill="currentColor" /> : <Send size={16} />}
+                          </button>
                         </div>
                       </div>
                     </div>
@@ -13197,7 +13387,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   // Merge identities and chronology before introducing message boundaries.
                   const pendingSteers = visiblePendingUserMessages.filter(entry => entry.turnId === turn.id && entry.steerBoundary);
                   const mergedItems = mergeTimelineItems(coalesceToolOutputs(historyItems, true), liveItems);
-                  const items = collapseCodeModeWrappers(coalesceToolOutputs(mergeSteerTimelineItems(mergedItems, pendingSteers.map(entry => entry.steerBoundary!), (item, boundary) => userTextsMatch(itemText(item), boundary.text))));
+                  const items = collapseCodeModeWrappers(coalesceToolOutputs(mergeSteerTimelineItems(mergedItems, pendingSteers.map(entry => entry.steerBoundary!), (item, boundary) => userTextsMatch(itemText(item), boundary.submittedText ?? boundary.text))));
                   const hasAgentAnswerFromIndex = new Array<boolean>(items.length + 1).fill(false);
                   for (let index = items.length - 1; index >= 0; index -= 1) {
                     const item = items[index];
@@ -13494,16 +13684,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   </div> : null}
                 </div>
               ) : null}
-              {Object.values(pendingApprovals).filter((request) => request.params.threadId === selectedThread?.id).map((request) => (
-                <div className="codexApprovalCard" role="alert" key={String(request.id)}>
-                  <strong>Codex 等待批准{request.method.includes("fileChange") ? "文件修改" : "命令执行"}</strong>
-                  <code>{String(request.params.command ?? request.params.reason ?? "请确认此操作")}</code>
-                  <div>
-                    <button type="button" onClick={() => answerApproval(request.id, "decline")}>拒绝</button>
-                    <button type="button" onClick={() => { answerApproval(request.id, "accept"); window.dispatchEvent(new CustomEvent("codex:pet-action", { detail: "approved" })); }}>仅批准这次</button>
-                  </div>
-                </div>
-              ))}
+              {renderApprovalRequests(selectedThread?.id)}
               {skillsPickerPresence.present ? createPortal(
                 <div className={`skillPickerScrim uiExitLayer${skillsPickerPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={skillsPickerPresence.closing} inert={skillsPickerPresence.closing} onMouseDown={(event) => {
                   if (event.target === event.currentTarget) setSkillsPickerOpen(false);
@@ -13563,9 +13744,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               <EditingPromptNotice draft={editingPromptDraft} busy={editingLastPrompt} confirmed={editingHistoryConfirmed} onConfirm={setEditingHistoryConfirmed} onCancel={cancelEditingPrompt}/>
               <div className="composerBody">
                 <div className="composerThreadActivity">
-                  <TurnRecoveryNotice key={`recovery:${selectedUserId}:${selectedThread?.id}`} state={selectedThread ? turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1)) : undefined} userId={selectedUserId} turnId={selectedThread?.turns.at(-1)?.id} onSelectModel={()=>document.querySelector<HTMLButtonElement>('.composerTools .groupedModelPicker .polishedSelectTrigger')?.click()} onAction={action => {
+                  <TurnRecoveryNotice key={`recovery:${selectedUserId}:${selectedThread?.id}`} state={selectedThread ? turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1)) : undefined} userId={selectedUserId} turnId={selectedThread?.turns.at(-1)?.id} onSelectModel={()=>document.querySelector<HTMLButtonElement>('.composerTools .groupedModelPicker .polishedSelectTrigger')?.click()} onCopy={copyTextToClipboard} onAction={(action, toolsReviewed) => {
                     if (!selectedThread) return;
-                    codexSocket.send({ type: action === "dismiss" ? "turn.error.dismiss" : action === "now" ? "turn.retry.now" : "turn.retry.cancel", threadId: selectedThread.id, requestId: `recovery-${requestToken()}` });
+                    const recovery = turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1));
+                    const types = { dismiss: "turn.error.dismiss", now: "turn.retry.now", cancel: "turn.retry.cancel", check: "turn.recovery.check", continue: "turn.recovery.continue" };
+                    codexSocket.send({ type: types[action], threadId: selectedThread.id, turnId: recovery?.interruption?.turnId ?? selectedThread.turns.at(-1)?.id,
+                      errorAt: recovery?.error?.at, historicalError: turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ? undefined : recovery?.error,
+                      toolsReviewed, requestId: `recovery-${requestToken()}` });
                   }} />
                   <ToolReveal key={`progress:${selectedUserId}:${selectedThread?.id ?? "new"}`} open={Boolean(selectedThread?.id && turnProgress[`${selectedUserId}:${selectedThread.id}`]?.turnId === selectedActiveTurnId)}><div className="composerRunNotice" role="status">{turnProgressText(selectedThread?.id ? turnProgress[`${selectedUserId}:${selectedThread.id}`] : undefined)}</div></ToolReveal>
                   <GoalProgress key={`goal:${selectedUserId}:${selectedThread?.id ?? "new"}`} controller={threadGoal} running={conversationRunState === "running"} />
@@ -13921,6 +14106,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       <SelectionAskAction ref={selectionAskActionRef} scope={`${selectedUserId}:${selectedThread?.id ?? ""}`} onAsk={openTemporaryAsk} />
       <PetBuddy key={selectedUserId} status={Object.values(pendingApprovals).some((request) => request.params.threadId === selectedThread?.id) ? "needsInput" : selectedActiveTurnId ? "running" : selectedThread?.turns?.at(-1)?.status && /fail|error/i.test(statusText(selectedThread.turns.at(-1)?.status)) ? "failed" : selectedThread?.turns?.at(-1)?.status && /complete|success|review/i.test(statusText(selectedThread.turns.at(-1)?.status)) ? "complete" : "idle"} />
     </main>
+    </HostResourceProvider>
     </RunnablePreviewContext.Provider>
   );
 }

@@ -67,6 +67,20 @@ Run the backend with `npm run serve`; it defaults to port `4576`. The static UI 
 
 Set `CODEX_WEB_ACCOUNT_POOL_FILE` to a private copy of `account-pool.example.json` with your own account homes. Set authentication and project/data roots through the `CODEX_WEB_*` environment variables. In particular, supply a strong `CODEX_WEB_DEFAULT_PASSWORD` or an authentication user file before exposing the service. The published defaults intentionally do not grant any named user a dedicated account; configure `CODEX_WEB_TRACKED_QUOTA_USER` and `CODEX_WEB_TRACKED_QUOTA_ALLOWED_ACCOUNT_ID` only if that policy is needed.
 
+Codex accounts with a service-owned `CODEX_HOME` use Codex's native online model
+discovery and native cache, inheriting the service's proxy environment. Startup
+backs up the private configuration before removing its old `model_catalog_json`
+pin, and uses the explicit project cwd as the configuration root. Existing model
+files, UI/extra model lists, third-party providers, credentials and databases are
+retained. Build, serve and deployment commands stay the same. Set
+`CODEX_WEB_CODEX_MODEL_DISCOVERY=legacy` to retain the previous catalog behavior.
+If the private configuration was already migrated, its original content is in
+`config.toml.before-native-model-discovery.*.bak` for an explicit configuration rollback.
+Default-mode questions are enabled for these native runtimes; set
+`CODEX_WEB_DEFAULT_MODE_REQUEST_USER_INPUT=false` to retain Plan-only questions.
+The isolated native regression can be run with
+`CODEX_NATIVE_TEST_BIN=/path/to/codex node --import tsx/esm tests/nativeModelDiscovery.native.mjs`.
+
 Never commit a real pool file, Codex home, token, browser/session cookie, SSH key, SQLite database, or exported user archive. Before publishing a fork, review `git status` and scan staged files for secrets.
 
 Document compilation/conversion requires local tools configured through `DOCUMENT_*` environment variables. The optional Linux installer is `scripts/setup-document-tools.sh`; `DOCUMENT_TOOLS_ROOT` controls its isolated installation directory. Install the authoring skill into your own configured runtimes with `CODEX_WEB_ACCOUNT_POOL_FILE=/private/pool.json node scripts/install-document-authoring-skill.mjs`.

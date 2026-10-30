@@ -17,3 +17,8 @@
 @keyframes recoveryToastOut{from{opacity:1;transform:none}to{opacity:0;transform:translateY(8px) scale(.985)}}
 @media(max-width:600px){.turnRecoveryNotice{padding:15px;border-radius:16px}.turnRecoveryActions{justify-content:flex-start}}
 @media(prefers-reduced-motion:reduce){.turnRecoveryNotice,.turnRecoveryDock.uiClosing .turnRecoveryNotice{animation:none}.turnRecoveryActions button,.turnRecoveryHeading button{transition:none}}
+.turnRecoveryMeta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 4px; opacity: .8; font-size: 12px; }
+.turnRecoveryBanner .turnRecoveryInspection { margin: 6px 0 0; }
+.turnRecoveryBanner .turnRecoveryReview { display: flex; align-items: flex-start; gap: 6px; margin-top: 6px; }
+.turnRecoveryReview input { flex: none; margin-top: 3px; }
+.turnRecoveryBanner .turnRecoveryActions button:disabled { opacity: .5; cursor: default; text-decoration: none; }

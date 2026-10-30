@@ -34,6 +34,21 @@ import type {
 } from "./types";
 
 const defaultUserId = "admin";
+export function readHostResources(signal: AbortSignal): Promise<{ data: import("../shared/hostResources").HostResources }> {
+  return request("/api/system/resources", { signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]) });
+}
+export function checkHostNetwork(signal: AbortSignal): Promise<{ data: import("../shared/hostResources").HostNetworkProbeResult }> {
+  return request("/api/system/network/check", { method: "POST", signal: AbortSignal.any([signal, AbortSignal.timeout(12_000)]) });
+}
+export function readCommunication(threadId: string, signal?: AbortSignal): Promise<{ data: import("../shared/sessionCommunication").CommunicationSnapshot }> {
+  return request(`/api/threads/${encodeURIComponent(threadId)}/communication`, { signal });
+}
+export function readCommunicationTargets(threadId: string, query: string, signal: AbortSignal): Promise<{ data: import("../shared/sessionTasks").SessionTaskTarget[] }> {
+  return request(`/api/threads/${encodeURIComponent(threadId)}/communication/targets?query=${encodeURIComponent(query)}`, { signal, cache: "no-store" });
+}
+export function sendCommunication(threadId: string, command: import("../shared/sessionCommunication").CommunicationCommand): Promise<{ data: Record<string, unknown> }> {
+  return request(`/api/threads/${encodeURIComponent(threadId)}/communication`, { method: "POST", body: JSON.stringify(command), signal: AbortSignal.timeout(15000) });
+}
 export const THREAD_READ_MAX_LIMIT = 240;
 
 let currentUserId = localStorage.getItem("codex-web-user-id") || defaultUserId;
@@ -365,14 +380,15 @@ export interface McpServerSummary {
   runtimeStatus: string | null;
   authStatus: string;
   toolCount: number;
+  toolNames: string[];
 }
 
-export function readThreadMcpStatus(projectId: string, threadId: string): Promise<{
+export function readThreadMcpStatus(projectId: string, threadId: string, signal?: AbortSignal): Promise<{
   data: McpServerSummary[];
   nextCursor: string | null;
   sharedRuntimeWarning: string;
 }> {
-  return request(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/mcp-status`, { cache: "no-store" });
+  return request(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/mcp-status`, { cache: "no-store", signal });
 }
 
 export function createUser(input: { name: string }): Promise<{ data: UserProfile }> {

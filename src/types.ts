@@ -1,8 +1,9 @@
+import type { RuntimeModelMetadata } from "../shared/agentRuntime";
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type ApprovalPolicy = "untrusted" | "on-request" | "never";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
-export interface ModelProfile {
+export interface ModelProfile extends RuntimeModelMetadata {
   id: string;
   label: string;
   model: string;

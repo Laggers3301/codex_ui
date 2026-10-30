@@ -23,6 +23,7 @@ export function latestUserTimelineIndex(items: ThreadItem[]): number {
 export interface SteerTimelineBoundary {
   id: string;
   text: string;
+  submittedText?: string;
   timelineAt: string;
   beforeItemIds: string[];
 }
@@ -30,7 +31,7 @@ export interface SteerTimelineBoundary {
 /** A steer belongs to the running turn, not a detached conversation tail.
  * Previously visible items retain their positions even if their output finishes
  * later. New live identities go after the steer, without trusting clock skew. */
-export function mergeSteerTimelineItems(items: ThreadItem[], boundaries: SteerTimelineBoundary[], matches = (item: ThreadItem, boundary: SteerTimelineBoundary) => String(item.text ?? "").trim() === boundary.text.trim()): ThreadItem[] {
+export function mergeSteerTimelineItems(items: ThreadItem[], boundaries: SteerTimelineBoundary[], matches = (item: ThreadItem, boundary: SteerTimelineBoundary) => String(item.text ?? "").trim() === (boundary.submittedText ?? boundary.text).trim()): ThreadItem[] {
   let result = items;
   for (const boundary of boundaries) {
     const old = new Set(boundary.beforeItemIds);

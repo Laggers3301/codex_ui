@@ -1,3 +1,4 @@
+import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -8,6 +9,7 @@ import { serverConfig } from "./config.js";
 import type { RpcEnvelope } from "./types.js";
 import { AppError } from "./appErrors.js";
 import {authDiagnostic} from "./authDiagnostics.js";
+import { nativeModelDiscoveryArgs, nativeModelDiscoveryEnabled, prepareNativeModelDiscovery } from "./nativeModelDiscovery.js";
 
 /**
  * The process used as the JSON-RPC transport for a Codex app-server.
@@ -20,6 +22,8 @@ export interface CodexBridgeLaunchOptions {
   command: string;
   args: readonly string[];
   env?: NodeJS.ProcessEnv;
+  /** A service-owned CODEX_HOME; third-party provider bridges leave this unset. */
+  nativeModelDiscoveryHome?: string;
   scope?: {
     unitPrefix: string;
     slice: string;
@@ -64,6 +68,16 @@ interface ServerRequestRecord {
   receivedAt: string;
 }
 
+function defaultLaunchOptions(): CodexBridgeLaunchOptions {
+  const home = process.env.CODEX_HOME?.trim();
+  return {
+    command: serverConfig.codexBin,
+    args: ["app-server", "--listen", "stdio://"],
+    env: process.env,
+    ...(home && nativeModelDiscoveryEnabled(home) ? { nativeModelDiscoveryHome: home } : {})
+  };
+}
+
 export function classifyRpcEnvelope(message: RpcEnvelope): "response" | "serverRequest" | "notification" {
   if (message.id !== undefined && !message.method) {
     return "response";
@@ -95,11 +109,7 @@ export class CodexBridge extends EventEmitter {
   private pressureReported = false;
   private lowMemorySince: number | null = null;
 
-  constructor(private readonly launch: CodexBridgeLaunchOptions = {
-    command: serverConfig.codexBin,
-    args: ["app-server", "--listen", "stdio://"],
-    env: process.env
-  }) {
+  constructor(private readonly launch: CodexBridgeLaunchOptions = defaultLaunchOptions()) {
     super();
   }
 
@@ -144,6 +154,7 @@ export class CodexBridge extends EventEmitter {
   }
 
   async request(method: string, params?: unknown, timeoutMs = 120_000): Promise<unknown> {
+    assertCodexModelRequest(params);
     await this.start();
     if (["turn/start", "thread/start", "thread/queue/start", "thread/queue/add"].includes(method)) {
       const headroom = this.getMemoryHeadroom();
@@ -160,8 +171,8 @@ export class CodexBridge extends EventEmitter {
     if (!this.serverRequests.has(id)) {
       throw new Error(`Unknown Codex server request: ${id}`);
     }
-    this.serverRequests.delete(id);
     this.write({ id, result });
+    this.serverRequests.delete(id);
   }
 
   rejectServerRequest(id: number | string, message: string): void {
@@ -202,13 +213,18 @@ export class CodexBridge extends EventEmitter {
   }
 
   private async spawnServer(): Promise<void> {
-    const command = codexProcessCommand(this.launch);
     const runtimeEnvironment = { ...(this.launch.env ?? process.env) };
+    const nativeHome = this.launch.nativeModelDiscoveryHome;
+    if (nativeHome) prepareNativeModelDiscovery(nativeHome);
+    const command = codexProcessCommand(nativeHome ? {
+      ...this.launch, args: [...this.launch.args, ...nativeModelDiscoveryArgs(runtimeEnvironment)]
+    } : this.launch);
     // OAuth app credentials belong to the web backend, never to agent shells.
     for (const key of Object.keys(runtimeEnvironment)) if (key.startsWith("FEISHU_")) delete runtimeEnvironment[key];
     this.proc = spawn(command.command, command.args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: runtimeEnvironment,
+      ...(nativeHome ? { cwd: nativeHome } : {}),
       shell: false
     });
 

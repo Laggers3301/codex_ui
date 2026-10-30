@@ -1,3 +1,4 @@
+import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
 import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -18,6 +19,7 @@ import { authFailureCodes as AUTH_FAILURE_CODES, permanentAuthCode, credentialTi
 import {authDiagnostic, type AuthDiagnostic, type AuthPhase} from "./authDiagnostics.js";
 import { ProviderTurnProtocol } from "./providerProtocol.js";
 import { validateModelRequest } from "./modelRequestValidation.js";
+import { nativeModelDiscoveryEnabled } from "./nativeModelDiscovery.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -236,12 +238,12 @@ function processIdFromParams(params: unknown): string | null {
   return typeof value === "string" && value ? value : null;
 }
 
-export function accountAppServerArgs(codexHome: string): string[] {
+export function accountAppServerArgs(codexHome: string, kind: "codex-account" | "api-provider" = "codex-account"): string[] {
   ensureDefaultAgentLanguage(codexHome);
   installSubagentHistoryGuard(codexHome);
   const modelCatalogPath = path.join(codexHome, MODEL_CATALOG_FILENAME);
   const args = ["app-server", "--listen", "stdio://"];
-  if (fs.existsSync(modelCatalogPath)) {
+  if (!nativeModelDiscoveryEnabled(codexHome, kind) && fs.existsSync(modelCatalogPath)) {
     args.push("-c", `model_catalog_json=${JSON.stringify(responsesCompatibleModelCatalog(modelCatalogPath))}`);
   }
   return args;
@@ -263,7 +265,7 @@ function accountSupportedModels(codexHome: string): Set<string> | null {
   }
 }
 
-function createAccountBridge(codexHome: string, accountId: string, adoptCandidate = false): CodexBridge {
+function createAccountBridge(codexHome: string, accountId: string, adoptCandidate = false, kind: "codex-account" | "api-provider" = "codex-account"): CodexBridge {
   prepareVerifiedProviderCatalog(codexHome, accountId);
   const scope = process.env.CODEX_WEB_ISOLATE_AGENT_SCOPES === "1" ? {
     unitPrefix: `codex-agent-${accountId.replace(/[^A-Za-z0-9-]/g, "-")}`,
@@ -284,8 +286,9 @@ function createAccountBridge(codexHome: string, accountId: string, adoptCandidat
     args: ["--exclusive", "--nonblock", "--no-fork", "--conflict-exit-code", "75",
       path.join(codexHome, ".web-runtime.lock"), process.execPath,
       fileURLToPath(new URL("../scripts/run-account-runtime.mjs", import.meta.url)),
-      serverConfig.codexBin, ...accountAppServerArgs(codexHome)],
+      serverConfig.codexBin, ...accountAppServerArgs(codexHome, kind)],
     env: { ...process.env, CODEX_HOME: codexHome, CODEX_WEB_RUNTIME_ADOPT_CANDIDATE: adoptCandidate ? "1" : "0" },
+    ...(nativeModelDiscoveryEnabled(codexHome, kind) ? { nativeModelDiscoveryHome: codexHome } : {}),
     scope
   });
 }
@@ -301,7 +304,7 @@ export class AccountPoolBridge extends EventEmitter {
   private readonly accountsById = new Map<string, AccountRuntime>();
   private readonly threadAccounts = new Map<string, string>();
   private readonly processAccounts = new Map<string, string>();
-  private readonly serverRequestAccounts = new Map<number | string, { bridge: CodexBridge; originalId: number | string }>();
+  private readonly serverRequestAccounts = new Map<number | string, { bridge: CodexBridge; originalId: number | string; accountId: string }>();
   private readonly stateFile: string;
   private readonly quotaCacheMs: number;
   private accountRefreshInFlight: Promise<void> | null = null;
@@ -555,17 +558,19 @@ export class AccountPoolBridge extends EventEmitter {
     return new AccountPoolBridge(parsed, path.dirname(absolute), (home, id) => {
       const coldStart = !launchedHomes.has(home);
       launchedHomes.add(home);
-      return createAccountBridge(home, id, coldStart && process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE === "1");
+      const kind = parsed.accounts.find(entry => entry.id === id)?.kind ?? "codex-account";
+      return createAccountBridge(home, id, coldStart && process.env.CODEX_WEB_AUTO_RUNTIME_UPDATE === "1", kind);
     });
   }
 
   constructor(
     config: AccountPoolFile,
     configDirectory = process.cwd(),
-    bridgeFactory: (codexHome: string, accountId: string) => CodexBridge = createAccountBridge
+    bridgeFactory?: (codexHome: string, accountId: string) => CodexBridge
   ) {
     super();
-    this.bridgeFactory = bridgeFactory;
+    this.bridgeFactory = bridgeFactory ?? ((home, id) => createAccountBridge(home, id, false,
+      config.accounts.find(entry => entry.id === id)?.kind ?? "codex-account"));
     const enabled = config.accounts.filter((entry) => entry.enabled !== false);
     if (!enabled.length) {
       throw new Error("The Codex account pool has no enabled accounts.");
@@ -670,7 +675,7 @@ export class AccountPoolBridge extends EventEmitter {
       const original = asRecord(request);
       const originalId = original.id as number | string;
       const id = `pool-${this.nextServerRequestId++}`;
-      this.serverRequestAccounts.set(id, { bridge, originalId });
+      this.serverRequestAccounts.set(id, { bridge, originalId, accountId: account.id });
       this.emit("serverRequest", { ...original, id, accountId: account.id, accountLabel: account.label });
     });
     bridge.on("status", (status) => {
@@ -956,6 +961,12 @@ export class AccountPoolBridge extends EventEmitter {
       }));
   }
 
+  /** Native Codex owns its remote discovery/cache; UI catalog sources stay
+   * independent and are still returned by modelCatalogTargets(). */
+  automaticModelCatalogTargets(): ModelCatalogTarget[] {
+    return this.modelCatalogTargets().filter(target => !nativeModelDiscoveryEnabled(target.codexHome));
+  }
+
   /**
    * Install a validated catalog and replace only this account's app-server.
    * New requests wait on the maintenance barrier, while running turns cause a
@@ -1034,11 +1045,11 @@ export class AccountPoolBridge extends EventEmitter {
     }
   }
 
-  getPendingServerRequests(): Array<{ id: number | string; method: string; params: unknown; receivedAt: string }> {
+  getPendingServerRequests(): Array<{ id: number | string; method: string; params: unknown; receivedAt: string; accountId: string }> {
     return Array.from(this.serverRequestAccounts.entries()).map(([id, route]) => {
       const original = route.bridge.getPendingServerRequests().find((item) => item.id === route.originalId);
-      return original ? { ...original, id } : null;
-    }).filter((item): item is { id: number | string; method: string; params: unknown; receivedAt: string } => Boolean(item));
+      return original ? { ...original, id, accountId: route.accountId } : null;
+    }).filter((item): item is { id: number | string; method: string; params: unknown; receivedAt: string; accountId: string } => Boolean(item));
   }
 
   notify(method: string, params?: unknown): void {
@@ -1077,8 +1088,8 @@ export class AccountPoolBridge extends EventEmitter {
   respondToServerRequest(id: number | string, result: unknown): void {
     const route = this.serverRequestAccounts.get(id);
     if (!route) throw new Error(`Unknown Codex server request: ${id}`);
-    this.serverRequestAccounts.delete(id);
     route.bridge.respondToServerRequest(route.originalId, result);
+    this.serverRequestAccounts.delete(id);
   }
 
   rejectServerRequest(id: number | string, message: string): void {
@@ -1148,6 +1159,7 @@ export class AccountPoolBridge extends EventEmitter {
   }
 
   async startThreadOnAccount(accountId: string, params: unknown, timeoutMs = 120_000): Promise<unknown> {
+    assertCodexModelRequest(params);
     const account = this.accountsById.get(accountId);
     if (!account) throw new Error(`Unknown account-pool account: ${accountId}`);
     const model = asRecord(params).model;
@@ -1165,6 +1177,7 @@ export class AccountPoolBridge extends EventEmitter {
 
   /** Execute an exact native fork on a specific account selected by branch routing. */
   async forkThreadOnAccount(accountId: string, params: unknown, timeoutMs = 120_000): Promise<unknown> {
+    assertCodexModelRequest(params);
     const account = this.accountsById.get(accountId);
     if (!account) throw new Error(`Unknown account-pool account: ${accountId}`);
     try {
@@ -1278,6 +1291,7 @@ export class AccountPoolBridge extends EventEmitter {
   }
 
   private async accountForRequest(method: string, params: unknown): Promise<AccountRuntime> {
+    assertCodexModelRequest(params);
     const threadId = threadIdFromParams(params);
     if (threadId) {
       const known = this.accountsById.get(this.threadAccounts.get(threadId) ?? "");

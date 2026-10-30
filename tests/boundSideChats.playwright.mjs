@@ -1,3 +1,4 @@
+import { setContentViewport } from "./contentViewport.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
@@ -55,6 +56,8 @@ async function switchMain(page, id, text) {
   await page.locator("#conversation-messages").getByText(text, { exact: true }).waitFor();
 }
 
+const settleLayout = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(resolve)))));
+
 try {
   const backend = start(["--import", "tsx/esm", "tests/boundSideChats.server.ts"]);
   const metadata = await ready(backend, output => {
@@ -84,11 +87,11 @@ try {
   await checkPolicyMenu(first, first.locator('.topbarPolicySelect:not(.approvalSelect) .polishedSelectTrigger'));
   const sideAccess = panel(first).locator('.polishedSelectTrigger').filter({ hasText: /完全访问|项目可写|只读/ });
   await checkPolicyMenu(first, sideAccess);
-  await first.setViewportSize({ width: 1100, height: 500 });
+  await setContentViewport(first, { width: 1100, height: 500 });
   await checkPolicyMenu(first, sideAccess);
-  await first.setViewportSize({ width: 393, height: 780 });
+  await setContentViewport(first, { width: 393, height: 780 });
   await checkPolicyMenu(first, sideAccess);
-  await first.setViewportSize({ width: 1600, height: 1000 });
+  await setContentViewport(first, { width: 1600, height: 1000 });
   const mainInput = first.locator('.composer:not(.temporaryAskComposer) [contenteditable="true"]').first();
   const glow = first.locator('.composerAmbientGlow');
   await mainInput.focus();
@@ -105,7 +108,10 @@ try {
   await mainInput.evaluate(element => element.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "" })));
   await composer(first).fill("A 的草稿");
   await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "true");
-  await composer(first).fill("");
+  // Use the user's select-all/delete sequence so ProseMirror observes its own
+  // selection before deletion, rather than racing fill()'s native DOM range.
+  await composer(first).press("ControlOrMeta+A");
+  await composer(first).press("Backspace");
   await first.waitForFunction(() => document.querySelector('.composerAmbientGlow')?.dataset.active === "false");
   assert.ok(await composer(first).evaluate(element => document.activeElement === element), "clearing the side editor also fades the glow without losing focus");
   await composer(first).fill("A 的草稿");
@@ -127,6 +133,38 @@ try {
   assert.ok(snapshot.calls.some(call => call.method === "thread/fork" && call.threadId === "main-a"));
   assert.equal(snapshot.calls.some(call => call.method === "thread/start"), false);
   assert.equal(snapshot.calls.filter(call => call.method === "thread/fork").length, 1);
+
+  const append = (threadId, delta) => context.request.post(origin + "/api/__test/append", { data: { threadId, delta } });
+  const sideScroller = panel(first).locator(".temporaryAskMessages");
+  await append(a.threadId, "\n\n" + Array.from({ length: 65 }, (_, i) => `侧边长回答第 ${i + 1} 段，用于上翻阅读时保持滚动位置。`).join("\n\n"));
+  await panel(first).getByText("侧边长回答第 65 段，用于上翻阅读时保持滚动位置。", { exact: true }).waitFor();
+  await first.waitForFunction(() => { const e = document.querySelector('.temporaryAskMessages'); return e.scrollHeight - e.clientHeight > 1000; });
+  await sideScroller.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  await settleLayout(first);
+  await sideScroller.evaluate(element => { element.scrollTop = 250; });
+  await settleLayout(first);
+  const readingTop = await sideScroller.evaluate(element => element.scrollTop);
+  const assertReadingPosition = async label => {
+    await settleLayout(first);
+    assert.ok(Math.abs(await sideScroller.evaluate(element => element.scrollTop) - readingTop) < 3, label);
+  };
+  await context.request.post(origin + "/api/__test/start-main", { data: { threadId: "main-a" } });
+  await append("main-a", "\n\n主会话滚动测试片段一");
+  await first.locator("#conversation-messages").getByText("主会话滚动测试片段一", { exact: false }).first().waitFor();
+  await assertReadingPosition("main-thread streaming must not scroll a side chat being read");
+  await context.request.post(origin + "/api/__test/main-tool", { data: { threadId: "main-a" } });
+  await append("main-a", "\n\n主会话滚动测试片段二");
+  await first.locator("#conversation-messages").getByText("主会话滚动测试片段二", { exact: false }).first().waitFor();
+  await assertReadingPosition("main-thread tool updates must not move the side chat");
+  await append(a.threadId, "\n\n侧边继续生成时也要保留上翻位置");
+  await panel(first).getByText("侧边继续生成时也要保留上翻位置", { exact: true }).waitFor();
+  await assertReadingPosition("side-thread streaming must respect a reader who scrolled up");
+  await sideScroller.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  await settleLayout(first);
+  await append(a.threadId, "\n\n" + Array.from({ length: 12 }, (_, i) => `回到底部后自动跟随第 ${i + 1} 段`).join("\n\n"));
+  await panel(first).getByText("回到底部后自动跟随第 12 段", { exact: true }).waitFor();
+  await first.waitForFunction(() => { const e = document.querySelector('.temporaryAskMessages'); return e.scrollHeight - e.clientHeight - e.scrollTop < 3; });
+  await complete("main-a");
 
   const second = await openPage("main-a", quoteA);
   await panel(second).getByText("侧边回答 1：A 的草稿", { exact: true }).waitFor();
@@ -204,6 +242,7 @@ try {
     newTabRestoresRunningSideChat: true, restoredSideKeepsStreaming: true, reloadRestoresSideChat: true, followupReusesThread: true,
     lateAcknowledgementStaysWithParent: true, backgroundCompletionDoesNotSwitchPanel: true,
     closeOnlyInterruptsMatchingSide: true, deletedSideDoesNotReturn: true, errorCanBeSelectedAndDismissed: true,
+    mainStreamDoesNotScrollSide: true, mainToolsDoNotScrollSide: true, sideStreamPreservesReadingPosition: true, sideFollowingResumesAtBottom: true,
     accessMenusFitViewport: true, draftAndPreeditKeepGlow: true, clearDraftFadesWithFocus: true, pageErrors: errors }));
 } catch (error) {
   for (const page of browser?.contexts().flatMap(context => context.pages()) ?? []) {

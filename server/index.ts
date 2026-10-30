@@ -21,6 +21,8 @@ import { registerPetRoutes } from "./pets.js";
 import { registerUiUpdateRoutes } from "./uiUpdates.js";
 import { registerSpeechRoutes } from "./speech.js";
 import { registerFeishuRoutes } from "./feishu.js";
+import { registerHostResourceRoutes } from "./hostResources.js";
+import { registerSessionCommunicationRoutes } from "./sessionCommunicationRoutes.js";
 import {AuthDiagnosticLog,type AuthDiagnostic} from "./authDiagnostics.js";
 import {DeviceAuthorization,startAuthorizationControl} from "./deviceAuthorization.js";
 
@@ -83,7 +85,7 @@ app.addHook("onRequest", async (request, reply) => {
   if (isPublicPath(pathname)) {
     return;
   }
-  if ((pathname === "/api/browser/mcp" || pathname === "/api/schedules/mcp" || pathname === "/api/feishu/mcp") && browserMcpAuthorized(request.headers)) return;
+  if (["/api/browser/mcp", "/api/schedules/mcp", "/api/feishu/mcp", "/api/communication/mcp"].includes(pathname) && browserMcpAuthorized(request.headers)) return;
 
   // A peer can request only its local leaderboard snapshot with the shared
   // internal token; browser login cookies never leave this machine.
@@ -154,6 +156,8 @@ registerPetRoutes(app);
 registerUiUpdateRoutes(app);
 registerSpeechRoutes(app);
 registerFeishuRoutes(app);
+registerHostResourceRoutes(app);
+registerSessionCommunicationRoutes(app, store);
 app.addHook("onClose", async () => { await browserService.dispose(); });
 
 function escapeHtml(value: string): string {
