@@ -31,11 +31,26 @@ export function useMobileComposerControls(element: HTMLElement | null) {
       // keyboard blurs. An actual outside interaction dismisses this latch.
       element.dataset.mobileDetailOpen = "true";
     };
+    const focusEditor = (event: MouseEvent) => {
+      if (!matchMedia("(max-width: 720px)").matches || !(event.target instanceof Element)
+          || event.target.closest("button,a,input,textarea,select,[role='button']")) return;
+      const textArea = event.target.closest(".composerRichEditor");
+      const capsulePadding = (event.target === element || event.target.matches(".composerBody"))
+        && element.getBoundingClientRect().height <= 60;
+      if (!textArea && !capsulePadding) return;
+      const editor = element.querySelector<HTMLElement>(".composerRichInput[contenteditable='true']");
+      // Focus in the trusted click itself, not after React, a timer or RAF:
+      // WebKit's keyboard permission is tied to this user gesture. The text
+      // wrapper/padding is not itself contenteditable, so a native tap there
+      // previously only expanded the shell and needed another tap to type.
+      if (editor && document.activeElement !== editor) editor.focus({ preventScroll: true });
+    };
     const outside = (event: Event) => {
       if (event.target instanceof Node && !element.contains(event.target)) delete element.dataset.mobileDetailOpen;
     };
     element.addEventListener("pointerdown", begin, true);
     element.addEventListener("click", keepDetails, true);
+    element.addEventListener("click", focusEditor);
     document.addEventListener("pointerdown", outside, true);
     document.addEventListener("focusin", outside, true);
     window.addEventListener("pointerup", finish, true);
@@ -44,6 +59,7 @@ export function useMobileComposerControls(element: HTMLElement | null) {
       release(); element.removeEventListener("pointerdown", begin, true);
       delete element.dataset.mobileDetailOpen;
       element.removeEventListener("click", keepDetails, true);
+      element.removeEventListener("click", focusEditor);
       document.removeEventListener("pointerdown", outside, true);
       document.removeEventListener("focusin", outside, true);
       window.removeEventListener("pointerup", finish, true);

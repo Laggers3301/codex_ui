@@ -78,6 +78,20 @@
           write("boxSizing", "border-box");
           write("width", `${width}px`);
           write("maxHeight", `${Math.min(600, availableHeight)}px`);
+          if (window.matchMedia("(max-width: 720px)").matches) {
+            // Let fixed positioning resolve the menu's own height. Reading it
+            // after maxHeight writes forces a second layout on every frame
+            // while the capsule expands or the keyboard moves its anchor.
+            write("left", `${Math.max(viewportLeft + 12, Math.min(rect.left, viewportLeft + viewportWidth - width - 12))}px`);
+            if (bottom - viewportTop < 52) {
+              write("top", `${viewportTop + 12}px`);
+              write("bottom", "auto");
+            } else {
+              write("top", "auto");
+              write("bottom", `calc(100% - ${bottom}px)`);
+            }
+            return;
+          }
           // Read the resulting size once, before unrelated position writes.
           // Unchanged keyboard/anchor events must not force another layout.
           const menuHeight = plusMenu.offsetHeight;

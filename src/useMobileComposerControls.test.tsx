@@ -4,6 +4,39 @@ import { createRoot } from "react-dom/client";
 import { expect, it, vi } from "vitest";
 import { useMobileComposerControls } from "./useMobileComposerControls";
 
+it("focuses the mobile editor synchronously on one wrapper or capsule-padding click, not controls or desktop", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  let mobile = true;
+  vi.stubGlobal("matchMedia", () => ({ matches: mobile }));
+  const element = document.createElement("div"), mount = document.createElement("div");
+  element.innerHTML = '<div class="composerBody"><div class="composerRichEditor"><div class="composerRichInput" contenteditable="true" tabindex="0">保留草稿</div><span class="composerPredictionGhost">预测不采纳</span></div><button>+</button></div>';
+  element.getBoundingClientRect = () => ({ height: 52 } as DOMRect);
+  document.body.append(element, mount);
+  const root = createRoot(mount), editor = element.querySelector<HTMLElement>(".composerRichInput")!;
+  const focus = vi.spyOn(editor, "focus");
+  function Fixture() { useMobileComposerControls(element); return null; }
+  try {
+    await act(async () => root.render(<Fixture />));
+    element.querySelector<HTMLElement>(".composerPredictionGhost")!.click();
+    expect(focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
+    expect(document.activeElement).toBe(editor);
+    expect(editor.textContent).toBe("保留草稿");
+    editor.blur(); focus.mockClear();
+    element.querySelector<HTMLElement>(".composerBody")!.click();
+    expect(document.activeElement).toBe(editor);
+    editor.blur(); focus.mockClear();
+    element.querySelector("button")!.click(); expect(focus).not.toHaveBeenCalled();
+    mobile = false; element.querySelector<HTMLElement>(".composerRichEditor")!.click();
+    expect(focus).not.toHaveBeenCalled();
+    await act(async () => root.unmount());
+    mobile = true; element.querySelector<HTMLElement>(".composerRichEditor")!.click();
+    expect(focus).not.toHaveBeenCalled();
+  } finally {
+    if (mount.childNodes.length) await act(async () => root.unmount());
+    element.remove(); mount.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals();
+  }
+});
+
 it("holds mobile controls across keyboard blur, releases and cleans up without touching desktop", async () => {
   vi.useFakeTimers(); vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   let mobile = true;
