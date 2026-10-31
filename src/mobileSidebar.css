@@ -66,13 +66,13 @@ html[data-glass-scrolling] .topbar .controls button.topbarGlassControl {
   /* Both poses must have the same width. The legacy collapsed 100dvw/-105%
      pose otherwise reveals the right edge again and starts a second exit. */
   .workspace > .threadList:not(.collapsed),
-  body:has(.threadList.collapsed) .workspace > .threadList.collapsed {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList.collapsed {
     z-index: 900 !important; width: min(380px, 92dvw) !important; max-width: 92dvw !important;
     transform: translate3d(var(--mobile-sidebar-offset, 0px),0,0);
     transition: transform .28s cubic-bezier(.22,1,.36,1);
     border-radius: 0 20px 20px 0; box-shadow: 12px 0 35px rgb(0 0 0 / .15);
   }
-  body:has(.threadList.collapsed) .workspace > .threadList.collapsed {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList.collapsed {
     transform: translate3d(-100%,0,0); opacity: 0; visibility: hidden;
     pointer-events: none; transition: none;
   }

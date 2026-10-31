@@ -13,4 +13,11 @@ describe("deferred tool disclosure rendering", () => {
     expect(renderToStaticMarkup(<ToolReveal open>{children}</ToolReveal>)).toContain("tool details");
     expect(children).toHaveBeenCalledOnce();
   });
+  it("retains only explicitly opted-in small live disclosures, hidden and inert", () => {
+    const html = renderToStaticMarkup(<ToolReveal open={false} keepMounted><button>live row</button></ToolReveal>);
+    expect(html).toContain("live row");
+    expect(html).toContain('aria-hidden="true"');
+    expect(html).toContain('inert=""');
+    expect(html).not.toContain("isOpen");
+  });
 });

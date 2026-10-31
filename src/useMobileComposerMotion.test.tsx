@@ -11,6 +11,8 @@ it("animates the real composer height once per compact transition and cleans up"
   const disconnect = vi.fn();
   vi.stubGlobal("ResizeObserver", class { constructor(callback: () => void) { resize = callback; } observe() {} disconnect = disconnect; });
   const element = document.createElement("div"), container = document.createElement("div"); document.body.append(container, element);
+  const editor = document.createElement("div"); editor.className = "composerRichEditor";
+  editor.textContent = "保留的草稿"; element.append(editor);
   let height = 52; element.getBoundingClientRect = () => ({ height } as DOMRect);
   const animation = { onfinish: null as null | (() => void), cancel: vi.fn() };
   const animate = vi.fn(() => animation); element.animate = animate as unknown as typeof element.animate;
@@ -22,7 +24,9 @@ it("animates the real composer height once per compact transition and cleans up"
     expect(animate.mock.calls[0]).toEqual([[{ "--mobile-composer-motion-height": "52px" }, { "--mobile-composer-motion-height": "132px" }], { duration: 260, easing: "cubic-bezier(.22,1,.36,1)" }]);
     resize(); expect(animate).toHaveBeenCalledOnce();
     animation.onfinish?.(); expect(element.dataset.mobileComposerMotion).toBeUndefined();
+    editor.scrollTop = 32;
     height = 52; resize(); expect(element.dataset.mobileComposerMotion).toBe("collapse");
+    expect(editor.scrollTop).toBe(0); expect(editor.textContent).toBe("保留的草稿");
     await act(async () => root.unmount()); expect(animation.cancel).toHaveBeenCalledOnce(); expect(disconnect).toHaveBeenCalledOnce();
     expect(element.style.getPropertyValue("--mobile-composer-motion-height")).toBe("");
   } finally {

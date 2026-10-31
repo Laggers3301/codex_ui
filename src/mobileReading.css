@@ -5,6 +5,9 @@
 @property --mobile-composer-motion-height {syntax:"<length>";inherits:false;initial-value:52px;}
 @keyframes mobileComposerControlsArrive {from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
 @media(max-width:720px) {
+  /* Renaming keeps the drawer open behind the dialog; its backdrop must sit
+     above the drawer/backdrop pair, not below the mobile click shield. */
+  .modalScrim:has(.renameThreadDialog) {z-index:1000;}
   :root[data-theme] .conversation>.composer.composerLiquidGlass[data-mobile-idle][data-mobile-composer-motion] {height:var(--mobile-composer-motion-height)!important;min-height:0!important;max-height:none!important;}
   .composer[data-mobile-composer-motion]>.composerBody {overflow:clip;}
   .composer[data-mobile-composer-motion="expand"] .composerTools {animation:mobileComposerControlsArrive .26s ease both;}
@@ -86,6 +89,8 @@
   :root[data-theme] .messageItem.kind-tool.toolBundle.toolBundleShimmering>.messageMeta.toolBundleTitle,
   :root[data-theme] .messageItem.kind-tool.toolBundle.toolBundleShimmering .messageItem.kind-tool.toolBundleEntry>.messageMeta {background-image:none!important;animation:none!important;}
   :root .topbar>.controls {min-height:0;opacity:0;transform:translateY(-5px);visibility:hidden;pointer-events:none;transition:opacity .22s ease,transform .3s cubic-bezier(.22,1,.36,1),visibility .3s;}
+  :root .topbar>.controls {will-change:transform;}
+  .v2PlusMenu:not([hidden]) {will-change:opacity,transform;}
   :root .topbar[data-mobile-controls="visible"]>.controls {opacity:1;transform:none;visibility:visible;pointer-events:auto;}
   :root .topbar .controls>.rightWorkspaceToggle {display:none!important;}
   :root .topbar>.mobileRightWorkspaceToggle {display:grid;position:absolute;top:max(4px,env(safe-area-inset-top));right:max(10px,env(safe-area-inset-right));width:28px;height:28px;min-width:28px;padding:0;border:0;background:transparent;}

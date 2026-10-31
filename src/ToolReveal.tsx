@@ -5,14 +5,16 @@ export function ToolReveal({
   open,
   children,
   className = "",
-  settleMs = 300
+  settleMs = 300,
+  keepMounted = false
 }: {
   open: boolean;
   children: ReactNode | (() => ReactNode);
   className?: string;
   settleMs?: number;
+  keepMounted?: boolean;
 }) {
-  const [mounted, setMounted] = useState(open);
+  const [mounted, setMounted] = useState(open || keepMounted);
   const [visible, setVisible] = useState(open);
   const initialEffect = useRef(true);
   useEffect(() => {
@@ -22,6 +24,10 @@ export function ToolReveal({
       initialEffect.current = false;
       return;
     }
+    // Small live activity rows can retain their DOM. Toggling them should not
+    // repeatedly parse SVGs, invalidate relational selectors, or wait two RAFs.
+    // Large tool outputs keep the default lazy/unmount behavior.
+    if (keepMounted) { setMounted(true); setVisible(open); return; }
     let frame = 0;
     let secondFrame = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -35,7 +41,7 @@ export function ToolReveal({
       timer = setTimeout(() => setMounted(false), window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : settleMs);
     }
     return () => { cancelAnimationFrame(frame); cancelAnimationFrame(secondFrame); clearTimeout(timer); };
-  }, [open, settleMs]);
+  }, [open, settleMs, keepMounted]);
   // A settled, empty disclosure must not consume a flex/grid slot (and its
   // associated gap). Keep it present only while opening or animating closed.
   if (!mounted && !open) return null;

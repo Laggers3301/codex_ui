@@ -1,4 +1,5 @@
 import { CircleFiveLine, Diamonds, GeometricFlowers, Planet, Robot, StarOne, SunOne } from "@icon-park/svg";
+import { useMemo } from "react";
 import "./subagentPanel.css";
 
 const glyphs = [SunOne, GeometricFlowers, CircleFiveLine, Planet, Diamonds, StarOne];
@@ -18,7 +19,7 @@ export function SubagentAvatar({ name }: { name: string }) {
   const identity = subagentAvatarIdentity(name);
   // IconPark is already the application's Apache-licensed icon library. The
   // public OpenAI illustration assets don't declare a reuse license.
-  const svg = (identity.glyph === glyphs.length ? Robot : glyphs[identity.glyph])({ theme: "multi-color", size: 16, strokeWidth: 3,
-    fill: ["var(--agent-ink)", "var(--agent-fill)", "var(--agent-ink)", "var(--agent-fill)"] }).replace(/^<\?xml[^>]*>/, "");
+  const svg = useMemo(() => (identity.glyph === glyphs.length ? Robot : glyphs[identity.glyph])({ theme: "multi-color", size: 16, strokeWidth: 3,
+    fill: ["var(--agent-ink)", "var(--agent-fill)", "var(--agent-ink)", "var(--agent-fill)"] }).replace(/^<\?xml[^>]*>/, ""), [identity.glyph]);
   return <span className={`subagentAvatar agentColor${identity.color}`} aria-hidden="true" dangerouslySetInnerHTML={{ __html: svg }} />;
 }

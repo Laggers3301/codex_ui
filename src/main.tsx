@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { App } from "./App";
+import { observePhoneViewport } from "./phoneViewport";
 import "./styles.css";
 import "./softCorners.css";
 import "./mobileSidebar.css";
@@ -8,6 +9,7 @@ import "./panelTypography.css";
 import "./mobileReading.css";
 import "./imageViewerMotion.css";
 import "./readingScale.css";
+observePhoneViewport();
 
 // Installation is independent of opting into notifications. The existing
 // push subscription flow reuses this same root-scoped worker.

@@ -3,8 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <link rel="preload" href="/fonts/NotoSansSC-VF-ui.woff2" as="font" type="font/woff2" crossorigin />
-    <link rel="preload" href="/fonts/NotoSansSC-VF-common.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/NotoSansSC-VF-ui.woff2" as="font" type="font/woff2" crossorigin media="(min-width: 721px)" />
+    <link rel="preload" href="/fonts/NotoSansSC-VF-common.woff2" as="font" type="font/woff2" crossorigin media="(min-width: 721px)" />
     <link rel="icon" type="image/svg+xml" href="/chatgpt-favicon.svg?v=20260824" />
     <link rel="manifest" href="/manifest.webmanifest?v=20261028-3" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -24,37 +24,6 @@
         const platform = navigator.userAgentData?.platform || navigator.platform || navigator.userAgent;
         if (/Win/i.test(platform)) document.documentElement.dataset.platform = "windows";
         else if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)) document.documentElement.dataset.platform = "mobile";
-      })();
-    </script>
-    <script>
-      (() => {
-        const phoneQuery = window.matchMedia("(max-width: 900px)");
-        let frame = 0;
-
-        function syncPhoneViewport() {
-          frame = 0;
-          const root = document.documentElement;
-          if (!phoneQuery.matches) {
-            root.style.removeProperty("--phone-viewport-height");
-            return;
-          }
-          const viewportHeight = Math.round(window.visualViewport?.height || window.innerHeight);
-          root.style.setProperty("--phone-viewport-height", `${viewportHeight}px`);
-          if (window.scrollX !== 0 || window.scrollY !== 0) window.scrollTo(0, 0);
-        }
-
-        function schedulePhoneViewportSync() {
-          if (frame) cancelAnimationFrame(frame);
-          frame = requestAnimationFrame(syncPhoneViewport);
-        }
-
-        schedulePhoneViewportSync();
-        phoneQuery.addEventListener?.("change", schedulePhoneViewportSync);
-        window.addEventListener("resize", schedulePhoneViewportSync, { passive: true });
-        window.addEventListener("orientationchange", schedulePhoneViewportSync, { passive: true });
-        window.addEventListener("scroll", schedulePhoneViewportSync, { passive: true });
-        window.visualViewport?.addEventListener("resize", schedulePhoneViewportSync, { passive: true });
-        window.visualViewport?.addEventListener("scroll", schedulePhoneViewportSync, { passive: true });
       })();
     </script>
     <script type="module" src="/src/main.tsx"></script>
@@ -105,15 +74,19 @@
           const width = Math.min(440, viewportWidth - 24);
           const bottom = Math.min(rect.top - 8, viewportTop + viewportHeight - 12);
           const availableHeight = Math.max(40, bottom - viewportTop - 12);
-          plusMenu.style.boxSizing = "border-box";
-          plusMenu.style.width = `${width}px`;
-          plusMenu.style.maxHeight = `${Math.min(600, availableHeight)}px`;
-          plusMenu.style.left = `${Math.max(viewportLeft + 12, Math.min(rect.left, viewportLeft + viewportWidth - width - 12))}px`;
-          plusMenu.style.bottom = "auto";
-          plusMenu.style.top = `${Math.max(viewportTop + 12, bottom - plusMenu.offsetHeight)}px`;
+          const write = (name, value) => { if (plusMenu.style[name] !== value) plusMenu.style[name] = value; };
+          write("boxSizing", "border-box");
+          write("width", `${width}px`);
+          write("maxHeight", `${Math.min(600, availableHeight)}px`);
+          // Read the resulting size once, before unrelated position writes.
+          // Unchanged keyboard/anchor events must not force another layout.
+          const menuHeight = plusMenu.offsetHeight;
+          write("left", `${Math.max(viewportLeft + 12, Math.min(rect.left, viewportLeft + viewportWidth - width - 12))}px`);
+          write("bottom", "auto");
+          write("top", `${Math.max(viewportTop + 12, bottom - menuHeight)}px`);
         };
         const schedulePlusPosition = () => {
-          if (plusPositionFrame) cancelAnimationFrame(plusPositionFrame);
+          if (plusPositionFrame) return;
           plusPositionFrame = requestAnimationFrame(positionPlusMenu);
         };
         window.addEventListener("resize", schedulePlusPosition, { passive: true });
@@ -155,13 +128,18 @@
               // During conversation switches the grid briefly reports 0px.
               // Do not persist that transient layout state into the fixed V2 dock.
               if (Number.isFinite(width) && width >= 180) {
-                document.documentElement.style.setProperty("--v2-sidebar-width", `${width}px`);
+                const style = document.documentElement.style;
+                const pixels = `${Math.round(width * 64) / 64}px`;
+                if (style.getPropertyValue("--v2-sidebar-width") !== pixels) style.setProperty("--v2-sidebar-width", pixels);
               }
             };
             applySidebarWidth(threadList.getBoundingClientRect().width);
             if (!window.__v2SidebarResizeObserver) {
               window.__v2SidebarResizeObserver = new ResizeObserver((entries) => {
-                const width = entries[0]?.contentRect.width;
+                // Initial layout uses the border box too. Mixing content and
+                // border widths makes every keyboard-driven height change
+                // toggle a root variable and restyle the entire transcript.
+                const width = entries[0]?.borderBoxSize?.[0]?.inlineSize ?? entries[0]?.target.getBoundingClientRect().width;
                 if (width !== undefined) applySidebarWidth(width);
               });
               window.__v2SidebarResizeObserver.observe(threadList);

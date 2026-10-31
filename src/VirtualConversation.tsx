@@ -12,6 +12,7 @@ import {
   type Ref
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { measureCommittedConversationRows } from "./committedConversationMeasurements";
 
 export interface VirtualConversationHandle {
   scrollToKey(key: string, align?: "start" | "center" | "end" | "auto"): boolean;
@@ -193,6 +194,16 @@ function VirtualConversationInner(
     !flowAnchorRef.current && scrollMotionFrameRef.current === null && !shouldFollowEnd?.()
     && item.end <= (instance.scrollOffset ?? 0)
   );
+  const virtualItems = virtualizer.getVirtualItems();
+  const committedRange = virtualItems.map(item => `${item.index}:${item.key}`).join("|");
+
+  useLayoutEffect(() => {
+    if (useFlowLayout || !scrollElementRef.current) return;
+    // measureElement intentionally skips synchronous reads while scrolling.
+    // A history prepend happens DURING that scrolling state. Measure the
+    // bounded mounted range before anchor restoration/paint, not the history.
+    measureCommittedConversationRows(scrollElementRef.current, virtualizer.resizeItem);
+  }, [committedRange, historyRevision, rowSignature, threadKey, useFlowLayout, virtualizer]);
 
   useLayoutEffect(() => {
     // The DOM scrollport is reused for the next conversation. A smooth-scroll
@@ -378,7 +389,6 @@ function VirtualConversationInner(
     cancelSmoothEnd();
   }, []);
 
-  const virtualItems = virtualizer.getVirtualItems();
   return (
     <div
       {...containerProps}

@@ -14,6 +14,12 @@ export function useMobileComposerMotion(element: HTMLElement | null) {
       if (animation) return;
       const height = element.getBoundingClientRect().height, compact = height <= 60;
       const before = previous; previous = { height, compact };
+      if (compact && !before.compact && matchMedia("(max-width: 720px)").matches) {
+        // A draft can now fold too. Do not leave its scrolled editing viewport
+        // halfway through a line in the one-line capsule preview.
+        const editor = element.querySelector<HTMLElement>(".composerRichEditor");
+        if (editor) editor.scrollTop = 0;
+      }
       if (compact === before.compact || before.height < 1 || Math.abs(height - before.height) < 2
           || !matchMedia("(max-width: 720px)").matches || matchMedia("(prefers-reduced-motion: reduce)").matches
           || typeof CSS === "undefined" || typeof CSS.registerProperty !== "function") return;

@@ -4158,7 +4158,7 @@ pre,
 .branchToolArchive.closing { animation:branchArchiveOut 240ms cubic-bezier(.4,0,.2,1) both; }
 @keyframes branchArchiveIn { from{opacity:0;transform:translateY(-6px)} to{opacity:1;transform:translateY(0)} }
 @keyframes branchArchiveOut { from{opacity:1;transform:translateY(0)} to{opacity:0;transform:translateY(-6px)} }
-@media(min-width:721px){.branchToolArchive{margin-left:calc(var(--v2-sidebar-width,280px) + 16px);transition:margin-left var(--sidebar-motion)}body:has(.threadList.collapsed) .branchToolArchive{margin-left:calc(var(--v2-collapsed-sidebar-width,56px) + 16px)}}
+@media(min-width:721px){.branchToolArchive{margin-left:calc(var(--v2-sidebar-width,280px) + 16px);transition:margin-left var(--sidebar-motion)}body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .branchToolArchive{margin-left:calc(var(--v2-collapsed-sidebar-width,56px) + 16px)}}
 @media(max-width:720px){.branchToolArchive{flex-wrap:wrap;gap:6px 10px;margin:6px 8px}.branchToolArchive span{flex:1 1 100%}.branchToolArchive a{white-space:normal}}
 .errorBanner .branchArchiveRetry { margin-left:12px; border:0; padding:4px 0; font:inherit; color:inherit; background:transparent; text-decoration:underline; cursor:pointer; }
 @media(prefers-reduced-motion:reduce){.branchToolArchive,.branchToolArchive.closing{animation:none}.branchToolArchive.closing{opacity:0}}
@@ -5411,7 +5411,7 @@ pre,
   width: 310px;
 }
 
-.conversation:has(.threadRunState.running) .messages::after {
+.conversation[data-run-state="running"] .messages::after {
   content: none;
   display: none;
 }
@@ -5473,7 +5473,7 @@ pre,
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .conversation:has(.threadRunState.running) .messages::after {
+  .conversation[data-run-state="running"] .messages::after {
     animation: none;
     color: #aeb1ab;
     background: none;
@@ -5758,12 +5758,12 @@ pre,
 }
 
 /* Symmetric spacing around activity rows. */
-body:has(.threadList.collapsed) .v2ProjectDock,
-body:has(.threadList.collapsed) .v2AccountDock {
+body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2ProjectDock,
+body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2AccountDock {
   display: none !important;
 }
 
-body:has(.threadList.collapsed) .threadListRestoreButton {
+body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .threadListRestoreButton {
   z-index: 40;
   display: grid;
 }
@@ -5776,9 +5776,9 @@ body:has(.threadList.collapsed) .threadListRestoreButton {
   -webkit-backdrop-filter: blur(14px) saturate(0.82) !important;
 }
 
-body:has(.filePreviewScrim) .v2ProjectDock,
-body:has(.filePreviewScrim) .v2AccountDock,
-body:has(.filePreviewScrim) .threadListRestoreButton {
+body[data-shell-file-preview] .v2ProjectDock,
+body[data-shell-file-preview] .v2AccountDock,
+body[data-shell-file-preview] .threadListRestoreButton {
   filter: blur(14px);
   opacity: 0.68;
   pointer-events: none;
@@ -6761,15 +6761,15 @@ body:has(.filePreviewScrim) .threadListRestoreButton {
 .settingsDialog:not(.leaderboardDialog) .dialogActions .iconTextButton.primary:hover { background: #f0f1ed; }
 
 /* Fixed sidebar chrome sits in its own stacking context, so blur it explicitly for every modal. */
-body:has(.modalScrim) .v2ProjectDock,
-body:has(.modalScrim) .threadList,
-body:has(.modalScrim) .v2AccountDock,
-body:has(.modalBackdrop) .v2ProjectDock,
-body:has(.modalBackdrop) .threadList,
-body:has(.modalBackdrop) .v2AccountDock,
-body:has(.globalSearchScrim) .v2ProjectDock,
-body:has(.globalSearchScrim) .threadList,
-body:has(.globalSearchScrim) .v2AccountDock {
+body[data-shell-modal-scrim] .v2ProjectDock,
+body[data-shell-modal-scrim] .threadList,
+body[data-shell-modal-scrim] .v2AccountDock,
+body[data-shell-modal-backdrop] .v2ProjectDock,
+body[data-shell-modal-backdrop] .threadList,
+body[data-shell-modal-backdrop] .v2AccountDock,
+body[data-shell-search] .v2ProjectDock,
+body[data-shell-search] .threadList,
+body[data-shell-search] .v2AccountDock {
   filter: blur(12px);
   opacity: 0.64;
   pointer-events: none;
@@ -9873,9 +9873,9 @@ textarea:focus {
     gap: 0;
     margin-right: calc(var(--workspace-action-gutter, 6px) - 1.5px);
   }
-  body:has(.threadList.collapsed) .v2BrandRow > strong,
-  body:has(.threadList.collapsed) .v2PrimaryNav button > strong,
-  body:has(.threadList.collapsed) .v2AccountTrigger > strong {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2BrandRow > strong,
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2PrimaryNav button > strong,
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2AccountTrigger > strong {
     opacity: 0;
     visibility: hidden;
     pointer-events: none;
@@ -9889,29 +9889,29 @@ textarea:focus {
     visibility: visible;
     transition: opacity 260ms ease 90ms, transform 420ms cubic-bezier(0.22, 1, 0.36, 1), visibility 0s;
   }
-  body:has(.threadList.collapsed) .workspace > .threadList > .listHeader,
-  body:has(.threadList.collapsed) .workspace > .threadList > .v2WorkspaceTree {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList > .listHeader,
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList > .v2WorkspaceTree {
     opacity: 0;
     transform: translateX(-12px);
     visibility: hidden;
     pointer-events: none;
     transition: opacity 160ms ease, transform 340ms cubic-bezier(0.22, 1, 0.36, 1), visibility 0s linear 340ms;
   }
-  body:has(.threadList.collapsed) .topbar { padding-left: calc(var(--v2-collapsed-sidebar-width) + 16px); }
-  body:has(.threadList.collapsed) .errorBanner { margin-left: calc(var(--v2-collapsed-sidebar-width) + 12px); }
-  body:has(.threadList.collapsed) .v2ProjectDock, body:has(.threadList.collapsed) .v2AccountDock { display: block !important; }
-  body:has(.threadList.collapsed) .v2AccountDock { width: var(--v2-collapsed-sidebar-width) !important; }
-  body:has(.threadList.collapsed) .v2BrandRow > .v2SidebarToggle { right: 8.5px; }
-  body:has(.threadList.collapsed) .v2BuildBadge { display: none !important; }
-  body:has(.threadList.collapsed) .v2AccountDock { padding: 7px 8px; }
-  body:has(.threadList.collapsed) .v2AccountTrigger { justify-content: flex-start; padding: 0 8px; }
-  body:has(.threadList.collapsed) .workspace > .threadList { display: flex !important; grid-column: 1; grid-row: 1; }
-  body:has(.threadList.collapsed) .workspace > .threadList > .v2ProjectDock,
-  body:has(.threadList.collapsed) .workspace > .threadList > .v2AccountDock {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .topbar { padding-left: calc(var(--v2-collapsed-sidebar-width) + 16px); }
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .errorBanner { margin-left: calc(var(--v2-collapsed-sidebar-width) + 12px); }
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2ProjectDock, body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2AccountDock { display: block !important; }
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2AccountDock { width: var(--v2-collapsed-sidebar-width) !important; }
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2BrandRow > .v2SidebarToggle { right: 8.5px; }
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2BuildBadge { display: none !important; }
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2AccountDock { padding: 7px 8px; }
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2AccountTrigger { justify-content: flex-start; padding: 0 8px; }
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList { display: flex !important; grid-column: 1; grid-row: 1; }
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList > .v2ProjectDock,
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList > .v2AccountDock {
     visibility: visible;
     pointer-events: auto;
   }
-  body:has(.threadList.collapsed) .workspace > .conversation { grid-column: 3; grid-row: 1; }
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .conversation { grid-column: 3; grid-row: 1; }
   .v2SidebarToggle { display: grid; width: 29px; height: 29px; place-items: center; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #aeb1ab; font-size: 22px; line-height: 1; }
   .v2SidebarToggle:hover { background: rgba(255, 255, 255, 0.06); color: #f1f2ee; }
   .threadListRestoreButton { display: none !important; }
@@ -9919,7 +9919,7 @@ textarea:focus {
 
 @media (max-width: 720px) {
   .workspace > .threadList:not(.collapsed),
-  body:has(.threadList.collapsed) .workspace > .threadList.collapsed {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList.collapsed {
     position: fixed;
     inset: 0 auto 0 0;
     z-index: 180;
@@ -9935,7 +9935,7 @@ textarea:focus {
     visibility: visible;
     transition: transform 420ms cubic-bezier(0.22, 1, 0.36, 1), opacity 280ms ease, visibility 0s;
   }
-  body:has(.threadList.collapsed) .workspace > .threadList.collapsed {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList.collapsed {
     transform: translateX(-105%);
     opacity: 0;
     visibility: hidden;
@@ -9947,15 +9947,15 @@ textarea:focus {
     position: absolute;
     left: 0;
   }
-  body:has(.threadList.collapsed) .workspace > .threadList > .v2ProjectDock,
-  body:has(.threadList.collapsed) .workspace > .threadList > .v2AccountDock {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList > .v2ProjectDock,
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList > .v2AccountDock {
     display: block !important;
   }
   @keyframes v2-sidebar-restore-enter {
     from { opacity: 0; transform: translateX(-8px); }
     to { opacity: 1; transform: translateX(0); }
   }
-  body:has(.threadList.collapsed) .threadListRestoreButton {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .threadListRestoreButton {
     animation: v2-sidebar-restore-enter 220ms ease-out 220ms both;
   }
 }
@@ -10466,16 +10466,16 @@ textarea:focus {
     padding: 6px max(10px, env(safe-area-inset-right)) max(6px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
   }
 
-  body:has(.threadList.collapsed) .v2ProjectDock,
-  body:has(.threadList.collapsed) .v2AccountDock {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2ProjectDock,
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2AccountDock {
     display: block !important;
   }
 
-  body:has(.threadList.collapsed) .topbar {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .topbar {
     padding-left: max(10px, env(safe-area-inset-left)) !important;
   }
 
-  body:has(.threadList.collapsed) .workspace > .threadList.collapsed {
+  body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .workspace > .threadList.collapsed {
     display: flex !important;
   }
 
@@ -10847,7 +10847,7 @@ textarea:focus {
   box-shadow: none !important;
   color: #f1f2ee;
 }
-body:has(.threadList.collapsed) .v2BrandRow > .v2ThemeToggle {
+body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2BrandRow > .v2ThemeToggle {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
@@ -11100,7 +11100,7 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
   .diffReviewResizeHandle { display: none; }
   .diffReviewPanelHeader { padding-top: max(10px, env(safe-area-inset-top)); }
   .diffReviewPanelBody { padding-bottom: max(18px, env(safe-area-inset-bottom)); }
-  body:has(.workspace.diffPanelOpen) .threadListRestoreButton { visibility: hidden; opacity: 0; pointer-events: none; }
+  body[data-shell-right-open][data-shell-right-open] .threadListRestoreButton { visibility: hidden; opacity: 0; pointer-events: none; }
 }
 @media (max-width: 720px) {
   .conversation > .composer .composerBody {
@@ -12735,7 +12735,7 @@ body.sidebarResizing :is(.workspace, .topbar, .errorBanner, .threadList, .v2Acco
 }
 .directoryPickerScrim.uiClosing { animation: workspaceScrimOut .26s ease both; }
 .directoryPickerScrim.uiClosing > .directoryDialog.uiGlassSurface { animation: workspaceDialogOut .26s cubic-bezier(.4,0,.7,1) both; }
-body:has(.directoryPickerScrim) :is(.threadList, .v2ProjectDock, .v2AccountDock) { filter: none !important; opacity: 1 !important; }
+body[data-shell-directory-picker] :is(.threadList, .v2ProjectDock, .v2AccountDock) { filter: none !important; opacity: 1 !important; }
 @media (max-width: 720px) {
   .workspace > .threadList:not(.collapsed) { padding: 0 10px max(66px, env(safe-area-inset-bottom)) !important; }
   .workspace > .threadList > .v2ProjectDock { max-width: 100% !important; padding: max(10px, env(safe-area-inset-top)) 0 3px !important; }

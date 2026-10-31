@@ -9,7 +9,12 @@ export function useMobileComposerControls(element: HTMLElement | null) {
     const release = () => { clearTimeout(timer); delete element.dataset.mobileControlInteraction; };
     const begin = (event: PointerEvent) => {
       if (!matchMedia("(max-width: 720px)").matches || !(event.target instanceof Element)
-          || !event.target.closest(".composerControlRow button,.composerTools button")) return;
+          || !event.target.closest("button")) return;
+      // Keep an already expanded editor open across blur, but never expand
+      // the idle capsule on pointerdown: that would move the pressed target
+      // before click/pointerup (especially fragile for touch on WebKit).
+      if (element.getBoundingClientRect().height <= 60
+          && !element.querySelector(".composerRichInput:focus-within")) return;
       clearTimeout(timer);
       element.dataset.mobileControlInteraction = "true";
       timer = setTimeout(release, 1600); // Interrupted gestures cannot pin it forever.
@@ -18,11 +23,29 @@ export function useMobileComposerControls(element: HTMLElement | null) {
       if (!element.hasAttribute("data-mobile-control-interaction")) return;
       clearTimeout(timer); timer = setTimeout(release, 350);
     };
+    const keepDetails = (event: MouseEvent) => {
+      if (!matchMedia("(max-width: 720px)").matches || !(event.target instanceof Element)
+          || !event.target.closest(".composerThreadActivity button,.queuedSubmissionStrip button")
+          || element.getBoundingClientRect().height <= 60) return;
+      // Reading/toggling inline task details must not collapse them when the
+      // keyboard blurs. An actual outside interaction dismisses this latch.
+      element.dataset.mobileDetailOpen = "true";
+    };
+    const outside = (event: Event) => {
+      if (event.target instanceof Node && !element.contains(event.target)) delete element.dataset.mobileDetailOpen;
+    };
     element.addEventListener("pointerdown", begin, true);
+    element.addEventListener("click", keepDetails, true);
+    document.addEventListener("pointerdown", outside, true);
+    document.addEventListener("focusin", outside, true);
     window.addEventListener("pointerup", finish, true);
     window.addEventListener("pointercancel", release, true);
     return () => {
       release(); element.removeEventListener("pointerdown", begin, true);
+      delete element.dataset.mobileDetailOpen;
+      element.removeEventListener("click", keepDetails, true);
+      document.removeEventListener("pointerdown", outside, true);
+      document.removeEventListener("focusin", outside, true);
       window.removeEventListener("pointerup", finish, true);
       window.removeEventListener("pointercancel", release, true);
     };

@@ -40,6 +40,9 @@
   animation: v2-seamless-shimmer 2.35s linear infinite;
 }
 .subagentCompletionIcon, .subagentCompletionIcon svg { display: block; width: 12px; height: 12px; }
+/* Retained small rows are inert while folded; do not spend frames on their
+   invisible shimmer. Opening resumes the same animation without DOM churn. */
+.toolReveal[aria-hidden="true"] .subagentRunningShimmer { animation-play-state: paused; }
 .subagentRow { border-radius: 7px; transition: background-color var(--ui-popover-fade-duration) var(--ui-popover-motion-ease); }
 .subagentRow:hover:not(:disabled) { background: var(--ui-hover); }
 .subagentDot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: 0 0 6px; }

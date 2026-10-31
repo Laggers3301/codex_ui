@@ -42,6 +42,7 @@ import StarterKit from "@tiptap/starter-kit";
 import { toggleComposerList } from "./composerList";
 import { clipboardTable, ComposerTableKit } from "./composerTable";
 import { useMobileSidebar } from "./useMobileSidebar";
+import { shouldDismissMobileSidebar } from "./mobileSidebarActions";
 import { TaskNotificationDialog } from "./TaskNotificationDialog";
 import { syncWebAppAppearance } from "./webAppAppearance";
 import { Bell as NotificationBell, Info as SettingsInfo, LogOut as AccountLogout } from "./PanelIcons";
@@ -106,6 +107,8 @@ import { useThreadGoal } from "./threadGoal";
 import { useThreadSchedules } from "./threadSchedules";
 import { ThreadSchedules, threadScheduleSummary } from "./ThreadSchedules";
 import { SubagentActivity, SubagentToolCard } from "./SubagentActivity";
+import { observeComposerViewportMetrics } from "./composerViewportMetrics";
+import { observeShellPresentation } from "./shellPresentation";
 import { SubagentPanel } from "./SubagentPanel";
 import { SubagentAvatar } from "./SubagentAvatar";
 import { SelectionAskAction, type SelectionAskActionHandle } from "./SelectionAskAction";
@@ -4481,6 +4484,7 @@ function beginVerticalResize(
 }
 
 export function App() {
+  useLayoutEffect(() => observeShellPresentation(document.body), []);
   const [colorTheme, setColorTheme] = useState<"dark" | "light">(() => window.localStorage.getItem("codex-web-color-theme") === "light" ? "light" : "dark");
   useLayoutEffect(() => {
     syncWebAppAppearance(colorTheme);
@@ -4748,6 +4752,9 @@ export function App() {
   const [rightWorkspaceOpen, setRightWorkspaceOpen] = useState(false);
   const mobileSidebarController = useRef(setMobileSidebarOpen);
   mobileSidebarController.current = setMobileSidebarOpen;
+  useEffect(() => {
+    if (globalSearchOpen && window.matchMedia("(max-width: 720px)").matches) mobileSidebarController.current(false);
+  }, [globalSearchOpen]);
   useEffect(() => {
     if (rightWorkspaceOpen && window.matchMedia("(max-width: 720px)").matches) mobileSidebarController.current(false);
   }, [rightWorkspaceOpen]);
@@ -5485,40 +5492,12 @@ export function App() {
 
   useLayoutEffect(() => {
     const composer = composerElement;
-    const conversation = composer?.parentElement;
-    if (!composer || !conversation) return;
-    const messages = messagesElement;
-    let previousHeight = 0;
-    const updateHeight = () => {
-      if(composerRef.current!==composer||!composer.isConnected)return;
-      const height = composer.getBoundingClientRect().height;
-      if(height<=0)return;
-      conversation.style.setProperty("--composer-height", `${height}px`);
-      if (Math.abs(height - previousHeight) < 1) return;
-      previousHeight = height;
+    if (!composer) return;
+    return observeComposerViewportMetrics(composer, messagesElement, () => {
       if (autoFollowMessagesRef.current && !manualMessageScrollLockRef.current) {
         conversationVirtualRef.current?.scrollToEnd("auto");
       }
-    };
-    const observer = new ResizeObserver(updateHeight);
-    observer.observe(composer);
-    const updateMessagesHeight = () => {
-      // Loading can hide or replace the scrollport. Do not persist a zero
-      // viewport or let a detached observer overwrite the current measurement.
-      if(messages&&messagesRef.current===messages&&messages.isConnected&&messages.clientHeight>0){
-        conversation.style.setProperty("--messages-viewport-height", `${messages.clientHeight}px`);
-      }
-    };
-    const messagesObserver = messages ? new ResizeObserver(updateMessagesHeight) : null;
-    if (messages) messagesObserver?.observe(messages);
-    updateHeight();
-    updateMessagesHeight();
-    return () => {
-      observer.disconnect();
-      messagesObserver?.disconnect();
-      conversation.style.removeProperty("--composer-height");
-      conversation.style.removeProperty("--messages-viewport-height");
-    };
+    });
   }, [messagesElement,composerElement]);
 
   useLayoutEffect(() => {
@@ -12664,7 +12643,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           {!threadListCollapsed ? <button className="mobileSidebarBackdrop" type="button" aria-label="收起侧边栏" onClick={() => setMobileSidebarOpen(false)} /> : null}
           <nav id="conversation-sidebar" className={`threadList ${threadListCollapsed ? "collapsed" : ""}`} onClickCapture={event => {
             if (!window.matchMedia("(max-width: 720px)").matches || !(event.target instanceof Element)) return;
-            if (event.target.closest(".v2PrimaryNav button,.v2AccountMenu button,.listHeaderActions button,.projectNewThreadButton,.projectRenameButton,.projectDeleteButton")) setMobileSidebarOpen(false);
+            if (shouldDismissMobileSidebar(event.target, event.currentTarget)) setMobileSidebarOpen(false);
           }}>
             <div className="v2ProjectDock">
               <div className="v2BrandRow">
@@ -12688,16 +12667,16 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 ><IconParkSmallArrow direction={threadListCollapsed ? "right" : "left"} /></button>
               </div>
               <div className="v2PrimaryNav">
-                <button type="button" onClick={() => setNewThreadProjectPickerOpen(true)}>
+                <button type="button" data-mobile-sidebar-dismiss="true" onClick={() => setNewThreadProjectPickerOpen(true)}>
                   <svg className="v2NavGlyph v2NewThreadGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7" /><path d="M16 3h5v5" /><path d="m21 3-9 9" /></svg>
                   <strong>新建对话</strong>
                 </button>
-                <button type="button" onClick={() => void openSkillsPicker(true)}>
+                <button type="button" data-mobile-sidebar-dismiss="true" onClick={() => void openSkillsPicker(true)}>
                   <svg className="v2NavGlyph v2PluginGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 22v-5" /><path d="M9 8V2" /><path d="M15 8V2" /><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z" /></svg>
                   <strong>插件</strong>
                   <AccountUpdateIndicator key={`plugins:${selectedUserId}`} userId={selectedUserId} menuOpen={skillsPickerOpen} target="plugins" dismissOnRefresh />
                 </button>
-                <button type="button" onClick={() => void chooseDirectory()} disabled={selectingDirectory}>
+                <button type="button" data-mobile-sidebar-dismiss="true" onClick={() => void chooseDirectory()} disabled={selectingDirectory}>
                   <svg className="v2NavGlyph v2NewWorkspaceGlyph" aria-hidden="true" viewBox="0 0 24 24"><path d="M12 10v6" /><path d="M9 13h6" /><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg>
                   <strong>{selectingDirectory ? "选择中…" : "新建工作区"}</strong>
                 </button>
@@ -12706,8 +12685,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <div className="listHeader">
               <span>项目</span>
               <span className="listHeaderActions">
-                <button className="iconButton mobileWorkspaceCreate" type="button" onClick={() => void chooseDirectory()} disabled={selectingDirectory} title="新建工作区" aria-label="新建工作区"><WorkspaceCreateIcon size={17} /></button>
-                <button className="iconButton v2SidebarSearchButton" type="button" onClick={() => setGlobalSearchOpen(true)} title="搜索会话和消息" aria-label="搜索会话和消息">
+                <button className="iconButton mobileWorkspaceCreate" type="button" data-mobile-sidebar-dismiss="true" onClick={() => void chooseDirectory()} disabled={selectingDirectory} title="新建工作区" aria-label="新建工作区"><WorkspaceCreateIcon size={17} /></button>
+                <button className="iconButton v2SidebarSearchButton" type="button" data-mobile-sidebar-dismiss="true" onClick={() => setGlobalSearchOpen(true)} title="搜索会话和消息" aria-label="搜索会话和消息">
                   <Search size={17} strokeWidth={2.2} />
                 </button>
                 <button className="iconButton" type="button" onClick={() => { sidebarThreadLists.refresh(); void refreshThreads(selectedProjectIdRef.current, threadSearch); }} title="Refresh threads">
@@ -12789,6 +12768,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                       <button
                         className="projectNewThreadButton"
                         type="button"
+                        data-mobile-sidebar-dismiss="true"
                         onClick={(event) => {
                           event.preventDefault();
                           event.stopPropagation();
@@ -12987,13 +12967,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             >
               <HostResourceSummary onOpen={() => showRightWindow("resources")} />
               <div className={`v2AccountMenu${accountMenuPresence.closing ? " uiClosing" : ""}`} hidden={!accountMenuPresence.present} aria-hidden={!accountMenuOpen} inert={!accountMenuOpen}>
-                <button type="button" onClick={() => { setAccountMenuOpen(false); setPushError(""); setPushTestStatus(""); setNotificationSettingsOpen(true); }}>
+                <button type="button" data-mobile-sidebar-dismiss="true" onClick={() => { setAccountMenuOpen(false); setPushError(""); setPushTestStatus(""); setNotificationSettingsOpen(true); }}>
                   <span className="v2MenuIcon"><NotificationBell size={14} /></span><span>任务通知</span>
                 </button>
-                <button type="button" onClick={() => { setAccountMenuOpen(false); window.dispatchEvent(new Event("codex:open-pets")); }}>
+                <button type="button" data-mobile-sidebar-dismiss="true" onClick={() => { setAccountMenuOpen(false); window.dispatchEvent(new Event("codex:open-pets")); }}>
                   <span className="v2MenuIcon"><PanelMore size={14} /></span><span>我的宠物</span>
                 </button>
-                <button className="accountMenuLogout" type="button" onClick={() => window.location.assign("/__v2_logout")}>
+                <button className="accountMenuLogout" type="button" data-mobile-sidebar-dismiss="true" onClick={() => window.location.assign("/__v2_logout")}>
                   <span className="v2MenuIcon"><AccountLogout size={14} /></span><span>退出登录</span>
                 </button>
               </div>
@@ -13049,7 +13029,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             </Suspense>
             {writingChatVisible ? <div className="writingCanvasChatResize" role="separator" aria-label="调整写作与聊天宽度" aria-orientation="vertical" onMouseDown={event => beginRightPanelResize(event, writingChatWidth, setWritingChatWidth, "codex-writing-chat-width", 310, Math.min(650, window.innerWidth * .5))} /> : null}
           </> : null}
-          <section className="conversation">
+          <section className="conversation" data-run-state={conversationRunState}>
             <div className="conversationHeader">
               <div className="conversationTitle">
                 <h2>{selectedThread?.name || selectedThread?.preview || "New Thread"}</h2>

@@ -43,7 +43,7 @@
   position: relative;
 }
 
-body:has(.threadList.collapsed) .v2PrimaryNav button > .accountUpdateIndicator {
+body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2PrimaryNav button > .accountUpdateIndicator {
   position: absolute;
   left: 29px;
   right: auto;
@@ -51,7 +51,7 @@ body:has(.threadList.collapsed) .v2PrimaryNav button > .accountUpdateIndicator {
   margin: 0;
 }
 
-body:has(.threadList.collapsed) .v2AccountTrigger .accountUpdateIndicator {
+body[data-shell-sidebar-collapsed][data-shell-sidebar-collapsed] .v2AccountTrigger .accountUpdateIndicator {
   position: absolute;
   top: 4px;
   left: 28px;

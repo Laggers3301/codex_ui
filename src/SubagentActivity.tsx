@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { memo, useMemo, useRef, useState } from "react";
 import { PeoplesTwo, Down, Check } from "@icon-park/svg";
 import { ToolReveal } from "./ToolReveal";
 import { SubagentAvatar } from "./SubagentAvatar";
@@ -9,13 +9,13 @@ import { activityWindow } from "./subagentOrganization";
 import "./threadActivity.css";
 
 export function ActivityIcon({ name }: { name: "agents" | "down" }) {
-  const svg = (name === "agents" ? PeoplesTwo : Down)({ theme: "outline", size: 16, fill: "currentColor", strokeWidth: 3 }).replace(/^<\?xml[^>]*>/, "");
+  const svg = useMemo(() => (name === "agents" ? PeoplesTwo : Down)({ theme: "outline", size: 16, fill: "currentColor", strokeWidth: 3 }).replace(/^<\?xml[^>]*>/, ""), [name]);
   return <span className="threadActivityIcon" aria-hidden="true" dangerouslySetInnerHTML={{ __html: svg }} />;
 }
-function AgentRow({ agent, onOpen }: { agent: AgentEntry; onOpen?: (name?: string) => void }) {
+const AgentRow = memo(function AgentRow({ agent, onOpen }: { agent: AgentEntry; onOpen?: (name?: string) => void }) {
   const [open, setOpen] = useState(false);
   return <div><button type="button" className="subagentRow" disabled={!onOpen && !agent.summary} aria-expanded={onOpen ? undefined : open} onClick={event => { event.stopPropagation(); if (onOpen) onOpen(agent.name); else setOpen(value => !value); }}><SubagentAvatar name={agent.name} /><span className="subagentName">{agent.name.replace(/^\/root\//, "")}</span>{agent.model ? <span className="subagentModel">{agent.model}</span> : null}<span className={`subagentState state-${agent.state}${agent.state === "running" || agent.state === "dispatched" ? " subagentRunningShimmer" : ""}`}>{agent.state === "completed" ? <span className="subagentCompletionIcon" aria-hidden="true" dangerouslySetInnerHTML={{ __html: Check({ theme: "outline", size: 12, fill: "currentColor", strokeWidth: 3 }).replace(/^<\?xml[^>]*>/, "") }} /> : null}{agentStateLabel[agent.state]}</span></button>{onOpen ? null : <ToolReveal open={open}>{agent.summary ? <p className="subagentSummary">{agent.summary}</p> : null}</ToolReveal>}</div>;
-}
+});
 export function SubagentToolCard({ item, onOpenAgent, knownAgents = [] }: { item: ThreadItem; onOpenAgent?: (name?: string) => void; knownAgents?: AgentEntry[] }) {
   const operation = parseAgentOperation(item);
   if (!operation) return null;
@@ -63,7 +63,7 @@ export function SubagentActivity({ agents, onOpen, onOpenHistory, parentRunning 
       <button className="threadActivityHeading" type="button" onClick={() => setOpen(value => !value)} aria-expanded={open}>
         <ActivityIcon name="agents" /><span>{retained.current.summary}</span><span className={open ? "activityChevron open" : "activityChevron"}><ActivityIcon name="down" /></span>
       </button>
-      <ToolReveal open={open && activityPresent}><div className="subagentRows">{retained.current.rows.map(agent => <AgentRow key={agent.id} agent={agent} onOpen={onOpen} />)}
+      <ToolReveal open={open && activityPresent} keepMounted={activityPresent}><div className="subagentRows">{retained.current.rows.map(agent => <AgentRow key={agent.id} agent={agent} onOpen={onOpen} />)}
         {onOpen && (active > activity.active.length || activity.recent.length > 3) ? <button className="subagentMoreActivity" type="button" onClick={() => onOpen()}>查看全部本轮记录</button> : null}
       </div></ToolReveal>
     </ToolReveal>

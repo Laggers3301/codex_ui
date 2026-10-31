@@ -1,8 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { collectAgents, isActiveAgent, parseAgentOperation, reconcileSubagents } from "./subagentPresentation";
 import { mergeTimelineItems } from "./conversationTimeline";
 
 describe("subagent presentation", () => {
+  it("does not throw JSON parser exceptions for ordinary tool output or status labels", () => {
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      for (let i = 0; i < 100; i++) expect(parseAgentOperation({ id: String(i), type: "toolCall", tool: "exec", input: "printf fixture", output: "普通工具文本输出" })).toBeNull();
+      expect(collectAgents([{ id: "list", type: "toolCall", tool: "list_agents", output: { agents: [{ id: "agent", name: "worker", status: "running" }] } }])[0].state).toBe("running");
+      expect(parse).not.toHaveBeenCalled();
+    } finally { parse.mockRestore(); }
+  });
+  it("still decodes bounded double-encoded JSON and MCP JSON text wrappers", () => {
+    const row = { agents: [{ id: "agent", task_name: "worker", status: "completed" }] };
+    expect(parseAgentOperation({ id: "double", type: "toolCall", tool: "list_agents", output: JSON.stringify(JSON.stringify(row)) })?.agents[0].state).toBe("completed");
+    expect(parseAgentOperation({ id: "mcp", type: "toolCall", tool: "list_agents", output: { content: [{ type: "text", text: "readable non-JSON note" }, { type: "text", text: "  " + JSON.stringify(row) }] } })?.agents[0].name).toBe("worker");
+  });
   it("renders encrypted spawn as task/model metadata without ciphertext", () => {
     const operation = parseAgentOperation({ id: "a", type: "toolCall", tool: "collaboration.spawn_agent", completed: true,
       input: JSON.stringify({ task_name: "document_backend", model: "gpt-6-luna", message: "gAAAA" + "A".repeat(2000) }), aggregatedOutput: '{"task_name":"/root/document_backend"}' });

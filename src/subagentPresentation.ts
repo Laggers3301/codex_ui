@@ -16,6 +16,10 @@ function object(value: unknown, depth = 0): Record<string, unknown> {
   if (depth > 4) return {};
   if (typeof value === "string") {
     if (value.length >= MAX_AGENT_PAYLOAD) return {};
+    // Ordinary shell output and status labels are not JSON objects. Parsing
+    // them through exceptions on every render is very costly on mobile.
+    const first = value.trimStart()[0];
+    if (first !== "{" && first !== '"') return {};
     try { return object(JSON.parse(value), depth + 1); } catch { return {}; }
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
