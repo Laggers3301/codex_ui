@@ -1262,7 +1262,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         }
         return { threadId, turnId: tracked?.turnId ?? expectedTurnId, pendingServerRequests: requests,
           message: requests.some(pending => isApprovalRequest(pending.method)) ? "已重新取得待批准操作。"
-            : phaseFromProbe(status.activeFlags) === "waiting_approval" ? "运行时仍报告等待批准，但未返回可操作的批准请求。不能据此判断或批准具体操作。"
+            : phaseFromProbe(status.activeFlags) === "waiting_approval" ? "运行时仍报告等待批准，但未返回可操作的批准请求。不能据此判断或批准具体操作。若重新核对后仍无请求，可停止本轮，再发送继续指令；历史记录会保留。"
             : status.type ? "当前未发现待批准操作，已更新运行状态。" : "暂时无法确认运行状态，请稍后重新核对。" };
       });
     });

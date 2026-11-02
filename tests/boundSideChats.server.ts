@@ -254,10 +254,13 @@ app.post<{ Body: { pause: boolean } }>("/api/__test/hold-interrupt", async reque
 app.post("/api/__test/fail-next-approval", async () => { bridge.failNextApproval = true; return { ok: true }; });
 app.post<{ Body: { threadId: string; kind: string; emit?: boolean } }>("/api/__test/approval", async request => {
   const { threadId, kind, emit = true } = request.body, id = bridge.nextApprovalId++;
-  const pending = { id, method: `item/${kind}/requestApproval`, receivedAt: new Date().toISOString(), params: {
+  const pending = { id, method: kind.startsWith("mcp") ? "mcpServer/elicitation/request" : `item/${kind}/requestApproval`, receivedAt: new Date().toISOString(), params: {
     threadId, turnId: threads.get(threadId)!.turns.at(-1).id, itemId: `approval-${id}`,
     reason: "核对 lzc 分支的最新代码", cwd: root,
-    ...(kind === "commandExecution" ? { command: "git fetch origin lzc" } : kind === "permissions"
+    ...(kind.startsWith("mcp") ? { serverName: "codex_browser", mode: "form", message: 'Allow the codex_browser MCP server to run tool "browser_action"?',
+      _meta: { codex_approval_kind: "mcp_tool_call", tool_description: "读取当前浏览器页面快照", tool_params: { action: "snapshot" } },
+      requestedSchema: { type: "object", properties: kind === "mcpForm" ? { code: { type: "string" } } : {} }
+    } : kind === "commandExecution" ? { command: "git fetch origin lzc" } : kind === "permissions"
       ? { permissions: { network: { enabled: true }, fileSystem: { read: ["/tmp/approval-fixture"], write: null } } }
       : kind === "fileChange" ? { grantRoot: "/tmp/approval-fixture" } : kind === "claudeTool" ? {toolName:"Bash",toolInput:{command:"git status --short"}} : {})
   } };

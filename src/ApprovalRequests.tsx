@@ -1,4 +1,4 @@
-import { approvalDecisions, type ApprovalDecision, type ApprovalRequest } from "../shared/approvals";
+import { approvalDecisions, isMcpConsentRequest, isMcpElicitationRequest, type ApprovalDecision, type ApprovalRequest } from "../shared/approvals";
 
 export function ApprovalRequests({ requests, waiting, checking, message, answering, operation, onRefresh, onAnswer }: {
   requests: ApprovalRequest[];
@@ -14,17 +14,26 @@ export function ApprovalRequests({ requests, waiting, checking, message, answeri
   return <section className="codexApprovalRequests" aria-label="待批准操作">
     {requests.map(request => {
       const params = request.params;
+      const mcp = isMcpElicitationRequest(request.method);
+      const mcpMeta = mcp && params._meta && typeof params._meta === "object" && !Array.isArray(params._meta) ? params._meta as Record<string, unknown> : {};
       const network = params.networkApprovalContext;
       const claude = request.method === "item/claudeTool/requestApproval";
       const permissions = request.method === "item/permissions/requestApproval";
       const fileChange = request.method === "item/fileChange/requestApproval";
-      const title = claude ? `工具 ${String(params.toolName ?? "操作")}` : permissions ? "权限申请" : fileChange ? "文件修改" : network ? "网络访问" : request.method === "item/commandExecution/requestApproval" ? "命令执行" : "操作";
+      const title = mcp ? "MCP 工具调用" : claude ? `工具 ${String(params.toolName ?? "操作")}` : permissions ? "权限申请" : fileChange ? "文件修改" : network ? "网络访问" : request.method === "item/commandExecution/requestApproval" ? "命令执行" : "操作";
       const decisions = approvalDecisions(request);
-      const detail = claude ? JSON.stringify(params.toolInput ?? {}, null, 2) : operation(request);
+      const detail = mcp ? (mcpMeta.tool_params !== undefined ? JSON.stringify(mcpMeta.tool_params, null, 2) : operation(request)) : claude ? JSON.stringify(params.toolInput ?? {}, null, 2) : operation(request);
       return <div className="codexApprovalCard" role="alert" aria-label={`批准${title}`} key={String(request.id)}>
         <strong>{claude ? "Claude" : "Codex"} 等待批准{title}</strong>
+        {mcp ? <>
+          <p>MCP 服务：<code>{String(params.serverName ?? "未提供")}</code></p>
+          {typeof params.message === "string" ? <p>{params.message}</p> : null}
+          {typeof mcpMeta.tool_description === "string" ? <p>{mcpMeta.tool_description}</p> : null}
+          {typeof params.url === "string" ? <p>授权地址：<code>{params.url}</code></p> : null}
+          {!isMcpConsentRequest(request) ? <p>此请求需要填写表单、外部授权或设备验证，当前页面暂不支持完成。可以拒绝或取消操作，避免会话继续阻塞。</p> : null}
+        </> : null}
         {typeof params.reason === "string" && params.reason ? <p>申请原因：{params.reason}</p> : null}
-        {detail ? <pre>{detail}</pre> : permissions || network || params.grantRoot ? null : <p>运行时未提供具体操作内容。可以先重新核对，再决定是否批准。</p>}
+        {detail ? <pre>{detail}</pre> : mcp || permissions || network || params.grantRoot ? null : <p>运行时未提供具体操作内容。可以先重新核对，再决定是否批准。</p>}
         {typeof params.cwd === "string" ? <p>工作目录：<code>{params.cwd}</code></p> : null}
         {params.grantRoot ? <p>申请本会话的写入目录：<code>{String(params.grantRoot)}</code></p> : null}
         {network ? <pre>网络目标：{JSON.stringify(network, null, 2)}</pre> : null}

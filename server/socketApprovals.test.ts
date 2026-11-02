@@ -60,6 +60,27 @@ async function fixture(run: (test: any) => Promise<void>) {
 }
 
 describe("socket approvals", () => {
+  it("restores native MCP consent on reconnect and inspection, keeping decisions scoped to its owner", () => fixture(async ({ bridge, client, start, approval }: any) => {
+    const first = await client(); start();
+    const request = approval(10, "mcpServer/elicitation/request", false);
+    request.params = { threadId: "thread-a", turnId: null, serverName: "codex_browser", mode: "form", message: "Allow browser_action snapshot?", requestedSchema: { type: "object", properties: {} } };
+    approval(11, "item/commandExecution/requestApproval");
+    const restored = await client(), other = await client("other");
+    expect(restored.hello.data.pendingServerRequests.map((r: any) => r.id)).toEqual([10, 11]);
+    expect(other.hello.data.pendingServerRequests).toEqual([]);
+    first.send({ type: "approval.sync", requestId: "mcp-sync", threadId: "thread-a", turnId: "turn-a" });
+    expect((await first.wait((m: Message) => m.requestId === "mcp-sync")).data.pendingServerRequests.map((r: any) => r.id)).toEqual([10, 11]);
+    other.send({ type: "approval.respond", requestId: "mcp-foreign", codexRequestId: 10, threadId: "thread-a", result: { decision: "accept" } });
+    expect((await other.wait((m: Message) => m.requestId === "mcp-foreign")).ok).toBe(false);
+    restored.send({ type: "approval.respond", requestId: "mcp-wrong-thread", codexRequestId: 10, threadId: "thread-b", result: { decision: "accept" } });
+    expect((await restored.wait((m: Message) => m.requestId === "mcp-wrong-thread")).ok).toBe(false);
+    restored.send({ type: "approval.respond", requestId: "mcp-allow", codexRequestId: 10, threadId: "thread-a", result: { decision: "accept", content: { policy: "allow-all" } } });
+    expect((await restored.wait((m: Message) => m.requestId === "mcp-allow")).ok).toBe(true);
+    expect(bridge.responses).toEqual([{ id: 10, result: { action: "accept", content: {} } }]);
+    expect(bridge.pending.map((r: any) => r.id)).toEqual([11]);
+    expect(bridge.calls).toEqual([{ method: "thread/read", params: { threadId: "thread-a", includeTurns: false } }]);
+  }));
+
   it("restores permission requests, isolates users, and keeps the second approval waiting", () => fixture(async ({ bridge, client, start, approval }: any) => {
     const first = await client(); start(); const request = approval(1); approval(2, "item/commandExecution/requestApproval");
     const restored = await client(), other = await client("other");
