@@ -2,6 +2,14 @@ import {describe,it,expect} from "vitest";
 import {archivedOutputPreview,toolArchiveRoot,toolArchivePath} from "./toolOutputArchive.js";
 const make=(output:unknown)=>({timestamp:"2026-10-01T00:00:00Z",type:"response_item",payload:{type:"custom_tool_call_output",id:"item",call_id:"call",internal_chat_message_metadata_passthrough:{turn_id:"old",opaque:"unchanged"},output}});
 describe("tool archive preview",()=>{
+ it('supports opt-in compact previews without changing the normal policy',()=>{
+  const row=make(`HEAD${'x'.repeat(20000)}TAIL`);
+  expect(archivedOutputPreview(row,'/private/result.gz')).toBeNull();
+  const compact=archivedOutputPreview(row,'/private/result.gz',true)!;
+  expect(compact.payload.output).toContain('HEAD');expect(compact.payload.output).toContain('TAIL');
+  expect(Buffer.byteLength(compact.payload.output)).toBeLessThan(4096);
+  expect(row.payload.output).toContain('x'.repeat(20000));
+ });
  it("preserves small results",()=>expect(archivedOutputPreview(make("small"),"/private/result.gz")).toBeNull());
  it("keeps exact identity metadata and text head/tail",()=>{
   const row=make(`HEAD🙂${"x".repeat(200000)}TAIL结束`),next=archivedOutputPreview(row,"/private/result.gz")!;

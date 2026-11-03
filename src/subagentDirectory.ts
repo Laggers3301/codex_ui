@@ -7,6 +7,7 @@ export function sameSubagentDirectory(current: SubagentThreadSummary[], next: Su
   return current.length === next.length && current.every((agent, index) => {
     const other = next[index];
     return agent.id === other.id && agent.name === other.name && agent.parentThreadId === other.parentThreadId
+      && agent.inherited === other.inherited && agent.inheritedFromThreadId === other.inheritedFromThreadId
       && agent.model === other.model && agent.reasoningEffort === other.reasoningEffort
       && agent.state === other.state && agent.updatedAt === other.updatedAt
       && agent.createdAt === other.createdAt && agent.lastTaskAt === other.lastTaskAt;

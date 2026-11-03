@@ -23,17 +23,18 @@ function headTail(text:string,budget:number):string {
   return `${head}\n\n[…中间 ${Math.max(0,bytes.length-2*half)} 字节已归档…]\n\n${tail}`;
 }
 /** Keep the exact result shape, call ids and opaque passthrough metadata. */
-export function archivedOutputPreview(row:Record<string,any>,archivePath:string):Record<string,any>|null {
+export function archivedOutputPreview(row:Record<string,any>,archivePath:string,compact=false):Record<string,any>|null {
+  const threshold=compact?8*1024:toolArchiveThreshold,budget=compact?2*1024:previewBudget;
   const p=row.payload;
   if(row.type!=="response_item"||!p||!["custom_tool_call_output","function_call_output"].includes(p.type))return null;
   const serialized=JSON.stringify(p.output);
-  if(typeof serialized!=="string"||Buffer.byteLength(serialized)<=toolArchiveThreshold)return null;
+  if(typeof serialized!=="string"||Buffer.byteLength(serialized)<=threshold)return null;
   const notice=`[较早的超长工具结果已精简；完整结果在 ${archivePath}，按 call_id=${String(p.call_id??p.id??"未知")} 查询。]`;
   let output:unknown;
-  if(typeof p.output==="string")output=`${notice}\n${headTail(p.output,previewBudget)}`;
+  if(typeof p.output==="string")output=`${notice}\n${headTail(p.output,budget)}`;
   else if(Array.isArray(p.output)){
     const textCount=p.output.filter((b:any)=>b?.type==="input_text"&&typeof b.text==="string").length;
-    const perText=Math.max(128,Math.floor(previewBudget/Math.max(1,textCount)));
+    const perText=Math.max(128,Math.floor(budget/Math.max(1,textCount)));
     output=p.output.map((b:any)=>{
       if(b?.type==="input_text"&&typeof b.text==="string")return {...b,text:headTail(b.text,perText)};
       if(b?.type==="input_image"&&Buffer.byteLength(JSON.stringify(b))>toolArchiveThreshold)return {type:"input_text",text:"[较早的大尺寸工具图片已移入完整工具结果附件。]"};
@@ -45,13 +46,13 @@ export function archivedOutputPreview(row:Record<string,any>,archivePath:string)
   if(Buffer.byteLength(JSON.stringify(output))>=Buffer.byteLength(serialized))return null;
   return {...row,payload:{...p,output}};
 }
-export async function createToolOutputArchive(root:string,summary:ToolArchiveSummary) {
+export async function createToolOutputArchive(root:string,summary:ToolArchiveSummary,compact=false) {
   await fsp.mkdir(root,{recursive:true,mode:0o700});
   const final=toolArchivePath(root,summary.threadId),partial=`${final}.partial`,metadata=`${final}.json`;
   const gzip=createGzip({level:1}),output=fs.createWriteStream(partial,{flags:"wx",mode:0o600});
   const complete=pipeline(gzip,output);void complete.catch(()=>{});
   const write=async(bytes:Buffer|string)=>{if(!gzip.write(bytes))await once(gzip,"drain");};
-  await write(`${JSON.stringify({type:"archive_meta",payload:{version:summary.version,threadId:summary.threadId,sourceThreadId:summary.sourceThreadId,keptRecentTurnIds:summary.keptRecentTurnIds,createdAt:summary.createdAt,thresholdBytes:toolArchiveThreshold}})}\n`);
+  await write(`${JSON.stringify({type:"archive_meta",payload:{version:summary.version,threadId:summary.threadId,sourceThreadId:summary.sourceThreadId,keptRecentTurnIds:summary.keptRecentTurnIds,createdAt:summary.createdAt,thresholdBytes:compact?8*1024:toolArchiveThreshold,previewBytes:compact?2*1024:previewBudget}})}\n`);
   return {
     path:final,
     async append(bytes:Buffer,start:number){

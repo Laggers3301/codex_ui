@@ -7,6 +7,9 @@ const directoryCache = new Map<string, { signature: string; rows: SubagentThread
 const telemetryCache = new Map<string, { signature: string; value: Awaited<ReturnType<typeof readSubagentTelemetry>>; lastTaskAt: string | null }>();
 
 export interface SubagentThreadRecord {
+  inherited?: boolean;
+  inheritedFromThreadId?: string;
+  maxEndOffset?: number;
   id: string;
   parentThreadId: string;
   name: string;
@@ -243,9 +246,16 @@ export function findSubagentDescendant(parentThreadId: string, childThreadId: st
   return null;
 }
 
-export async function readSubagentDirectoryPage(parentThreadId: string, runtimeHomes: string[], options: { view?: "all" | "active" | "history"; q?: string; cursor?: string; limit?: number; resolveSessionFile?: (id: string, root: string) => Promise<string | null> } = {}) {
+export function subagentsForInheritance(parentThreadId: string, homes: string[]): SubagentThreadRecord[] {
+  const rows=new Map<string,SubagentThreadRecord>();
+  for(const home of homes)for(const row of uncappedFromRuntime(parentThreadId,path.resolve(home)))rows.set(row.id,row);
+  return [...rows.values()];
+}
+
+export async function readSubagentDirectoryPage(parentThreadId: string, runtimeHomes: string[], options: { inherited?: SubagentThreadRecord[]; view?: "all" | "active" | "history"; q?: string; cursor?: string; limit?: number; resolveSessionFile?: (id: string, root: string) => Promise<string | null> } = {}) {
   const view = options.view ?? "all", limit = Math.max(1, Math.min(100, Math.floor(options.limit ?? 40)));
   const all = new Map<string, SubagentThreadRecord>();
+  for(const row of options.inherited ?? [])all.set(row.id,row);
   for (const home of runtimeHomes) for (const row of uncappedFromRuntime(parentThreadId, path.resolve(home))) {
     const previous = all.get(row.id);
     if (!previous || Date.parse(row.updatedAt ?? "") > Date.parse(previous.updatedAt ?? "")) all.set(row.id, row);
@@ -255,6 +265,7 @@ export async function readSubagentDirectoryPage(parentThreadId: string, runtimeH
   const worker = async () => {
     while (cursorIndex < records.length) {
       const index = cursorIndex++, record = records[index];
+      if(record.inherited){enriched[index]={...record,state:'unknown',lastTaskAt:null};continue;}
       const root = path.join(record.runtimeHome, "sessions");
       const file = await (options.resolveSessionFile ? options.resolveSessionFile(record.id, root) : findSessionFile(root, record.id));
     let telemetry: Awaited<ReturnType<typeof readSubagentTelemetry>> = { state: "unknown" };
@@ -278,7 +289,7 @@ export async function readSubagentDirectoryPage(parentThreadId: string, runtimeH
   await Promise.all(Array.from({ length: Math.min(8, records.length) }, worker));
   const active = (row: SubagentDirectoryRow) => ["running", "waiting", "dispatched"].includes(row.state);
   const activeCount = enriched.filter(active).length, historyCount = enriched.length - activeCount;
-  const unknownCount = enriched.filter(row => row.state === "unknown").length;
+  const unknownCount = enriched.filter(row => row.state === "unknown" && !row.inherited).length;
   let filtered = enriched.filter(row => view === "all" || (view === "active" ? active(row) : !active(row)));
   const normalizedQ = options.q?.trim().toLocaleLowerCase() ?? "";
   if (normalizedQ) filtered = filtered.filter(row => `${row.id} ${row.name} ${row.model ?? ""}`.toLocaleLowerCase().includes(normalizedQ));

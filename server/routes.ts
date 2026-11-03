@@ -62,7 +62,9 @@ import { importStagedUserHandoff, type ImportedUserHandoff } from "./userHandoff
 import { pushPublicKey, sendUserPush } from "./webPush.js";
 import { pushSubscriptionSchema, validatePushEndpoint } from "./pushProtocol.js";
 import { advanceTrackedQuotaLedger, type TrackedQuotaLedgerAccount } from "./trackedQuotaLedger.js";
-import { configuredSubagentRuntimeHomes, findSubagentDescendant, readSubagentDirectoryPage } from "./subagentHistory.js";
+import { configuredSubagentRuntimeHomes, findSubagentDescendant, readSubagentDirectoryPage, subagentsForInheritance } from "./subagentHistory.js";
+import {freezeInheritedSubagents} from './subagentInheritance.js';
+import {indexedBranchCutoffTime} from './threadEventIndex.js';
 import { executionSettingsOverrides, queueScheduledPrompt, resumeThreadIfUnloaded, ScheduleConflictError, ScheduledTaskStore, type ScheduleRule } from "./scheduledTasks.js";
 
 const execFileAsync = promisify(execFile);
@@ -227,7 +229,8 @@ const threadBranchSchema = z.object({
   prompt: z.string().trim().max(24_000).optional().default(""),
   targetProjectId: z.string().uuid().optional(),
   model: z.string().trim().min(1).max(256).optional(),
-  archiveToolOutputs: z.boolean().optional().default(false)
+  archiveToolOutputs: z.boolean().optional().default(false),
+  compactToolOutputs: z.boolean().optional().default(false)
 });
 
 const threadReadQuerySchema = z.object({
@@ -4104,6 +4107,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       try {
         return await readSubagentDirectoryPage(request.params.threadId, configuredSubagentRuntimeHomes(request.params.threadId), {
           view: view as "all" | "active" | "history", q: query.q, cursor: query.cursor, limit,
+          inherited:store.getInheritedSubagents(request.params.threadId,userId),
           resolveSessionFile: (id, sessionsRoot) => findThreadJsonlPathById(id, sessionsRoot)
         });
       } catch (error) {
@@ -4124,7 +4128,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
       }
       const input = threadReadQuerySchema.parse(request.query ?? {});
-      const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId));
+      const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId))
+        ?? store.getInheritedSubagents(request.params.threadId,userId).find(row=>row.id===request.params.agentThreadId);
       if (!record) return reply.code(404).send({ error: "Subagent thread not found." });
       const sessionsRoot = path.join(record.runtimeHome, "sessions");
       const filePath = await findThreadJsonlPathById(record.id, sessionsRoot);
@@ -4133,9 +4138,11 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         before: input.before,
         cursor: input.cursor,
         limit: input.limit,
-        backgroundRefresh: !input.fresh && input.before === 0 && !input.cursor
+        backgroundRefresh: !record.inherited && !input.fresh && input.before === 0 && !input.cursor,
+        maxEndOffset:record.maxEndOffset
       });
       const result = sanitizeThreadPayloadForClient({ thread: indexedPage.thread });
+      if(record.inherited){const bounded=asRecord(asRecord(result).thread);bounded.preview='';bounded.inherited=true;}
       deferLargeToolOutputs(asRecord(result).thread);
       return { thread: asRecord(result).thread, history: indexedPage.history };
     } catch (error) {
@@ -4152,11 +4159,12 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) {
         return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
       }
-      const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId));
+      const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId))
+        ?? store.getInheritedSubagents(request.params.threadId,userId).find(row=>row.id===request.params.agentThreadId);
       if (!record) return reply.code(404).send({ error: "Subagent thread not found." });
       const sessionsRoot = path.join(record.runtimeHome, "sessions");
       const filePath = await findThreadJsonlPathById(record.id, sessionsRoot);
-      const indexedItem = filePath ? await readIndexedThreadItem(filePath, record.id, request.params.itemId) : null;
+      const indexedItem = filePath ? await readIndexedThreadItem(filePath, record.id, request.params.itemId,{maxEndOffset:record.maxEndOffset}) : null;
       if (!indexedItem) return reply.code(404).send({ error: "Tool output was not found in the thread index." });
       const output = typeof indexedItem.aggregatedOutput === "string"
         ? indexedItem.aggregatedOutput
@@ -4321,6 +4329,12 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       // Node; Codex performs the exact fork inside the owning app-server.
       const poolBridge = isAccountPoolBridge(bridge) ? bridge : null;
       const persistedSourcePath = await findThreadJsonlPathById(request.params.threadId);
+      const inheritedCandidates=new Map(store.getInheritedSubagents(request.params.threadId,userId).map(row=>[row.id,row]));
+      for(const row of subagentsForInheritance(request.params.threadId,configuredSubagentRuntimeHomes(request.params.threadId)))inheritedCandidates.set(row.id,row);
+      const inheritedSubagents=inheritedCandidates.size && persistedSourcePath
+        ? await freezeInheritedSubagents([...inheritedCandidates.values()],request.params.threadId,
+          await indexedBranchCutoffTime(persistedSourcePath,request.params.threadId,input.turnId),
+          row=>findThreadJsonlPathById(row.id,path.join(row.runtimeHome,'sessions'))) : [];
       let sourceThread: Record<string, unknown>;
       try {
         const source = await bridge.request("thread/read", { threadId: request.params.threadId, includeTurns: false }, 60_000);
@@ -4395,6 +4409,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           const copied = await copyLargeThreadBranch({
             sourcePath, sourceSessionsRoot, sourceThreadId: request.params.threadId,
             lastTurnId: input.turnId, targetSessionsRoot: path.join(routing.targetAccount.codexHome, "sessions"),
+            compactToolOutputs:input.compactToolOutputs,
             cwd: targetProject.rootPath,
             ...(archiveToolOutputs?{toolArchiveRoot:toolArchiveRoot(serverConfig.dataDir,userId)}:{})
           });
@@ -4420,6 +4435,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           poolBridge.assignThreadsToAccount([copied.threadId], routing.targetAccount.id);
           store.registerThreadOwner({ threadId: copied.threadId, userId, projectId: targetProject.id,
             rootPath: targetProject.rootPath, model, reasoningEffort });
+          store.setInheritedSubagents(copied.threadId,userId,inheritedSubagents);
           store.updateThreadDisplayName(copied.threadId, userId, branchTitle(
             presentation?.displayName ?? stringOrNull(sourceThread.name) ?? "会话",
             routing.targetAccount.label, routing.sourceAccount?.label ?? null
@@ -4471,6 +4487,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         reasoningEffort
       });
       store.setThreadExecutionSettings(createdThreadId, userId, branchExecution.sandbox, branchExecution.approvalPolicy);
+      store.setInheritedSubagents(createdThreadId,userId,inheritedSubagents);
       if (browserMcp?.bindingId) bindBrowserMcpThread(browserMcp.bindingId, createdThreadId, store);
       const targetAccount = poolBridge?.getKnownThreadAccount(createdThreadId)
         ?? (routing ? { id: routing.targetAccount.id, label: routing.targetAccount.label } : null);

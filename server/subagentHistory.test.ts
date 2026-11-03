@@ -210,6 +210,16 @@ describe("subagent history metadata", () => {
       expect(deniedParent.statusCode).toBe(403);
       expect(store.getThreadOwner(childId)).toBeNull();
       expect(bridge.request).not.toHaveBeenCalled();
+      const branchId='branch-thread';
+      store.registerThreadOwner({threadId:branchId,userId:'admin',projectId:project.id,rootPath:temporary});
+      const frozenEnd=fs.statSync(filePath).size;
+      store.setInheritedSubagents(branchId,'admin',[{id:childId,name:'Worker',parentThreadId:parentId,runtimeHome,inherited:true,inheritedFromThreadId:parentId,maxEndOffset:frozenEnd,createdAt:'2026-10-02T00:00:00Z',updatedAt:'2026-10-02T00:00:02Z'}]);
+      fs.appendFileSync(filePath,JSON.stringify({type:'event_msg',timestamp:'2026-10-03T00:00:00Z',payload:{type:'task_started',turn_id:'later-turn'}})+'\n'+JSON.stringify({type:'response_item',timestamp:'2026-10-03T00:00:01Z',payload:{type:'function_call_output',call_id:'later-output',output:'AFTER_BRANCH_PRIVATE_CONTENT'}})+'\n');
+      const inheritedList=await app.inject({url:`/api/projects/${project.id}/threads/${branchId}/subagents`});
+      expect(inheritedList.json().data).toMatchObject([{id:childId,inherited:true}]);
+      const inheritedRead=await app.inject({url:`/api/projects/${project.id}/threads/${branchId}/subagents/${childId}?limit=128`});
+      expect(inheritedRead.statusCode).toBe(200);expect(inheritedRead.body).toContain('child record');expect(inheritedRead.body).not.toContain('AFTER_BRANCH_PRIVATE_CONTENT');
+      expect((await app.inject({url:`/api/projects/${project.id}/threads/${branchId}/subagents/${childId}/items/later-output/output`})).statusCode).toBe(404);
     } finally {
       await app.close();
       store.close();

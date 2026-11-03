@@ -99,6 +99,7 @@ export async function copyLargeThreadBranch(options: {
   targetSessionsRoot: string;
   cwd: string;
   toolArchiveRoot?: string;
+  compactToolOutputs?: boolean;
 }): Promise<LegacyForkCopy> {
   const sourcePath = await rolloutSourcePath(options.sourcePath);
   const sourceBefore = await fsp.stat(sourcePath);
@@ -193,7 +194,7 @@ export async function copyLargeThreadBranch(options: {
       const targetIndex=turns.findIndex(t=>t.id===target.id);
       const recentIds=turns.slice(0,targetIndex+1).slice(-2).map(t=>t.id);
       const recent=new Set(recentIds);
-      archive=await createToolOutputArchive(options.toolArchiveRoot,{version:1,threadId,sourceThreadId:options.sourceThreadId,keptRecentTurnIds:recentIds,archivedRecords:0,archivedBytes:0,originalBranchBytes:header.length+sourceEnd-headerEnd,branchBytes:0,archiveBytes:0,createdAt:now.toISOString()});
+      archive=await createToolOutputArchive(options.toolArchiveRoot,{version:1,threadId,sourceThreadId:options.sourceThreadId,keptRecentTurnIds:recentIds,archivedRecords:0,archivedBytes:0,originalBranchBytes:header.length+sourceEnd-headerEnd,branchBytes:0,archiveBytes:0,createdAt:now.toISOString()},options.compactToolOutputs);
       const destinationHandle=await fsp.open(stagedPath,"a");
       let currentTurn:string|undefined;
       try{
@@ -209,7 +210,7 @@ export async function copyLargeThreadBranch(options: {
             const row=JSON.parse(record.bytes.toString("utf8"));
             const turnId=row.payload?.internal_chat_message_metadata_passthrough?.turn_id??currentTurn;
             // Missing turn attribution is unsafe: preserve rather than guess.
-            if(typeof turnId==="string"&&!recent.has(turnId))transformed=archivedOutputPreview(row,archive.path);
+            if(typeof turnId==="string"&&!recent.has(turnId))transformed=archivedOutputPreview(row,archive.path,options.compactToolOutputs);
           }
           if(transformed){await archive.append(record.bytes,record.start);await destinationHandle.writeFile(`${JSON.stringify(transformed)}\n`);}
           else await destinationHandle.writeFile(record.bytes);

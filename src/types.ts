@@ -379,6 +379,8 @@ export interface ThreadReadResponse {
 }
 
 export interface SubagentThreadSummary {
+  inherited?: boolean;
+  inheritedFromThreadId?: string;
   id: string;
   name: string;
   parentThreadId: string;

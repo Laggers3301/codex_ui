@@ -517,6 +517,23 @@ export const THREAD_PAGE_BYTE_BUDGET = 8 * 1024 * 1024;
 const MAX_SINGLE_RECORD_BYTES = 32 * 1024 * 1024;
 const historyReads = new HistoryReadScheduler();
 
+export async function indexedBranchCutoffTime(filePath: string, threadId: string, turnId?: string): Promise<number> {
+  await warmThreadIndex(filePath, threadId);
+  const row = turnId
+    ? db.prepare('SELECT end_offset FROM thread_turns WHERE thread_id=? AND turn_id=?').get(threadId, turnId)
+    : db.prepare('SELECT end_offset FROM thread_turns WHERE thread_id=? ORDER BY start_offset DESC LIMIT 1').get(threadId);
+  const end = Number((row as {end_offset?: number} | undefined)?.end_offset);
+  if (!Number.isSafeInteger(end) || end <= 0) throw new Error('分支轮次尚未结束，无法固定子代理历史边界。');
+  const file = await openReadableRollout(filePath);
+  try {
+    const start=Math.max(0,end-128*1024), buffer=Buffer.alloc(end-start);
+    await file.read(buffer,0,buffer.length,start);
+    const lines=buffer.toString('utf8').split('\n'); if(start)lines.shift();
+    for(const line of lines.reverse())try {const record=JSON.parse(line);const time=Date.parse(record.timestamp);if(Number.isFinite(time))return time;}catch{}
+    throw new Error('无法确定分支时间，未继承不明确的子代理记录。');
+  } finally {await file.close();}
+}
+
 export function readIndexedThreadPage(
   filePath: string,
   threadId: string,
