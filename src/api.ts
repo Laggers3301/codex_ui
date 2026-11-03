@@ -34,6 +34,9 @@ import type {
 } from "./types";
 
 const defaultUserId = "admin";
+export function readMemoryProcesses(signal: AbortSignal): Promise<{data: import('../shared/hostResources').MemoryProcesses}> {
+  return request('/api/system/memory-processes', {signal: AbortSignal.any([signal, AbortSignal.timeout(8000)])});
+}
 export function readHostResources(signal: AbortSignal): Promise<{ data: import("../shared/hostResources").HostResources }> {
   return request("/api/system/resources", { signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]) });
 }

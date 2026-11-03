@@ -6,6 +6,7 @@ import { serverConfig } from "./config.js";
 import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { readThreadFromJsonl, readThreadSummaryFromJsonl } from "./threadFallback.js";
 import {rolloutLogicalStat, rolloutStat,openReadableRollout,rolloutReadStream} from './rolloutStorage.js';
+import { HistoryReadScheduler } from './historyReadScheduler.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -514,21 +515,24 @@ async function indexedCollaborationMode(filePath: string, threadId: string): Pro
 // Bound source bytes BEFORE JSONL buffers, UTF-16 strings and objects coexist.
 export const THREAD_PAGE_BYTE_BUDGET = 8 * 1024 * 1024;
 const MAX_SINGLE_RECORD_BYTES = 32 * 1024 * 1024;
-let pageReadQueue: Promise<void> = Promise.resolve();
-async function serializedHistoryRead<T>(read: () => Promise<T>): Promise<T> {
-  const previous = pageReadQueue;
-  let release!: () => void;
-  pageReadQueue = new Promise<void>(resolve => { release = resolve; });
-  await previous;
-  try { return await read(); } finally { release(); }
-}
+const historyReads = new HistoryReadScheduler();
 
 export function readIndexedThreadPage(
   filePath: string,
   threadId: string,
   options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number }
 ) {
-  return serializedHistoryRead(() => readIndexedThreadPageUnlocked(filePath, threadId, options));
+  return historyReads.run(async () => {
+    const state = fileState(threadId);
+    const boundaryMatches = !state || await indexedRecordBoundaryMatches(filePath, threadId);
+    if (options.backgroundRefresh && state && boundaryMatches) {
+      const existingUpdate = updateLocks.get(threadId);
+      if (existingUpdate) await existingUpdate;
+      else void warmThreadIndex(filePath, threadId).catch(() => undefined);
+    } else {
+      await warmThreadIndex(filePath, threadId);
+    }
+  }, () => readIndexedThreadPageUnlocked(filePath, threadId, options));
 }
 
 async function readIndexedThreadPageUnlocked(
@@ -536,15 +540,6 @@ async function readIndexedThreadPageUnlocked(
   threadId: string,
   options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number }
 ) {
-  const state = fileState(threadId);
-  const boundaryMatches = !state || await indexedRecordBoundaryMatches(filePath, threadId);
-  if (options.backgroundRefresh && state && boundaryMatches) {
-    const existingUpdate = updateLocks.get(threadId);
-    if (existingUpdate) await existingUpdate;
-    else void warmThreadIndex(filePath, threadId).catch(() => undefined);
-  } else {
-    await warmThreadIndex(filePath, threadId);
-  }
   const collaborationMode = await indexedCollaborationMode(filePath, threadId);
   const withMode = (thread: JsonRecord) => collaborationMode ? { ...thread, collaborationMode } : thread;
   const maxEndOffset = options.maxEndOffset ?? Number.MAX_SAFE_INTEGER;
@@ -640,11 +635,10 @@ export function locateIndexedThreadItem(threadId: string, itemId: string) {
 }
 
 export function readIndexedThreadItem(filePath: string, threadId: string, itemId: string, options: { preferCall?: boolean; maxEndOffset?: number } = {}): Promise<JsonRecord | null> {
-  return serializedHistoryRead(() => readIndexedThreadItemUnlocked(filePath, threadId, itemId, options));
+  return historyReads.run(() => warmThreadIndex(filePath, threadId), () => readIndexedThreadItemUnlocked(filePath, threadId, itemId, options));
 }
 
 async function readIndexedThreadItemUnlocked(filePath: string, threadId: string, itemId: string, options: { preferCall?: boolean; maxEndOffset?: number }): Promise<JsonRecord | null> {
-  await warmThreadIndex(filePath, threadId);
   const row = db.prepare(`
     SELECT turn_id, start_offset, end_offset FROM thread_records
     WHERE thread_id = ? AND (record_id = ? OR call_id = ?) AND end_offset <= ? LIMIT 1

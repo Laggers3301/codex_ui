@@ -1,6 +1,6 @@
 /* One mobile reading scale across the three columns; geometry remains owned
    by each layout. Source/terminal grids and document pages keep their metrics. */
-.mobileHeaderTitle,.mobileRightWorkspaceToggle,.mobileRightResourceDock {display:none;}
+.mobileHeaderTitle,.mobileRightWorkspaceToggle {display:none;}
 :root .messageItem.kind-tool:not(.toolBundleEntry) {padding-left:0!important;margin-left:0!important;}
 @property --mobile-composer-motion-height {syntax:"<length>";inherits:false;initial-value:52px;}
 @keyframes mobileComposerControlsArrive {from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
@@ -90,6 +90,12 @@
   :root[data-theme] .messageItem.kind-tool.toolBundle.toolBundleShimmering .messageItem.kind-tool.toolBundleEntry>.messageMeta {background-image:none!important;animation:none!important;}
   :root .topbar>.controls {min-height:0;opacity:0;transform:translateY(-5px);visibility:hidden;pointer-events:none;transition:opacity .22s ease,transform .3s cubic-bezier(.22,1,.36,1),visibility .3s;}
   :root .topbar>.controls {will-change:transform;}
+  /* The animated controls establish a containing block (even at transform:none
+     because of will-change). A viewport-based fixed top counted that offset
+     twice. Anchor quota to this row, including while it is sliding in. */
+  :root .topbar>.controls {position:relative;}
+  :root .topbar .controls>.quotaPopoverAnchor {position:static;}
+  :root .topbar .quotaPopover {position:absolute;top:calc(100% + 8px);left:0;right:0;width:auto;}
   .v2PlusMenu:not([hidden]) {will-change:opacity,transform;}
   :root .topbar[data-mobile-controls="visible"]>.controls {opacity:1;transform:none;visibility:visible;pointer-events:auto;}
   :root .topbar .controls>.rightWorkspaceToggle {display:none!important;}
@@ -97,11 +103,7 @@
   .mobileRightWorkspaceToggle :is(svg,.rightWorkspaceIcon) {width:18px;height:18px;}
   :root .threadList .hostResourceDock {display:none!important;}
   :root .workspace>.threadList:has(.hostResourceSummary) {padding-bottom:calc(66px + env(safe-area-inset-bottom,0px))!important;}
-  :root .mobileRightResourceDock {display:block;flex:0 0 auto;padding:8px 14px 10px;}
-  :root .mobileRightResourceDock .hostResourceDock {width:100%;margin:0;font:400 var(--mobile-control-size)/1.35 var(--pool-ui-font);}
-  :root .mobileRightResourceDock .hostResourceDock :is(button,small,b,span) {font:inherit!important;}
-  :root .mobileRightResourceDock .hostResourceDock button {display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;min-width:0;min-height:44px;padding:4px 2px;border:0;border-radius:var(--ui-radius-control,14px);color:var(--ui-content);}
-  :root .mobileRightResourceDock .hostResourceTile>span svg {width:15px;height:15px;}
+  :root .rightWorkspaceResources .hostResourceDock {font-size:var(--mobile-control-size);}
   .composer:is([data-mobile-control-interaction],[data-mobile-plus-menu-open],:has(.polishedSelect.open,.groupedModelMenu,.v2PlusMenu))>.composerBody {overflow:visible;}
   :root .trackedQuotaDialog :is(h2,strong,span,small,p,button,em,label) {font-size:var(--mobile-text-size)!important;}
   :root .trackedQuotaDialog :is(small,.trackedQuotaFootnote,.trackedQuotaUpdated) {font-size:var(--mobile-meta-size)!important;}

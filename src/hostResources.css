@@ -3,6 +3,20 @@
 :root .v2AccountDock .v2AccountTrigger {position:relative;margin-top:4px;}
 :root .v2AccountDock .v2AccountTrigger::before {content:"";position:absolute;top:-2px;left:0;right:0;height:1px;background:var(--ui-divider);pointer-events:none;}
 .hostResourceSummary { display: contents; }
+.memoryTopFive {margin-top:10px;min-width:0;}
+.hostResourcesPanel button.memoryTopFiveToggle {display:inline-flex;flex-direction:row;justify-content:space-between;align-items:center;gap:8px;width:auto;max-width:100%;white-space:nowrap;margin-top:8px;border:0;border-radius:10px;background:var(--ui-hover);color:inherit;padding:8px 10px;font:inherit;cursor:pointer;}
+.memoryTopFiveToggle svg:last-child {transition:transform .2s ease;}
+.memoryTopFiveToggle[aria-expanded="true"] svg:last-child {transform:rotate(180deg);}
+.memoryTopFiveBody {min-width:0;padding-top:8px;}
+.memoryTopFiveToolbar {display:flex;justify-content:space-between;align-items:center;color:var(--ui-content-muted);font-size:13px;}
+.memoryTopFiveToolbar button {display:grid;place-items:center;border:0;border-radius:9px;padding:6px;background:var(--ui-hover);color:inherit;cursor:pointer;}
+.hostResourcesPanel .memoryProcess {margin-top:8px;padding:10px;border-radius:14px;background:var(--ui-hover);min-width:0;}
+.memoryProcess h4 {display:flex;align-items:center;justify-content:space-between;gap:8px;margin:0;font:inherit;}
+.memoryProcess h4 span {min-width:0;overflow-wrap:anywhere;}
+.memoryProcess strong {white-space:nowrap;font:inherit;}
+.memoryProcess dl {display:grid;grid-template-columns:max-content minmax(0,1fr);gap:4px 9px;margin:6px 0 0;font-size:13px;line-height:1.5;}
+.memoryProcess dt {color:var(--ui-content-muted);}
+.memoryProcess dd {margin:0;overflow-wrap:anywhere;user-select:text;}
 .hostResourceTile > span { display: flex; align-items:center;justify-content:center;gap:4px;min-width:0; }
 .hostResourceDock { font: 400 13px/1.4 var(--pool-ui-font), sans-serif; }
 .v2AccountDock .hostResourceDock button { font: inherit !important; }

@@ -7,7 +7,7 @@ export function journalItem(update: LiveStateUpdate): Item {
   const item = update.item;
   if (update.kind === "reasoning") return { id: update.item.itemId, type: "reasoning", text: update.item.text, summary: [update.item.text], completed: item.completed, timelineAt: item.startedAt, timelineOrder: item.sequence };
   return update.kind === "tool"
-    ? { id: item.itemId, callId: item.itemId, sourceItemId: update.item.sourceItemId, type: "toolCall", tool: update.item.tool, collaboration: update.item.collaboration, input: (update.historyItem ?? update.item).input, aggregatedOutput: (update.historyItem ?? update.item).output, completed: item.completed, timelineAt: item.startedAt, timelineOrder: item.sequence }
+    ? { id: item.itemId, callId: item.itemId, sourceItemId: update.item.sourceItemId, type: "toolCall", tool: update.item.tool, description: update.item.description, collaboration: update.item.collaboration, input: (update.historyItem ?? update.item).input, aggregatedOutput: (update.historyItem ?? update.item).output, completed: item.completed, timelineAt: item.startedAt, timelineOrder: item.sequence }
     : { id: update.item.sourceItemId, type: "agentMessage", text: update.item.text, completed: item.completed, streamState: update.item.streamState ?? (item.completed ? "completed" : "streaming"), timelineAt: item.startedAt, timelineOrder: item.sequence };
 }
 
@@ -39,6 +39,7 @@ export function overlayJournal(thread: Item, read: (turnId: string) => Item[], i
       if (existing && existing.type !== "toolCallOutput") {
         const index = items.indexOf(existing);
         merged[index] = { ...entry, ...merged[index], timelineAt: entry.timelineAt, timelineOrder: entry.timelineOrder };
+        if (entry.type === "toolCall" && !merged[index].description && typeof entry.description === "string") merged[index].description = entry.description;
         if (entry.type === "reasoning" && typeof entry.text === "string" && entry.text.trim()) {
           // Native history can still contain the empty item-start snapshot.
           const native = items[index];

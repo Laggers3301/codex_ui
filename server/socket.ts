@@ -10,7 +10,7 @@ import { z } from "zod";
 import { serverConfig } from "./config.js";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
-import { authenticatedUserFromHeaders } from "./auth.js";
+import { authenticatedUserFromHeaders, deletedWebUserIds, isDeletedWebUser } from "./auth.js";
 import { DEFAULT_USER_ID, type ProjectStore } from "./db.js";
 import { LiveStateStore } from "./liveState.js";
 import { isUserInputRequest, validateUserInputResponse } from "./userInput.js";
@@ -700,8 +700,13 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   // "open" but no reply or close event arrives. Probe every 15s and terminate
   // only sockets that miss a full ping interval so the client reconnects itself.
   const heartbeat = setInterval(() => {
+    const deletedUsers = deletedWebUserIds();
     for (const client of wss.clients) {
       const userClient = client as UserWebSocket;
+      if (userClient.codexUserId && deletedUsers.has(userClient.codexUserId)) {
+        client.close(1008, "Account access revoked.");
+        continue;
+      }
       if (userClient.isAlive === false) {
         client.terminate();
         continue;
@@ -1232,6 +1237,10 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     });
 
     ws.on("message", (raw) => {
+      if (isDeletedWebUser(sessionUserId)) {
+        ws.close(1008, "Account access revoked.");
+        return;
+      }
       void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission, (requestId) => {
         const pending = pendingApprovalTurns.get(requestId);
         if (pending) processBridgeNotification({ method: "serverRequest/resolved", accountId: pending.accountId, params: { threadId: pending.threadId, requestId } } as RpcEnvelope);

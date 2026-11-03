@@ -2,6 +2,13 @@ import { describe, expect, it } from "vitest";
 import { LiveStateStore } from "./liveState.js";
 
 describe("LiveStateStore reconnect bounds", () => {
+  it("preserves explicit tool descriptions across updates", () => {
+    const state = new LiveStateStore();
+    state.recordNotification({ method: "turn/started", params: { threadId: "t", turnId: "u" } });
+    state.recordNotification({ method: "item/started", params: { threadId: "t", turnId: "u", item: { id: "i", type: "commandExecution", command: "pwd", description: "检查目录" } } });
+    state.recordNotification({ method: "item/completed", params: { threadId: "t", turnId: "u", item: { id: "i", type: "commandExecution", command: "pwd" } } });
+    expect(state.snapshot().toolItems[0]).toMatchObject({ description: "检查目录", input: "pwd", completed: true });
+  });
   it("preserves typed async agent questions as tools for reconnect and answer delivery", () => {
     const state = new LiveStateStore();
     state.recordNotification({ method: "turn/started", params: { threadId: "thread", turnId: "turn" } });

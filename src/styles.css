@@ -5276,22 +5276,7 @@ pre,
   background: transparent !important;
 }
 
-.composerResizeHandle::after {
-  content: "";
-  position: absolute;
-  top: 4px;
-  right: 18px;
-  left: 18px;
-  height: 1px;
-  border-radius: 1px;
-  background: transparent;
-  transition: background-color 120ms ease;
-}
-
-.composerResizeHandle:hover::after,
-.composerResizeHandle:active::after {
-  background: rgba(255, 255, 255, 0.22);
-}
+.composerResizeHandle::after { content: none; }
 
 .composerTools .exportFormatSelect,
 .composerTools .compactCheckbox,
@@ -6436,6 +6421,51 @@ body[data-shell-file-preview] .threadListRestoreButton {
 .leaderboardMeter { background: #3c3e3a; }
 .leaderboardMeter span { background: #b8bbb5; }
 .leaderboardDialog .dialogActions { border-top-color: #353734; background: #242524; }
+
+.leaderboardBody > .leaderboardScope { grid-column: 1 / -1; }
+.leaderboardPanels { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 11px; grid-column: 1 / -1; min-width: 0; }
+.leaderboardPeriodPanel { min-width: 0; }
+.leaderboardPeopleRows { max-height: min(58vh, 560px); overflow-y: auto; overscroll-behavior: contain; }
+.leaderboardPersonRow { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; padding: 13px 16px; border: 0; border-bottom: 1px solid var(--ui-divider); background: transparent; color: var(--ui-content); font: inherit; text-align: left; cursor: pointer; }
+.leaderboardPersonRow:last-child { border-bottom: 0; }
+.leaderboardPersonRow:hover { background: var(--ui-hover); }
+.leaderboardPersonRow:focus-visible, .leaderboardBack:focus-visible, .leaderboardPeriodTabs button:focus-visible { outline: 2px solid var(--ui-content-muted); outline-offset: -2px; }
+.leaderboardPersonRow strong { min-width: 0; overflow-wrap: anywhere; font-size: 14px; font-weight: 550; }
+.leaderboardPersonRow > span { display: inline-flex; align-items: center; gap: 10px; flex-shrink: 0; font-size: 15px; font-variant-numeric: tabular-nums; }
+.leaderboardPersonRow svg { color: var(--ui-content-muted); }
+.leaderboardPersonDetails .leaderboardScopeHeader { align-items: center; }
+.leaderboardPersonDetails .leaderboardScopeHeader > div { text-align: right; }
+.leaderboardBack { display: inline-flex; align-items: center; gap: 3px; padding: 6px 0; border: 0; background: transparent; color: var(--ui-content); font: inherit; font-size: 13px; cursor: pointer; }
+.leaderboardPeriodTabs { display: flex; gap: 8px; padding: 12px 14px 0; }
+.leaderboardPeriodTabs button { padding: 6px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--ui-content-muted); font: inherit; font-size: 12px; cursor: pointer; }
+.leaderboardPeriodTabs button[aria-pressed="true"] { background: var(--ui-hover); color: var(--ui-content); }
+.leaderboardModelDetails { padding: 0 14px; max-height: min(45vh, 420px); overflow-y: auto; }
+.leaderboardModelDetail { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 6px 16px; padding: 13px 0; border-bottom: 1px solid var(--ui-divider); color: var(--ui-content); }
+.leaderboardModelDetail:last-child { border-bottom: 0; }
+.leaderboardModelDetail > div { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px; min-width: 0; }
+.leaderboardModelDetail strong { overflow-wrap: anywhere; font-size: 13px; font-weight: 550; }
+.leaderboardModelDetail small { color: var(--ui-content-muted); font-size: 11px; }
+.leaderboardModelDetail > span { font-variant-numeric: tabular-nums; font-size: 14px; }
+.leaderboardModelDetail p { grid-column: 1 / -1; margin: 0; color: var(--ui-content-muted); font-size: 11px; }
+.leaderboardQuotaNote { margin: 0; padding: 9px 14px 14px; color: var(--ui-content-muted); font-size: 11px; line-height: 1.6; }
+@media (max-width: 600px) {
+  .leaderboardPanels { gap: 8px; }
+  .leaderboardPeriodPanel .leaderboardScopeHeader { padding: 10px; gap: 6px; }
+  .leaderboardPeriodPanel .leaderboardScopeHeader h3 { font-size: 13px; }
+  .leaderboardPeriodPanel .leaderboardScopeHeader p { font-size: 11px; }
+  .leaderboardPeriodPanel .leaderboardPersonRow { padding: 11px 10px; gap: 6px; }
+  .leaderboardPeriodPanel .leaderboardPersonRow strong { font-size: 12px; }
+  .leaderboardPeriodPanel .leaderboardPersonRow > span { font-size: 12px; gap: 3px; }
+  .leaderboardPeriodPanel .leaderboardPersonRow > span > svg { display: none; }
+  .leaderboardPeriodPanel .leaderboardScopeHeader > div { min-width: 0; overflow-wrap: anywhere; }
+  .leaderboardPeriodPanel .leaderboardBack { font-size: 11px; gap: 0; flex-shrink: 0; }
+  .leaderboardPeriodPanel .leaderboardPeriodTabs { padding: 8px 8px 0; gap: 3px; }
+  .leaderboardPeriodPanel .leaderboardPeriodTabs button { padding: 5px; font-size: 11px; }
+  .leaderboardPeriodPanel .leaderboardModelDetails { padding: 0 9px; }
+  .leaderboardPeriodPanel .leaderboardModelDetail { gap: 6px; }
+  .leaderboardPeriodPanel .leaderboardModelDetail > span { font-size: 12px; }
+  .leaderboardPeriodPanel .leaderboardQuotaNote { padding: 8px 10px; }
+}
 
 /* Allow the model menu to float above the composer and the message stream. */
 .composer,
@@ -7662,6 +7692,10 @@ body[data-shell-search] .v2AccountDock {
   text-size-adjust: 100%;
   font-weight: 400;
 }
+
+.messageItem.kind-tool.toolBundleEntry::before { display: none !important; content: none !important; }
+.toolBundleTypeIcon { grid-column: 1; grid-row: 1; align-self: center; justify-self: center; color: var(--ui-content-muted); pointer-events: none; }
+.toolBundleEntry > .messageMeta { grid-column: 2 !important; grid-row: 1 !important; }
 
 .toolQuestionCard {
   grid-column: 1 / -1;

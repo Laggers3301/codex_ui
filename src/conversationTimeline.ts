@@ -131,7 +131,7 @@ export function collapseCodeModeWrappers(items: ThreadItem[]): ThreadItem[] {
 
 export function liveTimelineItems(entries: Array<{
   id: string; kind: "agent" | "tool" | "reasoning"; sourceItemId?: string; startedAt: string; sequence: number;
-  text?: string; tool?: string; input?: string; output?: string; completed?: boolean; streamState?: string; collaboration?: Record<string, unknown>;
+  text?: string; tool?: string; description?: string; input?: string; output?: string; completed?: boolean; streamState?: string; collaboration?: Record<string, unknown>;
 }>): ThreadItem[] {
   const items: ThreadItem[] = [];
   const agents = new Map<string, ThreadItem>();
@@ -139,7 +139,7 @@ export function liveTimelineItems(entries: Array<{
     if (entry.kind === "reasoning") {
       items.push({ id: entry.id, type: "reasoning", text: entry.text, summary: [entry.text ?? ""], completed: entry.completed, timelineAt: entry.startedAt, timelineOrder: entry.sequence, timelineLive: true });
     } else if (entry.kind === "tool") {
-      items.push({ id: entry.id, callId: entry.id, sourceItemId: entry.sourceItemId, type: "toolCall", tool: entry.tool, input: entry.input, aggregatedOutput: entry.output, completed: entry.completed, collaboration: entry.collaboration, timelineAt: entry.startedAt, timelineOrder: entry.sequence, timelineLive: true });
+      items.push({ id: entry.id, callId: entry.id, sourceItemId: entry.sourceItemId, type: "toolCall", tool: entry.tool, description: entry.description, input: entry.input, aggregatedOutput: entry.output, completed: entry.completed, collaboration: entry.collaboration, timelineAt: entry.startedAt, timelineOrder: entry.sequence, timelineLive: true });
     } else {
       const id = entry.sourceItemId ?? entry.id;
       const existing = agents.get(id);

@@ -12,13 +12,13 @@ describe("generic account update dot", () => {
     const app = Fastify(); registerUiUpdateRoutes(app);
     const headers = { cookie: createSessionCookie("mode-alice").split(";")[0] };
     try {
-      publishUiUpdate("mode-fix-one", ["questions", "plan", "threads"]);
-      for (const target of ["questions", "plan", "threads"]) {
+      publishUiUpdate("mode-fix-one", ["questions", "plan", "threads", "leaderboard"]);
+      for (const target of ["questions", "plan", "threads", "leaderboard"]) {
         expect((await app.inject({ url: `/api/ui-updates?target=${target}`, headers })).json().hasUnseen).toBe(true);
         expect((await app.inject({ method: "POST", url: "/api/ui-updates/seen", headers, payload: { version: "mode-fix-one", target } })).statusCode).toBe(200);
       }
-      publishUiUpdate("mode-fix-one", ["questions", "plan", "threads"]);
-      for (const target of ["questions", "plan", "threads", "account"]) expect((await app.inject({ url: `/api/ui-updates?target=${target}`, headers })).json().hasUnseen).toBe(false);
+      publishUiUpdate("mode-fix-one", ["questions", "plan", "threads", "leaderboard"]);
+      for (const target of ["questions", "plan", "threads", "leaderboard", "account"]) expect((await app.inject({ url: `/api/ui-updates?target=${target}`, headers })).json().hasUnseen).toBe(false);
     } finally { await app.close(); delete process.env.CODEX_WEB_UI_UPDATE_DIR; fs.rmSync(tmp, { recursive: true, force: true }); }
   });
   it("publishes question fixes at the question entry and acknowledges them per user", async () => {

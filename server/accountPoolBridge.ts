@@ -20,6 +20,7 @@ import {authDiagnostic, type AuthDiagnostic, type AuthPhase} from "./authDiagnos
 import { ProviderTurnProtocol } from "./providerProtocol.js";
 import { validateModelRequest } from "./modelRequestValidation.js";
 import { nativeModelDiscoveryEnabled } from "./nativeModelDiscovery.js";
+import { BranchConflictError } from "./largeThreadFork.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -1507,18 +1508,38 @@ export class AccountPoolBridge extends EventEmitter {
   }
 
   /** Select the best current account for a branch, independently of its source. */
-  getBranchRoutingDecision(threadId: string, model?: string, forcedTargetAccountId?: string): {
+  getBranchRoutingDecision(threadId: string, model?: string, forcedTargetAccountId?: string, requiredMemoryBytes?: number): {
     mode: "native" | "cross-account-native";
     sourceAccount: { id: string; label: string; codexHome: string } | null;
     targetAccount: { id: string; label: string; codexHome: string };
   } {
     const source = this.accountsById.get(this.threadAccounts.get(threadId) ?? "") ?? null;
-    const target = forcedTargetAccountId
+    let target = forcedTargetAccountId
       ? this.accountsById.get(forcedTargetAccountId)
       : this.chooseAccount(model);
     if (!target) throw new Error(`Unknown account-pool account: ${forcedTargetAccountId}`);
     if (model && target.supportedModels && !target.supportedModels.has(model)) {
       throw new Error(`Account ${target.id} does not support model ${model}.`);
+    }
+    if (requiredMemoryBytes !== undefined) {
+      if (!Number.isFinite(requiredMemoryBytes) || requiredMemoryBytes < 0) throw new Error("Invalid branch memory budget.");
+      const eligible = (account: AccountRuntime) => {
+        if (account.kind !== "codex-account" || account.health !== "ready" || account.authFailureCode
+          || model && account.supportedModels && !account.supportedModels.has(model)
+          || remainingPercent(account.cache?.limits) === 0) return false;
+        const available = account.bridge.getMemoryHeadroom();
+        return available !== null && Number.isFinite(available) && available >= requiredMemoryBytes;
+      };
+      if (!eligible(target)) {
+        // A per-user account restriction is an authorization boundary, not a
+        // preference to bypass when another runtime has more RAM.
+        const alternatives = forcedTargetAccountId ? [] : this.accounts.filter(eligible);
+        if (!alternatives.length) throw new BranchConflictError("当前没有支持同一模型且内存余量足够的 GPT 账号，已安全停止分支；原会话未修改。");
+        const selected = selectAccountCandidate(alternatives.map(account => ({ id: account.id, health: account.health,
+          remainingPercent: remainingPercent(account.cache?.limits), activeRequests: account.activeRequests,
+          assignedThreadCount: this.assignedThreadCount(account.id) })));
+        target = this.accountsById.get(selected.id)!;
+      }
     }
     const sourceAccount = source
       ? { id: source.id, label: source.label, codexHome: source.codexHome }

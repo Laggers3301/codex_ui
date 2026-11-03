@@ -106,7 +106,17 @@ export class TurnWatchdog {
 
   claimDueProbes(now = Date.now(), staleAfterMs = 120_000, probeEveryMs = 60_000): WatchdogProbeClaim[] {
     const claims: WatchdogProbeClaim[] = [];
-    for (const turn of this.turns.values()) {
+    // Super-agent's bounded background scheduling principle: observations must
+    // not fan out without limit and compete with interactive work. Oldest
+    // unobserved turns go first; users sharing one runtime share its one slot.
+    const active = [...this.turns.values()].filter(turn => turn.probeToken !== null);
+    const busyAccounts = new Set(active.map(turn => turn.accountId));
+    const available = Math.max(0, 2 - active.length);
+    const candidates = [...this.turns.values()].sort((a, b) =>
+      (a.lastProbeAt ?? -Infinity) - (b.lastProbeAt ?? -Infinity));
+    for (const turn of candidates) {
+      if (claims.length >= available) break;
+      if (busyAccounts.has(turn.accountId)) continue;
       if (now - turn.lastProgressAt < staleAfterMs || turn.probeToken !== null) continue;
       if (turn.lastProbeAt !== null && now - turn.lastProbeAt < probeEveryMs) continue;
       const shouldDiagnose = !turn.diagnosed;
@@ -114,6 +124,7 @@ export class TurnWatchdog {
       turn.lastProbeAt = now;
       const token = this.nextProbeToken++;
       turn.probeToken = token;
+      busyAccounts.add(turn.accountId);
       claims.push({ turn, token, shouldDiagnose });
     }
     return claims;

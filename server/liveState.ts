@@ -1,4 +1,5 @@
 import type { RpcEnvelope } from "./types.js";
+import { toolDescription } from "../shared/toolDescription.js";
 import { isQuestionToolName, readLiveQuestionNotification } from "../src/questionTool.js";
 
 type LiveTurnStatus = "running" | "completed";
@@ -36,6 +37,7 @@ export interface LiveReasoningMessage {
 }
 
 export interface LiveToolItem {
+  description?: string;
   collaboration?: Record<string, unknown>;
   internal?: boolean;
   itemId: string;
@@ -450,6 +452,7 @@ export class LiveStateStore {
       threadId: existing?.threadId ?? threadId,
       turnId: existing?.turnId ?? turnId ?? activeTurn?.turnId ?? null,
       tool: toolLabel(item) || existing?.tool || "tool",
+      description: toolDescription(item, item.arguments, item.input) ?? existing?.description,
       internal: isContextCompactionItem(item) || existing?.internal,
       ...(normalizedToken(item.type) === "collabagenttoolcall" ? { collaboration: {
         type: "collabAgentToolCall", tool: item.tool, status: item.status, senderThreadId: item.senderThreadId,

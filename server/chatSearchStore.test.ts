@@ -24,6 +24,19 @@ beforeEach(() => {
 afterEach(() => { search.close(); source.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe('message-only chat search', () => {
+  it('releases source WAL read snapshots between search-index batches', async () => {
+    thread('a', Array.from({length: 180}, (_, i) => `first ${i}`));
+    thread('b', ['second']);
+    source.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    const syncing = search.sync();
+    const checkpoint = await new Promise<{log:number;checkpointed:number}>(resolve => setTimeout(() => {
+      source.prepare('INSERT INTO thread_records VALUES(?,?,?,?,?,?)').run('a', 181, 'late', 'turn-a', 'user', 'later');
+      resolve(source.prepare('PRAGMA wal_checkpoint(PASSIVE)').get() as {log:number;checkpointed:number});
+    }, 0));
+    await syncing;
+    expect(checkpoint.log).toBeGreaterThan(0);
+    expect(checkpoint.checkpointed).toBe(checkpoint.log);
+  });
   it('groups before pagination; a large thread cannot crowd out other threads', async () => {
     thread('long', Array.from({length:120}, () => 'Markdown result'));
     thread('short', ['Markdown other']);

@@ -22,13 +22,15 @@ import { LegacyRollbackConflictError } from "./legacyRollback.js";
 import {readableRolloutPath, rolloutLogicalStat, rolloutReadStream, MAX_FULL_HISTORY_BYTES, HistoryMemoryLimitError} from './rolloutStorage.js';
 import { inheritedBillingTurnIds } from "./leaderboardForkUsage.js";
 import { billingLines } from "./billingLines.js";
-import { authenticatedUserFromHeaders } from "./auth.js";
+import { authenticatedUserFromHeaders, deletedWebUserIds, isDeletedWebUser } from "./auth.js";
+import { AppError } from "./appErrors.js";
+import { memberRealName } from "../shared/memberDirectory.js";
 import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
 import { registerScheduledTaskMcp } from "./scheduledTaskMcp.js";
 import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
 import { createCrossAccountForkSnapshot } from "./crossAccountFork.js";
-import { assertLargeBranchMemory, BranchConflictError, branchGate, copyLargeThreadBranch, isLegacyRollout, largeThreadForkBytes } from "./largeThreadFork.js";
+import { assertLargeBranchMemory, BranchConflictError, branchGate, copyLargeThreadBranch, isLegacyRollout, largeThreadForkBytes, largeBranchMemoryBudget, relocateLargeThreadBranch } from "./largeThreadFork.js";
 import {toolArchiveRoot,toolArchivePath,readToolArchiveSummary,type ToolArchiveSummary} from "./toolOutputArchive.js";
 import { DEFAULT_USER_ID, type ProjectStore, type ThreadPresentation } from "./db.js";
 import { registerSideChatRoutes } from "./sideChatRoutes.js";
@@ -742,10 +744,14 @@ type PublicLeaderboardModelUsage = PublicTokenBreakdown & {
   model: string;
   effort: string | null;
   sessionCount: number;
+  quotaPercent?: number | null;
+  poolQuotaPercent?: number | null;
 };
 
 type PublicLeaderboardUserUsage = PublicTokenBreakdown & {
   userId: string;
+  displayName?: string | null;
+  poolQuotaPercent?: number | null;
   sharePercent: number;
   quotaPercent: number | null;
   sessionCount: number;
@@ -766,7 +772,39 @@ type PublicCodexLeaderboard = {
   lifetime: PublicLeaderboardScope;
   updatedAt: string;
   errors: string[];
+  quotaAccountCount?: number;
 };
+
+/** Filter at response time, including cached boards, preserving actual billing totals. */
+export function filterDeletedLeaderboardUsers(
+  board: PublicCodexLeaderboard,
+  deletedIds: ReadonlySet<string> = deletedWebUserIds()
+): PublicCodexLeaderboard {
+  if (!deletedIds.size) return board;
+  return {
+    ...board,
+    currentCycle: { ...board.currentCycle, users: board.currentCycle.users.filter(user => !deletedIds.has(user.userId)) },
+    lifetime: { ...board.lifetime, users: board.lifetime.users.filter(user => !deletedIds.has(user.userId)) }
+  };
+}
+
+export function presentLeaderboard(board: PublicCodexLeaderboard): PublicCodexLeaderboard {
+  const filtered = filterDeletedLeaderboardUsers(board);
+  const count = board.quotaAccountCount ?? 0;
+  const poolPercent = (quota: number | null | undefined): number | null =>
+    count > 0 && typeof quota === "number" && Number.isFinite(quota) ? round2(quota / count) : null;
+  const scope = (value: PublicLeaderboardScope): PublicLeaderboardScope => ({
+    ...value,
+    users: value.users.map(user => ({
+      ...user,
+      displayName: memberRealName(user.userId),
+      poolQuotaPercent: poolPercent(user.quotaPercent),
+      models: user.models.map(model => ({ ...model, poolQuotaPercent: poolPercent(model.quotaPercent) }))
+    })).sort((a, b) => (b.poolQuotaPercent ?? -1) - (a.poolQuotaPercent ?? -1)
+      || b.totalTokens - a.totalTokens || a.userId.localeCompare(b.userId))
+  });
+  return { ...filtered, currentCycle: scope(filtered.currentCycle), lifetime: scope(filtered.lifetime) };
+}
 
 type TokenAccumulator = PublicTokenBreakdown;
 
@@ -1124,6 +1162,9 @@ function finalizeLeaderboardScope(
           model: modelBucket.model,
           effort: modelBucket.effort,
           sessionCount: modelBucket.sessions.size,
+          quotaPercent: totalTokens > 0 && options.totalQuotaUsedPercent !== null
+            ? round2((modelBucket.totals.totalTokens / totalTokens) * options.totalQuotaUsedPercent)
+            : null,
           ...modelBucket.totals
         }))
         .sort((left, right) => right.totalTokens - left.totalTokens || left.model.localeCompare(right.model));
@@ -1248,34 +1289,64 @@ export function usageInLeaderboardCycle(
     && (window.resetAt === null || usage.occurredAt < window.resetAt);
 }
 
+/** Express historical tokens as equivalent current-cycle quota, not token share.
+ * Historical model prices/limits were not recorded, so this is an estimate. */
+export function estimateLifetimeTokenQuota(historicalTokens: number, cycleTokens: number, cycleQuotaPercent: number | null): number | null {
+  if (!Number.isFinite(historicalTokens) || historicalTokens < 0 || !Number.isFinite(cycleTokens) || cycleTokens <= 0
+    || typeof cycleQuotaPercent !== "number" || !Number.isFinite(cycleQuotaPercent) || cycleQuotaPercent <= 0) return null;
+  return round2(historicalTokens / cycleTokens * cycleQuotaPercent);
+}
+
 export function mergeAccountLeaderboards(boards: PublicCodexLeaderboard[], sources: LeaderboardAccountSource[]): PublicCodexLeaderboard {
   const codexBoards = boards.filter((_, index) => sources[index]?.kind !== "api-provider");
-  const quotaByUser = new Map<string, number>();
-  for (const board of codexBoards) {
-    for (const user of board.currentCycle.users) {
-      if (user.quotaPercent !== null) quotaByUser.set(user.userId, (quotaByUser.get(user.userId) ?? 0) + user.quotaPercent);
+  const calibrated = codexBoards.filter(board => estimateLifetimeTokenQuota(1, board.currentCycle.totalTokens, board.currentCycle.quotaUsedPercent) !== null);
+  const poolCycleTokens = calibrated.reduce((sum, board) => sum + board.currentCycle.totalTokens, 0);
+  const poolCycleQuota = calibrated.reduce((sum, board) => sum + (board.currentCycle.quotaUsedPercent ?? 0), 0);
+  const lifetimeScopes = codexBoards.map(board => {
+    const ownCalibration = estimateLifetimeTokenQuota(1, board.currentCycle.totalTokens, board.currentCycle.quotaUsedPercent) !== null;
+    const estimate = (tokens: number) => estimateLifetimeTokenQuota(tokens,
+      ownCalibration ? board.currentCycle.totalTokens : poolCycleTokens,
+      ownCalibration ? board.currentCycle.quotaUsedPercent : poolCycleQuota);
+    return { ...board.lifetime, quotaUsedPercent: estimate(board.lifetime.totalTokens),
+      users: board.lifetime.users.map(user => ({ ...user, quotaPercent: estimate(user.totalTokens),
+        models: user.models.map(model => ({ ...model, quotaPercent: estimate(model.totalTokens) })) })) };
+  });
+
+  const mergePeriod = (period: "currentCycle" | "lifetime"): PublicLeaderboardScope => {
+    const quotaScopes = period === "currentCycle" ? codexBoards.map(board => board.currentCycle) : lifetimeScopes;
+    const quotaByUser = new Map<string, number>();
+    const quotaByModel = new Map<string, Map<string, number>>();
+    const unknownUsers = new Set<string>(), unknownModels = new Map<string, Set<string>>();
+    for (const scope of quotaScopes) {
+      for (const user of scope.users) {
+        if (user.quotaPercent !== null) quotaByUser.set(user.userId, (quotaByUser.get(user.userId) ?? 0) + user.quotaPercent);
+        else if (period === "lifetime") unknownUsers.add(user.userId);
+        const models = quotaByModel.get(user.userId) ?? new Map<string, number>();
+        const missing = unknownModels.get(user.userId) ?? new Set<string>();
+        for (const model of user.models) {
+          const quota = model.quotaPercent ?? (user.quotaPercent !== null && user.totalTokens > 0
+            ? user.quotaPercent * model.totalTokens / user.totalTokens : null);
+          const key = `${model.model}::${model.effort ?? ""}`;
+          if (quota !== null) models.set(key, (models.get(key) ?? 0) + quota);
+          else if (period === "lifetime") missing.add(key);
+        }
+        quotaByModel.set(user.userId, models);
+        unknownModels.set(user.userId, missing);
+      }
     }
-  }
-  const currentCycle = mergeLeaderboardScopes(
-    boards.map((board) => board.currentCycle),
-    boards.map((_, index) => `账号 ${index + 1}`),
-    false,
-    codexBoards.some((board) => board.currentCycle.quotaUsedPercent !== null)
-      ? codexBoards.reduce((sum, board) => sum + (board.currentCycle.quotaUsedPercent ?? 0), 0)
-      : null
-  );
-  // API tokens affect token rank/share, never a user's estimated GPT quota.
-  currentCycle.users = currentCycle.users.map((user) => ({ ...user, quotaPercent: quotaByUser.get(user.userId) ?? null }));
-  return {
-    currentCycle,
-    lifetime: mergeLeaderboardScopes(
-      boards.map((board) => board.lifetime),
-      boards.map((_, index) => `账号 ${index + 1}`),
-      false
-    ),
-    updatedAt: new Date().toISOString(),
-    errors: boards.flatMap((board) => board.errors)
+    const merged = mergeLeaderboardScopes(boards.map(board => board[period]), boards.map((_, index) => `账号 ${index + 1}`), false,
+      quotaScopes.some(scope => scope.quotaUsedPercent !== null)
+        ? quotaScopes.reduce((sum, scope) => sum + (scope.quotaUsedPercent ?? 0), 0) : null);
+    // Independent API plans never acquire GPT quota merely by sharing a login.
+    merged.users = merged.users.map(user => ({ ...user,
+      quotaPercent: unknownUsers.has(user.userId) ? null : quotaByUser.get(user.userId) ?? null,
+      models: user.models.map(model => ({ ...model, quotaPercent:
+        unknownModels.get(user.userId)?.has(`${model.model}::${model.effort ?? ""}`) ? null
+          : quotaByModel.get(user.userId)?.get(`${model.model}::${model.effort ?? ""}`) ?? null })) }));
+    return merged;
   };
+  return { quotaAccountCount: codexBoards.length, currentCycle: mergePeriod("currentCycle"), lifetime: mergePeriod("lifetime"),
+    updatedAt: new Date().toISOString(), errors: boards.flatMap(board => board.errors) };
 }
 
 /** The leaderboard and quota panel must show the same accrued estimate;
@@ -1291,8 +1362,14 @@ export function applyAccruedTrackedQuota(
     && Math.abs(ledger[source.id].resetAt - source.quota.rateLimits.primary.resetsAt) <= leaderboardResetDriftSeconds);
   if (!matched.length) return board;
   const accrued = round2(matched.reduce((sum, source) => sum + ledger[source.id].userCycleQuotaPercent, 0));
-  return { ...board, currentCycle: { ...board.currentCycle, users: board.currentCycle.users.map(user =>
-    sameTrackedUser(user.userId, userId) ? { ...user, quotaPercent: accrued } : user) } };
+  if (accrued === null) return board;
+  return { ...board, currentCycle: { ...board.currentCycle, users: board.currentCycle.users.map(user => {
+    if (!sameTrackedUser(user.userId, userId)) return user;
+    const models = user.models ?? [];
+    const total = models.reduce((sum, model) => sum + (model.quotaPercent ?? 0), 0);
+    return { ...user, quotaPercent: accrued, models: models.map(model => ({ ...model,
+      quotaPercent: model.quotaPercent != null && total > 0 ? round2(accrued * model.quotaPercent / total) : null })) };
+  }) } };
 }
 
 async function mergePeerLeaderboards(local: PublicCodexLeaderboard): Promise<PublicCodexLeaderboard> {
@@ -1576,8 +1653,9 @@ async function readCachedCodexLeaderboard(
     );
     const boards: PublicCodexLeaderboard[] = [];
     for (const source of sources) boards.push(await readCodexLeaderboard(source, store, apiCycleWindow));
-    const local = boards.length === 1 ? boards[0] : mergeAccountLeaderboards(boards, sources);
-    return applyAccruedTrackedQuota(local, sources, readTrackedQuotaLedger(), serverConfig.trackedQuotaUser);
+    const local = mergeAccountLeaderboards(boards, sources);
+    return { ...applyAccruedTrackedQuota(local, sources, readTrackedQuotaLedger(), serverConfig.trackedQuotaUser),
+      quotaAccountCount: sources.filter(source => source.kind !== "api-provider").length };
   })()
     .then((local) => includePeers ? mergePeerLeaderboards(local) : local)
     .then((data) => {
@@ -1822,6 +1900,7 @@ export async function assertTrackedUserQuotaAvailable(
   userId: string,
   threadId?: string
 ): Promise<void> {
+  if (isDeletedWebUser(userId)) throw new AppError("authentication_failed", "网页账号已删除，不能继续发起回答。");
   if (!serverConfig.trackedQuotaEnforce || !serverConfig.trackedQuotaUser || !sameTrackedUser(userId, serverConfig.trackedQuotaUser)) return;
   const allowedAccountId = allowedAccountForUser(userId);
   if (allowedAccountId) {
@@ -3241,7 +3320,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       reply.header("Cache-Control", "no-store");
       const forceRefresh = request.query.refresh === "true";
       if (!forceRefresh && leaderboardCache && leaderboardCache.expiresAt > Date.now()) {
-        return { data: leaderboardCache.data };
+        return { data: presentLeaderboard(leaderboardCache.data) };
       }
       // A token refresh must not wait for every provider's auth/quota probes.
       // The quota bridge refreshes its own cached snapshot independently.
@@ -3252,13 +3331,13 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const refresh=readCachedCodexLeaderboard(sources, store, forceRefresh, false);
       let timer:ReturnType<typeof setTimeout>|undefined;
       const data=await Promise.race([refresh,new Promise<null>(resolve=>{timer=setTimeout(()=>resolve(null),2000);})]).finally(()=>{if(timer)clearTimeout(timer);});
-      if(data)return {data};
+      if(data)return {data:presentLeaderboard(data)};
       const window=apiLeaderboardCycleWindow(sources.filter(s=>s.kind!=="api-provider").map(s=>({resetAt:s.quota.rateLimits?.primary?.resetsAt??null,resetWindowMins:s.quota.rateLimits?.primary?.windowDurationMins??null})),Math.floor(Date.now()/1000));
       const boards=[];
       for(const source of sources)boards.push(await readCodexLeaderboard(source,store,window,false,true));
       const cached=mergeAccountLeaderboards(boards,sources);
       cached.errors=[...new Set([...cached.errors,"完整统计正在后台更新，当前显示已缓存用量"] )];
-      return {data:cached};
+      return {data:presentLeaderboard(cached)};
     } catch (error) {
       return reply.code(502).send({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -4234,6 +4313,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const input = threadBranchSchema.parse(request.body ?? {});
       const targetProject = input.targetProjectId ? store.getProject(input.targetProjectId, userId) : project;
       if (!targetProject) return reply.code(404).send({ error: "Target project not found." });
+      const sourceExecution = targetProject.id === project.id ? store.getThreadExecutionSettings(request.params.threadId, userId) : null;
+      const branchExecution = sourceExecution ?? { sandbox: targetProject.defaultSandbox, approvalPolicy: targetProject.defaultApprovalPolicy };
       releaseBranch = branchGate.enter();
       // Resolve the source account and metadata cheaply first. Native forks do
       // not need to hydrate a potentially hundreds-of-megabytes history in
@@ -4271,7 +4352,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       if (allowedAccountId && (!poolBridge || !poolBridge.hasAccount(allowedAccountId))) {
         throw new Error(`${userId} 的专用账号 ${allowedAccountId} 当前不可用。`);
       }
-      const routing = poolBridge?.getBranchRoutingDecision(request.params.threadId, model, allowedAccountId ?? undefined) ?? null;
+      let routing = poolBridge?.getBranchRoutingDecision(request.params.threadId, model, allowedAccountId ?? undefined) ?? null;
       const nativeFork = !routing || routing.mode === "native";
       const browserMcp = options.browserTools ? mintBrowserMcpConfig(userId, targetProject.id) : null;
       const forkParams = {
@@ -4279,8 +4360,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         lastTurnId: input.turnId,
         cwd: targetProject.rootPath,
         model,
-        approvalPolicy: targetProject.defaultApprovalPolicy,
-        sandbox: targetProject.defaultSandbox,
+        approvalPolicy: branchExecution.approvalPolicy,
+        sandbox: branchExecution.sandbox,
         threadSource: "user",
         config: { ...contextConfig, ...browserMcp?.config },
         excludeTurns: true,
@@ -4318,7 +4399,19 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
             ...(archiveToolOutputs?{toolArchiveRoot:toolArchiveRoot(serverConfig.dataDir,userId)}:{})
           });
           if(archiveToolOutputs){
-            try{assertLargeBranchMemory(copied.copiedBytes);const headroom=poolBridge.getAccountMemoryHeadroom(routing.targetAccount.id);if(headroom!==null)assertLargeBranchMemory(copied.copiedBytes,headroom);}
+            try{
+              assertLargeBranchMemory(copied.copiedBytes);
+              if (model.startsWith("gpt-")) {
+                const next = poolBridge.getBranchRoutingDecision(request.params.threadId, model, allowedAccountId ?? undefined, largeBranchMemoryBudget(copied.copiedBytes));
+                if (next.targetAccount.id !== routing.targetAccount.id) {
+                  await relocateLargeThreadBranch(copied, path.join(routing.targetAccount.codexHome, "sessions"), path.join(next.targetAccount.codexHome, "sessions"));
+                  console.info("branch.memory_reroute", { sourceThreadId: request.params.threadId, threadId: copied.threadId,
+                    fromAccountId: routing.targetAccount.id, targetAccountId: next.targetAccount.id, copiedBytes: copied.copiedBytes });
+                }
+                routing = next;
+              }
+              const headroom=poolBridge.getAccountMemoryHeadroom(routing.targetAccount.id);if(headroom!==null)assertLargeBranchMemory(copied.copiedBytes,headroom);
+            }
             catch(error){await fs.promises.unlink(copied.path);const archivePath=toolArchivePath(toolArchiveRoot(serverConfig.dataDir,userId),copied.threadId);await Promise.all([archivePath,`${archivePath}.json`].map(f=>fs.promises.unlink(f).catch(()=>{})));throw error;}
             toolArchive=copied.toolArchive;
           }
@@ -4333,7 +4426,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           ));
           started = await bridge.request("thread/resume", {
             threadId: copied.threadId, path: copied.path, cwd: targetProject.rootPath, model,
-            approvalPolicy: targetProject.defaultApprovalPolicy, sandbox: targetProject.defaultSandbox,
+            approvalPolicy: branchExecution.approvalPolicy, sandbox: branchExecution.sandbox,
             config: { ...contextConfig, ...browserMcp?.config }, excludeTurns: true
           }, 60_000);
           streamedBranch = true;
@@ -4377,6 +4470,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         model,
         reasoningEffort
       });
+      store.setThreadExecutionSettings(createdThreadId, userId, branchExecution.sandbox, branchExecution.approvalPolicy);
       if (browserMcp?.bindingId) bindBrowserMcpThread(browserMcp.bindingId, createdThreadId, store);
       const targetAccount = poolBridge?.getKnownThreadAccount(createdThreadId)
         ?? (routing ? { id: routing.targetAccount.id, label: routing.targetAccount.label } : null);

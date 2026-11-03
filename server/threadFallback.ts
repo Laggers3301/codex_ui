@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import { toolDescription } from "../shared/toolDescription.js";
 import { createReadStream, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -255,6 +256,7 @@ function appendResponseItem(turn: FallbackTurn, payload: JsonObject, nextId: () 
       id,
       callId: payload.call_id,
       tool: payload.name,
+      description: toolDescription(payload, payload.arguments, payload.input),
       command: command || undefined,
       text: command || String(payload.name ?? "tool call")
     });
