@@ -2461,7 +2461,7 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 
 function errorStatus(error: unknown): number {
   if (error instanceof Error && "code" in error && error.code === "claude_session_rate_limit") return 429;
-  if (error instanceof Error && "code" in error && error.code === "claude_weekly_limit") return 429;
+  if (error instanceof Error && "code" in error && ["claude_weekly_limit", "claude_five_hour_limit"].includes(String(error.code))) return 429;
   if (error instanceof Error && "code" in error && String(error.code).startsWith("migration_")) return 409;
   if (error instanceof Error && "code" in error && error.code === "runtime_not_connected") return 409;
   if (error instanceof HistoryMemoryLimitError) return 413;

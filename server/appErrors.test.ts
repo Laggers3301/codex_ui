@@ -19,6 +19,10 @@ it("distinguishes confirmed quota, transient throttling and overloaded HTTP 429"
   expect(AppError.from({ error: { code: "ServerOverloaded", httpStatusCode: 429 } })).toMatchObject({ code: "model_overloaded", retryable: true });
   expect(AppError.from({ code: "quota_or_rate_limit", message: "quota exceeded" }).retryable).toBe(false);
 });
+it.each(["claude_five_hour_limit","claude_weekly_limit"])("preserves %s across socket, recovery and stored error serialization",code=>{
+  const publicError=new AppError(code,"此 Claude 账号已达到额度阈值，等待重置。").toPublic();
+  expect(AppError.from(JSON.parse(JSON.stringify(publicError))).toPublic()).toMatchObject({code,retryable:false,source:"provider",message:expect.stringContaining("等待重置")});
+});
 it("redacts nested errors and never serializes headers, requests or unknown fields", () => {
   const raw = { error: { code: "Unauthorized", message: 'Bearer top-secret api_key="secret-value" ark-123456789012345' }, headers: { Authorization: "header-secret" }, request: { body: "prompt-secret" }, codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 503 } } };
   const details = modelErrorDetails(raw);

@@ -16,6 +16,9 @@ export class AppError extends Error {
   static from(value: unknown): AppError {
     if (value instanceof AppError) return value;
     const { message: original, code: nativeCode, signature, status } = modelErrorDetails(value);
+    if (nativeCode === "claude_five_hour_limit" || nativeCode === "claude_weekly_limit") {
+      return new AppError(nativeCode, original, original);
+    }
     // Quota and credential failures must never enter a transient retry loop.
     if (/AccountQuotaExceeded|insufficient[_ .]quota|\bquota[_ .]?exceeded\b|usage_?limit|credits|balance.insufficient/i.test(signature)) return new AppError("quota_exceeded", "供应商额度已用尽或达到套餐上限，请等待额度重置或更换供应商。", original);
     if (status === 401 || /unauthorized|authentication|invalid.*token/i.test(signature)) return new AppError("authentication_failed", "账号认证失败，请查看错误详情。", original);

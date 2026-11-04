@@ -10280,7 +10280,7 @@ export function App() {
           promptRequestContextsRef.current.delete(message.requestId);
         }
         const providerNotice = isPromptRequest && !isStalePromptAck
-          ? classifyProviderFailure(requestContext?.model ?? selectedModelProfile.model, errorMessage)
+          ? classifyProviderFailure(requestContext?.model ?? selectedModelProfile.model, isRecord(message.data) && isRecord(message.data.appError) ? message.data.appError : errorMessage)
           : null;
         if (providerNotice) {
           setProviderFailure(providerNotice);

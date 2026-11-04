@@ -2,6 +2,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { RpcEnvelope } from "./types.js";
 import { redactModelError } from "../shared/modelError.js";
 import { claudeQuestions } from "./claudeUserInput.js";
+import { AppError } from "./appErrors.js";
 
 type RecordValue = Record<string, unknown>;
 const record = (v: unknown): RecordValue => v && typeof v === "object" && !Array.isArray(v) ? v as RecordValue : {};
@@ -176,7 +177,7 @@ export class ClaudeStreamAdapter {
     }
   }
 
-  finish(status: "completed" | "failed" | "interrupted", error?: string, usage?: unknown): void {
+  finish(status: "completed" | "failed" | "interrupted", error?: string | AppError, usage?: unknown): void {
     if (this.finished) return;
     this.finished = true;
     for (const item of this.items.values()) {
@@ -189,7 +190,7 @@ export class ClaudeStreamAdapter {
     }
     this.notify("turn/completed", { turn: {
       id: this.turnId, status, items: [...this.items.values()],
-      error: error ? { message: redactModelError(error) } : null,
+      error: error instanceof AppError ? error.toPublic() : error ? { message: redactModelError(error) } : null,
       ...(usage ? { usage } : {})
     } });
   }

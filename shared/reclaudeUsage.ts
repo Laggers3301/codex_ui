@@ -5,6 +5,20 @@ export interface ReclaudeUsageWindow {
   observedAt: number;
   source: "response" | "reclaude-cache";
 }
+export type ReclaudeLimitCode = "claude_five_hour_limit" | "claude_weekly_limit";
+
+export function isReclaudeWeeklyWindow(kind: string): boolean {
+  return kind === "seven_day" || kind.startsWith("seven_day_") || kind === "model_weekly";
+}
+
+export function reclaudeWindowThreshold(kind: string): number | null {
+  return isReclaudeWeeklyWindow(kind) ? 99 : kind === "five_hour" ? 100 : null;
+}
+
+export function reclaudeWindowActive(window: ReclaudeUsageWindow, now = Date.now()): boolean {
+  return window.resetsAt === null || window.resetsAt > now;
+}
+
 export interface ReclaudeAccountUsage {
   orgId: string;
   label: string;
@@ -12,6 +26,7 @@ export interface ReclaudeAccountUsage {
   windows: ReclaudeUsageWindow[];
   message: string;
   retryAfterSeconds: number | null;
+  limitCode?: ReclaudeLimitCode;
 }
 export interface ReclaudeQuota {
   limit: number; windowSeconds: number; used: number; remaining: number;

@@ -35,4 +35,11 @@ describe("model request failures", () => {
     expect(classifyProviderFailure("gpt-6-sol", { message: "refresh_token_reused", httpStatusCode: 401 })?.kind).toBe("auth");
     expect(classifyProviderFailure("gpt-6-sol", { message: "stream disconnected" })?.detail).toBe("stream disconnected");
   });
+  it("identifies Claude five-hour exhaustion and the preventive 99% weekly stop separately",()=>{
+    for(const [code,title] of [["claude_five_hour_limit","Claude 5 小时额度已达上限"],["claude_weekly_limit","Claude 周用量达到停用阈值"]]){
+      const notice=classifyProviderFailure("reclaude-sonnet@1",{code,message:"此 Claude 账号已暂停，还需等待 2 小时。"})!;
+      expect(notice).toMatchObject({kind:"limit",limitType:"quota",claudeLimitCode:code});
+      expect(providerFailureCopy(notice)).toMatchObject({title,message:expect.stringContaining("还需等待 2 小时")});
+    }
+  });
 });

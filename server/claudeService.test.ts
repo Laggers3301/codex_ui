@@ -55,17 +55,33 @@ function fixture(rateLimitInfo?: Record<string,unknown>) {
   return {home,cwd,project,store,service,config,rootA,rootB,binding,events,calls,start,turn};
 }
 describe("Claude conversation switching",()=>{
-  it("stops an active response at weekly 99% and rejects subsequent creates/resumes before any model call",async()=>{
-    const f=fixture({rateLimitType:"five_hour",utilization:.2,unifiedWindows:{seven_day:{utilization:.99,resetsAt:Math.floor(Date.now()/1000)+3600}}});
+  it.each([
+    {code:"claude_weekly_limit",kind:"seven_day",percent:.99},
+    {code:"claude_five_hour_limit",kind:"five_hour",percent:1}
+  ])("stops an active response at $code and rejects new calls on that account without automatic retry",async({code,kind,percent})=>{
+    const f=fixture({rateLimitType:kind,utilization:percent,resetsAt:Math.floor(Date.now()/1000)+3600});
     const id=await f.start();
     const result=await f.service.request("turn/start",{threadId:id,input:[{type:"text",text:"测试阈值"}]}) as any;
     await vi.waitFor(()=>expect(f.service.storage.turn(result.turn.id)?.status).toBe("interrupted"));
-    expect(JSON.stringify(f.service.storage.turn(result.turn.id))).toContain("99%");
-    await expect(f.start()).rejects.toMatchObject({code:"claude_weekly_limit"});
-    await expect(f.service.request("turn/start",{threadId:id,input:[{type:"text",text:"不得执行"}]})).rejects.toMatchObject({code:"claude_weekly_limit"});
+    expect(f.service.storage.turn(result.turn.id)).toMatchObject({error:{code,retryable:false,source:"provider"}});
+    await expect(f.start()).rejects.toMatchObject({code});
+    await expect(f.service.request("turn/start",{threadId:id,input:[{type:"text",text:"不得执行"}]})).rejects.toMatchObject({code});
     expect(f.calls).toHaveLength(1);expect(f.service.storage.quota().used).toBe(1);
     expect(f.service.profiles("admin").find(p=>p.model==="reclaude-sonnet@1")?.availability).toBe("disabled");
+    expect(f.service.profiles("admin").find(p=>p.model==="reclaude-sonnet@2")?.availability).toBe("ready");
     expect(f.service.usageStatus("bob").accounts).toEqual([]);
+  });
+  it("blocks an already accepted query when another organization on the same actual account reports weekly 99%",async()=>{
+    const f=fixture({rateLimitType:"seven_day",utilization:.99,resetsAt:Math.floor(Date.now()/1000)+3600});
+    f.binding("22",2,"account-A");
+    const first=await f.start();
+    const second=(await f.service.request("thread/start",{userId:"admin",projectId:f.project.id,cwd:f.cwd,model:"reclaude-sonnet@2"}) as any).thread.id;
+    const a=await f.service.request("turn/start",{threadId:first,input:[{type:"text",text:"先返回阈值"}]}) as any;
+    const b=await f.service.request("turn/start",{threadId:second,input:[{type:"text",text:"同一账号不得继续执行"}]}) as any;
+    await vi.waitFor(()=>expect(f.service.storage.turn(a.turn.id)?.status).toBe("interrupted"));
+    await vi.waitFor(()=>expect(f.service.storage.turn(b.turn.id)).toMatchObject({status:"failed",error:{code:"claude_weekly_limit",retryable:false}}));
+    expect(f.calls).toHaveLength(1);
+    expect(f.service.profiles("admin").every(profile=>profile.availability==="disabled")).toBe(true);
   });
   it("resumes after a binding directory move with no new session, and forks when the Claude account changes within that same org",async()=>{
     const f=fixture(), id=await f.start(); await f.turn(id);

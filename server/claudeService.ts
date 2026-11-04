@@ -49,10 +49,10 @@ export class ClaudeService {
     private forkWorker = offlineFork) {
     this.bindings = new ClaudeBindings(config);
     this.storage = new ClaudeSessionStorage(config.storageDirectory);
-    this.usage = new ReclaudeUsageMonitor(this.storage.db, (accountKey, message) => {
+    this.usage = new ReclaudeUsageMonitor(this.storage.db, (accountKey, error) => {
       for (const [id, runtime] of this.active) {
         const row = this.storage.get(id);
-        if (row?.accountKey === accountKey) runtime.interrupt(row.userId, id, message);
+        if (row?.accountKey === accountKey) runtime.interrupt(row.userId, id, error);
       }
     });
     if (config.usageCacheFile) {
@@ -280,10 +280,18 @@ export class ClaudeService {
         }
         this.emit("notification", event);
       });
-      setImmediate(() => void runtime.runTurn({ userId: row.userId, threadId: row.id, turnId, cwd: row.cwd, model: row.model, prompt,
-        collaborationMode:row.collaborationMode,
-        nativeSessionId: row.nativeSessionId, ...(row.initialized ? { resumeSessionId: row.nativeSessionId } : {}) })
-        .catch(error => { this.storage.saveTurn(row.id, { ...turn, status: "failed", error: { message: String(error) } }); this.active.delete(row.id); this.emit("notification", { method: "turn/completed", params: { threadId: row.id, turn: { ...turn, status: "failed", error: { message: String(error) } } } }); }));
+      setImmediate(() => void (async () => {
+        // Another turn on the same Claude identity can report a stop after
+        // this request was accepted but before its native query starts.
+        this.usage.assertAvailable(binding);
+        await runtime.runTurn({ userId: row.userId, threadId: row.id, turnId, cwd: row.cwd, model: row.model, prompt,
+          collaborationMode:row.collaborationMode,
+          nativeSessionId: row.nativeSessionId, ...(row.initialized ? { resumeSessionId: row.nativeSessionId } : {}) });
+      })().catch(error => {
+        const failed = { ...turn, status: "failed", error: AppError.from(error).toPublic() };
+        this.storage.saveTurn(row.id, failed); this.active.delete(row.id);
+        this.emit("notification", { method: "turn/completed", params: { threadId: row.id, turn: failed } });
+      }));
       return { turn };
     });
     if (method === "turn/interrupt") { this.active.get(row.id)?.interrupt(row.userId, row.id); return {}; }

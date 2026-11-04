@@ -60,7 +60,7 @@ interface PendingApproval {
 /** Native Claude execution adapter; the pre-auth application never activates
  * it. Tests inject an SDK fixture, so no credentials, CLI or model are used. */
 export class ClaudeRuntime extends EventEmitter {
-  private active = new Map<string, { controller: AbortController; query?: ClaudeQuery; stopReason?: string }>();
+  private active = new Map<string, { controller: AbortController; query?: ClaudeQuery; stopReason?: string | AppError }>();
   private sessions = new Map<string, string>();
   private pending = new Map<string, PendingApproval>();
 
@@ -93,7 +93,7 @@ export class ClaudeRuntime extends EventEmitter {
     if (!path.isAbsolute(binding.executable)) throw new Error("ReClaude executable must be an absolute path.");
     fs.accessSync(binding.executable, fs.constants.X_OK);
     const controller = new AbortController();
-    const state: { controller: AbortController; query?: ClaudeQuery; stopReason?: string } = { controller };
+    const state: { controller: AbortController; query?: ClaudeQuery; stopReason?: string | AppError } = { controller };
     this.active.set(input.threadId, state);
     const adapter = new ClaudeStreamAdapter(input.threadId, input.turnId, event => this.emit("notification", event));
     const canUseTool: CanUseTool = (name, original, context) => {
@@ -205,7 +205,7 @@ export class ClaudeRuntime extends EventEmitter {
     pending.settle({behavior:"deny",message:"用户已取消此请求。"});
   }
 
-  interrupt(userId: string, threadId: string, reason?: string): void {
+  interrupt(userId: string, threadId: string, reason?: string | AppError): void {
     this.ownedBinding(userId);
     const state = this.active.get(threadId);
     if (state && reason) state.stopReason = reason;
