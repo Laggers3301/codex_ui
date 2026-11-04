@@ -4,7 +4,7 @@ import path from "node:path";
 import {gunzipSync} from "node:zlib";
 import {toolArchivePath} from "./toolOutputArchive.js";
 import { describe, it, expect } from "vitest";
-import { assertLargeBranchMemory, BranchGate, copyLargeThreadBranch, isLegacyRollout } from "./largeThreadFork.js";
+import { assertLargeBranchMemory, BranchGate, copyLargeThreadBranch, isLegacyRollout, relocateLargeThreadBranch } from "./largeThreadFork.js";
 
 const event = (type: string, fields = {}) => ({ type: "event_msg", payload: { type, ...fields } });
 const turn = (id: string) => [event("task_started", { turn_id: id }),
@@ -25,6 +25,33 @@ async function fixture(run: (o: { root: string; source: string; sourcePath: stri
 }
 
 describe("bounded exact legacy branch", () => {
+  it('compact mode still retains the two latest turns and the full archived outputs',()=>{
+    const rows=['one','two','three'].flatMap(id=>turn(id).map(row=>row.type==='response_item' && (row.payload as any).type==='custom_tool_call_output'?{...row,payload:{...row.payload,output:`${id}-HEAD${'x'.repeat(20000)}${id}-TAIL`}}:row));
+    return fixture(async options=>{
+      const copied=await copyLargeThreadBranch({...options,lastTurnId:'three',toolArchiveRoot:path.join(options.root,'archives'),compactToolOutputs:true});
+      const text=await fs.readFile(copied.path,'utf8');
+      expect(copied.toolArchive?.archivedRecords).toBe(1);
+      expect(copied.toolArchive?.keptRecentTurnIds).toEqual(['two','three']);
+      expect(text).toContain(`two-HEAD${'x'.repeat(20000)}two-TAIL`);
+      expect(text).not.toContain(`one-HEAD${'x'.repeat(20000)}one-TAIL`);
+      expect(gunzipSync(await fs.readFile(toolArchivePath(path.join(options.root,'archives'),copied.threadId))).toString()).toContain(`one-HEAD${'x'.repeat(20000)}one-TAIL`);
+      expect(await fs.readFile(options.sourcePath,'utf8')).toBe(options.source);
+    },rows);
+  });
+  it("relocates only a fresh branch without altering its bytes, source or an existing destination", () => fixture(async options => {
+    const copied = await copyLargeThreadBranch({ ...options, lastTurnId: "two" });
+    const originalPath = copied.path, contents = await fs.readFile(copied.path, "utf8");
+    const target = path.join(options.root, "other-account", "sessions");
+    await relocateLargeThreadBranch(copied, options.targetSessionsRoot, target);
+    expect(await fs.readFile(copied.path, "utf8")).toBe(contents);
+    await expect(fs.stat(originalPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(options.sourcePath, "utf8")).toBe(options.source);
+    const collision = path.join(options.targetSessionsRoot, path.relative(target, copied.path));
+    await fs.mkdir(path.dirname(collision), { recursive: true }); await fs.writeFile(collision, "existing");
+    await expect(relocateLargeThreadBranch(copied, target, options.targetSessionsRoot)).rejects.toMatchObject({ code: "EEXIST" });
+    expect(await fs.readFile(collision, "utf8")).toBe("existing");
+    expect(await fs.readFile(copied.path, "utf8")).toBe(contents);
+  }));
   it('can select the latest terminal turn for guarded side questions, respecting rollback',()=>fixture(async options=>{
     const copied=await copyLargeThreadBranch(options);
     const text=await fs.readFile(copied.path,'utf8');

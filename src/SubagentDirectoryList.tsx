@@ -96,7 +96,7 @@ export function SubagentDirectoryList({ projectId, parentThreadId, visible, revi
       return <button className="subagentDirectoryRow" type="button" key={agent.id} onClick={() => onSelect(agent)} data-agent-id={agent.id} title={agent.name}>
         <SubagentAvatar name={agent.name} /><span className="subagentDirectoryIdentity"><span className="subagentDirectoryName">{agent.name.replace(/^\/root\//, "")}</span>
           <span className="subagentDirectoryDetails">{agent.model ? <span>{agent.model}</span> : null}{date ? <time dateTime={date.toISOString()}>{date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })}</time> : null}</span>
-        </span><span className={`subagentState state-${state}${state === "running" || state === "dispatched" ? " subagentRunningShimmer" : ""}`}>{agentStateLabel[state]}</span>
+        </span><span className={`subagentState state-${state}${state === "running" || state === "dispatched" ? " subagentRunningShimmer" : ""}`}>{agent.inherited ? '继承历史' : agentStateLabel[state]}</span>
       </button>;
     })
   ]), [groups, onSelect]);

@@ -1,7 +1,7 @@
 import type { SubagentThreadSummary, ThreadItem } from "./types";
 
 export type AgentState = "dispatched" | "running" | "waiting" | "completed" | "failed" | "interrupted" | "unknown";
-export type AgentEntry = { id: string; name: string; model?: string; state: AgentState; summary?: string; createdAt?: string | null; lastTaskAt?: string | null; updatedAt?: number | string | null };
+export type AgentEntry = { id: string; name: string; inherited?: boolean; model?: string; state: AgentState; summary?: string; createdAt?: string | null; lastTaskAt?: string | null; updatedAt?: number | string | null };
 export type AgentOperation = { action: string; agents: AgentEntry[]; summary?: string };
 const labels: Record<string, string> = {
   spawn_agent: "派发子任务", spawnagent: "派发子任务", createagent: "派发子任务",
@@ -132,15 +132,15 @@ export function isActiveAgent<T extends { state: AgentState }>(agent: T): boolea
 export function reconcileSubagents(loaded: AgentEntry[], directory: SubagentThreadSummary[]): AgentEntry[] {
   const canonical = (name: string) => name.replace(/^\/root\//, "");
   const reconciled = loaded.map(agent => {
-    const native = directory.find(row => row.id === agent.id || canonical(row.name) === canonical(agent.name));
+    const native = directory.find(row => row.id === agent.id || !row.inherited && canonical(row.name) === canonical(agent.name));
     if (!native) return agent;
     const state = agentState(native.state);
-    return { ...agent, id: native.id, createdAt: native.createdAt, lastTaskAt: native.lastTaskAt, updatedAt: native.updatedAt, model: native.model ?? agent.model,
+    return { ...agent, id: native.id, inherited:native.inherited, createdAt: native.createdAt, lastTaskAt: native.lastTaskAt, updatedAt: native.updatedAt, model: native.model ?? agent.model,
       state: state === "unknown" && !isActiveAgent(agent) ? agent.state : state };
   });
   for (const native of directory) {
-    if (native.name === "/root" || reconciled.some(agent => agent.id === native.id || canonical(agent.name) === canonical(native.name))) continue;
-    reconciled.push({ id: native.id, name: native.name, model: native.model ?? undefined, state: agentState(native.state), createdAt: native.createdAt, lastTaskAt: native.lastTaskAt, updatedAt: native.updatedAt });
+    if (native.name === "/root" || reconciled.some(agent => agent.id === native.id || !native.inherited && !agent.inherited && canonical(agent.name) === canonical(native.name))) continue;
+    reconciled.push({ id: native.id, name: native.name, inherited:native.inherited, model: native.model ?? undefined, state: agentState(native.state), createdAt: native.createdAt, lastTaskAt: native.lastTaskAt, updatedAt: native.updatedAt });
   }
   return reconciled;
 }

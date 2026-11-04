@@ -25,6 +25,7 @@ type StoredUser = {
 
 type UserDb = {
   users: Record<string, StoredUser>;
+  deletedUsers?: Record<string, { deletedAt: string }>;
 };
 
 function firstHeader(value: HeaderValue): string | undefined {
@@ -79,10 +80,19 @@ function loadUsers(): UserDb {
   }
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as UserDb;
-    return { users: parsed.users && typeof parsed.users === "object" ? parsed.users : {} };
+    return { ...parsed, users: parsed.users && typeof parsed.users === "object" ? parsed.users : {} };
   } catch {
     return { users: {} };
   }
+}
+
+/** Read on use so the local deletion command takes effect without a restart. */
+export function deletedWebUserIds(): ReadonlySet<string> {
+  return new Set(Object.keys(loadUsers().deletedUsers ?? {}));
+}
+
+export function isDeletedWebUser(userId: string): boolean {
+  return deletedWebUserIds().has(userId);
 }
 
 function saveUsers(db: UserDb): void {
@@ -136,6 +146,7 @@ export function verifyCredentials(username: string, password: string): boolean {
   }
 
   const db = loadUsers();
+  if (Object.hasOwn(db.deletedUsers ?? {}, cleanUsername)) return false;
   const stored = db.users[cleanUsername];
   if (stored) {
     return verifyStoredPassword(stored, password);
@@ -195,6 +206,7 @@ export function authenticatedUserFromHeaders(headers: HeadersLike): string | nul
     if (Date.now() > data.exp) {
       return null;
     }
+    if (isDeletedWebUser(data.u)) return null;
     return data.u;
   } catch {
     return null;

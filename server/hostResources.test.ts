@@ -57,6 +57,7 @@ describe("host resource sampling", () => {
     registerHostResourceRoutes(app, monitor);
     try {
       expect((await app.inject({ url: "/api/system/resources" })).statusCode).toBe(401);
+      expect((await app.inject({ url: "/api/system/memory-processes" })).statusCode).toBe(401);
       const headers = { cookie: createSessionCookie("admin") };
       const ok = await app.inject({ url: "/api/system/resources", headers }); expect(ok.statusCode).toBe(200); expect(ok.headers["cache-control"]).toBe("no-store");
       fail = true; const error = await app.inject({ url: "/api/system/resources", headers }); expect(error.statusCode).toBe(503); expect(error.body).not.toContain("private host details");

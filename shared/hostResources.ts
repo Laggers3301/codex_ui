@@ -1,3 +1,10 @@
+export interface MemoryProcess {
+  pid: number; name: string; rssBytes: number; osUser: string;
+  cwd: string | null; executable: string | null; resourceGroup: string | null;
+  ownerHint: string | null;
+}
+export interface MemoryProcesses { sampledAt: string; processes: MemoryProcess[]; }
+
 export interface HostResources {
   sampledAt: string;
   intervalMs: number | null;

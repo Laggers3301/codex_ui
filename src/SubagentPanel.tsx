@@ -143,6 +143,7 @@ export function SubagentPanel({ projectId, parentThreadId, initialAgent, initial
   }, [initialAgent, agents, visible, listLoading, projectId, parentThreadId]);
 
   const effectiveAgents = useMemo(() => agents.map(agent => {
+    if(agent.inherited)return agent;
     const latest = knownAgents.find(known => known.id === agent.id || canonical(known.name) === canonical(agent.name));
     const persistedState = agentState(agent.state);
     // A stale dispatch in an older parent page must never replace a child's
@@ -150,7 +151,7 @@ export function SubagentPanel({ projectId, parentThreadId, initialAgent, initial
     return { ...agent, state: persistedState === "unknown" ? latest?.state ?? persistedState : persistedState };
   }), [agents, knownAgents]);
   const selected = effectiveAgents.find(agent => agent.id === selectedId);
-  const selectedRunning = Boolean(selected && isActiveAgent({ ...selected, state: agentState(selected.state) }));
+  const selectedRunning = Boolean(selected && !selected.inherited && isActiveAgent({ ...selected, state: agentState(selected.state) }));
   const selectedState = agentState(selected?.state);
 
   useEffect(() => {
@@ -298,7 +299,7 @@ export function SubagentPanel({ projectId, parentThreadId, initialAgent, initial
     const latestTurn = view.thread.turns.at(-1);
     return view.thread.turns.flatMap(turn => {
       const items = coalesceToolOutputs(turn.items);
-      const latestAssistant = turn === latestTurn && agentState(turn.status) === "running" && !["completed", "failed", "interrupted"].includes(selectedState)
+      const latestAssistant = !selected?.inherited && turn === latestTurn && agentState(turn.status) === "running" && !["completed", "failed", "interrupted"].includes(selectedState)
         ? items.filter(item => {
           const role = String(item.role ?? "").toLowerCase();
           const type = String(item.type ?? "").toLowerCase();
@@ -310,12 +311,12 @@ export function SubagentPanel({ projectId, parentThreadId, initialAgent, initial
       return groups.map((row, index) => {
         const type = row.items[0].type.toLowerCase();
         const activity = row.bundle || ["reasoning", "toolcall", "filechange"].includes(type);
-        const runningActivity = activity && index === groups.length - 1 && turn.id === view.thread.turns.at(-1)?.id
+        const runningActivity = !selected?.inherited && activity && index === groups.length - 1 && turn.id === view.thread.turns.at(-1)?.id
           && agentState(turn.status) === "running" && !["completed", "failed", "interrupted"].includes(selectedState);
         return { ...row, activity, runningActivity, node: row.bundle ? renderBundle(row.items, turn, view.thread.id, `subagent:${view.thread.id}:${row.key}`, runningActivity) : nodes.get(row.items[0]) };
       });
     });
-  }, [view, renderItem, renderBundle, projectId, parentThreadId, selectedState]);
+  }, [view, renderItem, renderBundle, projectId, parentThreadId, selectedState, selected?.inherited]);
   useLayoutEffect(() => {
     if (view) groupedHistory.current = { scope: `${projectId}:${parentThreadId}:${view.thread.id}`, rows: transcript };
   }, [transcript, view, projectId, parentThreadId]);
@@ -325,6 +326,7 @@ export function SubagentPanel({ projectId, parentThreadId, initialAgent, initial
     <header className="diffReviewPanelHeader subagentPanelHeader">
       {selectedId ? <button type="button" onClick={() => setSelectedId(null)} aria-label="返回子代理列表"><Glyph name="back" /></button> : null}
       <div className="subagentPanelTitle">{selected ? <SubagentAvatar name={selected.name} /> : null}<h2 title={selected?.name}>{selected ? shortName(selected.name) : "子代理"}</h2></div>
+      {selected?.inherited ? <span className="subagentState">继承历史</span> : null}
       {selected ? <span className="subagentRecordModel" title={[selected.model, selected.reasoningEffort, agentStateLabel[selectedState]].filter(Boolean).join(" ")}>{selected.model ? <span className="subagentRecordModelName">{selected.model}{selected.reasoningEffort ? ` ${selected.reasoningEffort}` : ""}</span> : null}<span className={`subagentState${selectedState === "running" || selectedState === "dispatched" ? " subagentRunningShimmer" : ""}`}>{agentStateLabel[selectedState]}</span></span> : null}
       <button type="button" aria-label="刷新子代理记录" aria-busy={refreshing} disabled={refreshing} onClick={refresh}><Glyph name="refresh" /></button>
       <button type="button" aria-label="收起子代理面板" onClick={onClose}><Glyph name="close" /></button>

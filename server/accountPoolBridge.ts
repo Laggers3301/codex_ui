@@ -20,6 +20,7 @@ import {authDiagnostic, type AuthDiagnostic, type AuthPhase} from "./authDiagnos
 import { ProviderTurnProtocol } from "./providerProtocol.js";
 import { validateModelRequest } from "./modelRequestValidation.js";
 import { nativeModelDiscoveryEnabled } from "./nativeModelDiscovery.js";
+import { BranchConflictError } from "./largeThreadFork.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -243,6 +244,7 @@ export function accountAppServerArgs(codexHome: string, kind: "codex-account" | 
   installSubagentHistoryGuard(codexHome);
   const modelCatalogPath = path.join(codexHome, MODEL_CATALOG_FILENAME);
   const args = ["app-server", "--listen", "stdio://"];
+  if(kind==='codex-account')args.push('-c','thread_unload_delay_secs=60');
   if (!nativeModelDiscoveryEnabled(codexHome, kind) && fs.existsSync(modelCatalogPath)) {
     args.push("-c", `model_catalog_json=${JSON.stringify(responsesCompatibleModelCatalog(modelCatalogPath))}`);
   }
@@ -279,16 +281,17 @@ function createAccountBridge(codexHome: string, accountId: string, adoptCandidat
     if (!key) throw new Error("Ark API credential unavailable");
     env.ARK_PAY_API_KEY = key;
   }
+  const memoryLimit = process.env[`CODEX_WEB_ACCOUNT_MEMORY_MAX_${accountId.replace(/[^A-Za-z0-9_]/g, "_")}`] ?? "4G";
   const scope = process.env.CODEX_WEB_ISOLATE_AGENT_SCOPES === "1" ? {
     unitPrefix: `codex-agent-${accountId.replace(/[^A-Za-z0-9-]/g, "-")}`,
     slice: "codex-workers.slice",
-    // A 3 GiB high watermark below the 4 GiB allocation cap caused sustained
+    // A high watermark below the allocation cap caused sustained
     // direct reclaim during native history forks, then systemd-oomd killed the
     // account despite available host memory. Keep the hard cap, but do not
     // create a separate per-account reclaim stall below it. The worker slice
     // retains its aggregate pressure and allocation limits.
-    memoryHigh: "4G",
-    memoryMax: "4G",
+    memoryHigh: memoryLimit,
+    memoryMax: memoryLimit,
     memorySwapMax: "256M"
   } : undefined;
   return new CodexBridge({
@@ -300,6 +303,7 @@ function createAccountBridge(codexHome: string, accountId: string, adoptCandidat
       fileURLToPath(new URL("../scripts/run-account-runtime.mjs", import.meta.url)),
       serverConfig.codexBin, ...accountAppServerArgs(codexHome, kind)],
     env,
+    idleThreadReclaim:kind==='codex-account',
     ...(nativeModelDiscoveryEnabled(codexHome, kind) ? { nativeModelDiscoveryHome: codexHome } : {}),
     scope
   });
@@ -1143,7 +1147,7 @@ export class AccountPoolBridge extends EventEmitter {
       return result;
     } catch (error) {
       if (startingProcessId) this.processAccounts.delete(startingProcessId);
-      if (error instanceof Error && "code" in error && error.code === "unsupported_model_capability") throw error;
+      if (error instanceof Error && "code" in error && ['unsupported_model_capability','memory_pressure'].includes(String(error.code))) throw error;
       account.health = "degraded";
       account.lastError = error instanceof Error ? error.message : String(error);
       throw error;
@@ -1202,6 +1206,7 @@ export class AccountPoolBridge extends EventEmitter {
       }
       return result;
     } catch (error) {
+      if(error instanceof Error && 'code' in error && error.code==='memory_pressure')throw error;
       account.health = "degraded";
       account.lastError = error instanceof Error ? error.message : String(error);
       throw error;
@@ -1507,18 +1512,38 @@ export class AccountPoolBridge extends EventEmitter {
   }
 
   /** Select the best current account for a branch, independently of its source. */
-  getBranchRoutingDecision(threadId: string, model?: string, forcedTargetAccountId?: string): {
+  getBranchRoutingDecision(threadId: string, model?: string, forcedTargetAccountId?: string, requiredMemoryBytes?: number): {
     mode: "native" | "cross-account-native";
     sourceAccount: { id: string; label: string; codexHome: string } | null;
     targetAccount: { id: string; label: string; codexHome: string };
   } {
     const source = this.accountsById.get(this.threadAccounts.get(threadId) ?? "") ?? null;
-    const target = forcedTargetAccountId
+    let target = forcedTargetAccountId
       ? this.accountsById.get(forcedTargetAccountId)
       : this.chooseAccount(model);
     if (!target) throw new Error(`Unknown account-pool account: ${forcedTargetAccountId}`);
     if (model && target.supportedModels && !target.supportedModels.has(model)) {
       throw new Error(`Account ${target.id} does not support model ${model}.`);
+    }
+    if (requiredMemoryBytes !== undefined) {
+      if (!Number.isFinite(requiredMemoryBytes) || requiredMemoryBytes < 0) throw new Error("Invalid branch memory budget.");
+      const eligible = (account: AccountRuntime) => {
+        if (account.kind !== "codex-account" || account.health !== "ready" || account.authFailureCode
+          || model && account.supportedModels && !account.supportedModels.has(model)
+          || remainingPercent(account.cache?.limits) === 0) return false;
+        const available = account.bridge.getMemoryHeadroom();
+        return available !== null && Number.isFinite(available) && available >= requiredMemoryBytes;
+      };
+      if (!eligible(target)) {
+        // A per-user account restriction is an authorization boundary, not a
+        // preference to bypass when another runtime has more RAM.
+        const alternatives = forcedTargetAccountId ? [] : this.accounts.filter(eligible);
+        if (!alternatives.length) throw new BranchConflictError("当前没有支持同一模型且内存余量足够的 GPT 账号，已安全停止分支；原会话未修改。");
+        const selected = selectAccountCandidate(alternatives.map(account => ({ id: account.id, health: account.health,
+          remainingPercent: remainingPercent(account.cache?.limits), activeRequests: account.activeRequests,
+          assignedThreadCount: this.assignedThreadCount(account.id) })));
+        target = this.accountsById.get(selected.id)!;
+      }
     }
     const sourceAccount = source
       ? { id: source.id, label: source.label, codexHome: source.codexHome }

@@ -245,7 +245,7 @@ export class ProjectStore {
   constructor(dbPath = path.join(serverConfig.dataDir, "codex-web.sqlite")) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
-    // The live 100001 mirror briefly writes this database from a second
+    // The live account mirror briefly writes this database from a second
     // process. WAL keeps ordinary reads available during that write, while a
     // bounded busy timeout turns the remaining write/write race into a short
     // wait instead of an intermittent HTTP 500/502 "database is locked".
@@ -255,6 +255,10 @@ export class ProjectStore {
       PRAGMA synchronous = NORMAL;
     `);
     this.migrate();
+    this.db.exec(`CREATE TABLE IF NOT EXISTS branch_subagent_history (
+      thread_id TEXT NOT NULL,user_id TEXT NOT NULL,records_json TEXT NOT NULL,
+      PRIMARY KEY(thread_id,user_id)
+    )`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS thread_recovery_state (
       thread_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, state_json TEXT NOT NULL
     )`);
@@ -719,6 +723,14 @@ export class ProjectStore {
       "UPDATE thread_owners SET project_id = ?, root_path = ?, updated_at = ? WHERE thread_id = ? AND user_id = ?"
     ).run(projectId, path.resolve(rootPath), new Date().toISOString(), cleanThreadId, userId);
     return this.getThreadOwner(cleanThreadId);
+  }
+
+  getInheritedSubagents(threadId:string,userId:string): import('./subagentHistory.js').SubagentThreadRecord[] {
+    const row=this.db.prepare('SELECT records_json FROM branch_subagent_history WHERE thread_id=? AND user_id=?').get(threadId,userId) as {records_json:string}|undefined;
+    return row ? JSON.parse(row.records_json) : [];
+  }
+  setInheritedSubagents(threadId:string,userId:string,records:import('./subagentHistory.js').SubagentThreadRecord[]):void {
+    this.db.prepare('INSERT INTO branch_subagent_history VALUES(?,?,?) ON CONFLICT(thread_id,user_id) DO NOTHING').run(threadId,userId,JSON.stringify(records));
   }
 
   getThreadPresentation(userId: string, threadIds: Iterable<string>): Map<string, ThreadPresentation> {

@@ -81,6 +81,25 @@ describe("large legacy branch route", () => {
       expect(download.statusCode).toBe(200);expect(download.headers["content-type"]).toContain("application/gzip");expect(download.headers["cache-control"]).toBe("private, no-store");
       const forbidden=await app.inject({method:"GET",url:`/api/projects/${project.id}/threads/${compact.thread.id}/tool-output-archive?download=1`,headers:{cookie:createSessionCookie("bob")}});
       expect(forbidden.statusCode).toBe(403);
+      // After bounded archiving, move this same private copy to the eligible
+      // account instead of re-reading history or changing model/permissions.
+      vi.mocked(pool.getBranchRoutingDecision).mockImplementation((_thread, _model, _forced, memory) => ({
+        mode: memory === undefined ? "cross-account-native" : "native",
+        sourceAccount: { id: "0", label: "account-0", codexHome: homes[0] },
+        targetAccount: memory === undefined ? { id: "1", label: "account-1", codexHome: homes[1] } : { id: "0", label: "account-0", codexHome: homes[0] }
+      }));
+      store.setThreadExecutionSettings("source", "admin", "read-only", "untrusted");
+      const rerouted = await app.inject({ method: "POST", url: `/api/projects/${project.id}/threads/source/branch`, payload: { turnId: "one", archiveToolOutputs: true } });
+      expect(rerouted.statusCode).toBe(200);
+      const moved = rerouted.json().data;
+      expect(moved.targetAccount.id).toBe("0");
+      expect(moved.thread.path.startsWith(path.join(homes[0], "sessions") + path.sep)).toBe(true);
+      expect(calls.filter(call => call.method === "thread/resume").at(-1)).toMatchObject({ account: "0", params: {
+        model: project.defaultModel, approvalPolicy: "untrusted", sandbox: "read-only", excludeTurns: true
+      } });
+      expect(store.getThreadExecutionSettings(moved.thread.id, "admin")).toMatchObject({ approvalPolicy: "untrusted", sandbox: "read-only" });
+      expect(calls.some(call => call.method === "turn/start")).toBe(false);
+      expect(fs.readFileSync(sourcePath, "utf8")).toBe(source);
     } finally { await app.close(); pool.stop(); store.close(); serverConfig.dataDir=originalDataDir;vi.restoreAllMocks(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 });

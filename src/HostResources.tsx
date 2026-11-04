@@ -1,6 +1,9 @@
-import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Cpu, Globe, HardDrive, MemoryStick, RefreshCcw } from "lucide-react";
-import { checkHostNetwork, readHostResources } from "./api";
+import { checkHostNetwork, readHostResources, readMemoryProcesses } from "./api";
+import { ToolReveal } from './ToolReveal';
+import { ChevronDown as MemoryChevron } from './PanelIcons';
+import type { MemoryProcesses } from '../shared/hostResources';
 import { ComposerGlassMaterial } from "./ComposerGlassMaterial";
 import type { HostNetworkProbeResult, HostResources } from "../shared/hostResources";
 import "./hostResources.css";
@@ -130,32 +133,35 @@ function NetworkProbeResult() {
 }
 export function HostResourceSummary({ onOpen }: { onOpen: () => void }) {
   const state = useResources();
-  const dock = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    const element = dock.current, sidebar = element?.closest('.threadList');
-    if (!element || !sidebar) return;
-    const anchor = sidebar.querySelector('.v2WorkspaceFolderButton') ?? sidebar.querySelector('.v2ProjectDock');
-    if (!anchor) return;
-    const align = () => {
-      if (sidebar.classList.contains('collapsed')) { element.style.removeProperty('--resource-dock-width'); element.style.removeProperty('--resource-dock-offset'); return; }
-      const target = (sidebar.querySelector('.v2WorkspaceFolderButton') ?? anchor).getBoundingClientRect(), parent = element.parentElement!.getBoundingClientRect();
-      const inset = parseFloat(getComputedStyle(element.parentElement!).paddingLeft) || 0;
-      if (target.width <= 0) return;
-      element.style.setProperty('--resource-dock-width', `${target.width}px`);
-      element.style.setProperty('--resource-dock-offset', `${target.left - parent.left - inset}px`);
-    };
-    const observer = new ResizeObserver(align); observer.observe(sidebar); observer.observe(anchor); observer.observe(element.parentElement!); align();
-    const contents = new MutationObserver(align); contents.observe(sidebar, {childList:true,subtree:true});
-    return () => { observer.disconnect(); contents.disconnect(); };
-  }, []);
   const data = state.data, disk = data?.volumes[0]?.usagePercent;
-  return <div ref={dock} className="hostResourceDock"><div className={`hostResourceSummary${state.error ? " stale" : ""}`}>
+  return <div className="hostResourceDock"><div className={`hostResourceSummary${state.error ? " stale" : ""}`}>
     <button type="button" className="hostResourceTile" onClick={onOpen} aria-label="查看主机资源"><span><Cpu size={12} /><small>CPU</small></span><b>{percentage(data?.cpu.usagePercent)}</b><ComposerGlassMaterial variant="topbar" /></button>
     <button type="button" className="hostResourceTile" onClick={onOpen} aria-label="查看内存资源"><span><MemoryStick size={12} /><small>内存</small></span><b>{percentage(data?.memory.usagePercent)}</b><ComposerGlassMaterial variant="topbar" /></button>
     <button type="button" className="hostResourceTile hostResourceDisk" onClick={onOpen} aria-label="查看磁盘资源" title={data?.volumes.map(volumeTitle).join("\n\n") || "正在读取挂载信息"}><span><HardDrive size={12} /><small>磁盘</small></span><b>{percentage(disk)}</b><ComposerGlassMaterial variant="topbar" /></button>
   </div><NetworkProbeButton compact onOpen={onOpen} /></div>;
 }
+function MemoryTopFive({open}:{open:boolean}) {
+  const [data,setData]=useState<MemoryProcesses|null>(null), [error,setError]=useState(false), [loading,setLoading]=useState(false);
+  const [refresh,setRefresh]=useState(0);
+  useEffect(()=>{
+    if(!open)return;
+    const controller=new AbortController(); setLoading(true);setError(false);
+    readMemoryProcesses(controller.signal).then(result=>{if(!controller.signal.aborted)setData(result.data);}).catch(()=>{if(!controller.signal.aborted)setError(true);}).finally(()=>{if(!controller.signal.aborted)setLoading(false);});
+    return ()=>controller.abort();
+  },[open,refresh]);
+  return <ToolReveal open={open}><div className="memoryTopFiveBody">
+      <div className="memoryTopFiveToolbar"><span>{loading?'正在读取…':data?new Date(data.sampledAt).toLocaleTimeString():''}</span><button type="button" disabled={loading} onClick={()=>setRefresh(v=>v+1)} aria-label="刷新内存排行"><RefreshCcw size={14}/></button></div>
+      {error?<p role="status">读取失败，请重试。</p>:null}
+      {data?.processes.map(p=><section className="memoryProcess" key={p.pid}>
+        <h4><span>{p.name}</span><strong>{bytes(p.rssBytes)}</strong></h4>
+        <p>PID {p.pid} · 系统用户 {p.osUser}{p.ownerHint?` · 目录所属 ${p.ownerHint}`:''}</p>
+        <dl><dt>目录</dt><dd>{p.cwd??'无法读取'}</dd><dt>程序</dt><dd>{p.executable??'无法读取'}</dd><dt>资源组</dt><dd>{p.resourceGroup??'无法读取'}</dd></dl>
+      </section>)}
+    </div></ToolReveal>;
+}
+
 export function HostResourcePanel() {
+  const [memoryExpanded,setMemoryExpanded]=useState(false);
   const state = useResources();
   const { data, error, fetching, refresh } = state;
   return <section className="hostResourcesPanel" aria-label="主机资源">
@@ -167,8 +173,10 @@ export function HostResourcePanel() {
         {data.cpu.usagePercent == null ? <p>等待下一次采样计算使用率。</p> : null}
         {data.cpu.loadAverage ? <p>平均负载（1 / 5 / 15 分钟）：{data.cpu.loadAverage.map(value => value.toFixed(2)).join(" / ")}</p> : null}
       </article>
-      <article><h3><MemoryStick size={16} />内存 <strong>{percentage(data.memory.usagePercent)}</strong></h3><Meter label="内存使用率" value={data.memory.usagePercent} /><p>已用 {bytes(data.memory.usedBytes)} / {bytes(data.memory.totalBytes)}</p><p>可用 {bytes(data.memory.availableBytes)}</p>
+      <article><h3><MemoryStick size={16} />内存<strong>{percentage(data.memory.usagePercent)}</strong></h3><Meter label="内存使用率" value={data.memory.usagePercent} /><p>已用 {bytes(data.memory.usedBytes)} / {bytes(data.memory.totalBytes)}</p><p>可用 {bytes(data.memory.availableBytes)}</p>
         {data.memory.swapTotalBytes != null && data.memory.swapUsedBytes != null ? <p>Swap：{bytes(data.memory.swapUsedBytes)} / {bytes(data.memory.swapTotalBytes)}</p> : null}
+        <button type="button" className="memoryTopFiveToggle" aria-label="内存占用 Top 5" aria-expanded={memoryExpanded} onClick={()=>setMemoryExpanded(v=>!v)}>内存占用 Top 5<MemoryChevron size={14} /></button>
+        <MemoryTopFive open={memoryExpanded} />
       </article>
       <article><h3><HardDrive size={16} />磁盘空间</h3>{data.volumes.map(volume => <div className="hostResourceVolume" key={volume.labels.join("/")}><h4><span className="hostResourceDisk" title={volumeTitle(volume)}>{volume.labels.join(" / ")}</span><strong>{percentage(volume.usagePercent)}</strong></h4><Meter label={`${volume.labels.join("、")}磁盘占用率`} value={volume.usagePercent} /><p>已用 {bytes(volume.usedBytes)} / {bytes(volume.totalBytes)} · 可用 {bytes(volume.availableBytes)}</p></div>)}</article>
       <article><h3><HardDrive size={16} />磁盘 I/O</h3>{data.disks.map(disk => <div className="hostResourceVolume" key={disk.name}><h4><span className="hostResourceDisk" title={`挂载路径（含分区）：${disk.mountPoints?.join("、") || "暂时无法关联"}`}>{disk.name}</span><strong>{percentage(disk.busyPercent)}</strong></h4><Meter label={`${disk.name} I/O 繁忙时间占比`} value={disk.busyPercent} /><p>{disk.readBytesPerSecond == null ? "等待下一次采样计算读写速率。" : `读取 ${bytes(disk.readBytesPerSecond)}/s · 写入 ${bytes(disk.writeBytesPerSecond ?? 0)}/s`}</p></div>)}<p>I/O 百分比表示采样区间的繁忙时间；空间占用显示在上方。</p></article>

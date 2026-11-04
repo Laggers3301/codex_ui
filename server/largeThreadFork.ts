@@ -99,6 +99,7 @@ export async function copyLargeThreadBranch(options: {
   targetSessionsRoot: string;
   cwd: string;
   toolArchiveRoot?: string;
+  compactToolOutputs?: boolean;
 }): Promise<LegacyForkCopy> {
   const sourcePath = await rolloutSourcePath(options.sourcePath);
   const sourceBefore = await fsp.stat(sourcePath);
@@ -193,7 +194,7 @@ export async function copyLargeThreadBranch(options: {
       const targetIndex=turns.findIndex(t=>t.id===target.id);
       const recentIds=turns.slice(0,targetIndex+1).slice(-2).map(t=>t.id);
       const recent=new Set(recentIds);
-      archive=await createToolOutputArchive(options.toolArchiveRoot,{version:1,threadId,sourceThreadId:options.sourceThreadId,keptRecentTurnIds:recentIds,archivedRecords:0,archivedBytes:0,originalBranchBytes:header.length+sourceEnd-headerEnd,branchBytes:0,archiveBytes:0,createdAt:now.toISOString()});
+      archive=await createToolOutputArchive(options.toolArchiveRoot,{version:1,threadId,sourceThreadId:options.sourceThreadId,keptRecentTurnIds:recentIds,archivedRecords:0,archivedBytes:0,originalBranchBytes:header.length+sourceEnd-headerEnd,branchBytes:0,archiveBytes:0,createdAt:now.toISOString()},options.compactToolOutputs);
       const destinationHandle=await fsp.open(stagedPath,"a");
       let currentTurn:string|undefined;
       try{
@@ -209,7 +210,7 @@ export async function copyLargeThreadBranch(options: {
             const row=JSON.parse(record.bytes.toString("utf8"));
             const turnId=row.payload?.internal_chat_message_metadata_passthrough?.turn_id??currentTurn;
             // Missing turn attribution is unsafe: preserve rather than guess.
-            if(typeof turnId==="string"&&!recent.has(turnId))transformed=archivedOutputPreview(row,archive.path);
+            if(typeof turnId==="string"&&!recent.has(turnId))transformed=archivedOutputPreview(row,archive.path,options.compactToolOutputs);
           }
           if(transformed){await archive.append(record.bytes,record.start);await destinationHandle.writeFile(`${JSON.stringify(transformed)}\n`);}
           else await destinationHandle.writeFile(record.bytes);
@@ -241,6 +242,31 @@ export async function copyLargeThreadBranch(options: {
   }
 }
 
+export function largeBranchMemoryBudget(sourceBytes: number): number {
+  if (!Number.isFinite(sourceBytes) || sourceBytes < 0) throw new Error("Invalid branch history size.");
+  return sourceBytes * 3 + 512 * 1024 * 1024;
+}
+
+/** Move only a newly created branch, never the original rollout. Keep its ID,
+ * archive references and bytes, and fail rather than overwrite another file. */
+export async function relocateLargeThreadBranch(copy: LegacyForkCopy, sourceSessionsRoot: string, targetSessionsRoot: string): Promise<void> {
+  const sourceRoot = await fsp.realpath(sourceSessionsRoot);
+  if (!inside(await fsp.realpath(copy.path), sourceRoot) || !path.basename(copy.path).endsWith(`-${copy.threadId}.jsonl`)) {
+    throw new BranchConflictError("分支副本路径不匹配，未移动会话记录。");
+  }
+  await fsp.mkdir(targetSessionsRoot, { recursive: true, mode: 0o700 });
+  const targetRoot = await fsp.realpath(targetSessionsRoot);
+  const destination = path.join(targetRoot, path.relative(sourceRoot, copy.path));
+  await fsp.mkdir(path.dirname(destination), { recursive: true, mode: 0o700 });
+  if (!inside(await fsp.realpath(path.dirname(destination)), targetRoot)) throw new BranchConflictError("分支目标目录越界，未移动会话记录。");
+  // Runtime session roots live on the same filesystem. An exclusive hard link
+  // transfers this fresh private file without another large buffer or copy.
+  await fsp.link(copy.path, destination);
+  try { await fsp.unlink(copy.path); }
+  catch (error) { await fsp.unlink(destination); throw error; }
+  copy.path = destination;
+}
+
 export function assertLargeBranchMemory(sourceBytes: number, availableBytes?: number): void {
   let available = availableBytes;
   if (available === undefined) {
@@ -251,7 +277,7 @@ export function assertLargeBranchMemory(sourceBytes: number, availableBytes?: nu
   }
   // Measured native resume needs ~2.4x this legacy rollout. Keep headroom for
   // the shared running conversations rather than raising their resource cap.
-  if (!Number.isFinite(available) || available! < sourceBytes * 3 + 512 * 1024 * 1024) {
+  if (!Number.isFinite(available) || available! < largeBranchMemoryBudget(sourceBytes)) {
     throw new BranchConflictError("当前可用内存不足以安全加载这个大历史分支，请稍后重试；不会中断其他会话。");
   }
 }

@@ -1,4 +1,5 @@
 import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
+import { accountPoolNeedsQuotaRetry, quotaHasUsableRateLimits } from "./quotaRefreshPolicy";
 import { Children, cloneElement, Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { lazy, Suspense } from "react";
@@ -71,6 +72,10 @@ import {
   FolderPlus,
   FolderOpen,
   GitBranch,
+  Globe,
+  TerminalSquare,
+  Image as ToolImage,
+  Wrench,
   Lightbulb,
   MessageSquare,
   Minus,
@@ -101,6 +106,7 @@ import { useProviderQuotas, providerRemaining, ProviderQuotaDetails, ProviderFai
 import { isToolSummaryClick, recordToolDisclosurePointerDown } from "./toolDisclosure";
 import { ToolArrivalRegistry } from "./toolArrivalRegistry";
 import { skillReadSummary } from "./skillReadSummary";
+import { toolPresentation } from "./toolPresentation";
 import { localizedSkill, skillSection } from "./skillLocalization";
 import { GoalProgress } from "./GoalProgress";
 import { useThreadGoal } from "./threadGoal";
@@ -114,6 +120,8 @@ import { SubagentAvatar } from "./SubagentAvatar";
 import { SelectionAskAction, type SelectionAskActionHandle } from "./SelectionAskAction";
 import { PetBuddy } from "./PetBuddy";
 import { AccountUpdateIndicator } from "./AccountUpdateIndicator";
+import { LeaderboardPanel, leaderboardPercent } from "./LeaderboardPanel";
+import { memberRealName } from "../shared/memberDirectory";
 import { useConversationPlanMode } from "./useConversationPlanMode";
 import { TurnRecoveryNotice, historicalRecovery, hasRecoveryNotice, type TurnRecoveryView } from "./TurnRecoveryNotice";
 import { FeishuOffice } from "./FeishuOffice";
@@ -740,7 +748,7 @@ interface LiveToolEntry extends LiveToolItem {}
 type LiveTimelineEntry =
   | { id: string; kind: "reasoning"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; text: string; completed: boolean }
   | { id: string; kind: "agent"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; text: string; sourceItemId?: string; completed?: boolean; streamState?: LiveDeltaEntry["streamState"] }
-  | { id: string; kind: "tool"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; tool: string; input: string; output: string; completed: boolean; sourceItemId?: string; collaboration?: Record<string, unknown> };
+  | { id: string; kind: "tool"; threadId: string | null; turnId: string | null; startedAt: string; sequence: number; tool: string; description?: string; input: string; output: string; completed: boolean; sourceItemId?: string; collaboration?: Record<string, unknown> };
 
 interface PendingUserMessage {
   id: string;
@@ -894,14 +902,6 @@ const composerSlashCommands = [
 function pushKeyBytes(value: string): Uint8Array<ArrayBuffer> {
   const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
   return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
-}
-
-function quotaHasUsableRateLimits(quota: CodexQuota | null | undefined): boolean {
-  const windows = [quota?.rateLimits?.primary, quota?.rateLimits?.secondary];
-  if (windows.some((window) => typeof window?.usedPercent === "number")) return true;
-  return Object.values(quota?.rateLimitsByLimitId ?? {}).some((snapshot) => (
-    typeof snapshot.primary?.usedPercent === "number" || typeof snapshot.secondary?.usedPercent === "number"
-  ));
 }
 
 function mergeAccountPoolWithLastKnownGood(previous: CodexAccountPool | null, incoming: CodexAccountPool): CodexAccountPool {
@@ -3964,7 +3964,7 @@ function QuotaPopover({ quota, pool, loading, closing, userId }: { quota: CodexQ
 }
 
 function userDisplayName(userId: string, users: UserProfile[]): string {
-  return users.find((user) => user.id === userId)?.name ?? userId;
+  return memberRealName(userId) ?? users.find((user) => user.id === userId)?.name ?? `待核实（${userId}）`;
 }
 
 function leaderboardScopeLabel(scope: CodexLeaderboardScope): string {
@@ -3980,28 +3980,17 @@ function leaderboardScopeLabel(scope: CodexLeaderboardScope): string {
 }
 
 function leaderboardMarkdown(leaderboard: CodexLeaderboard, users: UserProfile[]): string {
-  const section = (title: string, scope: CodexLeaderboardScope) => {
-    const lines = [`**${title}**`, `- 总计：${leaderboardScopeLabel(scope)}`];
-    if (!scope.users.length) {
-      lines.push("- 暂无本地 token_count 记录。");
-      return lines;
-    }
-    for (const user of scope.users) {
-      const name = userDisplayName(user.userId, users);
-      const quotaPart = user.quotaPercent === null ? "" : `，约吃掉总额度 ${percentText(user.quotaPercent)}%`;
-      lines.push(`- ${name}：${formatNumber(user.totalTokens)} token，占本榜 ${percentText(user.sharePercent)}%${quotaPart}`);
-      lines.push(`  输入 ${formatNumber(user.inputTokens)} / 输出 ${formatNumber(user.outputTokens)} / reasoning ${formatNumber(user.reasoningOutputTokens)} / 会话 ${user.sessionCount}`);
-      if (user.models.length) {
-        lines.push(`  模型：${user.models.map((model) => `${model.model}${model.effort ? ` ${model.effort}` : ""} ${formatNumber(model.totalTokens)}`).join("；")}`);
-      }
-    }
-    return lines;
-  };
   const lines = [
-    "**模型 Token 排行榜**",
-    ...section("当前周期", leaderboard.currentCycle),
+    "**额度排行榜**",
+    "总 GPT 号池合计容量为 100%，以下为估算占用。",
+    "**当前周期**",
+    ...leaderboard.currentCycle.users.map(user =>
+      `- ${userDisplayName(user.userId, users)}：${leaderboardPercent(user.poolQuotaPercent)}`),
     "",
-    ...section("历史累计", leaderboard.lifetime)
+    "**总榜**",
+    "历史 Token 按当前周期比例折算为累计估算额度，可超过 100%；缺少校准依据显示 —。",
+    ...leaderboard.lifetime.users.map(user =>
+      `- ${userDisplayName(user.userId, users)}：${leaderboardPercent(user.poolQuotaPercent)}`)
   ];
   if (leaderboard.errors.length) {
     lines.push("", `读取警告：${leaderboard.errors.join("；")}`);
@@ -4098,7 +4087,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
               <span>账号剩余 {account.accountRemainingPercent === null ? "--" : `${percentText(account.accountRemainingPercent)}%`}</span>
             </header>
             <div className="trackedQuotaMetrics">
-              <div><span>sample-user 今日</span><strong>{percentText(account.todayQuotaPercent)}%</strong><small>{formatNumber(account.todayTokens)} token</small></div>
+              <div><span>lzc 今日</span><strong>{percentText(account.todayQuotaPercent)}%</strong><small>{formatNumber(account.todayTokens)} token</small></div>
               <div><span>本周期累计</span><strong>{percentText(account.userCycleQuotaPercent)}%</strong><small>{formatNumber(account.userCycleTokens)} token</small></div>
             </div>
             <p>{account.cycleStartAt && account.resetAt
@@ -4116,7 +4105,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
             <em>{percentText(day.quotaPercent)}%</em>
             <small>{day.accounts.map((account) => `${account.accountLabel} ${percentText(account.quotaPercent)}%`).join(" · ")}</small>
           </article>
-        )) : <div className="emptyState">当前额度周期暂无 sample-user token 记录。</div>}
+        )) : <div className="emptyState">当前额度周期暂无 lzc token 记录。</div>}
       </section>
 
       <p className="trackedQuotaFootnote">个人百分比为估算值，并非 OpenAI 提供的个人扣额；多人共用账号时无法精确拆分。{usage.dailyLimitEnforced
@@ -4546,6 +4535,7 @@ export function App() {
   const interruptTimeoutsRef = useRef(new Map<string, number>());
   const newThreadDraftModeRef = useRef(true);
   const quotaRefreshInFlightRef = useRef<Promise<QuotaRefreshResult> | null>(null);
+  const quotaRefreshForceRef = useRef(false);
   const quotaRefreshThreadIdRef = useRef<string | undefined>(undefined);
   const leaderboardRefreshInFlightRef = useRef<Promise<LeaderboardRefreshResult> | null>(null);
   const trackedQuotaRefreshInFlightRef = useRef<Promise<TrackedQuotaRefreshResult> | null>(null);
@@ -6804,7 +6794,7 @@ export function App() {
 
     const cachedPoolNeedsRetry = () => {
       const cached = storedJson<CodexAccountPool | null>(accountPoolSnapshotStorageKey, null);
-      return !cached?.accounts.length || cached.accounts.some((account) => !quotaHasUsableRateLimits(account.quota));
+      return accountPoolNeedsQuotaRetry(cached);
     };
 
     const scheduleNext = (delay = quotaAutoRefreshMs) => {
@@ -7180,6 +7170,12 @@ export function App() {
       await pending;
       return refreshQuota(showMessage, options);
     }
+    // A hover can start a cached read just before a deliberate refresh click.
+    // Finish that read, then honor the explicit force without duplicating it.
+    if (pending && options.force && !quotaRefreshForceRef.current) {
+      await pending;
+      return refreshQuota(showMessage, options);
+    }
     const background = options.background === true;
     if (!background) {
       setQuotaLoading(true);
@@ -7188,6 +7184,7 @@ export function App() {
     let refresh = quotaRefreshInFlightRef.current;
     if (!refresh) {
       quotaRefreshThreadIdRef.current = threadId;
+      quotaRefreshForceRef.current = options.force === true;
       refresh = readCodexAccountPool(options.force === true, threadId)
         .then((response): QuotaRefreshResult => {
           const previous = storedJson<CodexAccountPool | null>(accountPoolSnapshotStorageKey, null);
@@ -7207,6 +7204,7 @@ export function App() {
         }))
         .finally(() => {
           quotaRefreshInFlightRef.current = null;
+          quotaRefreshForceRef.current = false;
         });
       quotaRefreshInFlightRef.current = refresh;
     }
@@ -10833,8 +10831,10 @@ export function App() {
     const inputText = safeText(call.input) || safeText(call.command);
     const agentOperation = parseAgentOperation(call);
     const questions = parseQuestionToolItem(call);
+    const presentation = toolPresentation(call);
+    const ToolIcon = ({ web: Globe, file: FileText, search: Search, agent: Bot, terminal: TerminalSquare, image: ToolImage, tool: Wrench })[presentation.icon];
     if (questions && !historyContext?.readOnly && questionIsAnswered(call.id, contextTurnId, undefined, contextThreadId)) return null;
-    const toolSummary = agentOperation?.agents.map(agent => agent.name.replace(/^\/root\//, "")).join(" · ") || questions?.map((question) => question.title).join(" · ") || skillReadSummary(call) || (agentOperation ? "" : [
+    const toolSummary = agentOperation?.agents.map(agent => agent.name.replace(/^\/root\//, "")).join(" · ") || questions?.map((question) => question.title).join(" · ") || skillReadSummary(call) || presentation.description || (agentOperation ? "" : [
       ...(Array.isArray(call.summary) ? call.summary.map(safeText) : []),
       safeText(call.command),
       inputText
@@ -10874,6 +10874,7 @@ export function App() {
           });
         }}
       >
+        <ToolIcon className="toolBundleTypeIcon" size={16} aria-hidden="true" />
         <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
         <ToolReveal open={expanded}>
         {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer, answers) => chooseToolQuestion(call.id, answer, answers, contextThreadId, contextProjectId)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
@@ -12179,11 +12180,11 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             setLeaderboardOpen(false);
           }
         }}>
-          <section className="settingsDialog leaderboardDialog" role="dialog" aria-modal="true" aria-label="模型 Token 排行榜">
+          <section className="settingsDialog leaderboardDialog" role="dialog" aria-modal="true" aria-label="额度排行榜">
             <div className="dialogHeader">
               <div>
-                <h2>Token 排行榜</h2>
-                <p>按本机会话 token_count 统计，包含 API 模型；不等同供应商账单。</p>
+                <h2>额度排行榜</h2>
+                <p>总 GPT 号池容量为 100%，两榜额度均为估算；总榜由历史 Token 折算。点击姓名查看模型明细。</p>
               </div>
               <button className="iconButton" type="button" onClick={() => setLeaderboardOpen(false)} title="关闭">
                 <X size={18} />
@@ -12194,8 +12195,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 <div className="emptyState">读取排行榜中...</div>
               ) : leaderboard ? (
                 <>
-                  <LeaderboardScopeView title="当前周期" scope={leaderboard.currentCycle} users={users} />
-                  <LeaderboardScopeView title="历史累计" scope={leaderboard.lifetime} users={users} />
+                  <LeaderboardPanel leaderboard={leaderboard} />
                   <LeaderboardWarnings errors={leaderboard.errors} />
                   <p className="leaderboardUpdated">{leaderboardLoading ? "正在更新 · " : ""}更新于 {new Date(leaderboard.updatedAt).toLocaleString()}</p>
                 </>
@@ -12219,10 +12219,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         <div className={`modalBackdrop uiExitLayer${trackedQuotaPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={trackedQuotaPresence.closing} inert={trackedQuotaPresence.closing} onMouseDown={(event) => {
           if (event.target === event.currentTarget) setTrackedQuotaOpen(false);
         }}>
-          <section className="settingsDialog trackedQuotaDialog" role="dialog" aria-modal="true" aria-label="sample-user 额度占用">
+          <section className="settingsDialog trackedQuotaDialog" role="dialog" aria-modal="true" aria-label="lzc 额度占用">
             <div className="dialogHeader">
               <div>
-                <h2>sample-user 额度占用</h2>
+                <h2>lzc 额度占用</h2>
                 <p>各账号分别统计，并按自然日合计。</p>
               </div>
               <button className="iconButton" type="button" onClick={() => setTrackedQuotaOpen(false)} title="关闭">
@@ -12233,7 +12233,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               ? <div className="emptyState">正在核对各账号的会话记录…</div>
               : trackedQuotaUsage
                 ? <TrackedQuotaDetails usage={trackedQuotaUsage} />
-                : <div className="emptyState">暂未读取到 sample-user 用量。</div>}
+                : <div className="emptyState">暂未读取到 lzc 用量。</div>}
             <div className="dialogActions">
               <span className="trackedQuotaUpdated">{trackedQuotaUsage ? `更新于 ${new Date(trackedQuotaUsage.updatedAt).toLocaleString()}` : ""}</span>
               <button className="iconTextButton" type="button" onClick={() => setTrackedQuotaOpen(false)}>关闭</button>
@@ -12531,8 +12531,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               设置
             </button>
             <button className={`trackedQuotaButton topbarGlassControl${trackedQuotaUsage && trackedQuotaUsage.todayQuotaPercent > 50 ? " warning" : ""}`}
-              type="button" onClick={() => void refreshTrackedQuota(true)} title="查看 sample-user 今日估算用量和历史统计（仅显示，不限制使用）" aria-label="sample-user 额度占用">
-              sample-user {trackedQuotaUsage ? `${percentText(trackedQuotaUsage.todayQuotaPercent)}%` : "--"}
+              type="button" onClick={() => void refreshTrackedQuota(true)} title="查看 lzc 今日估算用量和历史统计（仅显示，不限制使用）" aria-label="lzc 额度占用">
+              lzc {trackedQuotaUsage ? `${percentText(trackedQuotaUsage.todayQuotaPercent)}%` : "--"}
               <ComposerGlassMaterial variant="topbar" />
             </button>
             <div
@@ -12581,10 +12581,11 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 setLeaderboardOpen(true);
                 void refreshLeaderboard(false, false);
               }}
-              title="查看当前周期和历史累计 token 排行榜"
+              title="查看实名额度排行和模型使用明细"
             >
               <Trophy size={14} />
               排行榜
+              <AccountUpdateIndicator key={`leaderboard:${selectedUserId}`} userId={selectedUserId} menuOpen={leaderboardOpen} target="leaderboard" />
             </button>
             <PolishedSelect<SandboxMode>
               className="topbarPolicySelect"
@@ -12965,7 +12966,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 }
               }}
             >
-              <HostResourceSummary onOpen={() => showRightWindow("resources")} />
               <div className={`v2AccountMenu${accountMenuPresence.closing ? " uiClosing" : ""}`} hidden={!accountMenuPresence.present} aria-hidden={!accountMenuOpen} inert={!accountMenuOpen}>
                 <button type="button" data-mobile-sidebar-dismiss="true" onClick={() => { setAccountMenuOpen(false); setPushError(""); setPushTestStatus(""); setNotificationSettingsOpen(true); }}>
                   <span className="v2MenuIcon"><NotificationBell size={14} /></span><span>任务通知</span>
@@ -13264,25 +13264,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 ) : null}
                 {temporaryAsk && temporaryPanelMount ? createPortal((
                   <aside className="temporaryAskPanel temporaryAskDocked" aria-label="临时侧边对话">
-                    <header className="temporaryAskHeader">
-                      <div className="temporaryAskHeaderLeft">
-                        <span className="temporaryAskHeaderBadge" aria-hidden="true"><MessageSquare size={15} /></span>
-                        <div className="temporaryAskHeaderText">
-                          <span className="temporaryAskHeaderTitle">侧边聊天</span>
-                          <span className={`temporaryAskHeaderState ${temporaryAsk.status}`}>
-                            {temporaryAsk.status === "closing" ? "正在关闭" : temporaryStopBusy ? "正在停止" : temporaryAsk.status === "running"
-                              ? "实时处理中"
-                              : temporaryAsk.status === "starting"
-                                ? "启动中"
-                                : temporaryAsk.threadId
-                                  ? "已就绪"
-                                  : "等待提问"}
-                          </span>
-                          <small>随主会话保存，切换会话时自动恢复</small>
-                        </div>
-                      </div>
-                      <button className="iconButton temporaryAskHeaderButton" type="button" onClick={closeTemporaryAsk} disabled={temporaryAsk.status === "closing"} title="关闭并删除临时对话" aria-label="关闭并删除临时对话"><X size={16} /></button>
-                    </header>
                     <SideChatMessages conversationId={temporaryAsk.id} requestId={temporaryAsk.requestId}>
                       <article className="messageItem kind-user type-userMessage temporaryAskQuote">
                         <div className="messageMeta">引用的文本片段</div>
@@ -13965,8 +13946,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
           </section>
           </div>
           <RightWorkspace scope={`${selectedUserId}:${selectedThread?.id ?? "new"}`} open={rightWorkspaceOpen} active={rightWorkspaceTab} width={diffPanelWidth} tabs={rightTabs}
-            mobileSummary={<HostResourceSummary onOpen={() => showRightWindow("resources")} />}
-            overview={<WorkspaceOverview sections={workspaceSections} />} onSelect={setRightWorkspaceTab} onHide={() => setMobileRightWorkspaceOpen(false)}
+            overview={<WorkspaceOverview sections={workspaceSections} resources={<HostResourceSummary onOpen={() => showRightWindow("resources")} />} />} onSelect={setRightWorkspaceTab} onHide={() => setMobileRightWorkspaceOpen(false)}
             onResize={event => {
               setDiffPanelResizing(true);
               beginRightPanelResize(event, diffPanelWidth, setDiffPanelWidth, "codex-web-diff-panel-width", 350, Math.min(900, window.innerWidth - (threadListCollapsed ? 56 : threadListWidth) - 320));

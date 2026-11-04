@@ -6,6 +6,7 @@ import { serverConfig } from "./config.js";
 import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { readThreadFromJsonl, readThreadSummaryFromJsonl } from "./threadFallback.js";
 import {rolloutLogicalStat, rolloutStat,openReadableRollout,rolloutReadStream} from './rolloutStorage.js';
+import { HistoryReadScheduler } from './historyReadScheduler.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -514,13 +515,23 @@ async function indexedCollaborationMode(filePath: string, threadId: string): Pro
 // Bound source bytes BEFORE JSONL buffers, UTF-16 strings and objects coexist.
 export const THREAD_PAGE_BYTE_BUDGET = 8 * 1024 * 1024;
 const MAX_SINGLE_RECORD_BYTES = 32 * 1024 * 1024;
-let pageReadQueue: Promise<void> = Promise.resolve();
-async function serializedHistoryRead<T>(read: () => Promise<T>): Promise<T> {
-  const previous = pageReadQueue;
-  let release!: () => void;
-  pageReadQueue = new Promise<void>(resolve => { release = resolve; });
-  await previous;
-  try { return await read(); } finally { release(); }
+const historyReads = new HistoryReadScheduler();
+
+export async function indexedBranchCutoffTime(filePath: string, threadId: string, turnId?: string): Promise<number> {
+  await warmThreadIndex(filePath, threadId);
+  const row = turnId
+    ? db.prepare('SELECT end_offset FROM thread_turns WHERE thread_id=? AND turn_id=?').get(threadId, turnId)
+    : db.prepare('SELECT end_offset FROM thread_turns WHERE thread_id=? ORDER BY start_offset DESC LIMIT 1').get(threadId);
+  const end = Number((row as {end_offset?: number} | undefined)?.end_offset);
+  if (!Number.isSafeInteger(end) || end <= 0) throw new Error('分支轮次尚未结束，无法固定子代理历史边界。');
+  const file = await openReadableRollout(filePath);
+  try {
+    const start=Math.max(0,end-128*1024), buffer=Buffer.alloc(end-start);
+    await file.read(buffer,0,buffer.length,start);
+    const lines=buffer.toString('utf8').split('\n'); if(start)lines.shift();
+    for(const line of lines.reverse())try {const record=JSON.parse(line);const time=Date.parse(record.timestamp);if(Number.isFinite(time))return time;}catch{}
+    throw new Error('无法确定分支时间，未继承不明确的子代理记录。');
+  } finally {await file.close();}
 }
 
 export function readIndexedThreadPage(
@@ -528,7 +539,17 @@ export function readIndexedThreadPage(
   threadId: string,
   options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number }
 ) {
-  return serializedHistoryRead(() => readIndexedThreadPageUnlocked(filePath, threadId, options));
+  return historyReads.run(async () => {
+    const state = fileState(threadId);
+    const boundaryMatches = !state || await indexedRecordBoundaryMatches(filePath, threadId);
+    if (options.backgroundRefresh && state && boundaryMatches) {
+      const existingUpdate = updateLocks.get(threadId);
+      if (existingUpdate) await existingUpdate;
+      else void warmThreadIndex(filePath, threadId).catch(() => undefined);
+    } else {
+      await warmThreadIndex(filePath, threadId);
+    }
+  }, () => readIndexedThreadPageUnlocked(filePath, threadId, options));
 }
 
 async function readIndexedThreadPageUnlocked(
@@ -536,15 +557,6 @@ async function readIndexedThreadPageUnlocked(
   threadId: string,
   options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number }
 ) {
-  const state = fileState(threadId);
-  const boundaryMatches = !state || await indexedRecordBoundaryMatches(filePath, threadId);
-  if (options.backgroundRefresh && state && boundaryMatches) {
-    const existingUpdate = updateLocks.get(threadId);
-    if (existingUpdate) await existingUpdate;
-    else void warmThreadIndex(filePath, threadId).catch(() => undefined);
-  } else {
-    await warmThreadIndex(filePath, threadId);
-  }
   const collaborationMode = await indexedCollaborationMode(filePath, threadId);
   const withMode = (thread: JsonRecord) => collaborationMode ? { ...thread, collaborationMode } : thread;
   const maxEndOffset = options.maxEndOffset ?? Number.MAX_SAFE_INTEGER;
@@ -640,11 +652,10 @@ export function locateIndexedThreadItem(threadId: string, itemId: string) {
 }
 
 export function readIndexedThreadItem(filePath: string, threadId: string, itemId: string, options: { preferCall?: boolean; maxEndOffset?: number } = {}): Promise<JsonRecord | null> {
-  return serializedHistoryRead(() => readIndexedThreadItemUnlocked(filePath, threadId, itemId, options));
+  return historyReads.run(() => warmThreadIndex(filePath, threadId), () => readIndexedThreadItemUnlocked(filePath, threadId, itemId, options));
 }
 
 async function readIndexedThreadItemUnlocked(filePath: string, threadId: string, itemId: string, options: { preferCall?: boolean; maxEndOffset?: number }): Promise<JsonRecord | null> {
-  await warmThreadIndex(filePath, threadId);
   const row = db.prepare(`
     SELECT turn_id, start_offset, end_offset FROM thread_records
     WHERE thread_id = ? AND (record_id = ? OR call_id = ?) AND end_offset <= ? LIMIT 1

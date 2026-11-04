@@ -82,10 +82,14 @@ export interface CodexLeaderboardModelUsage extends CodexTokenBreakdown {
   model: string;
   effort: string | null;
   sessionCount: number;
+  quotaPercent?: number | null;
+  poolQuotaPercent?: number | null;
 }
 
 export interface CodexLeaderboardUserUsage extends CodexTokenBreakdown {
   userId: string;
+  displayName?: string | null;
+  poolQuotaPercent?: number | null;
   sharePercent: number;
   quotaPercent: number | null;
   sessionCount: number;
@@ -106,6 +110,7 @@ export interface CodexLeaderboard {
   lifetime: CodexLeaderboardScope;
   updatedAt: string;
   errors: string[];
+  quotaAccountCount?: number;
 }
 
 export interface TrackedQuotaDayAccount {
@@ -374,6 +379,8 @@ export interface ThreadReadResponse {
 }
 
 export interface SubagentThreadSummary {
+  inherited?: boolean;
+  inheritedFromThreadId?: string;
   id: string;
   name: string;
   parentThreadId: string;
@@ -462,6 +469,7 @@ export interface LiveTurnState {
 }
 
 export interface LiveToolItem {
+  description?: string;
   collaboration?: Record<string, unknown>;
   sourceItemId?: string;
   itemId: string;

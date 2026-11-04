@@ -3,6 +3,59 @@ import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
 
+it('uses the selected completed turn, not the time the branch is created',async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'branch-cutoff-'));
+  vi.stubEnv('CODEX_THREAD_INDEX_DB',path.join(root,'index.sqlite'));vi.stubEnv('CODEX_WEB_CODEX_SESSION_ROOTS',root);vi.resetModules();
+  try {
+    const file=path.join(root,'rollout-source.jsonl');
+    await fs.writeFile(file,[{type:'session_meta',payload:{id:'source'}},
+      {type:'event_msg',timestamp:'2026-10-01T00:00:00Z',payload:{type:'task_started',turn_id:'old'}},
+      {type:'event_msg',timestamp:'2026-10-01T01:00:00Z',payload:{type:'task_complete',turn_id:'old'}},
+      {type:'event_msg',timestamp:'2026-10-02T00:00:00Z',payload:{type:'task_started',turn_id:'new'}},
+      {type:'event_msg',timestamp:'2026-10-02T01:00:00Z',payload:{type:'task_complete',turn_id:'new'}}].map(row=>JSON.stringify(row)).join('\n')+'\n');
+    const {indexedBranchCutoffTime}=await import('./threadEventIndex.js');
+    expect(await indexedBranchCutoffTime(file,'source','old')).toBe(Date.parse('2026-10-01T01:00:00Z'));
+    expect(await indexedBranchCutoffTime(file,'source')).toBe(Date.parse('2026-10-02T01:00:00Z'));
+  } finally {vi.unstubAllEnvs();vi.resetModules();await fs.rm(root,{recursive:true,force:true});}
+});
+
+it("allows an already indexed thread to load while another thread waits on slow index IO", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-index-head-of-line-"));
+  vi.stubEnv("CODEX_THREAD_INDEX_DB", path.join(root, "index.sqlite"));
+  vi.stubEnv("CODEX_WEB_CODEX_SESSION_ROOTS", root); vi.resetModules();
+  let release!: () => void, started!: () => void;
+  const wait = new Promise<void>(resolve => { release = resolve; });
+  const waiting = new Promise<void>(resolve => { started = resolve; });
+  let a: Promise<unknown> | undefined;
+  try {
+    const aFile = path.join(root, "slow.jsonl"), bFile = path.join(root, "ready.jsonl");
+    const content = (id: string, text: string) => [
+      { type: 'session_meta', payload: { id } },
+      { type: 'event_msg', payload: { type: 'task_started', turn_id: id + '-turn' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } }
+    ].map(x => JSON.stringify(x)).join('\n') + '\n';
+    await fs.writeFile(aFile, content('slow', 'slow fixture'));
+    await fs.writeFile(bFile, content('ready', 'ready fixture'));
+    const { readIndexedThreadPage } = await import('./threadEventIndex.js');
+    await readIndexedThreadPage(bFile, 'ready', { limit: 10 });
+    const originalStat = fs.stat.bind(fs);
+    vi.spyOn(fs, 'stat').mockImplementation((async (file: Parameters<typeof fs.stat>[0]) => {
+      if (file === aFile) { started(); await wait; }
+      return originalStat(file);
+    }) as typeof fs.stat);
+    a = readIndexedThreadPage(aFile, 'slow', { limit: 10 });
+    await waiting;
+    const ready = await Promise.race([
+      readIndexedThreadPage(bFile, 'ready', { limit: 10 }).then(result => JSON.stringify(result.thread)),
+      new Promise<string>((_, reject) => setTimeout(() => reject(Error('ready page was blocked by slow index')), 1500))
+    ]);
+    expect(ready).toContain('ready fixture');
+  } finally {
+    release(); await a?.catch(() => undefined); vi.restoreAllMocks(); vi.unstubAllEnvs();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}, 10000);
+
 it("bounds pages by source bytes and preserves every older tool record and full output", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-index-bytes-"));
   vi.stubEnv("CODEX_THREAD_INDEX_DB", path.join(root, "index.sqlite"));

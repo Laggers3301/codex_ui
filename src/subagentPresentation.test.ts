@@ -3,6 +3,10 @@ import { collectAgents, isActiveAgent, parseAgentOperation, reconcileSubagents }
 import { mergeTimelineItems } from "./conversationTimeline";
 
 describe("subagent presentation", () => {
+  it('keeps inherited and new agents distinct even when their task names match',()=>{
+    const result=reconcileSubagents([{id:'new',name:'/root/worker',state:'running'}],[{id:'old',name:'/root/worker',parentThreadId:'source',inherited:true,state:'unknown'}]);
+    expect(result.map(row=>row.id)).toEqual(['new','old']);expect(result[1].inherited).toBe(true);
+  });
   it("does not throw JSON parser exceptions for ordinary tool output or status labels", () => {
     const parse = vi.spyOn(JSON, "parse");
     try {

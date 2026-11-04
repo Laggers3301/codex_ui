@@ -6,6 +6,7 @@ import { authenticatedUserFromHeaders } from "./auth.js";
 import { serverConfig } from "./config.js";
 import type { HostResources } from "../shared/hostResources.js";
 import { HostNetworkProbe } from "./hostNetwork.js";
+import { MemoryProcessMonitor } from './memoryProcesses.js';
 
 const percent = (part: number, total: number) => total > 0 ? Math.max(0, Math.min(100, part / total * 100)) : 0;
 export function cpuCounters(text: string): { total: number; idle: number } | null {
@@ -137,6 +138,13 @@ export class HostResourceMonitor {
 }
 
 export function registerHostResourceRoutes(app: FastifyInstance, monitor = new HostResourceMonitor(), network = new HostNetworkProbe()): void {
+  const processes = new MemoryProcessMonitor();
+  app.get('/api/system/memory-processes', async (request, reply) => {
+    if (!authenticatedUserFromHeaders(request.headers)) return reply.code(401).send({error:'请先登录。'});
+    reply.header('Cache-Control','no-store');
+    try { return {data:await processes.read()}; }
+    catch { return reply.code(503).send({error:'暂时无法读取进程排行，请重试。'}); }
+  });
   app.get("/api/system/resources", async (request, reply) => {
     if (!authenticatedUserFromHeaders(request.headers)) return reply.code(401).send({ error: "请先登录。" });
     reply.header("Cache-Control", "no-store");

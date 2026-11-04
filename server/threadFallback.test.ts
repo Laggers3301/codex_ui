@@ -18,7 +18,7 @@ describe("forked JSONL recovery", () => {
     const records = [
       { type: "session_meta", payload: { id: "tools" } },
       { type: "turn_context", payload: { turn_id: "turn" } },
-      { timestamp: "2026-09-16T01:00:00Z", type: "response_item", payload: { type: "custom_tool_call", id: "response-call", call_id: "call", name: "exec", input: "run()" } },
+      { timestamp: "2026-09-16T01:00:00Z", type: "response_item", payload: { type: "custom_tool_call", id: "response-call", call_id: "call", name: "exec", description: "检查配置", input: "run()" } },
       { timestamp: "2026-09-16T01:00:01Z", type: "response_item", payload: { type: "custom_tool_call_output", id: "response-output", call_id: "call", output: "done" } }
     ];
     const lines = records.map((record) => JSON.stringify(record) + "\n");
@@ -27,7 +27,7 @@ describe("forked JSONL recovery", () => {
     const page = await readThreadFromJsonl(filePath, "tools", root, { startOffset: Buffer.byteLength(lines.slice(0, 3).join("")), syntheticTurnId: "turn" });
     const fullItems = (full.thread.turns as { items: Record<string, unknown>[] }[])[0].items;
     const pageItems = (page.thread.turns as { items: Record<string, unknown>[] }[])[0].items;
-    expect(fullItems[0]).toMatchObject({ callId: "call", timelineAt: "2026-09-16T01:00:00Z" });
+    expect(fullItems[0]).toMatchObject({ callId: "call", timelineAt: "2026-09-16T01:00:00Z", description: "检查配置", command: "run()" });
     expect(pageItems[0]).toEqual(fullItems[1]);
     expect(pageItems[0]).toMatchObject({ id: "response-output", callId: "call" });
   });

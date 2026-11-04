@@ -64,12 +64,19 @@ export class ChatSearchStore {
     if (this.syncing) return;
     this.syncing = true;
     try {
-      const files = this.source.prepare('SELECT * FROM thread_files ORDER BY updated_at DESC').iterate();
-      const present = new Set(this.source.prepare('SELECT thread_id FROM thread_files').all().map(row => row.thread_id));
+      // Do not keep a source iterator open across await yieldTurn(): that pins
+      // the WAL read snapshot for the entire potentially long search sync and
+      // prevents the history writer from checkpointing. Snapshot only IDs, and
+      // fetch each file's current metadata with a completed short read.
+      const ids = this.source.prepare('SELECT thread_id FROM thread_files ORDER BY updated_at DESC').all().map(row => row.thread_id);
+      const present = new Set(ids);
+      const readFile = this.source.prepare('SELECT * FROM thread_files WHERE thread_id=?');
       for (const row of this.db.prepare('SELECT thread_id FROM threads').all()) {
         if (!present.has(row.thread_id)) this.clearThread(row.thread_id);
       }
-      for (const file of files) {
+      for (const id of ids) {
+        const file = readFile.get(id);
+        if (!file) continue;
         let previous = this.db.prepare('SELECT * FROM threads WHERE thread_id=?').get(file.thread_id);
         if (previous?.source_updated === file.updated_at && previous.source_size === file.indexed_offset
           && previous.source_generation === (file.index_generation ?? 0)) continue;

@@ -15,7 +15,7 @@ describe("durable tool timeline", () => {
       live.recordNotification({ method: "turn/started", params: { threadId: "thread", turnId: "turn" } });
       for (let n = 0; n < 60; n++) {
         const update = live.recordNotification({ method: "item/completed", params: {
-          threadId: "thread", turnId: "turn", item: { id: `nested-${n}`, type: n === 0 ? "imageView" : "commandExecution", command: "x".repeat(8000), output: `out-${n}` }
+          threadId: "thread", turnId: "turn", item: { id: `nested-${n}`, type: n === 0 ? "imageView" : "commandExecution", description: "查看图片", command: "x".repeat(8000), output: `out-${n}` }
         } });
         expect(update).not.toBeNull();
         store.saveTimelineItem("thread", "turn", journalItem(update!));
@@ -27,7 +27,7 @@ describe("durable tool timeline", () => {
       store = new ProjectStore(path.join(root, "test.sqlite"));
       const saved = store.readTimelineItems("thread", "turn");
       expect(saved).toHaveLength(60);
-      expect(saved[0]).toMatchObject({ tool: "view_image", input: "x".repeat(8000) });
+      expect(saved[0]).toMatchObject({ tool: "view_image", description: "查看图片", input: "x".repeat(8000) });
       const thread = overlayJournal({ turns: [{ id: "turn", items: [] }] }, (id) => store.readTimelineItems("thread", id), true);
       expect((thread.turns as { items: unknown[] }[])[0].items).toHaveLength(60);
       expect(store.readTimelineItems("other-thread", "turn")).toHaveLength(0);
@@ -43,6 +43,12 @@ describe("durable tool timeline", () => {
     ] }] };
     const result = overlayJournal(history, () => entries, false);
     expect((result.turns as { items: { id: string }[] }[])[0].items.map((item) => item.id)).toEqual(["response-2", "message", "call-3"]);
+  });
+
+  it("keeps journal descriptions when native history has no description", () => {
+    const thread = { turns: [{ id: "t", items: [{ id: "i", type: "toolCall", description: undefined }] }] };
+    const result = overlayJournal(thread, () => [{ id: "i", type: "toolCall", description: "检查配置" }], true);
+    expect((result.turns as { items: { description?: string }[] }[])[0].items[0].description).toBe("检查配置");
   });
 
   it("restores a turn diff on a historical page without duplicating a native file-change item", () => {

@@ -2,6 +2,36 @@ import { describe, expect, it } from "vitest";
 import { meaningfulTurnProgressMethod, phaseFromProbe, TurnWatchdog } from "./turnWatchdog.js";
 
 describe("TurnWatchdog", () => {
+  it("bounds simultaneous diagnostics globally and per shared runtime, draining oldest first", () => {
+    const watchdog = new TurnWatchdog();
+    for (let index = 0; index < 12; index++) watchdog.start(`u-${index}`, `a-${index % 3}`, `t-${index}`, `r-${index}`, 0);
+    const seen = new Set<string>();
+    for (let pass = 0; pass < 6; pass++) {
+      const claims = watchdog.claimDueProbes(120_000 + pass * 15_000);
+      expect(claims).toHaveLength(2);
+      expect(new Set(claims.map(c => c.turn.accountId)).size).toBe(2);
+      expect(watchdog.claimDueProbes(120_000 + pass * 15_000)).toEqual([]);
+      for (const claim of claims) {
+        expect(seen.has(claim.turn.threadId)).toBe(false);
+        seen.add(claim.turn.threadId);
+        watchdog.resolveProbe(claim.turn.userId, claim.turn.accountId, claim.turn.threadId, claim.turn.turnId, claim.token, "active", []);
+        expect(claim.turn.lastProgressAt).toBe(0);
+      }
+    }
+    expect(seen.size).toBe(12);
+  });
+
+  it("releases a failed diagnostic slot without marking queued work as diagnosed", () => {
+    const watchdog = new TurnWatchdog();
+    watchdog.start("u1", "shared", "t1", "r1", 0);
+    const queued = watchdog.start("u2", "shared", "t2", "r2", 0);
+    const first = watchdog.claimDueProbes(120_000);
+    expect(first).toHaveLength(1);
+    expect(queued.lastProbeAt).toBeNull(); expect(queued.diagnosed).toBe(false);
+    watchdog.failProbe("u1", "shared", "t1", "r1", first[0]!.token);
+    expect(watchdog.claimDueProbes(120_001)[0]?.turn.threadId).toBe("t2");
+  });
+
   it("replaces old wait flags with fresh snapshots and ignores probes after newer progress", () => {
     const watchdog = new TurnWatchdog();
     const turn = watchdog.start("user-a", "account-a", "thread-a", "turn-a", 0);
