@@ -1,9 +1,10 @@
 /** Runtime identity is separate from the model's display name. ReClaude models
  * use a reserved prefix so they can never fall through to a Codex provider. */
 export type AgentRuntime = "codex" | "claude-code";
-export type ModelAvailability = "ready" | "not-connected";
+export type ModelAvailability = "ready" | "not-connected" | "disabled";
 export interface RuntimeModelMetadata {
   runtime?: AgentRuntime;
+  nativeModelId?: string;
   availability?: ModelAvailability;
   unavailableReason?: string;
 }
@@ -15,7 +16,7 @@ export function isReclaudeModel(model: unknown): boolean {
 }
 
 export function modelIsAvailable(profile: RuntimeModelMetadata): boolean {
-  return profile.availability !== "not-connected";
+  return profile.availability !== "not-connected" && profile.availability !== "disabled";
 }
 
 /** These are model-family previews, not a claim of account entitlement. No
