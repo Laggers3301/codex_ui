@@ -2,10 +2,12 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-const state=vi.hoisted(()=>({source:null as string|null, size:0, rejectBudget:false, checked:[] as number[]}));
+const state=vi.hoisted(()=>({source:null as string|null, size:0, rejectBudget:false, checked:[] as number[],claude:false,transfers:[] as any[]}));
 vi.mock('./threadFallback.js',()=>({findThreadJsonlPathById:async()=>state.source,threadJsonlSessionsRoot:(file:string)=>path.dirname(file)}));
 vi.mock('./rolloutStorage.js',async original=>({...await original<typeof import('./rolloutStorage.js')>(),rolloutLogicalStat:async()=>({size:state.size})}));
 vi.mock('./accountPoolBridge.js',()=>({isAccountPoolBridge:(value:any)=>value.pool===true}));
+vi.mock('./claudeService.js',()=>({getClaudeService:()=>state.claude?{owns:(id:string)=>id==='main'}:undefined}));
+vi.mock('./runtimeHistoryTransfer.js',()=>({getRuntimeHistoryTransfer:()=>({migrate:async(input:any)=>{state.transfers.push(input);return{threadId:'imported-child'};}})}));
 vi.mock('./largeThreadFork.js',async original=>({...await original<typeof import('./largeThreadFork.js')>(),assertLargeBranchMemory:(bytes:number)=>{state.checked.push(bytes);if(state.rejectBudget)throw new Error('insufficient memory');}}));
 import { ProjectStore } from './db.js';
 import type { CodexBridge } from './codexBridge.js';
@@ -16,7 +18,7 @@ import { serverConfig } from './config.js';
 import { gunzipSync } from 'node:zlib';
 
 async function fixture() {
-  state.source=null;state.size=0;state.rejectBudget=false;state.checked=[];
+  state.source=null;state.size=0;state.rejectBudget=false;state.checked=[];state.claude=false;state.transfers=[];
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'side-fork-safe-'));
   const store=new ProjectStore(path.join(root,'test.sqlite'));
   const project=store.createProject({name:'isolated',rootPath:root});
@@ -38,6 +40,19 @@ async function fixture() {
     dispose:async()=>{store.close();await fs.rm(root,{recursive:true,force:true});}};
 }
 describe('guarded same-account side forks',()=>{
+  it('imports history into the selected engine before creating a Codex side chat from a Claude parent',async()=>{
+    const f=await fixture();state.claude=true;
+    try{await f.run();expect(state.transfers).toEqual([expect.objectContaining({sourceThreadId:'main',targetModel:'gpt-6.1-sol',userId:'admin',projectId:f.project.id})]);
+      expect(f.calls).toEqual([{method:'thread/read',params:{threadId:'imported-child',includeTurns:false}}]);}
+    finally{await f.dispose();}
+  });
+  it('also imports a Codex parent into a Claude side chat and keeps a same-engine Claude fork native',async()=>{
+    const f=await fixture();f.params.model='reclaude-sonnet@1';
+    try{await f.run();expect(state.transfers[0].targetModel).toBe('reclaude-sonnet@1');
+      state.claude=true;state.transfers=[];f.calls.length=0;await f.run();
+      expect(state.transfers).toHaveLength(0);expect(f.calls[0]).toMatchObject({method:'thread/fork',params:{threadId:'main',projectId:f.project.id}});}
+    finally{await f.dispose();}
+  });
   it('shares the ordinary branch lock and releases it after failure',async()=>{
     const f=await fixture(),release=branchGate.enter();
     try{await expect(f.run()).rejects.toThrow(/已有分支/);expect(f.calls).toHaveLength(0);}

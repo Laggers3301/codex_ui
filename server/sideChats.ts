@@ -147,10 +147,20 @@ export class SideChatStore {
     return true;
   }
 
+  retarget(id: string, userId: string, requestId: string, threadId: string): boolean {
+    const side=this.byId(id,userId);
+    if(!side||side.requestId!==requestId||side.status!=="starting")return false;
+    if(!this.owners.userCanAccessThread(threadId,userId,side.projectId)||threadId===side.parentThreadId)throw new SideChatError("侧边会话归属不匹配。",403);
+    const result=this.db.prepare("UPDATE side_chats SET thread_id=?,turn_id=NULL,revision=revision+1,updated_at=? WHERE id=? AND request_id=? AND status='starting' AND deleted_at IS NULL")
+      .run(threadId,new Date().toISOString(),id,requestId);
+    if(result.changes)this.changed(side);
+    return !!result.changes;
+  }
+
   failed(id: string, userId: string, requestId: string, error: unknown): void {
     const side = this.byId(id, userId);
     if (!side || side.requestId !== requestId || side.status !== "starting") return;
-    this.db.prepare("UPDATE side_chats SET status='error',error=?,revision=revision+1,updated_at=? WHERE id=? AND deleted_at IS NULL AND status='starting' AND request_id=?")
+    this.db.prepare("UPDATE side_chats SET status='error',error=?,draft=CASE WHEN draft='' THEN last_prompt ELSE draft END,revision=revision+1,updated_at=? WHERE id=? AND deleted_at IS NULL AND status='starting' AND request_id=?")
       .run(error instanceof Error ? error.message : String(error), new Date().toISOString(), id, requestId);
     this.changed(side);
   }

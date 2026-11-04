@@ -5281,6 +5281,7 @@ export function App() {
     const requestId = `temp-${requestToken()}`;
     const next = sideChatController.begin(current.userId, current.parentThreadId, requestId, text);
     if (!next) return;
+    setError(current => current.startsWith("侧边提问失败：") ? "" : current);
     try {
       codexSocket.send(current.threadId ? {
         type: "turn.start",
@@ -5311,9 +5312,9 @@ export function App() {
         approvalPolicy,
       });
     } catch (caught) {
-      const failed = { ...next, status: "error" as const };
+      const failed = { ...next, status: "error" as const, error:caught instanceof Error?caught.message:String(caught) };
       sideChatController.updateAsk(failed);
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(`侧边提问失败：${caught instanceof Error ? caught.message : String(caught)}`);
     }
   }
 
@@ -10122,7 +10123,7 @@ export function App() {
         }
         if (!message.ok) {
           if (interruptQueued) clearQueuedInterrupt(message.requestId);
-          const failed = { ...temporary, status: "error" as const };
+          const failed = { ...temporary, status: "error" as const, error:message.error??"发送失败，请修改后重试。" };
           sideChatController.updateAsk(failed);
           if (temporary.parentThreadId === selectedThreadRef.current?.id && temporary.userId === selectedUserId) setError(`侧边提问失败：${message.error ?? "Codex 未接受请求。"}`);
           return;

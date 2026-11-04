@@ -8,12 +8,24 @@ import { rolloutLogicalStat } from './rolloutStorage.js';
 import { assertLargeBranchMemory, branchGate, BranchConflictError, copyLargeThreadBranch, isLegacyRollout, largeThreadForkBytes } from './largeThreadFork.js';
 import { toolArchivePath, toolArchiveRoot } from './toolOutputArchive.js';
 import { serverConfig } from './config.js';
+import { getClaudeService } from './claudeService.js';
+import { getRuntimeHistoryTransfer } from './runtimeHistoryTransfer.js';
+import { isReclaudeModel } from '../shared/agentRuntime.js';
+import { randomUUID } from 'node:crypto';
 
 /** Same-account context inheritance, never an unguarded bulk native fork. */
 export async function forkSideChatContext(bridge: CodexBridge, store: ProjectStore, userId: string, projectId: string,
   parentThreadId: string, params: Record<string, unknown>, reasoningEffort: string) {
   const release = branchGate.enter();
   try {
+    const claude=getClaudeService(bridge),sourceClaude=!!claude?.owns(parentThreadId);
+    if(sourceClaude!==isReclaudeModel(params.model)){
+      const transfers=getRuntimeHistoryTransfer(bridge,store);
+      if(!transfers)throw new BranchConflictError('跨引擎侧边会话尚未配置。');
+      const result=await transfers.migrate({operationId:randomUUID(),sourceThreadId:parentThreadId,userId,projectId,targetModel:String(params.model)}) as {threadId:string};
+      return await bridge.request('thread/read',{threadId:result.threadId,includeTurns:false});
+    }
+    if(sourceClaude)return await bridge.request('thread/fork',{...params,threadId:parentThreadId,projectId,excludeTurns:true});
     const pool = isAccountPoolBridge(bridge) ? bridge : null;
     const account = pool ? await pool.resolveThreadAccount(parentThreadId) : null;
     if (pool && !pool.canThreadUseModel(parentThreadId, String(params.model))) {

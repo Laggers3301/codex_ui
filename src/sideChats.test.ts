@@ -78,4 +78,18 @@ describe("main-thread side chat restoration", () => {
     expect(f.controller.get("admin", "b")?.draft).toBe("b draft");
     expect(f.controller.get("admin", "a")?.draft).toBe("");
   });
+
+  it("returns a failed send to its draft and does not pin it after a successful retry", async()=>{
+    const f=fixture([row("a")]);await f.controller.load("admin","project","a");
+    const ask=f.controller.begin("admin","a","failed-send","可修改后重试的问题")!;
+    f.controller.updateAsk({...ask,status:"error",error:"账号尚未就绪"});
+    expect(f.controller.get("admin","a")?.draft).toBe("可修改后重试的问题");
+    expect(f.controller.get("admin","a")?.ask.prompts.some(prompt=>prompt.requestId==="failed-send")).toBe(false);
+    await f.controller.flush(sideChatKey("admin","a"));
+    const retry=f.controller.begin("admin","a","retry-send","修改后的问题")!;
+    expect(retry.error).toBeNull();
+    expect(retry.prompts.filter(prompt=>!prompt.turnId).map(prompt=>prompt.requestId)).toEqual(["retry-send"]);
+    f.controller.updateAsk({...retry,turnId:"accepted-turn",status:"complete"});
+    expect(f.controller.get("admin","a")?.ask.prompts.some(prompt=>prompt.requestId==="failed-send")).toBe(false);
+  });
 });

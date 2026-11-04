@@ -79,8 +79,8 @@ export class SideChatController {
     const key = sideChatKey(record.userId, record.parentThreadId), previous = this.sessions.get(key);
     const same = previous?.record.id === record.id;
     if (same && previous.record.revision > record.revision) return;
-    const prompts = same ? [...previous.ask.prompts] : [];
-    if (record.requestId && record.lastPrompt) {
+    const prompts = same ? previous.ask.prompts.filter(prompt=>!(record.status==="error"&&!record.turnId&&prompt.requestId===record.requestId)) : [];
+    if (record.requestId && record.lastPrompt && !(record.status==="error"&&!record.turnId)) {
       const index = prompts.findIndex(prompt => prompt.requestId === record.requestId);
       const prompt = { requestId: record.requestId, turnId: record.turnId, text: record.lastPrompt, createdAt: Date.parse(record.updatedAt) };
       if (index < 0) prompts.push(prompt); else prompts[index] = prompt;
@@ -187,8 +187,8 @@ export class SideChatController {
     const key = sideChatKey(user, parent), session = this.sessions.get(key);
     if (!session || ["starting", "running", "closing"].includes(session.ask.status)) return null;
     this.cancelSave(key);
-    const ask = { ...session.ask, requestId, prompt: text, turnId: null, status: "starting" as const,
-      prompts: [...session.ask.prompts, { requestId, turnId: null, text, createdAt: Date.now() }] };
+    const ask = { ...session.ask, requestId, prompt: text, turnId: null, status: "starting" as const, error:null,
+      prompts: [...session.ask.prompts.filter(prompt=>prompt.turnId), { requestId, turnId: null, text, createdAt: Date.now() }] };
     this.sessions.set(key, { ...session, ask, draft: "", dirty: false, pendingRequestId: requestId });
     this.publish(key); return ask;
   }
@@ -196,8 +196,12 @@ export class SideChatController {
   updateAsk(ask: TemporaryAsk): void {
     const key = sideChatKey(ask.userId, ask.parentThreadId), session = this.sessions.get(key);
     if (!session || session.ask.id !== ask.id) return;
-    this.sessions.set(key, { ...session, ask, pendingRequestId: ask.status === "starting" ? session.pendingRequestId : undefined });
+    const failed=ask.status==="error"&&!ask.turnId;
+    this.sessions.set(key, { ...session, ask:failed?{...ask,prompts:ask.prompts.filter(prompt=>prompt.requestId!==ask.requestId)}:ask,
+      ...(failed?{draft:session.draft||ask.prompt,dirty:true}:{}),
+      pendingRequestId: ask.status === "starting" ? session.pendingRequestId : undefined });
     this.publish(key);
+    if(failed)void this.flush(key);
   }
 
   updateThread(threadId: string, update: (current: ThreadSummary | null) => ThreadSummary): void {
