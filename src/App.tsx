@@ -13824,7 +13824,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <button className="iconTextButton skillsButton" type="button" onClick={() => void openSkillsPicker(true)} disabled={!selectedProject || skillsLoading}>
                     {skillsLoading ? "加载技能..." : `技能 ${skills.length || ""}`}
                   </button>
-                  <button className="v2PlanModeBridge v2MovedIntoPlus" type="button" aria-pressed={planMode} aria-hidden="true" tabIndex={-1} onClick={() => setPlanMode((current) => !current)} title={planMode ? "关闭计划模式，下次发送可执行改动" : "开启 Codex 原生计划模式：先给出方案，不执行改动"}>{planMode ? "计划模式已开启" : "计划模式"}</button>
+                  <button className="v2PlanModeBridge v2MovedIntoPlus" type="button" aria-pressed={planMode} aria-hidden="true" tabIndex={-1} onClick={() => setPlanMode((current) => !current)} title={planMode ? "关闭计划模式，下次发送可执行改动" : "开启原生计划模式：先给出方案，不执行改动"}>{planMode ? "计划模式已开启" : "计划模式"}</button>
                   <select
                     className="skillSelect"
                     value=""

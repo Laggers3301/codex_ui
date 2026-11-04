@@ -106,6 +106,53 @@ describe("Claude runtime boundaries", () => {
       expect(notifications.at(-1)?.params).toMatchObject({turn:{status:"failed"}});
     }
   });
+
+  it("sends four native questions through the user-input protocol and returns only the user's validated answers", async () => {
+    const questions=Array.from({length:4},(_,index)=>({question:`问题 ${index+1}？`,header:`Q${index}`,options:[{label:"A",description:"第一项"},{label:"B",description:"第二项"}],multiSelect:index===3}));
+    let result:unknown;
+    const factory:ClaudeQueryFactory=async(_,options)=>({close:vi.fn(),async *[Symbol.asyncIterator](){
+      yield sdk(init);
+      yield sdk({type:"assistant",message:{id:"questions-message",content:[{type:"tool_use",id:"ask-1",name:"AskUserQuestion",input:{questions}}]}});
+      result=await options.canUseTool!("AskUserQuestion",{questions},{signal:options.abortController!.signal,toolUseID:"ask-1"});
+      yield sdk(success);
+    }});
+    const {runtime,input,notifications}=fixture(factory);
+    runtime.on("serverRequest",request=>{
+      expect(request).toMatchObject({method:"item/tool/requestUserInput",params:{itemId:"ask-1",isBlocking:true}});
+      expect(request.params.questions).toHaveLength(4);
+      expect(()=>runtime.answerApproval("alice",request.id,"accept")).toThrow();
+      expect(()=>runtime.answerUserInput("bob",request.id,{})).toThrow();
+      expect(()=>runtime.answerUserInput("alice",request.id,{answers:{}})).toThrow();
+      const answers=Object.fromEntries(request.params.questions.map((question:any,index:number)=>[question.id,{answers:[index===3?"A, B":"A"]}]));
+      request.params.questions[0].question="客户端不得改写的问题";
+      runtime.answerUserInput("alice",request.id,{answers});
+      expect(()=>runtime.answerUserInput("alice",request.id,{answers})).toThrow();
+    });
+    await runtime.runTurn(input);
+    expect(result).toEqual({behavior:"allow",updatedInput:{questions,answers:{"问题 1？":"A","问题 2？":"A","问题 3？":"A","问题 4？":"A, B"}}});
+    const tool=notifications.filter(event=>event.method==="item/started").map(event=>(event.params as any).item).find(item=>item.tool==="request_user_input");
+    expect(tool).toMatchObject({callId:"ask-1",arguments:{questions:[{id:"claude:ask-1:0"},{id:"claude:ask-1:1"},{id:"claude:ask-1:2"},{id:"claude:ask-1:3",multiSelect:true}]}});
+  });
+
+  it("selects native plan mode and can turn it off explicitly on the next turn", async () => {
+    const factory=vi.fn(async()=>query([init,success]));const {runtime,input}=fixture(factory);
+    await runtime.runTurn({...input,collaborationMode:"plan"});
+    await runtime.runTurn({...input,turnId:"execute",collaborationMode:"default"});
+    const calls=factory.mock.calls as unknown as Array<[string,Options]>;
+    expect(calls[0][1].permissionMode).toBe("plan");expect(calls[1][1].permissionMode).toBe("default");
+  });
+
+  it("cancels an unanswered question without granting tool permission", async()=>{
+    let result:unknown;
+    const factory:ClaudeQueryFactory=async(_,options)=>({close:vi.fn(),async *[Symbol.asyncIterator](){
+      result=await options.canUseTool!("AskUserQuestion",{questions:[{question:"选择？",options:[{label:"A"},{label:"B"}]}]},
+        {signal:options.abortController!.signal,toolUseID:"cancel-question"});
+    }});
+    const {runtime,input,notifications}=fixture(factory);
+    runtime.on("serverRequest",()=>runtime.interrupt("alice",input.threadId));
+    await runtime.runTurn(input);expect(result).toMatchObject({behavior:"deny"});
+    expect(notifications.at(-1)?.params).toMatchObject({turn:{status:"interrupted"}});
+  });
 });
 
 describe("Claude stream translation", () => {

@@ -10,27 +10,34 @@ import "./questionAnswerMessage.css";
 export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuestion[]; onChoose: (answer: string, answers: string[]) => Promise<boolean> }) {
   const [answers, setAnswers] = useState<(string | null)[]>(() => questions.map(() => null));
   const [customAnswers, setCustomAnswers] = useState<string[]>(() => questions.map(() => ""));
+  const [selections,setSelections]=useState<string[][]>(()=>questions.map(()=>[]));
   const [submitting, setSubmitting] = useState(false);
+  const hasMultiSelect=questions.some(question=>question.multiSelect);
+  const submit = async (next: (string|null)[]) => {
+    if(submitting||next.some(answer=>!answer?.trim()))return;
+    setSubmitting(true);
+    const reply=questions.length===1?next[0]!:questions.map((question,index)=>`${question.title}：${next[index]}`).join("\n");
+    try { if(!await onChoose(reply,next.map(answer=>answer!)))setSubmitting(false); }
+    catch {setSubmitting(false);}
+  };
   const selectOption = async (questionIndex: number, option: string) => {
     if (submitting || !option.trim()) return;
     const next = [...answers];
-    next[questionIndex] = option;
+    if(questions[questionIndex].multiSelect){
+      const chosen=selections[questionIndex]??[];
+      const values=chosen.includes(option)?chosen.filter(value=>value!==option):[...chosen,option];
+      setSelections(current=>current.map((row,index)=>index===questionIndex?values:row));
+      next[questionIndex]=values.length?values.join(", "):null;
+    } else next[questionIndex] = option;
     setAnswers(next);
-    if (next.some((answer) => answer === null)) return;
-    setSubmitting(true);
-    const reply = questions.length === 1 ? option : questions.map((question, index) => `${question.title}：${next[index]}`).join("\n");
-    try {
-      if (!await onChoose(reply, next.map(answer => answer!))) setSubmitting(false);
-    } catch {
-      setSubmitting(false);
-    }
+    if(!hasMultiSelect)await submit(next);
   };
   const hasChoices = questions.some((question) => question.options.length > 0);
   return <div className={`toolQuestionCard${submitting ? " submitting" : ""}`} aria-label="向用户提出的问题">
     {questions.map((question, index) => <section className="toolQuestionBlock" key={`${index}:${question.title}`}>
       <div className="toolQuestionHeading"><span className="toolQuestionTag">{question.options.length ? "选择题" : "问题"} {questions.length > 1 ? index + 1 : ""}{index === 0 ? <AccountUpdateIndicator userId={getApiUserId()} menuOpen={answers.some(answer => answer !== null)} target="questions" /> : null}</span><span>{question.title}</span></div>
       <div className="toolQuestionOptions">
-        {question.options.map((option, optionIndex) => <button type="button" className={`toolQuestionOption${answers[index] === option ? " selected" : ""}`} key={`${optionIndex}:${option}`} disabled={submitting} aria-pressed={answers[index] === option} onClick={(event) => { event.stopPropagation(); void selectOption(index, option); }} title="选择并发送答案">
+        {question.options.map((option, optionIndex) => <button type="button" className={`toolQuestionOption${(question.multiSelect?selections[index]?.includes(option):answers[index]===option) ? " selected" : ""}`} key={`${optionIndex}:${option}`} disabled={submitting} aria-pressed={question.multiSelect?selections[index]?.includes(option):answers[index]===option} onClick={(event) => { event.stopPropagation(); void selectOption(index, option); }} title={question.multiSelect?"选择或取消此选项":"选择并发送答案"}>
           <span className="toolQuestionOptionNumber">{optionIndex + 1}</span><span>{option}</span>
         </button>)}
         <div className="toolQuestionOther">
@@ -50,7 +57,8 @@ export function ToolQuestionCard({ questions, onChoose }: { questions: ToolQuest
         </div>
       </div>
     </section>)}
-    <p className="toolQuestionHint">{submitting ? "正在发送答案…" : questions.length > 1 ? "回答所有问题后发送；也可以在输入框输入自己的回答。" : hasChoices ? "点击选项后自动发送；也可以输入自己的回答。" : "输入回答后按 Enter 或点击发送。"}</p>
+    {hasMultiSelect?<button type="button" className="toolQuestionOption" disabled={submitting||answers.some(answer=>!answer?.trim())} onClick={()=>void submit(answers)}>发送答案</button>:null}
+    <p className="toolQuestionHint">{submitting ? "正在发送答案…" : hasMultiSelect?"可选择多个选项，回答完后点击发送答案。":questions.length > 1 ? "回答所有问题后发送；也可以在输入框输入自己的回答。" : hasChoices ? "点击选项后自动发送；也可以输入自己的回答。" : "输入回答后按 Enter 或点击发送。"}</p>
   </div>;
 }
 
