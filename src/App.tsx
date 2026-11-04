@@ -1,4 +1,5 @@
 import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
+import { RuntimeMigrationDialog } from "./RuntimeMigrationDialog";
 import { ReclaudeUsage } from "./ReclaudeUsage";
 import { accountPoolNeedsQuotaRetry, quotaHasUsableRateLimits } from "./quotaRefreshPolicy";
 import { Children, cloneElement, Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
@@ -4713,6 +4714,7 @@ export function App() {
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
   const [pendingDeleteThreadId, setPendingDeleteThreadId] = useState<string | null>(null);
   const [threadContextMenu, setThreadContextMenu] = useState<ThreadContextMenu | null>(null);
+  const [runtimeMigration,setRuntimeMigration]=useState<{thread:ThreadSummary;projectId:string;initialModel?:string}|null>(null);
   const threadContextMenuSnapshot = useRef<ThreadContextMenu | null>(null);
   if (threadContextMenu) threadContextMenuSnapshot.current = threadContextMenu;
   const threadContextMenuPresence = useExitPresence(Boolean(threadContextMenu), 180);
@@ -6034,7 +6036,7 @@ export function App() {
     setThreadContextMenu({
       thread,
       x: Math.max(8, Math.min(event.clientX, window.innerWidth - 184)),
-      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 136))
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 184))
     });
   }
 
@@ -7888,6 +7890,9 @@ export function App() {
     }
     const previousModel = thread.configuredModel ?? selectedProject?.defaultModel ?? profile.model;
     const previousEffort = thread.configuredReasoningEffort ?? selectedProject?.defaultReasoningEffort ?? profile.effort;
+    if(isReclaudeModel(previousModel)!==isReclaudeModel(profile.model)) {
+      setRuntimeMigration({thread,projectId,initialModel:profile.model});return;
+    }
     setError("");
     setSavingThreadModel(true);
     if(turnRecoveries[`${selectedUserId}:${thread.id}`]?.job?.status==='waiting') {
@@ -11864,6 +11869,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         )}
       />
 
+      {runtimeMigration?<RuntimeMigrationDialog key={runtimeMigration.thread.id} threadId={runtimeMigration.thread.id} projectId={runtimeMigration.projectId}
+        name={runtimeMigration.thread.name??runtimeMigration.thread.preview??"会话"} sourceClaude={isReclaudeModel(runtimeMigration.thread.configuredModel??selectedProject?.defaultModel)}
+        profiles={modelProfiles} initialModel={runtimeMigration.initialModel} onClose={()=>setRuntimeMigration(null)}
+        onComplete={async result=>{const projectId=runtimeMigration.projectId;setRuntimeMigration(null);await refreshThreads(projectId);await openThread(result.threadId,projectId,undefined,{skipCache:true,requireFresh:true});
+          addLocalMessage(`已迁移 ${result.messageCount} 条对话记录，原会话保留。[下载完整源记录](${result.historySourceUrl})\n\n${result.warnings.join("\n")}`,"会话迁移");}}/>:null}
+
       {threadContextMenuPresence.present && displayedThreadContextMenu ? createPortal(
         <div
           key={`${displayedThreadContextMenu.thread.id}:${displayedThreadContextMenu.x}:${displayedThreadContextMenu.y}`}
@@ -11885,6 +11896,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <PencilLine size={15} />
             重命名会话
           </button>
+          {modelProfiles.some(profile=>isReclaudeModel(profile.model)&&modelIsAvailable(profile))||isReclaudeModel(displayedThreadContextMenu.thread.configuredModel)?<button type="button" role="menuitem" onClick={()=>{
+            const projectId=threadProjectIdsRef.current.get(displayedThreadContextMenu.thread.id)??selectedProjectIdRef.current;
+            if(projectId)setRuntimeMigration({thread:displayedThreadContextMenu.thread,projectId});setThreadContextMenu(null);
+          }}><GitBranch size={15}/>迁移会话</button>:null}
           <button type="button" role="menuitem" onClick={() => void toggleThreadPin(displayedThreadContextMenu.thread)}>
             <Pin size={15} />
             {displayedThreadContextMenu.thread.pinned ? "取消置顶" : "置顶会话"}

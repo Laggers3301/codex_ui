@@ -1,5 +1,6 @@
 import { claudePendingProfiles, isReclaudeModel } from "../shared/agentRuntime.js";
 import { assertRuntimeModel, getClaudeService } from "./claudeService.js";
+import { getRuntimeHistoryTransfer } from "./runtimeHistoryTransfer.js";
 import fs from "node:fs";
 import { ProviderUsageTracker } from "./providerUsage.js";
 import { registerProviderQuotaRoutes } from "./providerQuota.js";
@@ -2461,6 +2462,7 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 function errorStatus(error: unknown): number {
   if (error instanceof Error && "code" in error && error.code === "claude_session_rate_limit") return 429;
   if (error instanceof Error && "code" in error && error.code === "claude_weekly_limit") return 429;
+  if (error instanceof Error && "code" in error && String(error.code).startsWith("migration_")) return 409;
   if (error instanceof Error && "code" in error && error.code === "runtime_not_connected") return 409;
   if (error instanceof HistoryMemoryLimitError) return 413;
   if (error instanceof LegacyRollbackConflictError || error instanceof ScheduleConflictError || error instanceof BranchConflictError) return 409;
@@ -3003,6 +3005,7 @@ function deferLargeToolOutputs(threadValue: unknown): void {
 export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore, options: { backgroundIndexing?: boolean; browserTools?: boolean } = {}): void {
   const availableModelProfiles = () => listModelProfiles(isAccountPoolBridge(bridge) ? bridge.modelCatalogTargets().map(target => target.catalogPath) : []);
   const claudeService = getClaudeService(bridge);
+  const historyTransfers = getRuntimeHistoryTransfer(bridge,store);
   registerProviderQuotaRoutes(app, request => userIdFromRequest(request, store));
   registerSideChatRoutes(app, bridge, store, request => userIdFromRequest(request, store));
   const predictions=isAccountPoolBridge(bridge)?new ComposerPredictions(bridge):null;
@@ -4327,6 +4330,33 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       }
       return {data:summary};
     }catch(error){return reply.code(errorStatus(error)).send({error:error instanceof Error?error.message:String(error)});}
+  });
+
+  app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/migrate-runtime", async (request, reply) => {
+    try {
+      const userId=userIdFromRequest(request,store);
+      if(!store.userCanAccessThread(request.params.threadId,userId,request.params.id))return reply.code(403).send({error:"无权迁移此会话。"});
+      if(!historyTransfers||!claudeService)return reply.code(409).send({error:"ReClaude 尚未配置。"});
+      const input=z.object({operationId:z.string().uuid(),model:z.string().min(1).max(120)}).strict().parse(request.body);
+      if(![...availableModelProfiles(),...claudeService.profiles(userId)].some(profile=>profile.model===input.model))return reply.code(400).send({error:"目标模型不可用。"});
+      const result=await historyTransfers.migrate({operationId:input.operationId,sourceThreadId:request.params.threadId,userId,
+        projectId:request.params.id,targetModel:input.model,targetAccountId:allowedAccountForUser(userId)??undefined});
+      return {data:result};
+    } catch(error) {
+      const code=error instanceof Error&&"code"in error?String(error.code):"migration_failed";
+      const quota=claudeService?.storage.quota();
+      if(code==="claude_session_rate_limit"&&quota)reply.header("Retry-After",String(quota.retryAfterSeconds));
+      return reply.code(errorStatus(error)).send({error:error instanceof Error?error.message:String(error),code,
+        ...(code==="claude_session_rate_limit"&&quota?{retryAfterSeconds:quota.retryAfterSeconds,retryAt:quota.retryAt}:{})});
+    }
+  });
+  app.get<{Params:{id:string;threadId:string;operationId:string}}>("/api/projects/:id/threads/:threadId/migration-source/:operationId",async(request,reply)=>{
+    const userId=userIdFromRequest(request,store);
+    if(!store.userCanAccessThread(request.params.threadId,userId,request.params.id))return reply.code(403).send({error:"无权读取此历史。"});
+    const file=historyTransfers?.archive(request.params.operationId,userId,request.params.threadId);
+    if(!file)return reply.code(404).send({error:"迁移源记录不存在。"});
+    return reply.header("Cache-Control","private, no-store").header("X-Content-Type-Options","nosniff")
+      .header("Content-Disposition",'attachment; filename="migration-source.jsonl"').type("application/x-ndjson").send(fs.createReadStream(file));
   });
 
   app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/branch", async (request, reply) => {

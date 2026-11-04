@@ -338,6 +338,13 @@ export function listModels(): Promise<{ data: ModelProfile[]; defaultModel: stri
 export function readReclaudeUsage(signal?: AbortSignal): Promise<{data:import("../shared/reclaudeUsage").ReclaudeUsageStatus}> {
   return request("/api/reclaude/usage",{signal,cache:"no-store"});
 }
+export interface RuntimeMigrationResult {
+  threadId:string;sourceThreadId:string;model:string;operationId:string;messageCount:number;warnings:string[];historySourceUrl:string;
+}
+export function migrateThreadRuntime(projectId:string,threadId:string,input:{operationId:string;model:string}):Promise<{data:RuntimeMigrationResult}> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/migrate-runtime`,{method:"POST",body:JSON.stringify(input)});
+}
+
 export function requestComposerPrediction(projectId:string,threadId:string,sourceTurnId:string,modelKey:string,signal:AbortSignal):Promise<{data:{text:string|null;sourceTurnId:string;eligible:boolean}}> {
   return request(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/prediction`,{
     method:"POST",body:JSON.stringify({sourceTurnId,modelKey}),signal,

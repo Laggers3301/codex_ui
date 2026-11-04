@@ -1,0 +1,153 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
+import Fastify from "fastify";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ProjectStore } from "./db.js";
+import { ClaudeService, getClaudeService, withClaudeService } from "./claudeService.js";
+import { ClaudeRuntime } from "./claudeRuntime.js";
+import type { CodexBridge } from "./codexBridge.js";
+import type { ClaudeIntegrationConfig } from "./claudeBindings.js";
+import { registerRoutes } from "./routes.js";
+import { locateClaudeHistory } from "./claudeSessionStorage.js";
+
+const cleanup: Array<() => void> = [];
+afterEach(() => { cleanup.splice(0).reverse().forEach(fn => fn()); vi.restoreAllMocks(); });
+function fixture(rateLimitInfo?: Record<string,unknown>) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "claude-service-"));
+  cleanup.push(() => fs.rmSync(home, {recursive:true,force:true}));
+  const store = new ProjectStore(path.join(home,"app.sqlite")); cleanup.push(() => store.close());
+  const cwd = path.join(home,"workspace"); fs.mkdirSync(cwd);
+  const project = store.createProject({ name:"fixture", rootPath:cwd });
+  const config: ClaudeIntegrationConfig = { home, executable:"/bin/true", storageDirectory:path.join(home,"state"), users:{admin:{workspaceRoot:cwd,orgIds:["1","2"]}} };
+  const binding = (deviceId: string, orgId: number, uuid: string) => {
+    const dir = path.join(home,`.rec/claude/accounts/${deviceId}`); fs.mkdirSync(path.join(dir,"config"),{recursive:true});
+    fs.writeFileSync(path.join(dir,"device.json"),JSON.stringify({sk:"fixture-only",org_id:orgId,org_name:`org${orgId}`}));
+    fs.writeFileSync(path.join(dir,"config/.claude.json"),JSON.stringify({oauthAccount:{accountUuid:uuid}}));
+    return path.join(dir,"config");
+  };
+  const rootA = binding("11",1,"account-A"), rootB = binding("22",2,"account-B");
+  const events: any[] = [], calls: any[] = [];
+  const runtimeFactory = (b: any) => new ClaudeRuntime(b, async(prompt,options) => {
+    calls.push({prompt,options});
+    const id = String(options.resume ?? options.extraArgs?.["session-id"]), userId = randomUUID(), messageId = randomUUID();
+    const file = path.join(b.configRoot,"projects","-fixture",`${id}.jsonl`); fs.mkdirSync(path.dirname(file),{recursive:true});
+    fs.appendFileSync(file,[{type:"user",uuid:userId,parentUuid:null,sessionId:id,cwd,isSidechain:false,message:{role:"user",content:prompt}},
+      {type:"assistant",uuid:messageId,parentUuid:userId,sessionId:id,cwd,isSidechain:false,message:{id:messageId,role:"assistant",content:[{type:"text",text:"完成"}]}}].map(row=>JSON.stringify(row)).join("\n")+"\n");
+    return {close(){},async *[Symbol.asyncIterator]() {
+      yield {type:"system",subtype:"init",session_id:id,model:"sonnet",tools:[],skills:[],mcp_servers:[]} as any;
+      if(rateLimitInfo)yield {type:"rate_limit_event",rate_limit_info:rateLimitInfo,session_id:id,uuid:randomUUID()} as any;
+      yield {type:"assistant",uuid:messageId,session_id:id,message:{id:messageId,role:"assistant",content:[{type:"text",text:"完成"}]}} as any;
+      yield {type:"result",subtype:"success",is_error:false,result:"完成",session_id:id} as any;
+    }};
+  });
+  const service = new ClaudeService(config,store,(type,event)=>events.push({type,...event}),runtimeFactory);
+  cleanup.push(()=>service.close());
+  vi.spyOn(service.bindings,"refresh").mockImplementation(async(user,model)=>service.bindings.resolve(user,model));
+  const start = async () => (await service.request("thread/start",{userId:"admin",projectId:project.id,cwd,model:"reclaude-sonnet@1"}) as any).thread.id as string;
+  const turn = async (threadId:string,model="reclaude-sonnet@1") => {
+    const result = await service.request("turn/start",{threadId,model,input:[{type:"text",text:"检查文件"}]}) as any;
+    await vi.waitFor(()=>expect(service.storage.turn(result.turn.id)?.status).toBe("completed"));
+    return result.turn.id;
+  };
+  return {home,cwd,project,store,service,config,rootA,rootB,binding,events,calls,start,turn};
+}
+describe("Claude conversation switching",()=>{
+  it("stops an active response at weekly 99% and rejects subsequent creates/resumes before any model call",async()=>{
+    const f=fixture({rateLimitType:"five_hour",utilization:.2,unifiedWindows:{seven_day:{utilization:.99,resetsAt:Math.floor(Date.now()/1000)+3600}}});
+    const id=await f.start();
+    const result=await f.service.request("turn/start",{threadId:id,input:[{type:"text",text:"测试阈值"}]}) as any;
+    await vi.waitFor(()=>expect(f.service.storage.turn(result.turn.id)?.status).toBe("interrupted"));
+    expect(JSON.stringify(f.service.storage.turn(result.turn.id))).toContain("99%");
+    await expect(f.start()).rejects.toMatchObject({code:"claude_weekly_limit"});
+    await expect(f.service.request("turn/start",{threadId:id,input:[{type:"text",text:"不得执行"}]})).rejects.toMatchObject({code:"claude_weekly_limit"});
+    expect(f.calls).toHaveLength(1);expect(f.service.storage.quota().used).toBe(1);
+    expect(f.service.profiles("admin").find(p=>p.model==="reclaude-sonnet@1")?.availability).toBe("disabled");
+    expect(f.service.usageStatus("bob").accounts).toEqual([]);
+  });
+  it("resumes after a binding directory move with no new session, and forks when the Claude account changes within that same org",async()=>{
+    const f=fixture(), id=await f.start(); await f.turn(id);
+    const original=f.service.storage.get(id)!.nativeSessionId;
+    const moved=path.join(f.home,".rec/claude/accounts/33"); fs.renameSync(path.dirname(f.rootA),moved);
+    await f.service.request("thread/resume",{threadId:id,model:"reclaude-sonnet@1"});
+    expect(f.service.storage.get(id)!.nativeSessionId).toBe(original); expect(f.service.storage.quota().used).toBe(1);
+    const newRoot=f.binding("33",1,"account-C");
+    const source=locateClaudeHistory(original,[newRoot])!, bytes=fs.readFileSync(source);
+    await f.service.request("thread/resume",{threadId:id,model:"reclaude-sonnet@1"});
+    const changed=f.service.storage.get(id)!;
+    expect(changed.nativeSessionId).not.toBe(original);expect(changed.parentSessionId).toBe(original);
+    expect(f.service.storage.quota().used).toBe(2);expect(f.calls).toHaveLength(1);
+    expect(fs.readFileSync(source)).toEqual(bytes);
+    await f.turn(id);expect(f.calls[1].options.resume).toBe(changed.nativeSessionId);
+    expect(f.service.storage.quota().used).toBe(2);
+  });
+  it("branches to a different organization entirely offline, inherits full UI history and resumes only the new native id",async()=>{
+    const f=fixture(), id=await f.start(), first=await f.turn(id);
+    const parent=f.service.storage.get(id)!;
+    const refreshCalls=vi.mocked(f.service.bindings.refresh).mock.calls.length;
+    const result=await f.service.request("thread/fork",{threadId:id,model:"reclaude-sonnet@2",lastTurnId:first}) as any;
+    expect(vi.mocked(f.service.bindings.refresh).mock.calls).toHaveLength(refreshCalls);
+    const child=f.service.storage.get(result.thread.id)!;
+    expect(child.nativeSessionId).not.toBe(parent.nativeSessionId); expect(child.orgId).toBe("2");
+    expect(f.calls).toHaveLength(1);
+    expect(f.service.history(child.id).thread.turns[0].id).toBe(first);
+    await f.turn(child.id,"reclaude-sonnet@2");
+    expect(f.calls[1].options).toMatchObject({resume:child.nativeSessionId,env:{RECLAUDE_ORG:"2"}});
+    expect(f.service.history(child.id).thread.turns).toHaveLength(2);
+    expect(f.service.history(id).thread.turns).toHaveLength(1);
+  });
+  it("rejects workflow before model execution and does not count ordinary resumes twice",async()=>{
+    const f=fixture(),id=await f.start();
+    await expect(f.service.request("turn/start",{threadId:id,input:[{type:"text",text:"$superagent-workflow 启动"}]})).rejects.toMatchObject({code:"workflow_disabled"});
+    expect(f.calls).toHaveLength(0);await f.turn(id);await f.turn(id);expect(f.service.storage.quota().used).toBe(1);
+    for(let i=0;i<4;i++)await f.start();
+    await expect(f.start()).rejects.toMatchObject({code:"claude_session_rate_limit"});
+    await f.turn(id);expect(f.service.storage.quota().used).toBe(5);
+    await expect(f.service.request("thread/resume",{threadId:id,model:"reclaude-sonnet@2"})).rejects.toMatchObject({code:"claude_session_rate_limit"});
+    expect(f.service.storage.get(id)!.orgId).toBe("1");
+  });
+  it("rejects unauthorized projects and cross-user bindings before creating a session",async()=>{
+    const f=fixture();
+    await expect(f.service.request("thread/start",{userId:"bob",projectId:f.project.id,cwd:f.cwd,model:"reclaude-sonnet@1"})).rejects.toMatchObject({code:"runtime_forbidden"});
+    expect(f.service.storage.quota().used).toBe(0);
+    expect(f.service.bindings.profiles("bob")).toEqual([]);
+  });
+  it("exposes authenticated Claude models and durable paginated history through the existing HTTP routes",async()=>{
+    const f=fixture();
+    const base=Object.assign(new EventEmitter(),{request:vi.fn(async()=>({data:[]})),getPendingServerRequests:()=>[]}) as unknown as CodexBridge;
+    const bridge=withClaudeService(base,f.store,{...f.config,storageDirectory:path.join(f.home,"routes-state")});
+    const service=getClaudeService(bridge)!;cleanup.push(()=>service.close());
+    vi.spyOn(service.bindings,"refresh").mockImplementation(async(user,model)=>service.bindings.resolve(user,model));
+    const result=await bridge.request("thread/start",{userId:"admin",projectId:f.project.id,cwd:f.cwd,model:"reclaude-sonnet@1"}) as any;
+    const id=result.thread.id;
+    service.storage.saveTurn(id,{id:randomUUID(),status:"completed",items:[{id:"message",type:"agentMessage",text:"已持久化"},
+      {id:"claude-tool::q1",callId:"q1",type:"dynamicToolCall",tool:"request_user_input",arguments:{questions:[{id:"one",question:"选择？",options:["A","B"]}]},status:"completed"}]});
+    f.store.recordQuestionAnswer(id,"q1","admin",{answers:{one:{answers:["B"]}}});
+    const app=Fastify();registerRoutes(app,bridge,f.store,{backgroundIndexing:false});
+    try {
+      const models=await app.inject({method:"GET",url:"/api/models"});expect(models.json().data.some((p:any)=>p.model==="reclaude-sonnet@1"&&p.availability==="ready")).toBe(true);
+      const response=await app.inject({method:"GET",url:`/api/threads/${id}?projectId=${f.project.id}`});expect(response.statusCode).toBe(200);expect(response.json().thread.turns[0].items[0].text).toBe("已持久化");
+      expect(response.json().thread).toMatchObject({configuredModel:"reclaude-sonnet@1",configuredReasoningEffort:"medium"});
+      expect(response.json().thread.answeredQuestionItemIds).toContain("q1");
+      expect(response.json().thread.questionAnswers["claude-tool::q1"]).toEqual({answers:{one:{answers:["B"]}}});
+      const list=await app.inject({method:"GET",url:`/api/projects/${f.project.id}/threads`});expect(list.json().data.some((row:any)=>row.id===id)).toBe(true);
+      const usage=await app.inject({method:"GET",url:"/api/reclaude/usage"});
+      expect(usage.json().data).toMatchObject({thresholdPercent:99,monitoring:"response-events",creations:{used:1,remaining:4}});
+      for(let i=0;i<4;i++)service.storage.reserve(randomUUID());
+      // Pure Codex starts and forks still go to the native bridge at a full Claude quota.
+      await bridge.request("thread/start",{model:"gpt-6.1-sol",cwd:f.cwd});
+      await bridge.request("thread/fork",{threadId:"codex-source",model:"gpt-6.1-sol"});
+      expect(service.storage.quota().used).toBe(5);
+      const codexId=randomUUID();f.store.registerThreadOwner({threadId:codexId,userId:"admin",projectId:f.project.id,rootPath:f.cwd,model:"gpt-6.1-sol",reasoningEffort:"medium"});
+      const target=models.json().data.find((profile:any)=>profile.model.startsWith("reclaude-"));
+      const callsBeforeLimit=vi.mocked(base.request).mock.calls.length;
+      const rejected=await app.inject({method:"POST",url:`/api/projects/${f.project.id}/threads/${codexId}/migrate-runtime`,payload:{operationId:randomUUID(),model:target.model}});
+      expect(rejected.statusCode).toBe(429);expect(rejected.json()).toMatchObject({code:"claude_session_rate_limit",retryAfterSeconds:expect.any(Number)});
+      expect(rejected.json().error).toContain("还需等待");expect(Number(rejected.headers["retry-after"])).toBeGreaterThan(3500);
+      expect(rejected.json().error).toContain("Claude 会话");expect(rejected.json().error).toContain("Codex");
+      expect(vi.mocked(base.request).mock.calls).toHaveLength(callsBeforeLimit);
+    } finally {await app.close();}
+  });
+});

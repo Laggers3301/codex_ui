@@ -1,0 +1,11 @@
+.runtimeMigrationDialog { max-width: 520px; }
+.runtimeMigrationDialog .workspaceFeatureBody { display: grid; gap: 14px; padding: 20px; }
+.runtimeMigrationDialog p { margin: 0; font-size: 13px; line-height: 1.65; overflow-wrap: anywhere; }
+.runtimeMigrationDialog label { display: grid; gap: 8px; font-size: 13px; }
+.runtimeMigrationDialog select { width: 100%; padding: 9px; border: 1px solid var(--border, #8885); border-radius: 8px; background: var(--panel-bg, Canvas); color: inherit; }
+.runtimeMigrationDialog .runtimeMigrationError { color: #df645c; }
+.runtimeMigrationDialog .primaryButton { min-height: 40px; padding: 9px 16px; border: 1px solid #8886; border-radius: 9px; background: #7773; color: inherit; font-weight: 600; cursor: pointer; }
+.runtimeMigrationDialog .primaryButton:disabled { opacity: .5; cursor: default; }
+.reclaudeUsage { margin: 6px 12px; font-size: 12px; color: var(--text-secondary, inherit); }
+.reclaudeUsage > button { display: flex; justify-content: space-between; gap: 12px; width: 100%; padding: 5px 0; border: 0; background: transparent; color: inherit; cursor: pointer; }
+.reclaudeUsage p { margin: 5px 0; line-height: 1.6; overflow-wrap: anywhere; }
