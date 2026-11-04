@@ -1,6 +1,8 @@
 import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
 import { RuntimeMigrationDialog } from "./RuntimeMigrationDialog";
-import { ReclaudeUsage } from "./ReclaudeUsage";
+import { ReclaudeUsage, useReclaudeUsage } from "./ReclaudeUsage";
+import { ReclaudeQuotaDetails, reclaudeRemainingLabel } from "./reclaudeQuota";
+import type { ReclaudeUsageStatus } from "../shared/reclaudeUsage";
 import {runtimeModelLabel,runtimeModelTriggerLabel} from "./runtimeModelLabel";
 import { accountPoolNeedsQuotaRetry, quotaHasUsableRateLimits } from "./quotaRefreshPolicy";
 import { Children, cloneElement, Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
@@ -3908,20 +3910,26 @@ function accountRemainingLabel(account: CodexAccountPoolAccount): string {
   return remaining === null ? "--" : `${percentText(remaining)}%`;
 }
 
-function QuotaPopover({ quota, pool, loading, closing, userId }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean; userId: string }) {
+function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, currentClaudeOrgId }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean; userId: string; reclaudeStatus: ReclaudeUsageStatus | null; currentClaudeOrgId?: string }) {
   const providerQuotas = useProviderQuotas(userId);
   const quotaAccounts = pool?.accounts.filter((entry) => entry.kind !== "api-provider") ?? [];
+  const claudeAccounts = reclaudeStatus?.accounts ?? [];
+  const accountCount = quotaAccounts.length + providerQuotas.length + claudeAccounts.length;
   const defaultAccount = quotaAccounts.find((entry) => entry.selectedForNewThreads) ?? quotaAccounts[0] ?? null;
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(defaultAccount?.id ?? null);
-  const selectedProvider = providerQuotas.find(item => `provider:${item.id}` === selectedAccountId);
-  const selectedAccount = quotaAccounts.find((entry) => entry.id === selectedAccountId) ?? defaultAccount;
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
+  const ids = [...quotaAccounts.map(account => account.id), ...providerQuotas.map(account => `provider:${account.id}`), ...claudeAccounts.map(account => `reclaude:${account.orgId}`)];
+  const defaultId = claudeAccounts.some(account => account.orgId === currentClaudeOrgId) ? `reclaude:${currentClaudeOrgId}` : defaultAccount?.id ?? ids[0];
+  const activeId = selectedAccountId && ids.includes(selectedAccountId) ? selectedAccountId : defaultId;
+  const selectedProvider = providerQuotas.find(item => `provider:${item.id}` === activeId);
+  const selectedClaude = claudeAccounts.find(account => `reclaude:${account.orgId}` === activeId);
+  const selectedAccount = quotaAccounts.find((entry) => entry.id === activeId);
   const currentThreadAccount = quotaAccounts.find((entry) => entry.id === pool?.currentThreadAccountId) ?? null;
   const selectedQuota = selectedAccount?.quota ?? quota;
   return (
-    <section className={`quotaPopover accountPoolPopover ${closing ? "closing" : ""}`} role="status" aria-label="Codex 多账号额度详情" aria-hidden={closing} inert={closing}>
-      {pool && quotaAccounts.length ? (
+    <section className={`quotaPopover accountPoolPopover ${closing ? "closing" : ""}`} role="status" aria-label="多账号额度详情" aria-hidden={closing} inert={closing}>
+      {accountCount ? (
         <>
-          <div className="accountPoolTabs" style={{ "--account-columns": Math.min(3, quotaAccounts.length) } as CSSProperties} role="tablist" aria-label="Codex 账号额度">
+          <div className="accountPoolTabs" style={{ "--account-columns": Math.min(3, accountCount) } as CSSProperties} role="tablist" aria-label="账号额度">
             {[...quotaAccounts].sort((left,right)=>left.id.localeCompare(right.id,"en",{numeric:true})).map((account) => (
               <button
                 className={`accountPoolTab ${account.id === selectedAccount?.id ? "active" : ""} ${accountQuotaStatus(account) === "unavailable" ? "degraded" : ""} ${account.id === currentThreadAccount?.id ? "current" : ""} ${(remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent) ?? 100) <= 10 ? "lowQuota" : ""}`}
@@ -3941,8 +3949,14 @@ function QuotaPopover({ quota, pool, loading, closing, userId }: { quota: CodexQ
               aria-selected={item === selectedProvider} title={`${item.name} · ${item.stale ? "缓存用量" : "套餐用量"}`}
               className={`accountPoolTab ${item === selectedProvider ? "active" : ""} ${item.status !== "ready" ? "degraded" : ""}`}
               onClick={() => setSelectedAccountId(`provider:${item.id}`)}><span>{item.name}</span><strong>{providerRemaining(item)}</strong></button>)}
+            {claudeAccounts.map(account => <button type="button" role="tab" key={`reclaude:${account.orgId}`} data-account-id={`reclaude:${account.orgId}`}
+              aria-selected={account === selectedClaude} title={`${account.label} · ${account.message}`}
+              className={`accountPoolTab ${account === selectedClaude ? "active" : ""} ${account.orgId === currentClaudeOrgId ? "current" : ""} ${account.state === "disabled" ? "lowQuota" : ""}`}
+              onClick={() => setSelectedAccountId(`reclaude:${account.orgId}`)}>
+              <span className="reclaudeAccountName">{account.label}</span><strong>{reclaudeRemainingLabel(account)}</strong>
+            </button>)}
           </div>
-          {selectedProvider ? <ProviderQuotaDetails key={selectedProvider.id} item={selectedProvider} formatPeriod={period => rateWindowText({ usedPercent: period.usedPercent, windowDurationMins: null, resetsAt: period.resetsAt ? Date.parse(period.resetsAt) / 1000 : null }, ({ session: "5小时", weekly: "7天", monthly: "月度" } as Record<string, string>)[period.label] ?? period.label)} /> : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
+          {selectedClaude ? <ReclaudeQuotaDetails key={selectedClaude.orgId} account={selectedClaude} cacheError={reclaudeStatus?.cacheError}/> : selectedProvider ? <ProviderQuotaDetails key={selectedProvider.id} item={selectedProvider} formatPeriod={period => rateWindowText({ usedPercent: period.usedPercent, windowDurationMins: null, resetsAt: period.resetsAt ? Date.parse(period.resetsAt) / 1000 : null }, ({ session: "5小时", weekly: "7天", monthly: "月度" } as Record<string, string>)[period.label] ?? period.label)} /> : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
           {!selectedProvider && selectedAccount ? (
             <div className="accountPoolSelectedMeta">
               {accountQuotaStatus(selectedAccount) === "cached" ? <span>额度查询暂时失败 · 显示缓存，后台重试中</span> : null}
@@ -4846,6 +4860,16 @@ export function App() {
   const [newThreadContextConfig, setNewThreadContextConfig] = useState<ThreadContextConfig>(() => emptyThreadContextConfig());
   const [contextPinSaving, setContextPinSaving] = useState(false);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>(fallbackModelProfiles);
+  const {status:reclaudeUsage,receive:receiveReclaudeUsage}=useReclaudeUsage(selectedUserId);
+  useEffect(()=>{
+    if(!reclaudeUsage)return;
+    setModelProfiles(current=>current.map(profile=>{
+      if(!isReclaudeModel(profile.model)||profile.availability==="not-connected")return profile;
+      const account=reclaudeUsage.accounts.find(account=>account.orgId===profile.model.split("@")[1]);
+      if(!account)return profile;
+      return {...profile,availability:account.state==="disabled"?"disabled":"ready",unavailableReason:account.state==="disabled"?account.message:undefined};
+    }));
+  },[reclaudeUsage]);
   const [newThreadModelProfileId, setNewThreadModelProfileId] = useState(defaultModelProfileId);
   const [savingThreadModel, setSavingThreadModel] = useState(false);
   const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
@@ -10416,6 +10440,10 @@ export function App() {
         return;
       }
       const params = notification.params ?? {};
+      if (notification.method === "runtime/reclaudeUsage") {
+        if(isRecord(params.usage)&&Array.isArray(params.usage.accounts))receiveReclaudeUsage(params.usage as unknown as ReclaudeUsageStatus);
+        return;
+      }
       const recoveryChanges = recoverAgentStreams(liveAgentBasesRef.current, notification);
       if (recoveryChanges.length) {
         for (const [id, entry] of recoveryChanges) {
@@ -11875,7 +11903,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
       {runtimeMigration?<RuntimeMigrationDialog key={runtimeMigration.thread.id} threadId={runtimeMigration.thread.id} projectId={runtimeMigration.projectId}
         name={runtimeMigration.thread.name??runtimeMigration.thread.preview??"会话"} sourceClaude={isReclaudeModel(runtimeMigration.thread.configuredModel??selectedProject?.defaultModel)}
-        profiles={modelProfiles} initialModel={runtimeMigration.initialModel} onClose={()=>setRuntimeMigration(null)}
+        profiles={modelProfiles} usageStatus={reclaudeUsage} initialModel={runtimeMigration.initialModel} onClose={()=>setRuntimeMigration(null)}
         onComplete={async result=>{const projectId=runtimeMigration.projectId;setRuntimeMigration(null);await refreshThreads(projectId);await openThread(result.threadId,projectId,undefined,{skipCache:true,requireFresh:true});
           addLocalMessage(`已迁移 ${result.messageCount} 条对话记录，原会话保留。[下载完整源记录](${result.historySourceUrl})\n\n${result.warnings.join("\n")}`,"会话迁移");}}/>:null}
 
@@ -12592,7 +12620,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 {quotaLoading ? "额度..." : quotaSummaryLabel(quota, accountPool)}
                 <ComposerGlassMaterial variant="topbar" />
               </button>
-              {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} /> : null}
+              {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} reclaudeStatus={reclaudeUsage} currentClaudeOrgId={isReclaudeModel(selectedModelProfile.model)?selectedModelProfile.model.split("@")[1]:undefined} /> : null}
             </div>
             <button
               className="leaderboardButton"
@@ -13076,7 +13104,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 </select>
               </label>
             </div>
-            {isReclaudeModel(selectedModelProfile.model)?<ReclaudeUsage key={`${selectedUserId}:${selectedModelProfile.model}`} model={selectedModelProfile.model}/>:null}
+            {isReclaudeModel(selectedModelProfile.model)?<ReclaudeUsage key={`${selectedUserId}:${selectedModelProfile.model}`} model={selectedModelProfile.model} status={reclaudeUsage}/>:null}
             {exhaustedAccountNoticePresence.present
               && exhaustedAccountNotice
               && exhaustedAccountNotice.threadId === selectedThread?.id ? (
