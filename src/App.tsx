@@ -1,6 +1,7 @@
 import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
 import { RuntimeMigrationDialog } from "./RuntimeMigrationDialog";
 import { ReclaudeUsage } from "./ReclaudeUsage";
+import {runtimeModelLabel,runtimeModelTriggerLabel} from "./runtimeModelLabel";
 import { accountPoolNeedsQuotaRetry, quotaHasUsableRateLimits } from "./quotaRefreshPolicy";
 import { Children, cloneElement, Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -563,7 +564,7 @@ function modelPickerGroup(model: string): ModelPickerSection {
 }
 
 function modelPickerLabel(profile: ModelProfile): string {
-  return profile.model.endsWith('-ark-api') ? profile.label.replace(' · Ark API 按量', '') : profile.label;
+  return runtimeModelLabel(profile);
 }
 
 function MobileModelPage({ active, children }: { active: boolean; children: ReactNode }) {
@@ -574,13 +575,14 @@ function MobileModelPage({ active, children }: { active: boolean; children: Reac
 }
 
 export function ModelGroupedSelect({
-  value, profiles, onChange, disabled = false, title
+  value, profiles, onChange, disabled = false, title, onOpen
 }: {
   value: string;
   profiles: ModelProfile[];
   onChange: (value: string) => void;
   disabled?: boolean;
   title?: string;
+  onOpen?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const pickerRef = useRef<HTMLDivElement>(null);
@@ -657,13 +659,13 @@ export function ModelGroupedSelect({
     </button>
   ));
   return (
-    <div ref={pickerRef} className={`polishedSelect v2ModelPicker groupedModelPicker ${open ? "open" : ""}`}
+    <div ref={pickerRef} data-runtime={selected&&isReclaudeModel(selected.model)?"claude-code":"codex"} className={`polishedSelect v2ModelPicker groupedModelPicker ${open ? "open" : ""}`}
       style={mobile ? { "--mobile-model-menu-left": `${mobileMenuLeft}px` } as CSSProperties : undefined}
       onBlur={(event) => { if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget as Node)) setOpen(false); }}>
-      <button className="polishedSelectTrigger" type="button" disabled={disabled} title={title}
+      <button className="polishedSelectTrigger" type="button" disabled={disabled} title={[title,selected?modelPickerLabel(selected):undefined].filter(Boolean).join(" · ")}
         aria-haspopup="dialog" aria-expanded={open}
-        onClick={() => { if (!open) { setBranch(null); setProvider(null); } setOpen((current) => !current); }}>
-        <span>{selected ? modelPickerLabel(selected) : "选择模型"}</span>
+        onClick={() => { if (!open) { onOpen?.();setBranch(null); setProvider(null); } setOpen((current) => !current); }}>
+        <span>{selected ? runtimeModelTriggerLabel(selected,mobile) : "选择模型"}</span>
         <span className="polishedSelectChevron" aria-hidden="true" />
       </button>
       {menuPresence.present ? (
@@ -9887,6 +9889,7 @@ export function App() {
       return;
     }
     if (message.type === "hello") {
+      void refreshModels();
       const data = message.data as { liveState?: LiveStateSnapshot; turnProgress?: unknown[]; turnRecoveries?: TurnRecoveryView[]; pendingServerRequests?: Array<{ id: string | number; method: string; params: Record<string, unknown> }> } | undefined;
       setTurnRecoveries(current => ({ ...Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${selectedUserId}:`))),
         ...Object.fromEntries((data?.turnRecoveries ?? []).map(state => [`${selectedUserId}:${state.threadId}`, state])) }));
@@ -13347,6 +13350,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           <ModelGroupedSelect
                             value={temporaryModelProfileId}
                             onChange={setTemporaryModelProfileId}
+                            onOpen={()=>void refreshModels()}
                             disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
                             profiles={modelProfiles}
                           />
@@ -13806,6 +13810,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <ModelGroupedSelect
                     value={activeModelProfileId}
                     onChange={(profileId) => void changeConversationModelProfile(profileId)}
+                    onOpen={()=>void refreshModels()}
                     disabled={savingThreadModel || conversationRunState === "running" || Boolean(selectedThread && turnRecoveries[`${selectedUserId}:${selectedThread.id}`]?.job?.status === "running")}
                     title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
                     profiles={selectableModelProfiles}

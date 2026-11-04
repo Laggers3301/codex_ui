@@ -333,7 +333,7 @@ export function listUsers(): Promise<{ data: UserProfile[]; defaultUserId: strin
 }
 
 export function listModels(): Promise<{ data: ModelProfile[]; defaultModel: string; defaultReasoningEffort: ReasoningEffort }> {
-  return request("/api/models");
+  return request("/api/models",{cache:"no-store"});
 }
 export function readReclaudeUsage(signal?: AbortSignal): Promise<{data:import("../shared/reclaudeUsage").ReclaudeUsageStatus}> {
   return request("/api/reclaude/usage",{signal,cache:"no-store"});

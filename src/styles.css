@@ -13008,6 +13008,7 @@ body[data-shell-directory-picker] :is(.threadList, .v2ProjectDock, .v2AccountDoc
     min-width: 0;
     flex: 0 1 auto;
   }
+  .composerTools .groupedModelPicker[data-runtime="claude-code"] { flex-shrink: 0; }
   .composerTools .groupedModelPicker .polishedSelectTrigger > span:first-child {
     min-width: 0;
     overflow: hidden;
