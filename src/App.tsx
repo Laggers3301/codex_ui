@@ -1,4 +1,5 @@
 import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
+import { ReclaudeUsage } from "./ReclaudeUsage";
 import { accountPoolNeedsQuotaRetry, quotaHasUsableRateLimits } from "./quotaRefreshPolicy";
 import { Children, cloneElement, Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -644,13 +645,13 @@ export function ModelGroupedSelect({
     setProvider(next);
   };
   const branchTitle = lastBranch === "gpt" ? "GPT" : lastBranch === "claude" ? "Claude" : "国产模型";
-  const claudeNotice = lastBranch === "claude" ? <p className="groupedModelConnectionNote" role="status">尚未连接 ReClaude。以下为模型系列预览，可用型号将在账号连接后验证。</p> : null;
+  const claudeNotice = lastBranch === "claude" && !profiles.some(profile => isReclaudeModel(profile.model) && modelIsAvailable(profile)) ? <p className="groupedModelConnectionNote" role="status">{profiles.find(profile=>isReclaudeModel(profile.model)&&profile.availability==="disabled")?.unavailableReason??"尚未连接 ReClaude。以下为模型系列预览，可用型号将在账号连接后验证。"}</p> : null;
   const profileOptions = (group: ModelPickerSection) => visibleProfiles.filter((profile) => modelPickerGroup(profile.model) === group).map((profile) => (
     <button className={`polishedSelectOption groupedModelProfile${profile.id === value ? " selected" : ""}`}
       type="button" role="option" aria-selected={profile.id === value} key={profile.id}
       disabled={!modelIsAvailable(profile)} title={profile.unavailableReason}
       onClick={() => { if (modelIsAvailable(profile)) { onChange(profile.id); setOpen(false); } }}>
-      <span><strong>{modelPickerLabel(profile)}</strong>{!modelIsAvailable(profile) ? <small className="groupedModelConnectionStatus">待连接</small> : null}</span>
+      <span><strong>{modelPickerLabel(profile)}</strong>{!modelIsAvailable(profile) ? <small className="groupedModelConnectionStatus">{profile.availability==="disabled"?"已停用":"待连接"}</small> : null}</span>
       <span className="polishedSelectCheck" aria-hidden="true">{profile.id === value ? "✓" : ""}</span>
     </button>
   ));
@@ -9111,7 +9112,7 @@ export function App() {
   }
 
   async function sendPrompt(mode: "queue" | "steer" = "queue", questionAnswer?: string, predictedPrompt?: string): Promise<boolean> {
-    if (!modelIsAvailable(selectedModelProfile) || isReclaudeModel(selectedModelProfile.model)) {
+    if (!modelIsAvailable(selectedModelProfile)) {
       setError(selectedModelProfile.unavailableReason ?? CLAUDE_NOT_CONNECTED);
       return false;
     }
@@ -13056,6 +13057,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 </select>
               </label>
             </div>
+            {isReclaudeModel(selectedModelProfile.model)?<ReclaudeUsage key={`${selectedUserId}:${selectedModelProfile.model}`} model={selectedModelProfile.model}/>:null}
             {exhaustedAccountNoticePresence.present
               && exhaustedAccountNotice
               && exhaustedAccountNotice.threadId === selectedThread?.id ? (

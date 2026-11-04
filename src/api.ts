@@ -335,7 +335,9 @@ export function listUsers(): Promise<{ data: UserProfile[]; defaultUserId: strin
 export function listModels(): Promise<{ data: ModelProfile[]; defaultModel: string; defaultReasoningEffort: ReasoningEffort }> {
   return request("/api/models");
 }
-
+export function readReclaudeUsage(signal?: AbortSignal): Promise<{data:import("../shared/reclaudeUsage").ReclaudeUsageStatus}> {
+  return request("/api/reclaude/usage",{signal,cache:"no-store"});
+}
 export function requestComposerPrediction(projectId:string,threadId:string,sourceTurnId:string,modelKey:string,signal:AbortSignal):Promise<{data:{text:string|null;sourceTurnId:string;eligible:boolean}}> {
   return request(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/prediction`,{
     method:"POST",body:JSON.stringify({sourceTurnId,modelKey}),signal,
