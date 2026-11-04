@@ -244,6 +244,7 @@ export function accountAppServerArgs(codexHome: string, kind: "codex-account" | 
   installSubagentHistoryGuard(codexHome);
   const modelCatalogPath = path.join(codexHome, MODEL_CATALOG_FILENAME);
   const args = ["app-server", "--listen", "stdio://"];
+  if(kind==='codex-account')args.push('-c','thread_unload_delay_secs=60');
   if (!nativeModelDiscoveryEnabled(codexHome, kind) && fs.existsSync(modelCatalogPath)) {
     args.push("-c", `model_catalog_json=${JSON.stringify(responsesCompatibleModelCatalog(modelCatalogPath))}`);
   }
@@ -280,16 +281,17 @@ function createAccountBridge(codexHome: string, accountId: string, adoptCandidat
     if (!key) throw new Error("Ark API credential unavailable");
     env.ARK_PAY_API_KEY = key;
   }
+  const memoryLimit = process.env[`CODEX_WEB_ACCOUNT_MEMORY_MAX_${accountId.replace(/[^A-Za-z0-9_]/g, "_")}`] ?? "4G";
   const scope = process.env.CODEX_WEB_ISOLATE_AGENT_SCOPES === "1" ? {
     unitPrefix: `codex-agent-${accountId.replace(/[^A-Za-z0-9-]/g, "-")}`,
     slice: "codex-workers.slice",
-    // A 3 GiB high watermark below the 4 GiB allocation cap caused sustained
+    // A high watermark below the allocation cap caused sustained
     // direct reclaim during native history forks, then systemd-oomd killed the
     // account despite available host memory. Keep the hard cap, but do not
     // create a separate per-account reclaim stall below it. The worker slice
     // retains its aggregate pressure and allocation limits.
-    memoryHigh: "4G",
-    memoryMax: "4G",
+    memoryHigh: memoryLimit,
+    memoryMax: memoryLimit,
     memorySwapMax: "256M"
   } : undefined;
   return new CodexBridge({
@@ -301,6 +303,7 @@ function createAccountBridge(codexHome: string, accountId: string, adoptCandidat
       fileURLToPath(new URL("../scripts/run-account-runtime.mjs", import.meta.url)),
       serverConfig.codexBin, ...accountAppServerArgs(codexHome, kind)],
     env,
+    idleThreadReclaim:kind==='codex-account',
     ...(nativeModelDiscoveryEnabled(codexHome, kind) ? { nativeModelDiscoveryHome: codexHome } : {}),
     scope
   });
@@ -1144,7 +1147,7 @@ export class AccountPoolBridge extends EventEmitter {
       return result;
     } catch (error) {
       if (startingProcessId) this.processAccounts.delete(startingProcessId);
-      if (error instanceof Error && "code" in error && error.code === "unsupported_model_capability") throw error;
+      if (error instanceof Error && "code" in error && ['unsupported_model_capability','memory_pressure'].includes(String(error.code))) throw error;
       account.health = "degraded";
       account.lastError = error instanceof Error ? error.message : String(error);
       throw error;
@@ -1203,6 +1206,7 @@ export class AccountPoolBridge extends EventEmitter {
       }
       return result;
     } catch (error) {
+      if(error instanceof Error && 'code' in error && error.code==='memory_pressure')throw error;
       account.health = "degraded";
       account.lastError = error instanceof Error ? error.message : String(error);
       throw error;

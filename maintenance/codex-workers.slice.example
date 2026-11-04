@@ -1,0 +1,9 @@
+[Unit]
+Description=Bounded Codex account runtimes and their tool processes
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=8G
+MemoryMax=8G
+MemorySwapMax=512M
+CPUWeight=75

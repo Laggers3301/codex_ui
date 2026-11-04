@@ -584,12 +584,12 @@ describe("account-pool routing policy", () => {
   it("passes an account-local model catalog to that account's app-server", () => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-model-catalog-"));
     try {
-      expect(accountAppServerArgs(temporary)).toEqual(["app-server", "--listen", "stdio://"]);
+      expect(accountAppServerArgs(temporary)).toEqual(["app-server", "--listen", "stdio://", '-c', 'thread_unload_delay_secs=60']);
       expect(fs.readFileSync(path.join(temporary, "AGENTS.md"), "utf8")).toContain("默认以简体中文");
 
       const catalogPath = path.join(temporary, "model-catalog-gpt-5.6-sol-long-context.json");
       fs.writeFileSync(catalogPath, '{"models":[]}');
-      expect(accountAppServerArgs(temporary)).toEqual(["app-server", "--listen", "stdio://"]);
+      expect(accountAppServerArgs(temporary)).toEqual(["app-server", "--listen", "stdio://", '-c', 'thread_unload_delay_secs=60']);
       expect(accountAppServerArgs(temporary, "api-provider")).toEqual([
         "app-server",
         "--listen",

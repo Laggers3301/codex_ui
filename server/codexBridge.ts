@@ -10,6 +10,7 @@ import type { RpcEnvelope } from "./types.js";
 import { AppError } from "./appErrors.js";
 import {authDiagnostic} from "./authDiagnostics.js";
 import { nativeModelDiscoveryArgs, nativeModelDiscoveryEnabled, prepareNativeModelDiscovery } from "./nativeModelDiscovery.js";
+import {IdleThreadReclaimer,runtimeLoadScheduler,runtimeHistoryBytes,hostMemoryAvailable,assertRuntimeLoadBudget} from './runtimeMemoryLifecycle.js';
 
 /**
  * The process used as the JSON-RPC transport for a Codex app-server.
@@ -24,6 +25,7 @@ export interface CodexBridgeLaunchOptions {
   env?: NodeJS.ProcessEnv;
   /** A service-owned CODEX_HOME; third-party provider bridges leave this unset. */
   nativeModelDiscoveryHome?: string;
+  idleThreadReclaim?: boolean;
   scope?: {
     unitPrefix: string;
     slice: string;
@@ -108,6 +110,9 @@ export class CodexBridge extends EventEmitter {
   private resourceMonitor: ReturnType<typeof setInterval> | null = null;
   private pressureReported = false;
   private lowMemorySince: number | null = null;
+  private activeThreadIds=new Set<string>();
+  private unsubscribedThreads=new Set<string>();
+  private idleReclaimer=new IdleThreadReclaimer(id=>this.reclaimIdleThread(id));
 
   constructor(private readonly launch: CodexBridgeLaunchOptions = defaultLaunchOptions()) {
     super();
@@ -124,6 +129,7 @@ export class CodexBridge extends EventEmitter {
   }
 
   stop(): void {
+    this.idleReclaimer.clear();this.unsubscribedThreads.clear();this.activeThreadIds.clear();
     if (this.resourceMonitor) clearInterval(this.resourceMonitor);
     this.resourceMonitor = null;
     this.stopped = true;
@@ -156,11 +162,51 @@ export class CodexBridge extends EventEmitter {
   async request(method: string, params?: unknown, timeoutMs = 120_000): Promise<unknown> {
     assertCodexModelRequest(params);
     await this.start();
+    const input=params && typeof params==='object'?params as Record<string,unknown>:{};
+    const id=typeof input.threadId==='string'?input.threadId:null;
+    if(id && ['thread/resume','turn/start','turn/steer','review/start','thread/compact/start','thread/shellCommand'].includes(method)){
+      await this.idleReclaimer.beforeUse(id);
+      if(method!=='thread/resume' && this.unsubscribedThreads.has(id))await this.request('thread/resume',{threadId:id,excludeTurns:true},timeoutMs);
+    }
     if (["turn/start", "thread/start", "thread/queue/start", "thread/queue/add"].includes(method)) {
       const headroom = this.getMemoryHeadroom();
       if (headroom !== null && headroom < 512 * 1024 * 1024) throw new AppError("memory_pressure", "运行资源不足，暂时无法开始新任务。", "memory_pressure: 运行时可用内存不足 512 MiB，已阻止新增任务。");
     }
-    return this.sendRequest(method, params, timeoutMs);
+    const perform=async()=>{
+      if(this.launch.scope && (method==='thread/resume'||method==='thread/fork')){
+        let loaded=false;
+        if(method==='thread/resume' && id){
+          const read=await this.sendRequest('thread/read',{threadId:id,includeTurns:false},15000).catch(()=>null) as {thread?:{status?:{type?:string}}}|null;
+          loaded=read?.thread?.status?.type==='idle'||read?.thread?.status?.type==='active';
+        }
+        if(!loaded)assertRuntimeLoadBudget(await runtimeHistoryBytes(this.launch.env?.CODEX_HOME,input),hostMemoryAvailable(),this.getMemoryHeadroom());
+      }
+      return this.sendRequest(method,params,timeoutMs);
+    };
+    const result=await (this.launch.scope && ['thread/resume','thread/fork'].includes(method)?runtimeLoadScheduler.run(perform,timeoutMs):perform());
+    if(id && method==='thread/resume')this.unsubscribedThreads.delete(id);
+    const thread=(result as {thread?:{id?:string;status?:{type?:string}}}|null)?.thread;
+    if(this.launch.idleThreadReclaim && thread?.id && thread.status?.type==='idle')this.idleReclaimer.schedule(thread.id);
+    return result;
+  }
+
+  private async reclaimIdleThread(threadId:string):Promise<void|boolean>{
+    const proc=this.proc;
+    if(!this.launch.idleThreadReclaim || !proc || this.stopped)return;
+    if(this.activeThreadIds.size || this.pending.size || this.serverRequests.size)return false;
+    const read=await this.sendRequest('thread/read',{threadId,includeTurns:false},10000) as {thread?:{status?:{type?:string}}};
+    if(read.thread?.status?.type!=='idle')return false;
+    const goal=await this.sendRequest('thread/goal/get',{threadId},10000) as {goal?:{status?:string}};
+    if(goal.goal?.status==='active')return false;
+    const terminals=await this.sendRequest('thread/backgroundTerminals/list',{threadId},10000) as {data?:unknown[]};
+    if(!Array.isArray(terminals.data)||terminals.data.length)return false;
+    if(this.proc!==proc || this.activeThreadIds.size || this.pending.size || this.serverRequests.size)return false;
+    const result=await this.sendRequest('thread/unsubscribe',{threadId},10000) as {status?:string};
+    if(['unsubscribed','notSubscribed','notLoaded'].includes(result.status??'')){
+      this.unsubscribedThreads.add(threadId);
+      if(this.unsubscribedThreads.size>4096)this.unsubscribedThreads.delete(this.unsubscribedThreads.values().next().value!);
+      console.info('[runtime.idle.unsubscribed]',JSON.stringify({threadId}));
+    }
   }
 
   notify(method: string, params?: unknown): void {
@@ -248,6 +294,7 @@ export class CodexBridge extends EventEmitter {
     });
 
     proc.on("exit", (code, signal) => {
+      this.idleReclaimer.clear();this.unsubscribedThreads.clear();this.activeThreadIds.clear();
       if (this.resourceMonitor) clearInterval(this.resourceMonitor);
       this.resourceMonitor = null;
       this.emit("status", { state: "exited", code, signal });
@@ -386,6 +433,16 @@ export class CodexBridge extends EventEmitter {
     if (message.method === "serverRequest/resolved") {
       const requestId = (message.params as { requestId?: number | string } | null)?.requestId;
       if (requestId !== undefined) this.serverRequests.delete(requestId);
+    }
+    if(this.launch.idleThreadReclaim){
+      const p=message.params as {threadId?:string;status?:{type?:string}}|undefined;
+      if(p?.threadId){
+        if(message.method==='turn/started'||message.method==='thread/status/changed'&&p.status?.type==='active')this.activeThreadIds.add(p.threadId);
+        if(message.method==='turn/completed'||message.method==='thread/status/changed'&&p.status?.type==='idle'){
+          this.activeThreadIds.delete(p.threadId);this.idleReclaimer.schedule(p.threadId);
+        }
+        if(message.method==='thread/closed')this.activeThreadIds.delete(p.threadId);
+      }
     }
     this.emit("notification", message);
   }

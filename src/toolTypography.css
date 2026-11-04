@@ -1,0 +1,15 @@
+/* Tool activity and reasoning share a compact size on desktop and mobile. */
+:root { --tool-reading-size: 12px; }
+:root[data-theme] .messageItem.kind-tool :is(.messageMeta,.toolBundleTitleLabel,.toolBundleEntryLabel,.toolBundleEntrySummary,.toolRollingCount,.toolCountGlyph),
+:root[data-theme] .messageItem.kind-tool .messageMeta :is(.toolBundleTitleLabel,.toolBundleEntryLabel,.toolBundleEntrySummary,.toolRollingCount,.toolCountGlyph) {
+  font-size:var(--tool-reading-size)!important;
+}
+:root[data-theme] .messageItem.kind-tool :is(.toolBundleInput,.outputBlock,.outputBlock pre,.outputBlock code,.messageBody,.messageMarkdown) {
+  font-size:var(--tool-reading-size)!important;
+}
+:root[data-theme] .messageItem.kind-tool .toolBundleEntrySummary {line-height:1.5!important;}
+:root[data-theme] :is(.reasoningSummaryRow,.reasoningDisclosureTrigger,.reasoningLabel,.reasoningSummaryPreview,.reasoningExpandedBody),
+:root[data-theme] :is(.messageItem.kind-reasoning,.toolBundleReasoningEntry) :is(.messageMeta,.messageMarkdown,.messageMarkdown *) {
+  font-size:var(--tool-reading-size)!important;
+}
+:root[data-theme] .v2ThinkingLine { font-size:14px!important; }
