@@ -52,6 +52,38 @@ function fixture(){
     migrate:(source=id,model="gpt-6.1-sol",operationId=randomUUID())=>transfers.migrate({sourceThreadId:source,userId:"admin",projectId:project.id,targetModel:model,operationId})as Promise<any>};
 }
 describe("bidirectional runtime history transfer",()=>{
+  it("branches a Codex snapshot only through the selected turn and binds retries to that target",async()=>{
+    const f=fixture();
+    const first=await f.migrate();
+    const source=paths.get(first.threadId)!;
+    fs.appendFileSync(source,[
+      {type:"turn_context",payload:{turn_id:"cutoff-a"}},
+      {type:"response_item",payload:{type:"message",role:"assistant",content:[{type:"output_text",text:"SELECTED-ANSWER"}]}},
+      {type:"turn_context",payload:{turn_id:"future-b"}},
+      {type:"response_item",payload:{type:"message",role:"assistant",content:[{type:"output_text",text:"FUTURE-MUST-NOT-IMPORT"}]}}
+    ].map(r=>JSON.stringify(r)).join("\n")+"\n");
+    const before=fs.readFileSync(source),operationId=randomUUID();
+    const input={operationId,sourceThreadId:first.threadId,userId:"admin",projectId:f.project.id,targetModel:"reclaude-sonnet@1",sourceTurnId:"cutoff-a"};
+    const child=await f.transfers.migrate(input) as any;
+    const text=JSON.stringify(f.service.history(child.threadId));
+    expect(text).toContain("SELECTED-ANSWER");expect(text).not.toContain("FUTURE-MUST-NOT-IMPORT");
+    expect(fs.readFileSync(source)).toEqual(before);
+    await expect(f.transfers.migrate({...input,sourceTurnId:"future-b"})).rejects.toMatchObject({code:"migration_conflict"});
+    await expect(f.transfers.migrate({...input,targetAccountId:"different"})).rejects.toMatchObject({code:"migration_conflict"});
+    await expect(f.transfers.migrate({...input,operationId:randomUUID(),sourceTurnId:"missing"})).rejects.toMatchObject({code:"migration_cutoff_missing"});
+  });
+  it("branches Claude at its selected native message and preserves execution permissions",async()=>{
+    const f=fixture(),rows=fs.readFileSync(f.file,"utf8").trim().split("\n").map(l=>JSON.parse(l));
+    f.service.storage.saveTurn(f.id,{id:"selected-turn",status:"completed",nativeMessageId:rows[1].uuid,nativeSessionId:f.native,items:[]});
+    fs.appendFileSync(f.file,JSON.stringify({type:"assistant",uuid:randomUUID(),parentUuid:rows[1].uuid,sessionId:f.native,message:{role:"assistant",content:[{type:"text",text:"FUTURE-CLAUDE"}]}})+"\n");
+    f.store.setThreadExecutionSettings(f.id,"admin","read-only","never");
+    const result=await f.transfers.migrate({operationId:randomUUID(),sourceThreadId:f.id,userId:"admin",projectId:f.project.id,targetModel:"gpt-6.1-sol",sourceTurnId:"selected-turn",targetReasoningEffort:"max"}) as any;
+    expect(fs.readFileSync(paths.get(result.threadId)!,"utf8")).not.toContain("FUTURE-CLAUDE");
+    expect(f.store.getThreadExecutionSettings(result.threadId,"admin")).toMatchObject({sandbox:"read-only",approvalPolicy:"never"});
+    expect(f.request.mock.calls.some(([m])=>m==="turn/start")).toBe(false);
+    expect(f.request.mock.calls.find(([m])=>m==="thread/start")?.[1].config).toMatchObject({model_reasoning_effort:"max"});
+    expect(f.store.getThreadOwner(result.threadId)?.reasoningEffortOverride).toBe("max");
+  });
   it("copies both directions offline and counts only a Claude destination, once per operation",async()=>{
     const f=fixture(),source=fs.readFileSync(f.file),operationId=randomUUID();
     const first=await f.migrate(f.id,"gpt-6.1-sol",operationId);

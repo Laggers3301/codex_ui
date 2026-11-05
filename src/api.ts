@@ -629,8 +629,8 @@ export function deleteSideChat(side: SideChat): Promise<{ ok: boolean; data: Sid
 export function branchThread(
   projectId: string,
   threadId: string,
-  input: { turnId: string; prompt?: string; targetProjectId?: string; archiveToolOutputs?:boolean }
-): Promise<{ data: { thread: ThreadSummary; turn: { turn?: { id?: string } } | null; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null; branchMode: "native" | "cross-account-native" | "legacy-stream-import" | "legacy-tool-archive" } }> {
+  input: { turnId: string; prompt?: string; targetProjectId?: string; archiveToolOutputs?:boolean;targetAccountId?:string;model?:string;operationId?:string;reasoningEffort?:ReasoningEffort }
+): Promise<{ data: { thread: ThreadSummary; turn: { turn?: { id?: string } } | null; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null; branchMode: "native" | "cross-account-native" | "legacy-stream-import" | "legacy-tool-archive" | "cross-runtime" } }> {
   return request(`/api/projects/${projectId}/threads/${threadId}/branch`, {
     method: "POST",
     body: JSON.stringify(input)

@@ -1,0 +1,48 @@
+/* Shared chrome for global dialogs; editor/document content keeps its own type. */
+:root { --dialog-surface:var(--bg); --dialog-menu-surface:var(--bg); }
+:is(.modalScrim,.modalBackdrop,.globalSearchScrim,.workspaceFeatureScrim,.feishuScrim,.petPickerScrim,.skillPickerScrim,.taskNotificationScrim) {
+  background:rgb(0 0 0 / .28)!important;
+  backdrop-filter:blur(5px)!important;-webkit-backdrop-filter:blur(5px)!important;
+  animation:globalDialogVeilIn .22s ease both!important;
+}
+:is(.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.petPicker,.skillPickerPopover,.temporaryCloseDialog,.taskNotificationDialog) {
+  box-sizing:border-box;border:1px solid var(--line)!important;border-radius:18px!important;
+  background:var(--dialog-surface)!important;color:var(--ui-content)!important;
+  box-shadow:0 18px 60px rgb(0 0 0 / .2)!important;
+  font:400 14px/1.45 var(--pool-ui-font)!important;
+  animation:globalDialogPanelIn .28s cubic-bezier(.16,1,.3,1) both!important;
+}
+:is(.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.petPicker,.skillPickerPopover,.temporaryCloseDialog,.taskNotificationDialog) :is(h2,h3,header>strong,.dialogHeader>strong,.settingsHeader>strong) {
+  font:600 14px/1.45 var(--pool-ui-font)!important;color:var(--ui-heading);margin-block:0;
+}
+:is(.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.petPicker,.skillPickerPopover,.temporaryCloseDialog,.taskNotificationDialog) :is(p,label,button,button>span,label>span,input,select,textarea,.settingsHint,.emptyState) {
+  font-family:var(--pool-ui-font)!important;font-size:14px!important;font-weight:400!important;line-height:1.45;
+}
+:is(.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.petPicker,.skillPickerPopover,.temporaryCloseDialog,.taskNotificationDialog) :is(input:not([type="checkbox"]):not([type="radio"]),select,textarea) {
+  border-radius:10px!important;
+}
+:is(.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.petPicker,.skillPickerPopover,.temporaryCloseDialog,.taskNotificationDialog) :is(.dialogActions,.settingsFooter,footer) {
+  gap:10px;
+}
+.workspaceFeatureDialog { padding:14px; }
+.workspaceFeatureDialog header { padding:0 0 10px!important; }
+.workspaceFeatureDialog .workspaceFeatureBody { padding:0!important;gap:12px; }
+.workspaceFeatureDialog .workspaceFeatureBody>p { font-size:14px!important;font-weight:400;line-height:1.55; }
+.branchTargetDialog { padding:14px; }
+:is(.modalScrim,.modalBackdrop,.globalSearchScrim,.workspaceFeatureScrim,.feishuScrim,.petPickerScrim,.skillPickerScrim,.taskNotificationScrim):is(.uiClosing,.closing) {
+  animation:globalDialogVeilOut .22s ease both!important;pointer-events:none;
+}
+:is(.uiClosing,.closing) :is(.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.petPicker,.skillPickerPopover,.temporaryCloseDialog,.taskNotificationDialog) {
+  animation:globalDialogPanelOut .22s cubic-bezier(.4,0,1,1) both!important;pointer-events:none;
+}
+@keyframes globalDialogVeilIn { from{opacity:0} to{opacity:1} }
+@keyframes globalDialogVeilOut { from{opacity:1} to{opacity:0} }
+@keyframes globalDialogPanelIn { from{opacity:0;transform:translateY(12px) scale(.98)} to{opacity:1;transform:none} }
+@keyframes globalDialogPanelOut { from{opacity:1;transform:none} to{opacity:0;transform:translateY(8px) scale(.98)} }
+@media(max-width:720px) {
+  :is(.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.taskNotificationDialog) :is(input:not([type="checkbox"]):not([type="radio"]),textarea) { font-size:16px!important; }
+}
+@media(prefers-reduced-motion:reduce) {
+  html:root :is(.modalScrim,.modalBackdrop,.globalSearchScrim,.workspaceFeatureScrim,.feishuScrim,.petPickerScrim,.skillPickerScrim,.taskNotificationScrim,.branchChoiceMenu),
+  html:root :is(.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.petPicker,.skillPickerPopover,.temporaryCloseDialog,.taskNotificationDialog) { animation:none!important;transition:none!important; }
+}

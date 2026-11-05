@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { AppError } from "./appErrors.js";
 import type { VerifiedClaudeBinding } from "./claudeRuntime.js";
+import type {ClaudeEffort} from "../shared/agentRuntime.js";
 
 const run = promisify(execFile);
 export interface ClaudeIntegrationConfig {
@@ -19,7 +20,7 @@ export interface ClaudeIntegrationConfig {
 }
 export interface ClaudeBinding extends VerifiedClaudeBinding { deviceId: string; configRoot: string; accountKey: string; label: string; }
 const read = (file: string): Record<string, any> => JSON.parse(fs.readFileSync(file, "utf8"));
-export function claudeModelEntries(value: unknown): Array<{key:string;nativeId:string;label:string}> {
+export function claudeModelEntries(value: unknown): Array<{key:string;nativeId:string;label:string;supportedEffortLevels:ClaudeEffort[]}> {
   const seen = new Set<string>();
   return (Array.isArray(value) ? value : []).flatMap(row => {
     if (!row || typeof row !== "object" || typeof row.value !== "string" || row.value === "default") return [];
@@ -28,7 +29,8 @@ export function claudeModelEntries(value: unknown): Array<{key:string;nativeId:s
     const key = row.value.replace(/^claude-/, "");
     if (!/^[a-z][a-z0-9-]*$/.test(key) || seen.has(nativeId)) return [];
     seen.add(nativeId);
-    return [{key, nativeId, label:`Claude ${row.displayName.replace(/^Claude\s+/i, "").slice(0,100)}`}];
+    const supportedEffortLevels:ClaudeEffort[]=row.supportsEffort===true&&Array.isArray(row.supportedEffortLevels)?[...new Set<ClaudeEffort>(row.supportedEffortLevels.filter((e:unknown)=>typeof e==="string"&&["low","medium","high","xhigh","max"].includes(e)))]:[];
+    return [{key, nativeId, label:`Claude ${row.displayName.replace(/^Claude\s+/i, "").slice(0,100)}`,supportedEffortLevels}];
   });
 }
 
@@ -39,7 +41,7 @@ export class ClaudeBindings {
   private catalogFile(key: string) { return path.join(this.config.storageDirectory,"model-catalog",`${key}.json`); }
   private models(key: string) {
     try { const models=claudeModelEntries(read(this.catalogFile(key)));if(models.length)return models; } catch { /* Metadata unavailable; do not invent a version. */ }
-    return ["sonnet","opus","haiku"].map(family=>({key:family,nativeId:family,label:`Claude ${family[0].toUpperCase()+family.slice(1)}（版本待确认）`}));
+    return ["sonnet","opus","haiku"].map(family=>({key:family,nativeId:family,label:`Claude ${family[0].toUpperCase()+family.slice(1)}（版本待确认）`,supportedEffortLevels:[] as ClaudeEffort[]}));
   }
   async refreshModels(userId: string): Promise<void> {
     for (const binding of this.list(userId)) {
@@ -118,12 +120,19 @@ export class ClaudeBindings {
     return refreshed;
   }
   profiles(userId: string) {
-    return this.list(userId).flatMap(binding => this.models(binding.accountKey).map((entry, index) => ({
-      id: `reclaude-${entry.key}@${binding.orgId}:medium`, model:`reclaude-${entry.key}@${binding.orgId}`, label: `${entry.label} · ${binding.label}`,
+    return this.list(userId).flatMap(binding => this.models(binding.accountKey).flatMap((entry, index) => (entry.supportedEffortLevels.length?entry.supportedEffortLevels:["medium" as const]).map(effort=>({
+      id: `reclaude-${entry.key}@${binding.orgId}:${effort}`, model:`reclaude-${entry.key}@${binding.orgId}`, label: `${entry.label} · ${binding.label}`,
       displayName: `${entry.label} · ${binding.label}`,
       nativeModelId:entry.nativeId,
-      effort: "medium" as const, priority: 1000 + index, runtime: "claude-code" as const,
+      effort,supportedEffortLevels:entry.supportedEffortLevels, priority: 1000 + index, runtime: "claude-code" as const,
       availability: "ready" as const, workflow: false
-    })));
+    }))));
+  }
+  effort(userId:string,model:string,value:unknown):ClaudeEffort|undefined {
+    const profiles=this.profiles(userId).filter(p=>p.model===model),levels=profiles[0]?.supportedEffortLevels??[];
+    if(!levels.length){if(value!==undefined&&value!=="medium")throw new AppError("unsupported_model","此 Claude 模型未声明支持所选推理级别。");return undefined;}
+    const selected=value??(levels.includes("medium")?"medium":levels[0]);
+    if(typeof selected!=="string"||!levels.includes(selected as ClaudeEffort))throw new AppError("unsupported_model","此 Claude 模型不支持所选推理级别。");
+    return selected as ClaudeEffort;
   }
 }

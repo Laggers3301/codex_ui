@@ -36,13 +36,13 @@ it('serves installed pool catalogs even when the default account is stale or the
   const app=Fastify();
   vi.stubEnv('CODEX_WEB_EXTRA_MODEL_CATALOGS',providerCatalog);
   vi.stubEnv('CODEX_WEB_CODEX_MODEL_DISCOVERY','native');invalidateModelCatalogCache();
-  registerRoutes(app,pool as unknown as CodexBridge,{} as ProjectStore,{backgroundIndexing:false,browserTools:false});
+  registerRoutes(app,pool as unknown as CodexBridge,{ensureUser:(id:string)=>({id})} as unknown as ProjectStore,{backgroundIndexing:false,browserTools:false});
   try {
     for(const offline of [false,true]){
       invalidateModelCatalogCache();
       if(offline)vi.mocked(execFileSync).mockImplementationOnce(()=>{throw new Error('offline fixture');});
       const response=await app.inject({method:'GET',url:'/api/models'});
-      expect(response.statusCode).toBe(200);
+      expect(response.statusCode,response.body).toBe(200);
       const data=response.json().data;
       expect(data.filter((m:{model:string})=>m.model==='gpt-6.1-terra')).toHaveLength(2);
       expect(data.filter((m:{model:string})=>m.model==='provider-kept-by-ui')).toHaveLength(2);

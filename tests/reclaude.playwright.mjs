@@ -97,6 +97,43 @@ try {
   assert.equal(state.starts.length,0,"Neither model previews nor fixtures may start a native inference turn");
   assert.deepEqual(state.approvalResponses.at(-1).result,{decision:"decline"});
   assert.deepEqual(errors,[]);
+  // Branch requests are intercepted; these clicks never create a native session.
+  const branchBodies=[];
+  await page.route("**/api/models",route=>route.fulfill({json:{data:[{id:"gpt-test",model:"gpt-6.1-sol",label:"GPT fixture",effort:"high"},{id:"gpt-max-test",model:"gpt-6.1-sol",label:"GPT fixture",effort:"max"},{id:"claude-test",model:"reclaude-sonnet@1",label:"Claude Sonnet · ReClaude",effort:"medium",availability:"ready",supportedEffortLevels:["medium","max"]},{id:"claude-max-test",model:"reclaude-sonnet@1",label:"Claude Sonnet · ReClaude",effort:"max",availability:"ready",supportedEffortLevels:["medium","max"]}]}}));
+  await page.route("**/api/projects/*/threads/*/branch",async route=>{
+    branchBodies.push(route.request().postDataJSON());
+    await route.fulfill({json:{data:{thread:{id:"main-b",name:"分支 fixture",cwd:"/fixture",configuredModel:branchBodies.at(-1).model,turns:[]},sourceThreadId:"main-a",sourceTurnId:branchBodies.at(-1).turnId,turn:null,branchMode:"cross-runtime"}}});
+  });
+  for(const mobile of [false,true]){
+    await page.setViewportSize(mobile?{width:393,height:852}:{width:1440,height:1000});
+    await page.reload({waitUntil:"domcontentloaded"});
+    const show=page.getByRole("button",{name:"展开侧边栏",exact:true});if(await show.isVisible())await show.click();
+    await page.locator('[data-thread-id="main-a"] .threadSelectButton').click();
+    const branch=page.getByRole("button",{name:"选择账号并从此回答分支",exact:true}).last();
+    await branch.click();
+    const dialog=page.getByRole("dialog",{name:"选择分支目标"});await dialog.waitFor();
+    await dialog.getByRole("button",{name:/^目标账号/}).click();
+    await page.getByRole("listbox",{name:"目标账号",exact:true}).getByRole("option",{name:mobile?"ReClaude":"100002",exact:true}).click();
+    const chosen=mobile?"reclaude-sonnet@1":"gpt-6.1-sol";
+    if(!mobile){await dialog.getByRole("button",{name:/^推理级别/}).click();await page.getByRole("listbox",{name:"推理级别",exact:true}).getByRole("option",{name:"max",exact:true}).click();}
+    else {await dialog.getByRole("button",{name:/^推理级别/}).click();await page.getByRole("listbox",{name:"推理级别",exact:true}).getByRole("option",{name:"max",exact:true}).click();assert.ok(!(await dialog.getByRole("button",{name:/^目标模型/}).innerText()).includes("ReClaude"));}
+    await dialog.evaluate(async node=>{await Promise.all(node.getAnimations({subtree:true}).filter(a=>a.effect?.getTiming().iterations!==Infinity).map(a=>a.finished.catch(()=>{})));});
+    assert.equal(await dialog.evaluate(node=>{const r=node.getBoundingClientRect();return document.elementFromPoint(r.left+r.width/2,r.top+30)?.closest('[role="dialog"]')===node;}),true);
+    assert.equal(await dialog.locator('select').count(),0);
+    assert.equal(await dialog.evaluate(n=>getComputedStyle(n).fontSize),'14px');
+    assert.equal(await page.locator('.branchTargetScrim').evaluate(n=>getComputedStyle(n).backdropFilter),'blur(5px)');
+    for(const theme of ['light','dark']){
+      await page.evaluate(t=>document.documentElement.dataset.theme=t,theme);
+      await page.screenshot({path:`${evidence}/${mobile?"phone":"desktop"}-branch-${theme}.png`});
+    }
+    await page.screenshot({path:`${evidence}/${mobile?"phone":"desktop"}-branch-target.png`});
+    await dialog.getByRole("button",{name:"创建并打开",exact:true}).click();
+    await expect(dialog).toHaveCount(0);
+    assert.equal(branchBodies.at(-1).model,chosen);assert.equal(branchBodies.at(-1).reasoningEffort,"max");
+    if(mobile){assert.equal(branchBodies.at(-1).targetAccountId,undefined);assert.match(branchBodies.at(-1).operationId,/^[a-f0-9-]{36}$/);}
+    else {assert.equal(branchBodies.at(-1).targetAccountId,"100002");assert.equal(branchBodies.at(-1).reasoningEffort,"max");}
+  }
+  assert.equal(branchBodies.length,2);assert.deepEqual(errors,[]);
   const results={desktopAndPhoneMenus:true,unconnectedModelsDisabled:true,noFakeReasoningTiers:true,streamedTextVisible:true,fullSnapshotDeduplicated:true,nativeApprovalVisible:true,declineDelivered:true,reloadPreservesTimeline:true,nativeInferenceTurns:0,errors};
   await fs.writeFile(`${evidence}/results.json`,JSON.stringify(results,null,2)+"\n");console.log(JSON.stringify(results,null,2));
 } finally {

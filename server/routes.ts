@@ -230,6 +230,9 @@ const threadBranchSchema = z.object({
   prompt: z.string().trim().max(24_000).optional().default(""),
   targetProjectId: z.string().uuid().optional(),
   model: z.string().trim().min(1).max(256).optional(),
+  targetAccountId: z.string().trim().min(1).max(128).optional(),
+  reasoningEffort: effortSchema.optional(),
+  operationId: z.string().uuid().optional(),
   archiveToolOutputs: z.boolean().optional().default(false),
   compactToolOutputs: z.boolean().optional().default(false)
 });
@@ -4376,13 +4379,33 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const targetProject = input.targetProjectId ? store.getProject(input.targetProjectId, userId) : project;
       if (!targetProject) return reply.code(404).send({ error: "Target project not found." });
       const claude = getClaudeService(bridge);
+      const sourceIsClaude = Boolean(claude?.owns(request.params.threadId));
+      if (input.model && sourceIsClaude !== isReclaudeModel(input.model)) {
+        if (!historyTransfers || !claude) throw new Error("跨运行时分支尚未配置。");
+        if (targetProject.id !== project.id || input.prompt || input.archiveToolOutputs) throw new Error("跨运行时分支不接受修改目录、附加消息或精简历史。");
+        if (!input.operationId) throw new Error("跨运行时分支需要唯一操作标识。");
+        assertRuntimeModel(bridge, userId, {model: input.model});
+        if(input.reasoningEffort&&![...availableModelProfiles(),...claude.profiles(userId)].some(p=>p.model===input.model&&p.effort===input.reasoningEffort))return reply.code(400).send({error:"所选模型不支持该推理级别。"});
+        const restriction = allowedAccountForUser(userId);
+        if (restriction && input.targetAccountId && restriction !== input.targetAccountId) throw new Error("无权使用所选目标账号。");
+        const targetAccountId = restriction ?? input.targetAccountId;
+        if (isReclaudeModel(input.model) && input.targetAccountId) throw new Error("ReClaude 账号由目标模型绑定确定。");
+        if (targetAccountId && (!input.model.startsWith("gpt-") || !isAccountPoolBridge(bridge) || !bridge.hasAccount(targetAccountId))) throw new Error("所选 GPT 账号不存在或不支持该模型。");
+        const transfer = asRecord(await historyTransfers.migrate({operationId:input.operationId,sourceThreadId:request.params.threadId,userId,
+          projectId:project.id,targetModel:input.model,targetAccountId,sourceTurnId:input.turnId,targetReasoningEffort:input.reasoningEffort}));
+        const result=asRecord(await bridge.request("thread/read",{threadId:transfer.threadId,includeTurns:false}));
+        return {data:{thread:{...asRecord(result.thread),configuredModel:input.model,configuredReasoningEffort:input.reasoningEffort??"medium"},turn:null,sourceThreadId:request.params.threadId,sourceTurnId:input.turnId,
+          branchMode:"cross-runtime",warnings:transfer.warnings,historySourceUrl:transfer.historySourceUrl}};
+      }
       if (claude?.owns(request.params.threadId)) {
+        if (input.targetAccountId) throw new Error("ReClaude 分支的账号由目标模型绑定确定。");
         if (input.prompt) throw new Error("离线 fork 不接受模型消息；请创建分支后再发送任务。");
         if (input.archiveToolOutputs) throw new Error("Claude 分支保留完整原生历史，不支持精简工具历史。");
         const source = claude.storage.get(request.params.threadId)!;
         const model = input.model ?? source.model;
         assertRuntimeModel(bridge, userId, { model });
-        const result = asRecord(await bridge.request("thread/fork", { threadId: source.id, model, projectId: targetProject.id, lastTurnId: input.turnId }));
+        const effort=claude.bindings.effort(userId,model,input.reasoningEffort??store.getThreadOwner(source.id)?.reasoningEffortOverride);
+        const result = asRecord(await bridge.request("thread/fork", { threadId: source.id, model, effort, projectId: targetProject.id, lastTurnId: input.turnId }));
         const thread = asRecord(result.thread);
         store.updateThreadDisplayName(String(thread.id), userId, String(thread.name));
         return { data: { thread, turn: null, sourceThreadId: source.id, sourceTurnId: input.turnId,
@@ -4425,16 +4448,20 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       if (input.model && !availableModelProfiles().some(profile => profile.model === input.model)) {
         return reply.code(400).send({ error: "Selected branch model is not available." });
       }
-      const reasoningEffort = presentation?.reasoningEffort ?? owner?.reasoningEffortOverride ?? project.defaultReasoningEffort;
+      const reasoningEffort = input.reasoningEffort ?? presentation?.reasoningEffort ?? owner?.reasoningEffortOverride ?? project.defaultReasoningEffort;
+      if(input.reasoningEffort&&!availableModelProfiles().some(p=>p.model===model&&p.effort===input.reasoningEffort))return reply.code(400).send({error:"所选模型不支持该推理级别。"});
       const contextConfig = threadContextConfigOverrides(
         sourceContextConfig,
         contextWindowMeasuredForConfig(sourceContextConfig, sourceContextUsage)
       );
       const allowedAccountId = allowedAccountForUser(userId);
+      if (allowedAccountId && input.targetAccountId && allowedAccountId !== input.targetAccountId) throw new Error("无权使用所选目标账号。");
+      const forcedTargetAccountId=allowedAccountId ?? input.targetAccountId;
+      if (input.targetAccountId && (!model.startsWith("gpt-") || !poolBridge?.hasAccount(input.targetAccountId))) throw new Error("所选 GPT 账号或模型不可用。");
       if (allowedAccountId && (!poolBridge || !poolBridge.hasAccount(allowedAccountId))) {
         throw new Error(`${userId} 的专用账号 ${allowedAccountId} 当前不可用。`);
       }
-      let routing = poolBridge?.getBranchRoutingDecision(request.params.threadId, model, allowedAccountId ?? undefined) ?? null;
+      let routing = poolBridge?.getBranchRoutingDecision(request.params.threadId, model, forcedTargetAccountId ?? undefined) ?? null;
       const nativeFork = !routing || routing.mode === "native";
       const browserMcp = options.browserTools ? mintBrowserMcpConfig(userId, targetProject.id) : null;
       const forkParams = {
@@ -4445,7 +4472,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         approvalPolicy: branchExecution.approvalPolicy,
         sandbox: branchExecution.sandbox,
         threadSource: "user",
-        config: { ...contextConfig, ...browserMcp?.config },
+        config: { ...contextConfig, ...browserMcp?.config, model_reasoning_effort:reasoningEffort },
         excludeTurns: true,
         deferGoalContinuation: true
       };
@@ -4485,7 +4512,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
             try{
               assertLargeBranchMemory(copied.copiedBytes);
               if (model.startsWith("gpt-")) {
-                const next = poolBridge.getBranchRoutingDecision(request.params.threadId, model, allowedAccountId ?? undefined, largeBranchMemoryBudget(copied.copiedBytes));
+                const next = poolBridge.getBranchRoutingDecision(request.params.threadId, model, forcedTargetAccountId ?? undefined, largeBranchMemoryBudget(copied.copiedBytes));
                 if (next.targetAccount.id !== routing.targetAccount.id) {
                   await relocateLargeThreadBranch(copied, path.join(routing.targetAccount.codexHome, "sessions"), path.join(next.targetAccount.codexHome, "sessions"));
                   console.info("branch.memory_reroute", { sourceThreadId: request.params.threadId, threadId: copied.threadId,
@@ -4601,7 +4628,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       store.touchThreadOwner(createdThreadId);
       return {
         data: {
-          thread: createdThread,
+          thread: {...createdThread,configuredModel:model,configuredReasoningEffort:reasoningEffort},
           turn,
           sourceThreadId: request.params.threadId,
           sourceTurnId: input.turnId,

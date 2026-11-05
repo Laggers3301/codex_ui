@@ -109,6 +109,7 @@ import { ToolReveal } from "./ToolReveal";
 import { RollingToolCount, ToolArrivalList } from "./ToolActivityMotion";
 import { useProviderQuotas, providerRemaining, ProviderQuotaDetails, ProviderFailureSummary } from "./providerQuota";
 import { visibleProviderQuotas } from "./quotaTabs";
+import {BranchTargetDialog,type BranchTarget} from "./BranchTargetDialog";
 import { isToolSummaryClick, recordToolDisclosurePointerDown } from "./toolDisclosure";
 import { ToolArrivalRegistry } from "./toolArrivalRegistry";
 import { skillReadSummary } from "./skillReadSummary";
@@ -569,7 +570,7 @@ function modelPickerGroup(model: string): ModelPickerSection {
 }
 
 function modelPickerLabel(profile: ModelProfile): string {
-  return runtimeModelLabel(profile);
+  return runtimeModelLabel(profile)+(isReclaudeModel(profile.model)&&profile.supportedEffortLevels?.length?` ${profile.effort}`:"");
 }
 
 function MobileModelPage({ active, children }: { active: boolean; children: ReactNode }) {
@@ -4838,7 +4839,8 @@ export function App() {
   const [renamingThreadId, setRenamingThreadId] = useState<string | null>(null);
   const [branchingThread, setBranchingThread] = useState(false);
   const [branchingTurnKey, setBranchingTurnKey] = useState<string | null>(null);
-  const [archiveBranchRetry,setArchiveBranchRetry]=useState<{threadId:string;turnId:string}|null>(null);
+  const [archiveBranchRetry,setArchiveBranchRetry]=useState<{threadId:string;turnId:string;target?:BranchTarget}|null>(null);
+  const [branchTarget,setBranchTarget]=useState<{threadId:string;projectId:string;turnId:string}|null>(null);
   const branchingThreadRef = useRef(false);
   const [editingLastPrompt, setEditingLastPrompt] = useState(false);
   const editingCommitRef = useRef(false);
@@ -5121,14 +5123,22 @@ export function App() {
   const exhaustedAccountNoticePresence = useExitPresence(exhaustedAccountNoticeOpen, 440);
   const openingThreadPresence = useExitPresence(Boolean(openingThreadId), 240);
   const queuedSubmissionPresence = useExitPresence(Boolean(selectedThread && queuedSubmissions.length), 260);
-  const leaderboardPresence = useExitPresence(leaderboardOpen);
-  const trackedQuotaPresence = useExitPresence(trackedQuotaOpen);
-  const skillsPickerPresence = useExitPresence(skillsPickerOpen);
-  const temporaryClosePresence = useExitPresence(temporaryCloseConfirm);
-  const settingsPresence = useExitPresence(settingsOpen);
-  const notificationSettingsPresence = useExitPresence(notificationSettingsOpen);
-  const globalSearchPresence = useExitPresence(globalSearchOpen);
-  const directoryBrowserPresence = useExitPresence(directoryBrowserOpen);
+  const leaderboardPresence = useExitPresence(leaderboardOpen,220);
+  const trackedQuotaPresence = useExitPresence(trackedQuotaOpen,220);
+  const skillsPickerPresence = useExitPresence(skillsPickerOpen,220);
+  const temporaryClosePresence = useExitPresence(temporaryCloseConfirm,220);
+  const settingsPresence = useExitPresence(settingsOpen,220);
+  const notificationSettingsPresence = useExitPresence(notificationSettingsOpen,220);
+  const threadRenamePresence=useExitPresence(Boolean(renamingThread),220);
+  const projectRenamePresence=useExitPresence(Boolean(renamingProject),220);
+  const lastRenamingThread=useRef(renamingThread),lastRenamingProject=useRef(renamingProject);
+  if(renamingThread)lastRenamingThread.current=renamingThread;
+  if(renamingProject)lastRenamingProject.current=renamingProject;
+  const displayedRenamingThread=renamingThread??lastRenamingThread.current;
+  const displayedRenamingProject=renamingProject??lastRenamingProject.current;
+  useEffect(()=>{if(!threadRenamePresence.present)lastRenamingThread.current=null;if(!projectRenamePresence.present)lastRenamingProject.current=null;},[threadRenamePresence.present,projectRenamePresence.present]);
+  const globalSearchPresence = useExitPresence(globalSearchOpen,220);
+  const directoryBrowserPresence = useExitPresence(directoryBrowserOpen,220);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -6078,10 +6088,14 @@ export function App() {
     setRenamingThread(thread);
   }
 
-  async function createBranchFromTurn(turn: Pick<Turn,"id">,archiveToolOutputs=false) {
+  function chooseBranchTarget(turn:Pick<Turn,"id">){
+    if(selectedThread&&selectedProject)setBranchTarget({threadId:selectedThread.id,projectId:selectedProject.id,turnId:turn.id});
+  }
+
+  async function createBranchFromTurn(turn: Pick<Turn,"id">,archiveToolOutputs=false,target:BranchTarget={}) {
     const project = selectedProject;
     const sourceThread = selectedThread;
-    if (!sourceThread?.id || !project?.id || branchingThreadRef.current) return;
+    if (!sourceThread?.id || !project?.id || branchingThreadRef.current) return false;
     branchingThreadRef.current = true;
     setBranchingThread(true);
     setBranchingTurnKey(`${sourceThread.id}:${turn.id}`);
@@ -6089,13 +6103,13 @@ export function App() {
     setArchiveBranchRetry(null);
     const sourceViewToken = threadViewTokenRef.current;
     try {
-      const response = await branchThread(project.id, sourceThread.id, { turnId: turn.id, ...(archiveToolOutputs?{archiveToolOutputs:true}:{}) });
+      const response = await branchThread(project.id, sourceThread.id, { turnId: turn.id, ...target, ...(archiveToolOutputs?{archiveToolOutputs:true}:{}) });
       const rawThread = response.data.thread;
       const normalizedThread = sanitizeThreadForRender({
         ...rawThread,
         pinned: false,
-        configuredModel: rawThread.configuredModel ?? sourceThread.configuredModel ?? project.defaultModel,
-        configuredReasoningEffort: rawThread.configuredReasoningEffort ?? sourceThread.configuredReasoningEffort ?? project.defaultReasoningEffort,
+        configuredModel: target.model ?? rawThread.configuredModel ?? sourceThread.configuredModel ?? project.defaultModel,
+        configuredReasoningEffort: target.reasoningEffort ?? rawThread.configuredReasoningEffort ?? sourceThread.configuredReasoningEffort ?? project.defaultReasoningEffort,
         turns: rawThread.turns ?? []
       });
       threadProjectIdsRef.current.set(normalizedThread.id, project.id);
@@ -6107,7 +6121,7 @@ export function App() {
       });
       if (threadViewTokenRef.current !== sourceViewToken || selectedThreadRef.current?.id !== sourceThread.id) {
         void refreshThreads(project.id);
-        return;
+        return true;
       }
       const branchViewToken = ++threadViewTokenRef.current;
       newThreadDraftModeRef.current = false;
@@ -6119,9 +6133,11 @@ export function App() {
       void openThread(normalizedThread.id, project.id, branchViewToken, { skipCache: true, requireFresh: true });
       void refreshThreads(project.id);
       window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".composerRichInput")?.focus());
+      return true;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
-      if(!archiveToolOutputs&&caught instanceof Error&&caught.message.includes("可用内存不足"))setArchiveBranchRetry({threadId:sourceThread.id,turnId:turn.id});
+      if(!archiveToolOutputs&&caught instanceof Error&&caught.message.includes("可用内存不足"))setArchiveBranchRetry({threadId:sourceThread.id,turnId:turn.id,target});
+      return false;
     } finally {
       branchingThreadRef.current = false;
       setBranchingThread(false);
@@ -11915,6 +11931,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         )}
       />
 
+      {branchTarget?<BranchTargetDialog sourceModel={selectedThread?.configuredModel??selectedModelProfile.model} sourceEffort={selectedThread?.configuredReasoningEffort??selectedModelProfile.effort} pool={accountPool} profiles={modelProfiles} onClose={()=>setBranchTarget(null)} onConfirm={async target=>{
+        if(selectedThreadRef.current?.id!==branchTarget.threadId||selectedProject?.id!==branchTarget.projectId){setError("源会话已切换，请回到原会话重新选择分支点。");return false;}
+        return createBranchFromTurn({id:branchTarget.turnId},false,target);
+      }}/>:null}
       {runtimeMigration?<RuntimeMigrationDialog key={runtimeMigration.thread.id} threadId={runtimeMigration.thread.id} projectId={runtimeMigration.projectId}
         name={runtimeMigration.thread.name??runtimeMigration.thread.preview??"会话"} sourceClaude={isReclaudeModel(runtimeMigration.thread.configuredModel??selectedProject?.defaultModel)}
         profiles={modelProfiles} usageStatus={reclaudeUsage} initialModel={runtimeMigration.initialModel} onClose={()=>setRuntimeMigration(null)}
@@ -12069,8 +12089,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         </div>
       ) : null}
 
-      {renamingThread ? (
-        <div className="modalScrim" role="presentation" onMouseDown={(event) => {
+      {threadRenamePresence.present&&displayedRenamingThread ? (
+        <div className={`modalScrim${threadRenamePresence.closing?" uiClosing":""}`} aria-hidden={threadRenamePresence.closing} inert={threadRenamePresence.closing} role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) {
             closeThreadRename();
           }
@@ -12100,22 +12120,22 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 }
               }}
               maxLength={160}
-              disabled={renamingThreadId === renamingThread.id}
+              disabled={renamingThreadId === displayedRenamingThread.id}
             />
             <div className="dialogActions">
-              <button className="iconTextButton" type="button" onClick={closeThreadRename} disabled={renamingThreadId === renamingThread.id}>
+              <button className="iconTextButton" type="button" onClick={closeThreadRename} disabled={renamingThreadId === displayedRenamingThread.id}>
                 取消
               </button>
-              <button className="iconTextButton primary" type="submit" disabled={renamingThreadId === renamingThread.id || !threadRenameDraft.trim()}>
-                {renamingThreadId === renamingThread.id ? "重命名中" : "保存"}
+              <button className="iconTextButton primary" type="submit" disabled={renamingThreadId === displayedRenamingThread.id || !threadRenameDraft.trim()}>
+                {renamingThreadId === displayedRenamingThread.id ? "重命名中" : "保存"}
               </button>
             </div>
           </form>
         </div>
       ) : null}
 
-      {renamingProject ? (
-        <div className="modalScrim" role="presentation" onMouseDown={(event) => {
+      {projectRenamePresence.present&&displayedRenamingProject ? (
+        <div className={`modalScrim${projectRenamePresence.closing?" uiClosing":""}`} aria-hidden={projectRenamePresence.closing} inert={projectRenamePresence.closing} role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) {
             closeProjectRename();
           }
@@ -12145,14 +12165,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 }
               }}
               maxLength={120}
-              disabled={renamingProjectId === renamingProject.id}
+              disabled={renamingProjectId === displayedRenamingProject.id}
             />
             <div className="dialogActions">
-              <button className="iconTextButton" type="button" onClick={closeProjectRename} disabled={renamingProjectId === renamingProject.id}>
+              <button className="iconTextButton" type="button" onClick={closeProjectRename} disabled={renamingProjectId === displayedRenamingProject.id}>
                 取消
               </button>
-              <button className="iconTextButton primary" type="submit" disabled={renamingProjectId === renamingProject.id || !projectRenameDraft.trim()}>
-                {renamingProjectId === renamingProject.id ? "重命名中" : "保存"}
+              <button className="iconTextButton primary" type="submit" disabled={renamingProjectId === displayedRenamingProject.id || !projectRenameDraft.trim()}>
+                {renamingProjectId === displayedRenamingProject.id ? "重命名中" : "保存"}
               </button>
             </div>
           </form>
@@ -12679,7 +12699,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         {error ? (
           <div className="errorBanner" role="alert">
             <span className="errorBannerMessage">{error}</span>
-            {archiveBranchRetry&&archiveBranchRetry.threadId===selectedThread?.id?<button className="branchArchiveRetry" type="button" disabled={branchingThread} onClick={event=>{event.stopPropagation();if(archiveBranchRetry)void createBranchFromTurn({id:archiveBranchRetry.turnId},true);}}>精简较早的工具结果后分支</button>:null}
+            {archiveBranchRetry&&archiveBranchRetry.threadId===selectedThread?.id?<button className="branchArchiveRetry" type="button" disabled={branchingThread} onClick={event=>{event.stopPropagation();if(archiveBranchRetry)void createBranchFromTurn({id:archiveBranchRetry.turnId},true,archiveBranchRetry.target);}}>精简较早的工具结果后分支</button>:null}
             <button className="iconButton errorBannerDismiss" type="button" aria-label="关闭错误提示" title="关闭错误提示" onClick={() => setError("")}><X size={16} /></button>
           </div>
         ) : null}
@@ -13141,7 +13161,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     disabled={!exhaustedAccountNotice.hasAvailableAlternative || !latestBranchableTurn || branchingThread}
                     title={!latestBranchableTurn ? "当前没有可分支的已完成回答" : undefined}
                     onClick={() => {
-                      if (latestBranchableTurn) void createBranchFromTurn(latestBranchableTurn);
+                      if (latestBranchableTurn) chooseBranchTarget(latestBranchableTurn);
                     }}
                   >
                     <GitBranch size={14} /> {branchingThread ? "分支中…" : "分支"}
@@ -13161,7 +13181,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     type="button"
                     onClick={() => {
                       if (!latestBranchableTurn) return;
-                      void createBranchFromTurn(latestBranchableTurn);
+                      chooseBranchTarget(latestBranchableTurn);
                     }}
                     disabled={!latestBranchableTurn || branchingThread}
                   >
@@ -13596,7 +13616,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           <button type="button" title="复制本次回答全部文字" aria-label="复制本次回答全部文字" onClick={() => void copyPlainText(turnAgentText)}>
                             <ActionCopy size={15} />
                           </button>
-                          <button type="button" title={branchingThread ? "正在创建分支" : "从此回答直接创建新会话"} aria-label="从此回答直接创建新会话" aria-busy={branchingTurnKey === `${selectedThread?.id}:${turn.id}`} disabled={branchingThread} onClick={() => void createBranchFromTurn(turn)}>
+                          <button type="button" title={branchingThread ? "正在创建分支" : "选择账号并从此回答分支"} aria-label="选择账号并从此回答分支" aria-busy={branchingTurnKey === `${selectedThread?.id}:${turn.id}`} disabled={branchingThread} onClick={() => {if(selectedThread&&selectedProject)setBranchTarget({threadId:selectedThread.id,projectId:selectedProject.id,turnId:turn.id});}}>
                             {branchingTurnKey === `${selectedThread?.id}:${turn.id}`
                               ? <span className="branchCreatingSpinner" role="status" aria-label="正在创建分支" />
                               : <ActionBranch size={15} />}

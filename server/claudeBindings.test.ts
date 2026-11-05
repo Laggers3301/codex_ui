@@ -43,6 +43,12 @@ describe("native Claude model catalogue",()=>{
       expect(bindings.resolve("alice","reclaude-opus-4-6@1").verifiedModels["reclaude-opus-4-6@1"]).toBe("claude-opus-4-6");
       expect(()=>bindings.resolve("alice","reclaude-opus-99@1")).toThrow(/版本/);
       expect(bindings.profiles("bob")).toEqual([]);
+      rows[1]=Object.assign(rows[1],{supportsEffort:true,supportedEffortLevels:["low","medium","high","max","invalid"]});
+      fs.writeFileSync(path.join(state,`model-catalog/${key}.json`),JSON.stringify(rows));
+      expect(bindings.profiles("alice").filter(p=>p.model==="reclaude-opus@1").map(p=>p.effort)).toEqual(["low","medium","high","max"]);
+      expect(bindings.effort("alice","reclaude-opus@1","max")).toBe("max");
+      expect(()=>bindings.effort("alice","reclaude-opus@1","xhigh")).toThrow(/不支持/);
+      expect(bindings.effort("alice","reclaude-opus-4-6@1","medium")).toBeUndefined();
     }finally{fs.rmSync(home,{recursive:true,force:true});}
   });
 });

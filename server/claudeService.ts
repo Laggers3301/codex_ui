@@ -76,8 +76,9 @@ export class ClaudeService {
       ...(this.usage.cacheError ? {cacheError:this.usage.cacheError} : {}) };
   }
   profiles(userId: string) {
+    const bindings=new Map(this.bindings.list(userId).map(b=>[b.orgId,b]));
     return this.bindings.profiles(userId).map(profile => {
-      const status = this.usage.status(this.bindings.resolve(userId, profile.model));
+      const status = this.usage.status(bindings.get(profile.model.split("@")[1])!);
       return status.state === "disabled" ? {...profile, availability:"disabled" as const, unavailableReason:status.message} : profile;
     });
   }
@@ -99,7 +100,7 @@ export class ClaudeService {
   }
   summary(row: ClaudeConversation): RecordValue {
     return { id: row.id, name: row.name, preview: row.name, cwd: row.cwd, model: row.model, modelProvider: "reclaude",
-      runtime: "claude-code", configuredModel: row.model, configuredReasoningEffort: "medium",
+      runtime: "claude-code", configuredModel: row.model, configuredReasoningEffort: this.store.getThreadOwner(row.id)?.reasoningEffortOverride??"medium",
       collaborationMode: row.collaborationMode ?? "default",
       createdAt: Math.floor(row.createdAt / 1000), updatedAt: Math.floor(row.updatedAt / 1000),
       status: { type: this.active.has(row.id) ? "active" : "idle" }, turns: [], archived: row.archived };
@@ -211,6 +212,7 @@ export class ClaudeService {
       // Explicit fork is entirely local, including binding lookup. The next
       // user turn refreshes actual account identity before any model request.
       const model = p.model ?? row.model, binding = this.bindings.resolve(row.userId, model);
+      const forkEffort=this.bindings.effort(row.userId,model,p.effort);
       this.refreshUsageCache(); this.usage.assertAvailable(binding);
       const project = this.store.getProject(p.projectId ?? row.projectId, row.userId);
       if (!project) throw new Error("目标项目不存在。");
@@ -242,7 +244,7 @@ export class ClaudeService {
       const target = locateClaudeHistory(nativeSessionId, [binding.configRoot]);
       if (target) this.rememberArchive(child, target);
       this.storage.save(child);
-      this.store.registerThreadOwner({ threadId: child.id, userId: child.userId, projectId: child.projectId, rootPath: child.cwd, model, reasoningEffort: "medium" });
+      this.store.registerThreadOwner({ threadId: child.id, userId: child.userId, projectId: child.projectId, rootPath: child.cwd, model, reasoningEffort: forkEffort??"medium" });
       return { thread: this.summary(child) };
     });
     if (method === "turn/start") return this.locked(row.id, async () => {
@@ -252,6 +254,8 @@ export class ClaudeService {
       assertClaudeExecutionAllowed({ prompt, skillNames: parts.filter(part => part.type === "skill").map(part => part.name), executionOrigin: p.executionOrigin });
       if (!prompt.trim()) throw new Error("Prompt is required.");
       const binding = await this.prepare(row, p.model ?? row.model);
+      const effort=this.bindings.effort(row.userId,row.model,p.effort??this.store.getThreadOwner(row.id)?.reasoningEffortOverride);
+      this.store.setThreadModelConfig(row.id,row.userId,row.model,effort??"medium");
       const mode=p.collaborationMode?.mode;
       if(mode!==undefined&&mode!=="plan"&&mode!=="default")throw new Error("Invalid collaboration mode.");
       row.collaborationMode=mode??row.collaborationMode??"default";
@@ -303,6 +307,7 @@ export class ClaudeService {
         this.usage.assertAvailable(binding);
         await runtime.runTurn({ userId: row.userId, threadId: row.id, turnId, cwd: row.cwd, model: row.model, prompt,
           collaborationMode:row.collaborationMode,
+          effort,
           nativeSessionId: row.nativeSessionId, ...(row.initialized ? { resumeSessionId: row.nativeSessionId } : {}) });
       })().catch(error => {
         if (this.closed) return;

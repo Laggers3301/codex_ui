@@ -2,11 +2,13 @@
  * use a reserved prefix so they can never fall through to a Codex provider. */
 export type AgentRuntime = "codex" | "claude-code";
 export type ModelAvailability = "ready" | "not-connected" | "disabled";
+export type ClaudeEffort = "low" | "medium" | "high" | "xhigh" | "max";
 export interface RuntimeModelMetadata {
   runtime?: AgentRuntime;
   nativeModelId?: string;
   availability?: ModelAvailability;
   unavailableReason?: string;
+  supportedEffortLevels?: ClaudeEffort[];
 }
 
 export const CLAUDE_NOT_CONNECTED = "尚未连接 ReClaude 账号，暂时无法使用 Claude。账号连接后需验证可用模型。";
@@ -19,8 +21,8 @@ export function modelIsAvailable(profile: RuntimeModelMetadata): boolean {
   return profile.availability !== "not-connected" && profile.availability !== "disabled";
 }
 
-/** These are model-family previews, not a claim of account entitlement. No
- * Claude reasoning tiers are advertised; effort is a legacy UI storage field. */
+/** Unconnected previews do not advertise effort tiers or account entitlement.
+ * Connected profiles use the native client's supportedEffortLevels. */
 export function claudePendingProfiles() {
   return ["Sonnet", "Opus", "Haiku"].map((family, index) => ({
     id: `reclaude-${family.toLowerCase()}:medium`,

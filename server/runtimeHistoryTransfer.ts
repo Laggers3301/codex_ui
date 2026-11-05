@@ -14,15 +14,17 @@ import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import type { ClaudeConversation } from "./claudeSessionStorage.js";
 
 type Row = Record<string, any>;
+type TransferEffort="low"|"medium"|"high"|"xhigh"|"max"|"ultra";
 const record = (v: unknown): Row => v && typeof v === "object" && !Array.isArray(v) ? v as Row : {};
 export interface TransferMessage { role: "user" | "assistant"; text: string; sourceId?: string; }
 interface Transfer {
   id: string; userId: string; sourceThreadId: string; projectId: string; targetModel: string;
+  sourceTurnId?: string; targetAccountId?: string; targetReasoningEffort?:TransferEffort;
   sourceRuntime: "codex" | "claude-code"; phase: "preparing" | "prepared" | "creating" | "importing" | "completed" | "uncertain";
   sourceName: string; sourceHash?: string; archive?: string; messageCount: number; importedCount: number;
   warnings: string[]; targetThreadId?: string; nativeSessionId?: string; createdAt: number;
 }
-export interface TransferRequest { operationId: string; sourceThreadId: string; userId: string; projectId: string; targetModel: string; targetAccountId?: string; }
+export interface TransferRequest { operationId: string; sourceThreadId: string; userId: string; projectId: string; targetModel: string; targetAccountId?: string; sourceTurnId?: string;targetReasoningEffort?:TransferEffort; }
 const transferServices=new WeakMap<object,RuntimeHistoryTransfer>();
 export function getRuntimeHistoryTransfer(bridge: CodexBridge, store: ProjectStore) {
   let service=transferServices.get(bridge);
@@ -64,7 +66,7 @@ export class RuntimeHistoryTransfer {
   }
   async migrate(input: TransferRequest): Promise<unknown> {
     const existing = this.get(input.operationId);
-    if (existing && (existing.userId !== input.userId || existing.sourceThreadId !== input.sourceThreadId || existing.projectId !== input.projectId || existing.targetModel !== input.targetModel)) {
+    if (existing && (existing.userId !== input.userId || existing.sourceThreadId !== input.sourceThreadId || existing.projectId !== input.projectId || existing.targetModel !== input.targetModel || existing.sourceTurnId !== input.sourceTurnId || existing.targetAccountId !== input.targetAccountId || existing.targetReasoningEffort !== input.targetReasoningEffort)) {
       throw new AppError("migration_conflict", "迁移请求标识已用于另一个目标，请重新打开迁移窗口。");
     }
     const running = this.active.get(input.operationId);
@@ -95,7 +97,7 @@ export class RuntimeHistoryTransfer {
     if (isReclaudeModel(input.targetModel)) this.claude.usage.assertAvailable(this.claude.bindings.resolve(input.userId, input.targetModel));
     if (!row) {
       row = { id: input.operationId, sourceThreadId: input.sourceThreadId, userId: input.userId, projectId: input.projectId,
-        targetModel: input.targetModel, sourceRuntime, sourceName: "会话", phase: "preparing", messageCount: 0, importedCount: 0,
+        targetModel: input.targetModel, sourceTurnId:input.sourceTurnId, targetAccountId:input.targetAccountId,targetReasoningEffort:input.targetReasoningEffort, sourceRuntime, sourceName: "会话", phase: "preparing", messageCount: 0, importedCount: 0,
         warnings: [], createdAt: Date.now() };
       this.save(row);
     }
@@ -122,7 +124,12 @@ export class RuntimeHistoryTransfer {
     if(isReclaudeModel(row.targetModel))this.claude.storage.reserve(row.id);
     try {
       if (isReclaudeModel(row.targetModel)) await this.importClaude(row, project.rootPath);
-      else await this.importCodex(row, project, input.targetAccountId);
+      else {
+        const execution=this.store.getThreadExecutionSettings(input.sourceThreadId,input.userId);
+        await this.importCodex(row,execution?{...project,defaultSandbox:execution.sandbox,defaultApprovalPolicy:execution.approvalPolicy}:project,input.targetAccountId);
+      }
+      const execution=this.store.getThreadExecutionSettings(input.sourceThreadId,input.userId);
+      this.store.setThreadExecutionSettings(row.targetThreadId!,input.userId,execution?.sandbox??project.defaultSandbox,execution?.approvalPolicy??project.defaultApprovalPolicy);
       row.phase = "completed"; this.save(row);
       this.store.updateThreadDisplayName(row.targetThreadId!, row.userId, `${row.sourceName} · 迁移`);
       return this.result(row);
@@ -144,8 +151,16 @@ export class RuntimeHistoryTransfer {
     this.claude.storage.db.prepare("DELETE FROM runtime_transfer_items WHERE transfer_id=?").run(row.id);
     const insert=this.claude.storage.db.prepare("INSERT INTO runtime_transfer_items VALUES (?,?,?,?)");
     let turnId: string|null=null, skippedInternal=0, rawMessages=0;
+    let claudeCutoff:string|undefined, cutoffFound=false;
+    if(row.sourceRuntime==="claude-code"&&row.sourceTurnId){
+      const selected=this.claude.storage.turn(row.sourceTurnId);
+      if(typeof selected?.nativeMessageId!=="string"||!selected.nativeMessageId||selected.nativeSessionId!==this.claude.storage.get(row.sourceThreadId)?.nativeSessionId)
+        throw new AppError("migration_cutoff_missing","所选轮次没有可确认的原生分支位置，未创建目标会话。");
+      claudeCutoff=selected.nativeMessageId;
+    }
     const seen = new Set<string>();
     for await (const line of rolloutLines(archive)) {
+      if(cutoffFound)break;
       if (!line.trim()) continue;
       const raw=record(JSON.parse(line));
       if (row.sourceRuntime==="codex") {
@@ -169,6 +184,7 @@ export class RuntimeHistoryTransfer {
       } else {
         if(raw.sessionId && raw.sessionId!==this.claude.storage.get(row.sourceThreadId)?.nativeSessionId) throw new AppError("migration_identity_mismatch","Claude 历史标识不一致。");
         if(raw.isSidechain===true)continue;
+        if(claudeCutoff&&raw.uuid===claudeCutoff)cutoffFound=true;
         if(!["user","assistant"].includes(raw.type))continue;
         if(raw.uuid&&seen.has(raw.uuid))continue;if(raw.uuid)seen.add(raw.uuid);
         const message=portableClaudeMessage(raw);
@@ -176,6 +192,12 @@ export class RuntimeHistoryTransfer {
         insert.run(row.id,rawMessages++,null,JSON.stringify(message));
       }
     }
+    if(row.sourceTurnId&&row.sourceRuntime==="codex"){
+      const cutoff=this.claude.storage.db.prepare("SELECT MAX(seq) AS n FROM runtime_transfer_items WHERE transfer_id=? AND turn_id=?").get(row.id,row.sourceTurnId)?.n;
+      if(cutoff===null||cutoff===undefined)throw new AppError("migration_cutoff_missing","未找到所选分支轮次，未创建目标会话。");
+      this.claude.storage.db.prepare("DELETE FROM runtime_transfer_items WHERE transfer_id=? AND seq>?").run(row.id,cutoff as number);
+    }
+    if(claudeCutoff&&!cutoffFound)throw new AppError("migration_cutoff_missing","源记录中没有所选原生分支位置，未创建目标会话。");
     row.messageCount=Number((this.claude.storage.db.prepare("SELECT COUNT(*) AS n FROM runtime_transfer_items WHERE transfer_id=?").get(row.id) as {n:number}).n);
     if(!row.messageCount)throw new AppError("migration_empty","没有可迁移的对话内容，未创建目标会话。");
     row.warnings.push("已迁移用户消息、可见回答和工具记录；工具记录作为文字保留，不会执行。原生内部状态与附件原始数据保存在源记录中。");
@@ -184,6 +206,7 @@ export class RuntimeHistoryTransfer {
   }
   private async importClaude(row: Transfer,cwd:string) {
     const binding=this.claude.bindings.resolve(row.userId,row.targetModel);
+    const effort=this.claude.bindings.effort(row.userId,row.targetModel,row.targetReasoningEffort);
     this.claude.usage.assertAvailable(binding);
     const relative=path.relative(fs.realpathSync(binding.workspaceRoot),fs.realpathSync(cwd));
     if(relative===".."||relative.startsWith(`..${path.sep}`)||path.isAbsolute(relative))throw new AppError("workspace_forbidden","迁移目标工作目录不属于当前用户。");
@@ -212,12 +235,12 @@ export class RuntimeHistoryTransfer {
       name:`${row.sourceName} · 迁移`,model:row.targetModel,orgId:binding.orgId,accountKey:binding.accountKey,configRoot:binding.configRoot,
       initialized:true,archived:false,createdAt:Date.now(),updatedAt:Date.now()};
     this.claude.storage.save(conversation);
-    this.store.registerThreadOwner({threadId:row.targetThreadId,userId:row.userId,projectId:row.projectId,rootPath:cwd,model:row.targetModel,reasoningEffort:"medium"});
+    this.store.registerThreadOwner({threadId:row.targetThreadId,userId:row.userId,projectId:row.projectId,rootPath:cwd,model:row.targetModel,reasoningEffort:effort??"medium"});
   }
   private async importCodex(row:Transfer,project:{rootPath:string;defaultApprovalPolicy:string;defaultSandbox:string},accountId?:string) {
     row.phase="creating";this.save(row);
     const params={cwd:project.rootPath,model:row.targetModel,approvalPolicy:project.defaultApprovalPolicy,sandbox:project.defaultSandbox,
-      threadSource:"user",historyMode:"legacy"};
+      threadSource:"user",historyMode:"legacy",config:{model_reasoning_effort:row.targetReasoningEffort??"medium"}};
     const result=accountId&&isAccountPoolBridge(this.bridge)?await this.bridge.startThreadOnAccount(accountId,params):await this.bridge.request("thread/start",params);
     row.targetThreadId=record(record(result).thread).id;
     if(!row.targetThreadId)throw new Error("Codex 未返回目标会话标识。");
@@ -234,7 +257,7 @@ export class RuntimeHistoryTransfer {
       row.importedCount++;this.save(row);
     }
     await this.bridge.request("thread/name/set",{threadId:row.targetThreadId,name:`${row.sourceName} · 迁移`});
-    this.store.registerThreadOwner({threadId:row.targetThreadId,userId:row.userId,projectId:row.projectId,rootPath:project.rootPath,model:row.targetModel,reasoningEffort:"medium"});
+    this.store.registerThreadOwner({threadId:row.targetThreadId,userId:row.userId,projectId:row.projectId,rootPath:project.rootPath,model:row.targetModel,reasoningEffort:row.targetReasoningEffort??"medium"});
   }
 }
 

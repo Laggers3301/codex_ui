@@ -56,6 +56,19 @@ function fixture(rateLimitInfo?: Record<string,unknown>) {
   return {home,cwd,project,store,service,config,rootA,rootB,binding,events,calls,start,turn};
 }
 describe("Claude conversation switching",()=>{
+  it("passes client-advertised effort to the native SDK and persists the selected tier",async()=>{
+    const f=fixture(),binding=f.service.bindings.resolve("admin","reclaude-sonnet@1");
+    const dir=path.join(f.config.storageDirectory,"model-catalog");fs.mkdirSync(dir,{recursive:true});
+    fs.writeFileSync(path.join(dir,`${binding.accountKey}.json`),JSON.stringify([{value:"sonnet",resolvedModel:"claude-sonnet-5-5",displayName:"Sonnet 5.5",supportsEffort:true,supportedEffortLevels:["medium","high","max"]}]));
+    const id=await f.start();
+    const result=await f.service.request("turn/start",{threadId:id,model:"reclaude-sonnet@1",effort:"max",input:[{type:"text",text:"test"}]}) as any;
+    await vi.waitFor(()=>expect(f.service.storage.turn(result.turn.id)?.status).toBe("completed"));
+    expect(f.calls.at(-1).options.effort).toBe("max");
+    expect(f.service.summary(f.service.storage.get(id)!).configuredReasoningEffort).toBe("max");
+    const count=f.calls.length;
+    await expect(f.service.request("turn/start",{threadId:id,effort:"xhigh",input:[{type:"text",text:"test"}]})).rejects.toThrow(/不支持/);
+    expect(f.calls).toHaveLength(count);
+  });
   it("does not hash and archive the entire native history on ordinary follow-ups", async () => {
     const f = fixture(), id = await f.start();
     const stage = vi.spyOn(claudeStorage, "stageClaudeHistory");

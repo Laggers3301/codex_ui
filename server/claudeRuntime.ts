@@ -22,6 +22,7 @@ export interface VerifiedClaudeBinding {
   configRoot?: string;
 }
 export interface ClaudeTurnInput {
+  effort?: import("../shared/agentRuntime.js").ClaudeEffort;
   userId: string;
   threadId: string;
   turnId: string;
@@ -143,6 +144,7 @@ export class ClaudeRuntime extends EventEmitter {
       for (const key of Object.keys(env)) if (/^(?:CODEX_WEB_|OPENAI_|ARK_|MIMO_|ANTHROPIC_(?:API_KEY|AUTH_TOKEN|BASE_URL)$)/.test(key)) delete env[key];
       state.query = await this.factory(input.prompt, {
         cwd, model: nativeModel,
+        ...(input.effort?{effort:input.effort}:{}),
         pathToClaudeCodeExecutable: binding.executable,
         env: { ...env, RECLAUDE_ORG: binding.orgId, CLAUDE_CODE_DISABLE_WORKFLOWS: "1", ...(binding.configRoot ? { CLAUDE_CONFIG_DIR: binding.configRoot } : {}) },
         abortController: controller,

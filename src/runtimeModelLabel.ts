@@ -3,7 +3,7 @@ import type {ModelProfile} from "./types";
 
 export function runtimeModelLabel(profile: ModelProfile): string {
   if(!isReclaudeModel(profile.model))return profile.model.endsWith("-ark-api")?profile.label.replace(" · Ark API 按量",""):profile.label;
-  const names=[profile.displayName,profile.label].filter((name):name is string=>Boolean(name?.trim())).map(name=>name.includes(" · ")?`${name.split(" · ")[0]} · ReClaude`:name);
+  const names=[profile.displayName,profile.label].filter((name):name is string=>Boolean(name?.trim())).map(name=>name.split(" · ")[0]);
   const versioned=names.find(name=>/\d/.test(name.split(" · ")[0]));
   if(versioned)return versioned;
   const native=profile.nativeModelId?.match(/^claude-([a-z]+)-(\d+)(?:-(\d+))?(?:-\d{8})?$/i);
@@ -16,6 +16,6 @@ export function runtimeModelLabel(profile: ModelProfile): string {
 
 /** Keep the version visible before account labels on narrow mobile controls. */
 export function runtimeModelTriggerLabel(profile: ModelProfile, mobile: boolean): string {
-  const label=runtimeModelLabel(profile);
+  const label=runtimeModelLabel(profile)+(isReclaudeModel(profile.model)&&profile.supportedEffortLevels?.length?` ${profile.effort}`:"");
   return mobile&&isReclaudeModel(profile.model)?label.split(" · ")[0].replace(/^Claude\s+/i,""):label;
 }
