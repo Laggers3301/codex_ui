@@ -108,11 +108,13 @@ import { coalesceToolOutputs, collapseCodeModeWrappers, latestUserTimelineIndex,
 import { ToolReveal } from "./ToolReveal";
 import { RollingToolCount, ToolArrivalList } from "./ToolActivityMotion";
 import { useProviderQuotas, providerRemaining, ProviderQuotaDetails, ProviderFailureSummary } from "./providerQuota";
+import { visibleProviderQuotas } from "./quotaTabs";
 import { isToolSummaryClick, recordToolDisclosurePointerDown } from "./toolDisclosure";
 import { ToolArrivalRegistry } from "./toolArrivalRegistry";
 import { skillReadSummary } from "./skillReadSummary";
 import { toolPresentation } from "./toolPresentation";
 import { activityBundleSummary } from "./activityBundle";
+import { restoreSubmittedText } from "./composerSendDraft";
 import { localizedSkill, skillSection } from "./skillLocalization";
 import { GoalProgress } from "./GoalProgress";
 import { useThreadGoal } from "./threadGoal";
@@ -3912,13 +3914,13 @@ function accountRemainingLabel(account: CodexAccountPoolAccount): string {
 }
 
 function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, currentClaudeOrgId }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean; userId: string; reclaudeStatus: ReclaudeUsageStatus | null; currentClaudeOrgId?: string }) {
-  const providerQuotas = useProviderQuotas(userId);
+  const providerQuotas = visibleProviderQuotas(useProviderQuotas(userId));
   const quotaAccounts = pool?.accounts.filter((entry) => entry.kind !== "api-provider") ?? [];
   const claudeAccounts = reclaudeStatus?.accounts ?? [];
   const accountCount = quotaAccounts.length + providerQuotas.length + claudeAccounts.length;
   const defaultAccount = quotaAccounts.find((entry) => entry.selectedForNewThreads) ?? quotaAccounts[0] ?? null;
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
-  const ids = [...quotaAccounts.map(account => account.id), ...providerQuotas.map(account => `provider:${account.id}`), ...claudeAccounts.map(account => `reclaude:${account.orgId}`)];
+  const ids = [...quotaAccounts.map(account => account.id), ...claudeAccounts.map(account => `reclaude:${account.orgId}`), ...providerQuotas.map(account => `provider:${account.id}`)];
   const defaultId = claudeAccounts.some(account => account.orgId === currentClaudeOrgId) ? `reclaude:${currentClaudeOrgId}` : defaultAccount?.id ?? ids[0];
   const activeId = selectedAccountId && ids.includes(selectedAccountId) ? selectedAccountId : defaultId;
   const selectedProvider = providerQuotas.find(item => `provider:${item.id}` === activeId);
@@ -3946,16 +3948,16 @@ function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, c
                 <strong>{accountRemainingLabel(account)}</strong>
               </button>
             ))}
+            {claudeAccounts.map(account => <button type="button" role="tab" key={`reclaude:${account.orgId}`} data-account-id={`reclaude:${account.orgId}`}
+              aria-selected={account === selectedClaude} title={`ReClaude · ${account.message}`}
+              className={`accountPoolTab ${account === selectedClaude ? "active" : ""} ${account.orgId === currentClaudeOrgId ? "current" : ""} ${account.state === "disabled" ? "lowQuota" : ""}`}
+              onClick={() => setSelectedAccountId(`reclaude:${account.orgId}`)}>
+              <span className="reclaudeAccountName">ReClaude</span><strong>{reclaudeRemainingLabel(account)}</strong>
+            </button>)}
             {providerQuotas.map(item => <button type="button" role="tab" key={`provider:${item.id}`} data-account-id={`provider:${item.id}`}
               aria-selected={item === selectedProvider} title={`${item.name} · ${item.stale ? "缓存用量" : "套餐用量"}`}
               className={`accountPoolTab ${item === selectedProvider ? "active" : ""} ${item.status !== "ready" ? "degraded" : ""}`}
               onClick={() => setSelectedAccountId(`provider:${item.id}`)}><span>{item.name}</span><strong>{providerRemaining(item)}</strong></button>)}
-            {claudeAccounts.map(account => <button type="button" role="tab" key={`reclaude:${account.orgId}`} data-account-id={`reclaude:${account.orgId}`}
-              aria-selected={account === selectedClaude} title={`${account.label} · ${account.message}`}
-              className={`accountPoolTab ${account === selectedClaude ? "active" : ""} ${account.orgId === currentClaudeOrgId ? "current" : ""} ${account.state === "disabled" ? "lowQuota" : ""}`}
-              onClick={() => setSelectedAccountId(`reclaude:${account.orgId}`)}>
-              <span className="reclaudeAccountName">{account.label}</span><strong>{reclaudeRemainingLabel(account)}</strong>
-            </button>)}
           </div>
           {selectedClaude ? <ReclaudeQuotaDetails key={selectedClaude.orgId} account={selectedClaude} cacheError={reclaudeStatus?.cacheError}/> : selectedProvider ? <ProviderQuotaDetails key={selectedProvider.id} item={selectedProvider} formatPeriod={period => rateWindowText({ usedPercent: period.usedPercent, windowDurationMins: null, resetsAt: period.resetsAt ? Date.parse(period.resetsAt) / 1000 : null }, ({ session: "5小时", weekly: "7天", monthly: "月度" } as Record<string, string>)[period.label] ?? period.label)} /> : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
           {!selectedProvider && selectedAccount ? (
@@ -4540,6 +4542,7 @@ export function App() {
   const threadPrefetchesRef = useRef(new Set<string>());
   const promptRequestContextsRef = useRef(new Map<string, PromptRequestContext>());
   const pendingQueuedPromptsRef = useRef(new Map<string, { threadId: string; text: string; uploads: ComposerUpload[] }>());
+  const failedComposerDraftsRef = useRef(new Map<string, Array<{text:string;uploads:ComposerUpload[];skills:string[];reference:ComposerDocumentReference|null}>>());
   const pendingQueueSteersRef = useRef(new Map<string, { threadId: string; entry: QueuedSubmission }>());
   const interruptRequestContextsRef = useRef(new Map<string, TurnInterruptContext>());
   const threadRenameRequestContextsRef = useRef(new Map<string, ThreadRenameRequestContext>());
@@ -9144,6 +9147,22 @@ export function App() {
     }
   }
 
+  function restoreComposerSubmission(draft: {text:string;uploads:ComposerUpload[];skills:string[];reference:ComposerDocumentReference|null}) {
+    setPrompt(current => restoreSubmittedText(current, draft.text));
+    setUploadedFiles(current => [...draft.uploads.filter(file=>!current.some(existing=>existing.path===file.path)), ...current]);
+    setSelectedSkillNames(current => [...new Set([...draft.skills,...current])]);
+    setDocumentReference(current => current ?? draft.reference);
+  }
+
+  useEffect(() => {
+    const key = JSON.stringify([selectedUserId, selectedProject?.id, selectedThread?.id ?? null]);
+    const drafts = failedComposerDraftsRef.current.get(key);
+    if (!drafts) return;
+    failedComposerDraftsRef.current.delete(key);
+    // Older failures precede newer typing; restore in submission order.
+    for (const draft of [...drafts].reverse()) restoreComposerSubmission(draft);
+  }, [selectedUserId, selectedProject?.id, selectedThread?.id]);
+
   async function sendPrompt(mode: "queue" | "steer" = "queue", questionAnswer?: string, predictedPrompt?: string): Promise<boolean> {
     if (!modelIsAvailable(selectedModelProfile)) {
       setError(selectedModelProfile.unavailableReason ?? CLAUDE_NOT_CONNECTED);
@@ -9228,6 +9247,24 @@ export function App() {
     }
     const promptUploads = isQuestionAnswer ? [] : [...uploadedFiles];
     const skillNames = isQuestionAnswer ? [] : selectedSkills.map((skill) => skill.name);
+    const draftScope = JSON.stringify([selectedUserId, selectedProject.id, selectedThread?.id ?? null]);
+    const draftView = threadViewTokenRef.current;
+    const draft = {text:promptText, uploads:promptUploads, skills:skillNames, reference:documentReference};
+    let handedOff = false;
+    const handoff = () => {
+      if (isQuestionAnswer) return;
+      handedOff = true;
+      setPrompt(current => current.trim() === promptText ? "" : current);
+      setUploadedFiles(current => current.filter(file=>!promptUploads.includes(file)));
+      setSelectedSkillNames(current => current.filter(name=>!skillNames.includes(name)));
+      setDocumentReference(current => current === draft.reference ? null : current);
+    };
+    const finishHandoff = (accepted: boolean) => {
+      if (accepted || !handedOff) return;
+      handedOff = false;
+      if (threadViewTokenRef.current === draftView) restoreComposerSubmission(draft);
+      else failedComposerDraftsRef.current.set(draftScope, [...(failedComposerDraftsRef.current.get(draftScope) ?? []), draft]);
+    };
     const reference = !isQuestionAnswer && documentReference?.projectId === selectedProject.id ? (() => { const { projectId: _projectId, ...selection } = documentReference; return selection; })() : undefined;
     const sentPromptText = promptWithUploadedFiles(promptText, promptUploads);
     const visibleText = [skillNames.map((name) => `$${name}`).join(" "), visiblePromptText(promptText, promptUploads)].filter(Boolean).join("\n");
@@ -9249,16 +9286,12 @@ export function App() {
         });
         pendingQueuedPromptsRef.current.set(requestId, { threadId: selectedThread.id, text: promptText, uploads: promptUploads });
         setQueuedSubmissions((current) => [...current, { id: `pending:${requestId}`, input: [{ type: "text", text: sentPromptText }, ...skillNames.map((skill) => ({ type: "skill", name: skill }))], clientUserMessageId: requestId }]);
-        if (!await accepted) return false;
-        if (selectedThreadRef.current?.id !== selectedThread.id) return true;
-        if (!isQuestionAnswer) {
-          setPrompt(current => current.trim() === promptText ? "" : current);
-          setUploadedFiles(current => current.filter(file => !promptUploads.includes(file)));
-          setSelectedSkillNames(current => current.filter(name => !skillNames.includes(name)));
-          setDocumentReference(null);
-        }
-        return true;
+        handoff();
+        const ok = await accepted;
+        finishHandoff(ok);
+        return ok;
       } catch (caught) {
+        finishHandoff(false);
         finishQuestionAnswerAck(requestId, false);
         setError(caught instanceof Error ? caught.message : String(caught));
         return false;
@@ -9356,19 +9389,15 @@ export function App() {
         }
       ]);
       releasePendingPromptBottomHold(requestId, keepAtBottomUntil);
+      handoff();
       if (!isQuestionAnswer) {
         if (isEditedPrompt) setEditingLastPrompt(true);
-        try { if (!await accepted) return false; }
+        try { const ok = await accepted; finishHandoff(ok); return ok; }
         finally { if (isEditedPrompt) setEditingLastPrompt(false); }
-        if (threadViewTokenRef.current !== requestViewToken) return true;
-        setPrompt(current => current.trim() === promptText ? "" : current);
-        setUploadedFiles(current => current.filter(file => !promptUploads.includes(file)));
-        setSelectedSkillNames(current => current.filter(name => !skillNames.includes(name)));
-        setDocumentReference(null);
-        return true;
       }
       return await accepted;
     } catch (caught) {
+      finishHandoff(false);
       finishQuestionAnswerAck(requestId, false);
       promptRequestContextsRef.current.delete(requestId);
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -10122,8 +10151,6 @@ export function App() {
           pendingQueuedPromptsRef.current.delete(message.requestId);
           if (!message.ok && pending) {
             setQueuedSubmissions((current) => current.filter((entry) => entry.id !== `pending:${message.requestId}`));
-            setPrompt((current) => current || pending.text);
-            setUploadedFiles((current) => current.length ? current : pending.uploads);
             setError(`排队发送失败：${message.error ?? "Codex 未接受排队请求。"}`);
           } else if (message.ok && requestThreadId) {
             requestQueuedSubmissions(requestThreadId);

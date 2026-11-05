@@ -6,6 +6,24 @@ import {describe,it,expect} from "vitest";
 import {ClaudeBindings,claudeModelEntries} from "./claudeBindings.js";
 
 describe("native Claude model catalogue",()=>{
+  it("shares an admin-authorized binding with separate existing user workspaces only",()=>{
+    const home=fs.mkdtempSync(path.join(os.tmpdir(),"claude-shared-"));
+    try {
+      const users=path.join(home,"users");
+      for(const name of ["alice","bob"])fs.mkdirSync(path.join(users,name),{recursive:true});
+      fs.symlinkSync(path.join(users,"alice"),path.join(users,"alias"));
+      const base=path.join(home,".rec/claude/accounts/11");fs.mkdirSync(path.join(base,"config"),{recursive:true});
+      fs.writeFileSync(path.join(base,"device.json"),JSON.stringify({sk:"fixture",org_id:1}));
+      fs.writeFileSync(path.join(base,"config/.claude.json"),JSON.stringify({oauthAccount:{accountUuid:"fixture-account"}}));
+      const bindings=new ClaudeBindings({home,storageDirectory:path.join(home,"state"),executable:"/bin/true",users:{},sharedUsers:{workspaceDirectory:users,orgIds:["1"]}});
+      expect(bindings.list("alice")[0].workspaceRoot).toBe(path.join(users,"alice"));
+      expect(bindings.list("bob")[0].workspaceRoot).toBe(path.join(users,"bob"));
+      expect(bindings.list("alice")[0].accountKey).toBe(bindings.list("bob")[0].accountKey);
+      for(const name of ["missing","alias","../alice","alice/../bob"])expect(bindings.list(name)).toEqual([]);
+      bindings.config.sharedUsers!.orgIds=["2"];
+      expect(bindings.list("alice")).toEqual([]);
+    } finally {fs.rmSync(home,{recursive:true,force:true});}
+  });
   it("uses the client's versioned ids for execution and keeps legacy family selections working",()=>{
     const home=fs.mkdtempSync(path.join(os.tmpdir(),"claude-models-"));
     try{

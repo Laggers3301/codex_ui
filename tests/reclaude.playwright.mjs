@@ -31,6 +31,9 @@ try {
     localStorage.setItem("codex-v2-expanded-projects-admin",JSON.stringify([project]));
   },meta.projectId);
   const page=await context.newPage();page.on("pageerror",e=>errors.push(e.message));
+  await page.route("**/api/codex/account-pool*",route=>route.fulfill({json:{data:{strategy:"most-remaining",accounts:["100001","100002","100003","100004"].map((id,i)=>({id,label:id,health:"ready",selectedForNewThreads:i===0,assignedThreadCount:0,quota:{rateLimits:{primary:{usedPercent:20,windowDurationMins:300,resetsAt:null}}}}))}}}));
+  await page.route("**/api/codex/provider-quotas*",route=>route.fulfill({json:{data:{items:["mimo","ark"].map(id=>({id,name:id==="ark"?"Ark":"MiMo",status:"ready",periods:[{label:"weekly",usedPercent:20,resetsAt:null}],updatedAt:new Date().toISOString(),stale:false,message:null}))}}}));
+  await page.route("**/api/reclaude/usage",route=>route.fulfill({json:{data:{thresholdPercent:99,accounts:[{orgId:"1",label:"fixture",state:"available",message:"fixture",windows:[{kind:"five_hour",percent:20,resetsAt:Date.now()+3600000,observedAt:Date.now(),source:"response"}],retryAfterSeconds:null}],creations:{limit:5,used:0,remaining:5,windowSeconds:3600,retryAt:null,retryAfterSeconds:0},monitoring:"response-events"}}}));
   const post=async(name,data={})=>{
     const response=await context.request.post(origin+"/api/__test/"+name,{data});assert.ok(response.ok(),await response.text());return response.json();
   };
@@ -53,6 +56,18 @@ try {
     await page.evaluate(() => Promise.all(document.getAnimations().filter(a => a.effect?.getTiming().iterations !== Infinity).map(a => a.finished.catch(() => {}))));
     await page.screenshot({path:`${evidence}/${mobile?"phone":"desktop"}-claude-menu.png`});
     await page.locator(".groupedModelPicker .polishedSelectTrigger").click();
+  }
+  for(const mobile of [false,true]) {
+    await page.setViewportSize(mobile?{width:393,height:852}:{width:1440,height:1000});
+    const quota=page.locator(".quotaButton");
+    if(mobile)await page.locator(".mobileHeaderTitle").click();
+    await quota.dispatchEvent("click");
+    const tabs=page.locator(".accountPoolTabs [role=tab]");await expect(tabs).toHaveCount(6);
+    assert.deepEqual(await tabs.evaluateAll(nodes=>nodes.map(node=>node.getAttribute("data-account-id"))),["100001","100002","100003","100004","reclaude:1","provider:ark"]);
+    await tabs.nth(4).click();await expect(page.getByRole("tabpanel",{name:"ReClaude 额度"})).toBeVisible();
+    assert.ok(await page.locator(".accountPoolPopover").evaluate(node=>{const r=node.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth+1;}));
+    await page.screenshot({path:`${evidence}/${mobile?"phone":"desktop"}-shared-quota.png`});
+    await quota.dispatchEvent("click");
   }
   await page.setViewportSize({width:1440,height:1000});
   await post("claude-begin");

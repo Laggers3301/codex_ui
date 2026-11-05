@@ -11,6 +11,8 @@ const run = promisify(execFile);
 export interface ClaudeIntegrationConfig {
   home: string; executable: string; storageDirectory: string;
   users: Record<string, { workspaceRoot: string; orgIds: string[] }>;
+  /** Server-admin shared binding. Every user retains a separate workspace. */
+  sharedUsers?: { workspaceDirectory: string; orgIds: string[] };
   /** Optional local cache exported by a trusted ReClaude cache reader. Never
    * a Claude OAuth usage URL, shell command, or browser-provided file path. */
   usageCacheFile?: string;
@@ -59,7 +61,18 @@ export class ClaudeBindings {
     }
   }
   list(userId: string): ClaudeBinding[] {
-    const owner = this.config.users[userId]; if (!owner) return [];
+    let owner = this.config.users[userId];
+    const shared = this.config.sharedUsers;
+    if (!owner && shared && /^[a-zA-Z0-9_-]+$/.test(userId)) {
+      try {
+        const root = fs.realpathSync(shared.workspaceDirectory);
+        const workspaceRoot = fs.realpathSync(path.join(root, userId));
+        if (workspaceRoot === path.join(root, userId) && fs.statSync(workspaceRoot).isDirectory()) {
+          owner = { workspaceRoot, orgIds: shared.orgIds };
+        }
+      } catch { /* No existing private workspace; do not grant a broad root. */ }
+    }
+    if (!owner) return [];
     const directory = path.join(this.config.home, ".rec", "claude", "accounts");
     if (!fs.existsSync(directory)) return [];
     const bindings: ClaudeBinding[] = [];

@@ -3,7 +3,7 @@ import type {ModelProfile} from "./types";
 
 export function runtimeModelLabel(profile: ModelProfile): string {
   if(!isReclaudeModel(profile.model))return profile.model.endsWith("-ark-api")?profile.label.replace(" · Ark API 按量",""):profile.label;
-  const names=[profile.displayName,profile.label].filter((name):name is string=>Boolean(name?.trim()));
+  const names=[profile.displayName,profile.label].filter((name):name is string=>Boolean(name?.trim())).map(name=>name.includes(" · ")?`${name.split(" · ")[0]} · ReClaude`:name);
   const versioned=names.find(name=>/\d/.test(name.split(" · ")[0]));
   if(versioned)return versioned;
   const native=profile.nativeModelId?.match(/^claude-([a-z]+)-(\d+)(?:-(\d+))?(?:-\d{8})?$/i);

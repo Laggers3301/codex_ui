@@ -10,9 +10,10 @@ const account:ReclaudeAccountUsage={orgId:"1",label:"组织名",state:"available
 ]};
 it("shows both account windows and their reset times from the existing observation",()=>{
   const html=renderToStaticMarkup(<ReclaudeQuotaDetails account={account} now={now}/>);
-  expect(html).toContain("组织名 Claude 额度");expect(html).toContain("5 小时");expect(html).toContain("周限");
+  expect(html).toContain("ReClaude 额度");expect(html).not.toContain(account.label);expect(html).toContain("5 小时");expect(html).toContain("周限");
   for(const value of ["剩余 81%","已用 19%","剩余 59%","已用 41%","数据时间","重置"])expect(html).toContain(value);
   expect(reclaudeRemainingLabel(account,now)).toBe("59%");
+  expect(html).not.toContain(account.message);
 });
 it("does not treat unknown or elapsed windows as zero usage or full remaining quota",()=>{
   expect(reclaudeRemainingLabel({...account,windows:[]},now)).toBe("--");

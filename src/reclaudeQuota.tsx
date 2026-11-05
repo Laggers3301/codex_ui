@@ -25,7 +25,7 @@ function windowLabel(kind: string): string {
 export function ReclaudeQuotaDetails({ account, cacheError, now = Date.now() }: { account: ReclaudeAccountUsage; cacheError?: string; now?: number }) {
   const kinds = ["five_hour", "seven_day", ...account.windows.filter(window => isReclaudeWeeklyWindow(window.kind) && window.kind !== "seven_day").map(window => window.kind)];
   const observedAt = Math.max(0, ...account.windows.map(window => window.observedAt));
-  return <div className="providerQuotaDetails reclaudeQuotaDetails" role="tabpanel" aria-label={`${account.label} Claude 额度`}>
+  return <div className="providerQuotaDetails reclaudeQuotaDetails" role="tabpanel" aria-label="ReClaude 额度">
     {account.state === "disabled" ? <p className="providerQuotaRestriction" role="status">{account.limitCode === "claude_five_hour_limit" ? "5 小时额度已达上限 · 账号已暂停" : "周用量达到 99% 停用阈值 · 账号已停用"}</p> : null}
     <div className="quotaPopoverRows">
       {kinds.map(kind => {
@@ -41,7 +41,7 @@ export function ReclaudeQuotaDetails({ account, cacheError, now = Date.now() }: 
       })}
       <div className="providerQuotaUpdated"><span>数据时间</span><strong>{observedAt ? dateTime(observedAt) : "待更新"}</strong></div>
     </div>
-    <p>{account.message}</p>
+    {account.state === "disabled" ? <p>{account.message}</p> : null}
     {cacheError ? <p>{cacheError}</p> : null}
   </div>;
 }
