@@ -1,5 +1,6 @@
 import { mergeTimelineItems } from "./conversationTimeline";
 import { parseAgentOperation } from "./subagentPresentation";
+import { activityBundleSummary } from "./activityBundle";
 import type { ThreadItem, ThreadSummary, Turn } from "./types";
 
 export type SubagentRecordGroup = { key: string; turnId: string; items: ThreadItem[]; bundle: boolean };
@@ -16,7 +17,7 @@ export function groupSubagentRecordItems(turnId: string, items: ThreadItem[], pr
   const single = (item: ThreadItem) => rows.push({ key: `${turnId}:${item.id}`, turnId, items: [item], bundle: false });
   const flush = () => {
     if (!pending.length) return;
-    if (pending.some(item => item.type.toLowerCase() !== "reasoning")) {
+    if (activityBundleSummary(pending).bundle) {
       // Retain the existing identity when either older calls are prepended or
       // live calls/a following answer are appended. Open bundles stay open.
       const key = pending.map(item => oldKeys.get(item.id)).find(key => key && !usedKeys.has(key)) ?? `${turnId}:tools:${pending[0].id}`;

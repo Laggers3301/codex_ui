@@ -13,3 +13,5 @@
   font-size:var(--tool-reading-size)!important;
 }
 :root[data-theme] .v2ThinkingLine { font-size:14px!important; }
+.messageItem.toolBundle.reasoningOnlyBundle::before { display:none!important; }
+.messageItem.toolBundle.reasoningOnlyBundle > .reasoningGlyph { position:absolute; left:1px; top:5px; pointer-events:none; }

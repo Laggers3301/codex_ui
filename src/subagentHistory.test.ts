@@ -42,6 +42,14 @@ describe("subagent activity bundles", () => {
   const tool = (id: string): ThreadItem => ({ id, type: "toolCall", tool: "exec", input: "pwd" });
   const thought = (id: string): ThreadItem => ({ id, type: "reasoning", text: "检查文件" });
   const body = (id: string): ThreadItem => ({ id, type: "agentMessage", text: "结果" });
+  it('bundles multiple thoughts without swallowing prose and retains identity when tools arrive',()=>{
+    expect(groupSubagentRecordItems('turn',[thought('r1')])[0].bundle).toBe(false);
+    const initial=groupSubagentRecordItems('turn',[thought('r1'),thought('r2'),body('answer')]);
+    expect(initial.map(row=>[row.bundle,row.items.map(item=>item.id)])).toEqual([[true,['r1','r2']],[false,['answer']]]);
+    const mixed=groupSubagentRecordItems('turn',[thought('r1'),thought('r2'),tool('t1')],initial);
+    expect(mixed[0].key).toBe(initial[0].key);
+    expect(mixed[0].items).toHaveLength(3);
+  });
   it("groups consecutive calls/thoughts but never swallows prose or the next activity block", () => {
     const rows = groupSubagentRecordItems("turn", [body("start"), thought("r1"), tool("t1"), tool("t2"), body("answer"), tool("t3")]);
     expect(rows.map(row => [row.bundle, row.items.map(item => item.id)])).toEqual([
@@ -55,11 +63,11 @@ describe("subagent activity bundles", () => {
     const older = groupSubagentRecordItems("turn", [tool("older"), thought("r1"), tool("t1"), tool("t2"), body("answer")], complete);
     expect([live[0].key, complete[0].key, older[0].key]).toEqual([first[0].key, first[0].key, first[0].key]);
   });
-  it("does not bundle thinking-only summaries or standalone delegation cards", () => {
+  it("bundles thinking-only summaries but keeps standalone delegation cards separate", () => {
     const dispatch: ThreadItem = { id: "child", type: "toolCall", tool: "spawn_agent", input: { task_name: "worker" } };
     const rows = groupSubagentRecordItems("turn", [thought("r1"), thought("r2"), dispatch, tool("t1")]);
-    expect(rows.map(row => row.bundle)).toEqual([false, false, false, true]);
-    expect(rows[2].items[0]).toBe(dispatch);
+    expect(rows.map(row => row.bundle)).toEqual([true, false, true]);
+    expect(rows[1].items[0]).toBe(dispatch);
   });
   it("keeps file changes in activity and unpaired outputs visible outside the bundle", () => {
     const rows = groupSubagentRecordItems("turn", [tool("t1"), { id: "file", type: "fileChange", changes: [] }, { id: "output", type: "toolResult", output: "unpaired" }, body("answer")]);

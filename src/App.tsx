@@ -107,6 +107,7 @@ import { isToolSummaryClick, recordToolDisclosurePointerDown } from "./toolDiscl
 import { ToolArrivalRegistry } from "./toolArrivalRegistry";
 import { skillReadSummary } from "./skillReadSummary";
 import { toolPresentation } from "./toolPresentation";
+import { activityBundleSummary } from "./activityBundle";
 import { localizedSkill, skillSection } from "./skillLocalization";
 import { GoalProgress } from "./GoalProgress";
 import { useThreadGoal } from "./threadGoal";
@@ -9200,7 +9201,7 @@ export function App() {
     if (selectedThread && selectedActiveTurnId && mode === "queue") {
       const requestId = `queue-add-${requestToken()}`;
       try {
-        const accepted = isQuestionAnswer ? waitForQuestionAnswerAck(requestId) : null;
+        const accepted = waitForQuestionAnswerAck(requestId, "尚未确认排队消息已被接收，草稿和附件仍保留，请核对后重试。");
         codexSocket.send({
           type: "turn.queue.add",
           serviceTier: resolveServiceTier(codexFastModeEnabled),
@@ -9215,13 +9216,15 @@ export function App() {
         });
         pendingQueuedPromptsRef.current.set(requestId, { threadId: selectedThread.id, text: promptText, uploads: promptUploads });
         setQueuedSubmissions((current) => [...current, { id: `pending:${requestId}`, input: [{ type: "text", text: sentPromptText }, ...skillNames.map((skill) => ({ type: "skill", name: skill }))], clientUserMessageId: requestId }]);
+        if (!await accepted) return false;
+        if (selectedThreadRef.current?.id !== selectedThread.id) return true;
         if (!isQuestionAnswer) {
-          setPrompt("");
-          setUploadedFiles([]);
-          setSelectedSkillNames([]);
+          setPrompt(current => current.trim() === promptText ? "" : current);
+          setUploadedFiles(current => current.filter(file => !promptUploads.includes(file)));
+          setSelectedSkillNames(current => current.filter(name => !skillNames.includes(name)));
           setDocumentReference(null);
         }
-        return accepted ? await accepted : true;
+        return true;
       } catch (caught) {
         finishQuestionAnswerAck(requestId, false);
         setError(caught instanceof Error ? caught.message : String(caught));
@@ -9292,7 +9295,7 @@ export function App() {
           ...(threadContextFeatureEnabled && newThreadContextPin.trim() ? { contextPin: newThreadContextPin.trim() } : {})
         };
     try {
-      const accepted = isQuestionAnswer || isEditedPrompt ? waitForQuestionAnswerAck(requestId, isEditedPrompt ? "尚未确认修改后的提问已被接收，草稿和附件仍保留，请核对会话后重试。" : undefined) : null;
+      const accepted = waitForQuestionAnswerAck(requestId, isQuestionAnswer ? undefined : "尚未确认提问已被接收，草稿和附件仍保留，请核对会话后重试。", isQuestionAnswer ? 30_000 : 90_000);
       codexSocket.send(payload);
       if (payload.type !== "turn.steer") {
         setTopAnchoredPrompt({ requestId, threadId: selectedThread?.id ?? null, turnId: null, viewToken: requestViewToken });
@@ -9320,24 +9323,18 @@ export function App() {
         }
       ]);
       releasePendingPromptBottomHold(requestId, keepAtBottomUntil);
-      if (isEditedPrompt && accepted) {
-        setEditingLastPrompt(true);
+      if (!isQuestionAnswer) {
+        if (isEditedPrompt) setEditingLastPrompt(true);
         try { if (!await accepted) return false; }
-        finally { setEditingLastPrompt(false); }
-        if (selectedThreadRef.current?.id !== selectedThread?.id) return true;
+        finally { if (isEditedPrompt) setEditingLastPrompt(false); }
+        if (threadViewTokenRef.current !== requestViewToken) return true;
         setPrompt(current => current.trim() === promptText ? "" : current);
         setUploadedFiles(current => current.filter(file => !promptUploads.includes(file)));
         setSelectedSkillNames(current => current.filter(name => !skillNames.includes(name)));
         setDocumentReference(null);
         return true;
       }
-      if (!isQuestionAnswer) {
-        setPrompt("");
-        setUploadedFiles([]);
-        setSelectedSkillNames([]);
-        setDocumentReference(null);
-      }
-      return accepted ? await accepted : true;
+      return await accepted;
     } catch (caught) {
       finishQuestionAnswerAck(requestId, false);
       promptRequestContextsRef.current.delete(requestId);
@@ -9381,13 +9378,13 @@ export function App() {
     return questionHasAnswer(turns.flatMap(turn => turn.items ?? []), itemId);
   }
 
-  function waitForQuestionAnswerAck(requestId: string, timeoutMessage = "尚未确认答案已被接收，请刷新会话后重试。"): Promise<boolean> {
+  function waitForQuestionAnswerAck(requestId: string, timeoutMessage = "尚未确认答案已被接收，请刷新会话后重试。", timeoutMs = 30_000): Promise<boolean> {
     return new Promise(resolve => {
       const timer = window.setTimeout(() => {
         questionAnswerAcksRef.current.delete(requestId);
         setError(timeoutMessage);
         resolve(false);
-      }, 30_000);
+      }, timeoutMs);
       questionAnswerAcksRef.current.set(requestId, { resolve, timer });
     });
   }
@@ -10892,20 +10889,8 @@ export function App() {
   };
 
   const summarizeToolBundleTitle = (bundleItems: ThreadItem[], arrive = false): ReactNode => {
-    const toolCallItems = bundleItems.filter((item) => safeText(item.type).toLowerCase() === "toolcall");
-    const callToolNames = Array.from(new Set(
-      bundleItems
-        .filter((item) => safeText(item.type).toLowerCase() === "toolcall")
-        .map((item) => safeText(item.tool).trim())
-        .filter(Boolean)
-    ));
-    const displayedCount = toolCallItems.length > 0 ? toolCallItems.length : bundleItems.length;
-    const toolLabel = callToolNames.length === 1
-      ? callToolNames[0]
-      : callToolNames.length > 1
-        ? "工具"
-        : "tool";
-    return <>调用工具 · {toolLabel} × <RollingToolCount count={Math.max(1, displayedCount)} arrive={arrive} /></>;
+    const summary = activityBundleSummary(bundleItems);
+    return <>{summary.hasTools ? `调用工具 · ${summary.toolLabel}` : '思考'} × <RollingToolCount count={Math.max(1, summary.count)} arrive={arrive} /></>;
   };
 
   const renderPersistedToolBundle = (
@@ -10925,10 +10910,11 @@ export function App() {
     const running = hasRunningTool;
     const expanded = Boolean(expandedToolBundles[bundleId]);
     const bundleGroups = getToolBundleGroups(bundleItems);
+    const reasoningOnly = !activityBundleSummary(bundleItems).hasTools;
     const arrive = toolArrivals.current.belongsToLiveView(bundleItems[0]?.id ?? "", threadViewTokenRef.current);
     return (
       <article
-        className={`messageItem kind-tool type-toolCall toolBundle${arrive ? " toolBundleArrival" : ""}${expanded ? " toolExpanded" : ""}${shimmering ? " live toolBundleShimmering" : ""}${running ? " toolBundleRunning" : ""}`}
+        className={`messageItem kind-tool type-toolCall toolBundle${reasoningOnly ? " reasoningOnlyBundle" : ""}${arrive ? " toolBundleArrival" : ""}${expanded ? " toolExpanded" : ""}${shimmering ? " live toolBundleShimmering" : ""}${running ? " toolBundleRunning" : ""}`}
         key={bundleId}
         data-message-key={bundleId}
         aria-expanded={expanded}
@@ -10951,6 +10937,7 @@ export function App() {
           });
         }}
       >
+        {reasoningOnly ? <ReasoningGlyph /> : null}
         <div className={`messageMeta toolBundleTitle${shimmering ? " live" : ""}`}>
           <span className="toolBundleTitleLabel">{summarizeToolBundleTitle(bundleItems, arrive)}</span>
         </div>
@@ -11140,7 +11127,7 @@ export function App() {
     let toolBundleIndex = 0;
     const flushTools = () => {
       if (!pendingTools.length) return;
-      if (pendingTools.some((item) => itemKind(item) === "tool")) {
+      if (activityBundleSummary(pendingTools).bundle) {
         rendered.push(renderPersistedToolBundle(
           `temporary-${turn.id}-tools-${toolBundleIndex++}`,
           [...pendingTools],
@@ -13406,12 +13393,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     // A late public reasoning summary may precede the calls.
                     // Keep the bundle anchored to its first actual tool so it
                     // does not remount or forget expansion when that fills in.
-                    const bundleAnchor = pendingToolGroup.find(item => itemKind(item) === "tool") ?? pendingToolGroup[0];
+                    const firstBundleId = `${turn.id}-toolbundle-${pendingToolGroup[0].id}`;
+                    const bundleAnchor = expandedToolBundles[firstBundleId] ? pendingToolGroup[0]
+                      : pendingToolGroup.find(item => itemKind(item) === "tool") ?? pendingToolGroup[0];
                     const bundleId = `${turn.id}-toolbundle-${bundleAnchor.id}`;
                     const isLiveRunningTurn = Boolean(selectedActiveTurnId && turn.id === selectedActiveTurnId);
                     const keepShimmering = isLiveRunningTurn && !answerAlreadyStarting;
                     const isBundleComplete = !isLiveRunningTurn || pendingToolGroup.every((toolItem) => safeText(toolItem.type).toLowerCase() !== "toolcall" || toolItem.completed !== false);
-                    if (pendingToolGroup.some((item) => itemKind(item) === "tool")) {
+                    if (activityBundleSummary(pendingToolGroup).bundle) {
                       renderedHistoryItems.push(
                         renderPersistedToolBundle(
                           bundleId,
