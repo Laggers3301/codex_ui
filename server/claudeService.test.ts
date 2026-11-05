@@ -55,6 +55,45 @@ function fixture(rateLimitInfo?: Record<string,unknown>) {
   return {home,cwd,project,store,service,config,rootA,rootB,binding,events,calls,start,turn};
 }
 describe("Claude conversation switching",()=>{
+  it("keeps inherited history contiguous when a page reaches its byte budget", async () => {
+    const f = fixture(), parent = await f.start(), child = await f.start();
+    const text = "x".repeat(2 * 1024 ** 2);
+    for (let i = 0; i < 2; i++) f.service.storage.saveTurn(parent, {id:`parent-${i}`, text});
+    for (let i = 0; i < 4; i++) f.service.storage.saveTurn(child, {id:`child-${i}`, text});
+    const row = f.service.storage.get(child)!;
+    f.service.storage.save({...row, parentThreadId:parent, inheritedTurnCount:2});
+    const first = f.service.history(child);
+    expect(first.thread.turns.map(turn=>turn.id)).toEqual(["child-1", "child-2", "child-3"]);
+    const second = f.service.history(child, first.history.nextBefore);
+    expect(second.thread.turns.map(turn=>turn.id)).toEqual(["parent-0", "parent-1", "child-0"]);
+    expect(second.history.hasOlder).toBe(false);
+  });
+  it("ignores late callbacks and rejections after shutdown without invoking a queued model call", async () => {
+    const f = fixture(), first = await f.start();
+    await f.service.request("turn/start", {threadId:first, input:[{type:"text", text:"queued"}]});
+    f.service.close(); f.service.close();
+    await new Promise(resolve=>setImmediate(resolve));
+    expect(f.calls).toHaveLength(0);
+  });
+  it("does not write a closed database when an in-flight runtime rejects or emits late events", async () => {
+    const f = fixture(), id = await f.start();
+    let reject!: (error:Error)=>void;
+    const pending = new Promise<void>((_, fail)=>{reject=fail;});
+    const run = vi.spyOn(ClaudeRuntime.prototype, "runTurn").mockImplementation(()=>pending);
+    await f.service.request("turn/start", {threadId:id, input:[{type:"text", text:"pending"}]});
+    await vi.waitFor(()=>expect(run).toHaveBeenCalledOnce());
+    const runtime = run.mock.contexts[0];
+    f.service.close();
+    expect(()=>{
+      runtime.emit("nativeSession", {sessionId:"late"});
+      runtime.emit("rateLimit", {});
+      runtime.emit("serverRequest", {id:"late"});
+      runtime.emit("notification", {method:"turn/completed", params:{}});
+    }).not.toThrow();
+    reject(new Error("late fixture failure"));
+    await new Promise(resolve=>setImmediate(resolve));
+    expect(f.events.some(event=>event.method==="turn/completed")).toBe(false);
+  });
   it.each([
     {code:"claude_weekly_limit",kind:"seven_day",percent:.99},
     {code:"claude_five_hour_limit",kind:"five_hour",percent:1}
@@ -143,6 +182,8 @@ describe("Claude conversation switching",()=>{
     f.store.recordQuestionAnswer(id,"q1","admin",{answers:{one:{answers:["B"]}}});
     const app=Fastify();registerRoutes(app,bridge,f.store,{backgroundIndexing:false});
     try {
+      // CLI catalogue discovery must not block this menu or other providers.
+      vi.spyOn(service.bindings,"refreshModels").mockImplementation(()=>new Promise<void>(()=>{}));
       const models=await app.inject({method:"GET",url:"/api/models"});expect(models.json().data.some((p:any)=>p.model==="reclaude-sonnet@1"&&p.availability==="ready")).toBe(true);
       const response=await app.inject({method:"GET",url:`/api/threads/${id}?projectId=${f.project.id}`});expect(response.statusCode).toBe(200);expect(response.json().thread.turns[0].items[0].text).toBe("已持久化");
       expect(response.json().thread).toMatchObject({configuredModel:"reclaude-sonnet@1",configuredReasoningEffort:"medium"});

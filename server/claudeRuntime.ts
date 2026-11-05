@@ -137,10 +137,14 @@ export class ClaudeRuntime extends EventEmitter {
     };
     adapter.start();
     try {
+      const env = { ...process.env };
+      // The bound wrapper supplies Claude auth. Do not forward another provider's
+      // backend credentials (or an unrelated inherited Anthropic login) to tools.
+      for (const key of Object.keys(env)) if (/^(?:CODEX_WEB_|OPENAI_|ARK_|MIMO_|ANTHROPIC_(?:API_KEY|AUTH_TOKEN|BASE_URL)$)/.test(key)) delete env[key];
       state.query = await this.factory(input.prompt, {
         cwd, model: nativeModel,
         pathToClaudeCodeExecutable: binding.executable,
-        env: { ...process.env, RECLAUDE_ORG: binding.orgId, CLAUDE_CODE_DISABLE_WORKFLOWS: "1", ...(binding.configRoot ? { CLAUDE_CONFIG_DIR: binding.configRoot } : {}) },
+        env: { ...env, RECLAUDE_ORG: binding.orgId, CLAUDE_CODE_DISABLE_WORKFLOWS: "1", ...(binding.configRoot ? { CLAUDE_CONFIG_DIR: binding.configRoot } : {}) },
         abortController: controller,
         permissionMode: input.collaborationMode === "plan" ? "plan" : "default",
         canUseTool,

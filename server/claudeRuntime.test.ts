@@ -11,7 +11,7 @@ import { CodexBridge } from "./codexBridge.js";
 import { approvalResponse } from "../shared/approvals.js";
 
 const directories: string[] = [];
-afterEach(() => { for (const p of directories.splice(0)) fs.rmSync(p, { recursive: true, force: true }); vi.restoreAllMocks(); });
+afterEach(() => { for (const p of directories.splice(0)) fs.rmSync(p, { recursive: true, force: true }); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 function workspace() { const p = fs.mkdtempSync(path.join(os.tmpdir(), "claude-adapter-")); directories.push(p); return p; }
 const init = { type: "system", subtype: "init", session_id: "native-session", model: "sonnet", tools: ["Read", "Bash", "Skill"], skills: ["pdf"], mcp_servers: [{name: "fixture", status: "connected", secret: "not-public"}], apiKeySource: "not-public" };
 const success = { type: "result", subtype: "success", is_error: false, result: "检查完成", session_id: "native-session", usage: { input_tokens: 10, output_tokens: 5 } };
@@ -50,12 +50,16 @@ describe("Claude runtime boundaries", () => {
   });
 
   it("retains native skills/tool configuration and resumes only the adapter's own session mapping", async () => {
+    for (const key of ["OPENAI_API_KEY", "ARK_PAY_API_KEY", "MIMO_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CODEX_WEB_PRIVATE_CONFIG"]) vi.stubEnv(key, "fixture-backend-secret");
+    vi.stubEnv("HTTPS_PROXY", "http://fixture-proxy:8080");
     const factory = vi.fn(async () => query([init,success])); const {runtime,input,notifications} = fixture(factory);
     await runtime.runTurn(input);
     await runtime.runTurn({...input,turnId:"turn-b"});
     const options = (factory.mock.calls as unknown as Array<[string, Options]>).map(c=>c[1]);
     expect(options[0]).toMatchObject({cwd:input.cwd,model:"sonnet",permissionMode:"default",includePartialMessages:true,settingSources:["user","project","local"],tools:{type:"preset",preset:"claude_code"},env:{RECLAUDE_ORG:"org-1"}});
     expect(options[0].resume).toBeUndefined(); expect(options[1].resume).toBe("native-session");
+    expect(JSON.stringify(options[0].env)).not.toContain("fixture-backend-secret");
+    expect(options[0].env?.HTTPS_PROXY).toBe("http://fixture-proxy:8080");
     expect(JSON.stringify(notifications)).not.toContain("not-public");
     expect(notifications.find(e=>e.method==="runtime/initialized")?.params).toMatchObject({skills:["pdf"],tools:["Read","Bash","Skill"]});
     expect(()=>runtime.sessionForThread("bob",input.threadId)).toThrow();

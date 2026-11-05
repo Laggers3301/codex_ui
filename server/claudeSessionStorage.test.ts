@@ -24,6 +24,20 @@ export function historyFixture(root: string, id = randomUUID()) {
   return { file, id, assistantId, rows };
 }
 describe("global ReClaude session ledger", () => {
+  it("pages by bytes before reading bodies and preserves every original turn", () => {
+    const db = new ClaudeSessionStorage(temp(), () => 1000); databases.push(db);
+    for (let i = 0; i < 5; i++) db.saveTurn("large", {id:`large-${i}`, text:"中".repeat(700_000)});
+    expect(db.turns("large", 50).map(turn => turn.id)).toEqual(["large-2", "large-3", "large-4"]);
+    expect(db.turns("large", 50, 3).map(turn => turn.id)).toEqual(["large-0", "large-1"]);
+    expect(db.turnCount("large")).toBe(5);
+    db.saveTurn("oversize", {id:"oversize-turn", status:"inProgress", text:"x".repeat(9 * 1024 ** 2)});
+    expect(() => db.turns("oversize")).toThrow(/安全读取上限/);
+    expect(() => db.turn("oversize-turn")).toThrow(/安全内存读取上限/);
+    db.interruptUnfinishedTurns();
+    expect(db.db.prepare("SELECT json_extract(body, '$.status') AS status, length(CAST(body AS BLOB)) AS bytes FROM turns WHERE id='oversize-turn'").get())
+      .toMatchObject({status:"interrupted", bytes:expect.any(Number)});
+    expect(db.turnCount("oversize")).toBe(1);
+  });
   it("shares all five slots across connections, retains them on restart, and expires on the rolling boundary", () => {
     const root = temp(); let now = 1_000_000;
     const first = new ClaudeSessionStorage(root, () => now), second = new ClaudeSessionStorage(root, () => now); databases.push(first, second);

@@ -16,6 +16,7 @@ import { assertClaudeExecutionAllowed } from "./claudeExecutionPolicy.js";
 import { ClaudeSessionStorage, claudeConfigRoots, locateClaudeHistory, stageClaudeHistory, hashClaudeHistory, type ClaudeConversation } from "./claudeSessionStorage.js";
 import { ReclaudeUsageMonitor } from "./reclaudeUsage.js";
 import type { ReclaudeUsageStatus } from "../shared/reclaudeUsage.js";
+import { MAX_FULL_HISTORY_BYTES } from "./rolloutStorage.js";
 
 type RecordValue = Record<string, any>;
 const object = (v: unknown): RecordValue => v && typeof v === "object" && !Array.isArray(v) ? v as RecordValue : {};
@@ -35,6 +36,7 @@ export function assertRuntimeModel(bridge: object, userId: string, params: unkno
 }
 
 export class ClaudeService {
+  private closed = false;
   readonly bindings: ClaudeBindings;
   readonly storage: ClaudeSessionStorage;
   readonly usage: ReclaudeUsageMonitor;
@@ -61,9 +63,7 @@ export class ClaudeService {
       this.usageTimer.unref();
     }
     // A backend restart never repeats an uncertain model invocation.
-    for (const row of this.storage.list()) for (const turn of this.storage.turns(row.id, 1)) {
-      if (turn.status === "inProgress") this.storage.saveTurn(row.id, { ...turn, status: "interrupted", error: { message: "服务重启，本轮结果尚未确认。请检查记录后继续。" } });
-    }
+    this.storage.interruptUnfinishedTurns();
   }
   owns(id: string): boolean { return !!this.storage.get(id); }
   private refreshUsageCache() {
@@ -106,14 +106,17 @@ export class ClaudeService {
   }
   list(userId: string, projectId: string) { return this.storage.list(userId, projectId).map(row => this.summary(row)); }
   private count(row: ClaudeConversation) { return (row.inheritedTurnCount ?? 0) + this.storage.turnCount(row.id); }
-  private turns(row: ClaudeConversation, limit: number, before = 0): RecordValue[] {
+  private turns(row: ClaudeConversation, limit: number, before = 0, maxBytes = MAX_FULL_HISTORY_BYTES): RecordValue[] {
     const ownCount = this.storage.turnCount(row.id);
-    const own = before < ownCount ? this.storage.turns(row.id, Math.min(limit, ownCount - before), before) : [];
+    const ownLimit = before < ownCount ? Math.min(limit, ownCount - before) : 0;
+    const own = ownLimit ? this.storage.turns(row.id, ownLimit, before, maxBytes) : [];
     const inherited = row.parentThreadId && row.inheritedTurnCount ? this.storage.get(row.parentThreadId) : null;
-    if (!inherited || own.length >= limit) return own;
+    // A byte-limited own page must not jump over its remaining turns to the parent.
+    if (!inherited || own.length >= limit || own.length < ownLimit) return own;
     const skipped = Math.max(0, before - ownCount);
     const remaining = Math.max(0, (row.inheritedTurnCount ?? 0) - skipped);
-    return [...(remaining ? this.turns(inherited, Math.min(limit - own.length, remaining), this.count(inherited) - (row.inheritedTurnCount ?? 0) + skipped) : []), ...own];
+    const remainingBytes = maxBytes - own.reduce((sum, turn) => sum + Buffer.byteLength(JSON.stringify(turn)), 0);
+    return [...(remaining && remainingBytes > 0 ? this.turns(inherited, Math.min(limit - own.length, remaining), this.count(inherited) - (row.inheritedTurnCount ?? 0) + skipped, remainingBytes) : []), ...own];
   }
   history(id: string, before = 0, limit = 50) {
     const row = this.row(id), total = this.count(row);
@@ -248,20 +251,24 @@ export class ClaudeService {
       const turn: RecordValue = { id: turnId, status: "inProgress", items: [userItem], nativeSessionId: row.nativeSessionId };
       row.historyArchive = undefined; this.storage.save(row);
       this.storage.saveTurn(row.id, turn); this.active.set(row.id, runtime);
-      runtime.on("nativeCheckpoint", event => { checkpoint = event.messageId; });
+      runtime.on("nativeCheckpoint", event => { if (!this.closed) checkpoint = event.messageId; });
       runtime.on("rateLimit", event => {
+        if (this.closed) return;
         this.usage.observeResponse(binding.accountKey, event);
         this.emit("notification", { method: "runtime/reclaudeUsage", params: { threadId: row.id, usage: this.usageStatus(row.userId) } });
       });
       runtime.on("nativeSession", event => {
+        if (this.closed) return;
         if (event.sessionId !== row.nativeSessionId) { runtime.interrupt(row.userId, row.id); return; }
         row.initialized = true; this.storage.save(row);
       });
       runtime.on("serverRequest", event => {
+        if (this.closed) return;
         this.approvals.set(event.id, { ...event, receivedAt: new Date().toISOString(), runtime, userId: row.userId });
         this.emit("serverRequest", event);
       });
       runtime.on("notification", (event: RpcEnvelope) => {
+        if (this.closed) return;
         const params = object(event.params);
         if (event.method === "turn/started") params.turn.items = [userItem];
         if (event.method === "turn/completed") {
@@ -281,6 +288,7 @@ export class ClaudeService {
         this.emit("notification", event);
       });
       setImmediate(() => void (async () => {
+        if (this.closed) return;
         // Another turn on the same Claude identity can report a stop after
         // this request was accepted but before its native query starts.
         this.usage.assertAvailable(binding);
@@ -288,6 +296,7 @@ export class ClaudeService {
           collaborationMode:row.collaborationMode,
           nativeSessionId: row.nativeSessionId, ...(row.initialized ? { resumeSessionId: row.nativeSessionId } : {}) });
       })().catch(error => {
+        if (this.closed) return;
         const failed = { ...turn, status: "failed", error: AppError.from(error).toPublic() };
         this.storage.saveTurn(row.id, failed); this.active.delete(row.id);
         this.emit("notification", { method: "turn/completed", params: { threadId: row.id, turn: failed } });
@@ -325,7 +334,13 @@ export class ClaudeService {
     const pending=this.approvals.get(id);if(!pending)throw new Error("请求已结束。");
     pending.runtime.rejectRequest(pending.userId,id);this.approvals.delete(id);
   }
-  close() { if (this.usageTimer) clearInterval(this.usageTimer); for (const [id, runtime] of this.active) runtime.interrupt(this.row(id).userId, id); this.active.clear(); this.storage.close(); }
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.usageTimer) clearInterval(this.usageTimer);
+    for (const [id, runtime] of this.active) runtime.interrupt(this.row(id).userId, id);
+    this.active.clear(); this.approvals.clear(); this.storage.close();
+  }
 }
 
 export async function offlineFork(sessionId: string, configRoot: string, title: string, cutoff?: string): Promise<string> {

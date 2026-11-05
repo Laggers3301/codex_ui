@@ -3262,7 +3262,11 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
   app.get("/api/models", async (request,reply) => {
     reply.header("Cache-Control","private, no-store");
     const userId=userIdFromRequest(request,store);
-    await claudeService?.bindings.refreshModels(userId);
+    // Return the cached catalogue immediately. CLI discovery can take 30s;
+    // it must not hold up the shared model menu (including GPT and Ark).
+    void claudeService?.bindings.refreshModels(userId).catch(error => {
+      request.log.warn({ err: error }, "Claude model catalogue refresh failed");
+    });
     const profiles=claudeService?.profiles(userId)??[];
     return {
     data: [...availableModelProfiles(), ...(profiles.length ? profiles : claudePendingProfiles())],

@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { AppError } from "./appErrors.js";
 import { remainingTime } from "../shared/reclaudeUsage.js";
+import { HistoryMemoryLimitError, MAX_FULL_HISTORY_BYTES } from "./rolloutStorage.js";
 
 const HOUR = 3_600_000;
 const LIMIT = 5;
@@ -33,6 +34,7 @@ export class ClaudeSessionStorage {
       CREATE INDEX IF NOT EXISTS creations_time ON creations(created_at);
       CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS turns (thread_id TEXT NOT NULL, id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, body TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS turns_thread_time ON turns(thread_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS lineage (native_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS queue (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, created_at INTEGER NOT NULL, body TEXT NOT NULL);
     `);
@@ -77,14 +79,34 @@ export class ClaudeSessionStorage {
   saveTurn(threadId: string, turn: Record<string, unknown>) {
     this.db.prepare("INSERT INTO turns VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body").run(threadId, String(turn.id), this.now(), JSON.stringify(turn));
   }
-  turns(threadId: string, limit = 50, before?: number): Record<string, unknown>[] {
-    const rows = this.db.prepare("SELECT body FROM turns WHERE thread_id=? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?").all(threadId, Math.min(100, Math.max(1, limit)), Math.max(0, before ?? 0)) as Array<{ body: string }>;
-    return rows.reverse().map(row => JSON.parse(row.body));
+  interruptUnfinishedTurns() {
+    // Repair restart metadata in SQLite without loading possibly huge bodies into JS.
+    this.db.prepare("UPDATE turns SET body=json_set(body, '$.status', 'interrupted', '$.error', json(?)) WHERE json_extract(body, '$.status')='inProgress'")
+      .run(JSON.stringify({ message: "服务重启，本轮结果尚未确认。请检查记录后继续。" }));
+  }
+  turns(threadId: string, limit = 50, before = 0, maxBytes = MAX_FULL_HISTORY_BYTES): Record<string, unknown>[] {
+    // Size metadata first: never fetch all bodies and truncate after parsing.
+    const rows = this.db.prepare("SELECT id, length(CAST(body AS BLOB)) AS bytes FROM turns WHERE thread_id=? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?")
+      .all(threadId, Math.min(100, Math.max(1, limit)), Math.max(0, before)) as Array<{ id: string; bytes: number }>;
+    const selected: string[] = [];
+    let bytes = 0;
+    for (const row of rows) {
+      if (bytes + row.bytes > maxBytes) {
+        if (!selected.length && maxBytes === MAX_FULL_HISTORY_BYTES && row.bytes > MAX_FULL_HISTORY_BYTES) throw new HistoryMemoryLimitError("单轮 Claude 历史超过安全读取上限，原始历史未修改；请从原生历史归档查看。");
+        break;
+      }
+      selected.push(row.id); bytes += row.bytes;
+    }
+    const read = this.db.prepare("SELECT body FROM turns WHERE id=?");
+    return selected.reverse().map(id => JSON.parse((read.get(id) as { body: string }).body));
   }
   turnCount(threadId: string): number {
     return (this.db.prepare("SELECT COUNT(*) AS n FROM turns WHERE thread_id=?").get(threadId) as { n: number }).n;
   }
   turn(id: string): Record<string, unknown> | null {
+    const size = this.db.prepare("SELECT length(CAST(body AS BLOB)) AS bytes FROM turns WHERE id=?").get(id) as { bytes: number } | undefined;
+    if (!size) return null;
+    if (size.bytes > MAX_FULL_HISTORY_BYTES) throw new HistoryMemoryLimitError();
     const row = this.db.prepare("SELECT body FROM turns WHERE id=?").get(id) as {body: string} | undefined;
     return row ? JSON.parse(row.body) : null;
   }
