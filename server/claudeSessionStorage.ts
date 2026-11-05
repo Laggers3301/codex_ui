@@ -18,12 +18,14 @@ export interface ClaudeConversation {
   inheritedTurnCount?: number;
   collaborationMode?: "plan" | "default";
 }
+export interface ClaudeBindingMigration { id: string; before: ClaudeConversation; after: ClaudeConversation; }
 
 /** One database for every bound user/account/organization, including forks.
  * A failed or uncertain creation keeps its slot: restarting cannot reset the
  * limit or turn an ambiguous attempt into an uncounted new upstream session. */
 export class ClaudeSessionStorage {
   readonly db: DatabaseSync;
+  private transactionSequence = 0;
   constructor(readonly directory: string, private now = Date.now) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     const file = path.join(directory, "sessions.sqlite");
@@ -37,6 +39,7 @@ export class ClaudeSessionStorage {
       CREATE INDEX IF NOT EXISTS turns_thread_time ON turns(thread_id, created_at DESC);
       CREATE TABLE IF NOT EXISTS lineage (native_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS queue (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, created_at INTEGER NOT NULL, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS binding_migrations (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
     `);
     const columns=this.db.prepare("PRAGMA table_info(creations)").all() as Array<{name:string}>;
     if(!columns.some(column=>column.name==="runtime"))this.db.exec("ALTER TABLE creations ADD COLUMN runtime TEXT NOT NULL DEFAULT 'claude-code'");
@@ -68,9 +71,41 @@ export class ClaudeSessionStorage {
     const row = this.db.prepare("SELECT body FROM conversations WHERE id=?").get(id) as { body: string } | undefined;
     return row ? JSON.parse(row.body) : null;
   }
-  save(row: ClaudeConversation) {
+  private transaction<T>(action: () => T): T {
+    const savepoint = `claude_write_${++this.transactionSequence}`;
+    this.db.exec(`SAVEPOINT ${savepoint}`);
+    try { const result = action(); this.db.exec(`RELEASE ${savepoint}`); return result; }
+    catch (error) { this.db.exec(`ROLLBACK TO ${savepoint}; RELEASE ${savepoint}`); throw error; }
+  }
+  private write(row: ClaudeConversation) {
+    const previous = this.db.prepare("SELECT thread_id FROM lineage WHERE native_id=?").get(row.nativeSessionId) as {thread_id:string}|undefined;
+    if (previous && previous.thread_id !== row.id) throw new AppError("claude_history_conflict", "此原生会话已属于另一条网页会话，未修改记录。");
     this.db.prepare("INSERT INTO conversations VALUES (?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body").run(row.id, JSON.stringify(row));
     this.db.prepare("INSERT INTO lineage VALUES (?,?,?) ON CONFLICT(native_id) DO UPDATE SET body=excluded.body").run(row.nativeSessionId, row.id, JSON.stringify(row));
+  }
+  save(row: ClaudeConversation) { this.transaction(() => this.write(row)); }
+  beginBindingMigration(before: ClaudeConversation, after: ClaudeConversation): ClaudeBindingMigration {
+    if (["id", "userId", "projectId", "cwd"].some(key => before[key as keyof ClaudeConversation] !== after[key as keyof ClaudeConversation])) {
+      throw new AppError("runtime_forbidden", "会话迁移不能更改用户、项目或网页会话归属。");
+    }
+    const migration = { id: randomUUID(), before, after };
+    this.db.prepare("INSERT INTO binding_migrations VALUES(?,?,?)").run(migration.id, before.id, JSON.stringify(migration));
+    return migration;
+  }
+  pendingBindingMigrations(): ClaudeBindingMigration[] {
+    return (this.db.prepare("SELECT body FROM binding_migrations ORDER BY rowid").all() as Array<{body:string}>).map(row => JSON.parse(row.body));
+  }
+  finishBindingMigration(migration: ClaudeBindingMigration) {
+    this.transaction(() => {
+      const pending = this.db.prepare("SELECT 1 FROM binding_migrations WHERE id=?").get(migration.id);
+      if (!pending) return;
+      const current = this.get(migration.before.id);
+      if (!current || (current.nativeSessionId !== migration.before.nativeSessionId && current.nativeSessionId !== migration.after.nativeSessionId)) {
+        throw new AppError("claude_history_conflict", "会话的迁移记录已变化，未覆盖新的会话映射。");
+      }
+      this.write(migration.after);
+      this.db.prepare("DELETE FROM binding_migrations WHERE id=?").run(migration.id);
+    });
   }
   list(userId?: string, projectId?: string): ClaudeConversation[] {
     return (this.db.prepare("SELECT body FROM conversations").all() as Array<{ body: string }>).map(row => JSON.parse(row.body) as ClaudeConversation)

@@ -1,0 +1,15 @@
+.reclaudeAuthScrim {z-index:12060;}
+.reclaudeAuthDialog {width:min(460px,100%);}
+.reclaudeAuthDialog header {display:flex;align-items:center;justify-content:space-between;gap:16px;}
+.reclaudeAuthDialog h2 {margin:0;}
+.reclaudeAuthDialog p {font-size:14px;line-height:1.6;}
+.reclaudeAuthDialog label {display:grid;gap:8px;font-size:14px;}
+.reclaudeAuthDialog select {width:100%;padding:9px;border-radius:8px;background:var(--panel-strong,#303230);color:inherit;border:1px solid var(--line,#6666);}
+.reclaudeAuthDialog footer {display:flex;justify-content:flex-end;gap:10px;margin-top:22px;flex-wrap:wrap;}
+.taskNotificationDialog.reclaudeAuthDialog footer {justify-content:flex-end;}
+.reclaudeAuthDialog footer button,.reclaudeAuthEntry {padding:8px 12px;border-radius:9px;border:1px solid var(--line,#6666);background:var(--panel-strong,#303230);color:inherit;cursor:pointer;}
+.reclaudeAuthDialog button:disabled {opacity:.5;cursor:default;}
+.reclaudeAuthDialog a {color:var(--teal,#91b5ff);}
+.reclaudeAuthStatus {margin-top:18px;overflow-wrap:anywhere;}
+.reclaudeAuthError {color:var(--red,#f88);}
+.reclaudeAuthEntry {margin-top:10px;font-size:12px;}

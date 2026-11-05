@@ -338,6 +338,15 @@ export function listModels(): Promise<{ data: ModelProfile[]; defaultModel: stri
 export function readReclaudeUsage(signal?: AbortSignal): Promise<{data:import("../shared/reclaudeUsage").ReclaudeUsageStatus}> {
   return request("/api/reclaude/usage",{signal,cache:"no-store"});
 }
+export function readReclaudeAuthorization(signal?: AbortSignal): Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
+  return request("/api/reclaude/authorization", {signal,cache:"no-store"});
+}
+export function startReclaudeAuthorization(orgId:string,requestId:string):Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
+  return request("/api/reclaude/authorization/start", {method:"POST",body:JSON.stringify({orgId,requestId}),signal:AbortSignal.timeout(30000)});
+}
+export function cancelReclaudeAuthorization(id:string):Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
+  return request("/api/reclaude/authorization/cancel", {method:"POST",body:JSON.stringify({id}),signal:AbortSignal.timeout(10000)});
+}
 export interface RuntimeMigrationResult {
   threadId:string;sourceThreadId:string;model:string;operationId:string;messageCount:number;warnings:string[];historySourceUrl:string;
 }

@@ -28,7 +28,8 @@ export function useReclaudeUsage(scope: string) {
     void read();const timer=window.setInterval(()=>void read(),30_000);
     document.addEventListener("visibilitychange",read);
     window.addEventListener("focus",read);
-    return()=>{disposed=true;controller.abort();clearInterval(timer);document.removeEventListener("visibilitychange",read);window.removeEventListener("focus",read);};
+    window.addEventListener("reclaude-authenticated",read);
+    return()=>{disposed=true;controller.abort();clearInterval(timer);document.removeEventListener("visibilitychange",read);window.removeEventListener("focus",read);window.removeEventListener("reclaude-authenticated",read);};
   },[scope]);
   return {status:snapshot?.scope===scope?snapshot.data:null,receive};
 }

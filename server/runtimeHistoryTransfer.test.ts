@@ -52,6 +52,23 @@ function fixture(){
     migrate:(source=id,model="gpt-6.1-sol",operationId=randomUUID())=>transfers.migrate({sourceThreadId:source,userId:"admin",projectId:project.id,targetModel:model,operationId})as Promise<any>};
 }
 describe("bidirectional runtime history transfer",()=>{
+  it("accepts native fork ancestry headers after verifying the source header without modifying history",async()=>{
+    const f=fixture(),first=await f.migrate(),file=paths.get(first.threadId)!;
+    const rows=fs.readFileSync(file,'utf8').trim().split('\n');
+    rows.splice(1,0,JSON.stringify({type:'session_meta',payload:{id:randomUUID(),forked_from_id:randomUUID()}}),JSON.stringify({type:'session_meta',payload:{id:randomUUID()}}));
+    fs.writeFileSync(file,rows.join('\n')+'\n');const before=fs.readFileSync(file);
+    const child=await f.migrate(first.threadId,'reclaude-sonnet@1');
+    expect(child.messageCount).toBe(2);expect(JSON.stringify(f.service.history(child.threadId))).toContain('TRANSFER-5520');
+    expect(fs.readFileSync(file)).toEqual(before);expect(f.request.mock.calls.some(([m])=>m==='turn/start')).toBe(false);
+  });
+  it.each(['foreign','missing'])("rejects a %s source header before creating a Claude destination",async(kind)=>{
+    const f=fixture(),first=await f.migrate(),file=paths.get(first.threadId)!;
+    const rows=fs.readFileSync(file,'utf8').trim().split('\n');
+    if(kind==='foreign')rows[0]=JSON.stringify({type:'session_meta',payload:{id:randomUUID()}});else rows.shift();
+    fs.writeFileSync(file,rows.join('\n')+'\n');const before=fs.readFileSync(file),used=f.service.storage.quota().used;
+    await expect(f.migrate(first.threadId,'reclaude-sonnet@1')).rejects.toMatchObject({code:'migration_identity_mismatch'});
+    expect(f.service.storage.quota().used).toBe(used);expect(fs.readFileSync(file)).toEqual(before);
+  });
   it("branches a Codex snapshot only through the selected turn and binds retries to that target",async()=>{
     const f=fixture();
     const first=await f.migrate();

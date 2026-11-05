@@ -1,6 +1,7 @@
 import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
 import { RuntimeMigrationDialog } from "./RuntimeMigrationDialog";
 import { ReclaudeUsage, useReclaudeUsage } from "./ReclaudeUsage";
+import { ReclaudeAuthorizationDialog } from "./ReclaudeAuthorization";
 import { ReclaudeQuotaDetails, reclaudeRemainingLabel } from "./reclaudeQuota";
 import type { ReclaudeUsageStatus } from "../shared/reclaudeUsage";
 import {runtimeModelLabel,runtimeModelTriggerLabel} from "./runtimeModelLabel";
@@ -110,6 +111,7 @@ import { RollingToolCount, ToolArrivalList } from "./ToolActivityMotion";
 import { useProviderQuotas, providerRemaining, ProviderQuotaDetails, ProviderFailureSummary } from "./providerQuota";
 import { visibleProviderQuotas } from "./quotaTabs";
 import {BranchTargetDialog,type BranchTarget} from "./BranchTargetDialog";
+import {profilesByDescendingEffort} from "./effortOrder";
 import { isToolSummaryClick, recordToolDisclosurePointerDown } from "./toolDisclosure";
 import { ToolArrivalRegistry } from "./toolArrivalRegistry";
 import { skillReadSummary } from "./skillReadSummary";
@@ -655,7 +657,7 @@ export function ModelGroupedSelect({
   };
   const branchTitle = lastBranch === "gpt" ? "GPT" : lastBranch === "claude" ? "Claude" : "国产模型";
   const claudeNotice = lastBranch === "claude" && !profiles.some(profile => isReclaudeModel(profile.model) && modelIsAvailable(profile)) ? <p className="groupedModelConnectionNote" role="status">{profiles.find(profile=>isReclaudeModel(profile.model)&&profile.availability==="disabled")?.unavailableReason??"尚未连接 ReClaude。以下为模型系列预览，可用型号将在账号连接后验证。"}</p> : null;
-  const profileOptions = (group: ModelPickerSection) => visibleProfiles.filter((profile) => modelPickerGroup(profile.model) === group).map((profile) => (
+  const profileOptions = (group: ModelPickerSection) => (group==="claude"?profilesByDescendingEffort(visibleProfiles.filter(profile=>modelPickerGroup(profile.model)===group)):visibleProfiles.filter(profile=>modelPickerGroup(profile.model)===group)).map((profile) => (
     <button className={`polishedSelectOption groupedModelProfile${profile.id === value ? " selected" : ""}`}
       type="button" role="option" aria-selected={profile.id === value} key={profile.id}
       disabled={!modelIsAvailable(profile)} title={profile.unavailableReason}
@@ -3914,7 +3916,7 @@ function accountRemainingLabel(account: CodexAccountPoolAccount): string {
   return remaining === null ? "--" : `${percentText(remaining)}%`;
 }
 
-function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, currentClaudeOrgId }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean; userId: string; reclaudeStatus: ReclaudeUsageStatus | null; currentClaudeOrgId?: string }) {
+function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, currentClaudeOrgId, onReauthenticate }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean; userId: string; reclaudeStatus: ReclaudeUsageStatus | null; currentClaudeOrgId?: string; onReauthenticate:(orgId?:string)=>void }) {
   const providerQuotas = visibleProviderQuotas(useProviderQuotas(userId));
   const quotaAccounts = pool?.accounts.filter((entry) => entry.kind !== "api-provider") ?? [];
   const claudeAccounts = reclaudeStatus?.accounts ?? [];
@@ -3981,6 +3983,7 @@ function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, c
           ) : null}
         </>
       ) : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>{loading ? "正在读取额度…" : "暂未读取到额度"}</p>}
+      {selectedClaude ? <button className="reclaudeAuthEntry" type="button" onClick={() => onReauthenticate(selectedClaude.orgId)}>重新认证 ReClaude</button> : null}
     </section>
   );
 }
@@ -4867,6 +4870,7 @@ export function App() {
   const [contextPinSaving, setContextPinSaving] = useState(false);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>(fallbackModelProfiles);
   const {status:reclaudeUsage,receive:receiveReclaudeUsage}=useReclaudeUsage(selectedUserId);
+  const [reclaudeAuthTarget,setReclaudeAuthTarget]=useState<{orgId?:string}|null>(null);
   useEffect(()=>{
     if(!reclaudeUsage)return;
     setModelProfiles(current=>current.map(profile=>{
@@ -11565,6 +11569,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
   }
   const showPromptNavigator = promptNavigationItems.length > 0 || Boolean(selectedThread && threadHistory?.hasOlder);
   const globalEnterSendBlocked = Boolean(
+    reclaudeAuthTarget ||
     notificationSettingsPresence.present ||
     settingsPresence.present ||
     globalSearchPresence.present ||
@@ -11935,6 +11940,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         if(selectedThreadRef.current?.id!==branchTarget.threadId||selectedProject?.id!==branchTarget.projectId){setError("源会话已切换，请回到原会话重新选择分支点。");return false;}
         return createBranchFromTurn({id:branchTarget.turnId},false,target);
       }}/>:null}
+      {reclaudeAuthTarget ? <ReclaudeAuthorizationDialog key={`reclaude-auth:${selectedUserId}`} orgId={reclaudeAuthTarget.orgId}
+        onClose={()=>setReclaudeAuthTarget(null)} onAuthenticated={()=>{void refreshModels();window.dispatchEvent(new Event("reclaude-authenticated"));}}/> : null}
       {runtimeMigration?<RuntimeMigrationDialog key={runtimeMigration.thread.id} threadId={runtimeMigration.thread.id} projectId={runtimeMigration.projectId}
         name={runtimeMigration.thread.name??runtimeMigration.thread.preview??"会话"} sourceClaude={isReclaudeModel(runtimeMigration.thread.configuredModel??selectedProject?.defaultModel)}
         profiles={modelProfiles} usageStatus={reclaudeUsage} initialModel={runtimeMigration.initialModel} onClose={()=>setRuntimeMigration(null)}
@@ -12185,7 +12192,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <div className="directoryDialogHeader">
               <div>
                 <h2 id="directory-browser-title">选择项目目录</h2>
-                <p>{directoryBrowser?.currentPath ?? projectRoot}</p>
+                <p className="directoryCurrentPath" title={directoryBrowser?.currentPath ?? projectRoot}>{directoryBrowser?.currentPath ?? projectRoot}</p>
               </div>
               <button className="iconButton" type="button" onClick={closeDirectoryBrowser} title="关闭">
                 <X size={16} />
@@ -12228,13 +12235,14 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   className="directoryRow"
                   type="button"
                   key={entry.path}
+                  title={entry.path}
+                  aria-label={`打开 ${entry.name}，路径 ${entry.path}`}
                   onClick={() => void openDirectoryBrowser(entry.path)}
                   disabled={directoryBrowserLoading || directoryCreating}
                 >
                   <FolderOpen size={16} />
                   <span>
                     <strong>{entry.name}</strong>
-                    <small>{entry.path}</small>
                   </span>
                 </button>
               ))}
@@ -12654,7 +12662,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 {quotaLoading ? "额度..." : quotaSummaryLabel(quota, accountPool)}
                 <ComposerGlassMaterial variant="topbar" />
               </button>
-              {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} reclaudeStatus={reclaudeUsage} currentClaudeOrgId={isReclaudeModel(selectedModelProfile.model)?selectedModelProfile.model.split("@")[1]:undefined} /> : null}
+              {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} reclaudeStatus={reclaudeUsage} currentClaudeOrgId={isReclaudeModel(selectedModelProfile.model)?selectedModelProfile.model.split("@")[1]:undefined}
+                onReauthenticate={orgId=>{setReclaudeAuthTarget({orgId});setQuotaPopoverPinned(false);setQuotaPopoverOpen(false);}} /> : null}
             </div>
             <button
               className="leaderboardButton"

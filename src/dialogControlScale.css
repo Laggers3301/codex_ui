@@ -1,0 +1,50 @@
+/* Pair typography and geometry; desktop conversation text is untouched. */
+:root {
+  --dialog-text-size:14px;--dialog-text-line:20px;
+  --dialog-title-size:14px;--dialog-title-line:20px;
+  --dialog-control-height:36px;--dialog-control-pad-y:8px;--dialog-control-pad-x:12px;--dialog-control-radius:10px;
+}
+:root :is(.taskNotificationDialog,.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.petPicker,.skillPickerPopover,.temporaryCloseDialog) {
+  font-size:var(--dialog-text-size)!important;line-height:var(--dialog-text-line)!important;
+}
+:root :is(.taskNotificationDialog,.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.petPicker,.skillPickerPopover,.temporaryCloseDialog) :is(p,label,button,button>span,label>span,select,.settingsHint,.emptyState) {
+  font-size:var(--dialog-text-size)!important;line-height:var(--dialog-text-line)!important;
+}
+:root :is(.taskNotificationDialog,.workspaceFeatureDialog,.settingsDialog,.directoryDialog,.renameThreadDialog,.confirmDialog,.globalSearchDialog,.feishuDialog:not(.feishuDocked),.petPicker,.skillPickerPopover,.temporaryCloseDialog) :is(h2,h3,header>strong,.dialogHeader>strong,.settingsHeader>strong) {
+  font-size:var(--dialog-title-size)!important;line-height:var(--dialog-title-line)!important;
+}
+:root :is(.taskNotificationTest,.skillPickerFooter button,.branchChoiceTrigger,.directoryToolbar .iconTextButton,.directoryDialog .dialogActions button) {
+  box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  min-height:var(--dialog-control-height);border:0!important;padding:var(--dialog-control-pad-y) var(--dialog-control-pad-x)!important;
+  font-size:var(--dialog-text-size)!important;line-height:var(--dialog-text-line)!important;font-weight:400!important;
+  border-radius:var(--dialog-control-radius)!important;
+}
+:root .branchChoiceTrigger {justify-content:space-between;}
+:root .skillPickerFooter {flex-shrink:0;grid-template-columns:max-content minmax(0,1fr) max-content;gap:10px;padding:12px 16px;}
+:root .skillPickerFooter button {white-space:nowrap;}
+:root .skillPickerFooter>span {font-size:13px!important;line-height:20px!important;}
+:root :is(.taskNotificationIcon,.directoryDialogHeader>.iconButton,.directoryToolbar>.iconButton) {
+  box-sizing:border-box;display:inline-grid;place-items:center;width:var(--dialog-control-height);height:var(--dialog-control-height);min-width:var(--dialog-control-height);padding:0!important;flex-shrink:0;
+}
+:root .branchChoiceMenu {font-size:var(--dialog-text-size)!important;line-height:var(--dialog-text-line)!important;}
+:root .branchChoiceMenu .polishedSelectOption {box-sizing:border-box;min-height:var(--dialog-control-height);padding:var(--dialog-control-pad-y) var(--dialog-control-pad-x)!important;line-height:var(--dialog-text-line)!important;}
+:root .branchTargetDialog .branchTargetNote {font-size:13px!important;line-height:20px!important;}
+:root .directoryDialogHeader>div {min-width:0;}
+:root .directoryDialog .directoryCurrentPath {margin-top:4px;font-size:13px!important;line-height:20px!important;font-weight:400!important;color:var(--ui-content-muted);overflow-wrap:anywhere;max-height:60px;overflow:auto;}
+:root .directoryDialog .directoryRow {box-sizing:border-box;min-height:40px;padding:8px 10px;gap:10px;border-radius:10px;}
+:root .directoryDialog .directoryRow strong {font-size:var(--dialog-text-size)!important;line-height:var(--dialog-text-line)!important;font-weight:500!important;font-style:normal;}
+:root .directoryDialog .directoryList {padding:6px;}
+:root .exhaustedAccountNotice {box-sizing:border-box;left:clamp(12px,3vw,28px);right:clamp(12px,3vw,28px);width:auto;max-width:none;min-height:52px;padding:8px 12px;gap:12px;}
+:root .exhaustedAccountNoticeCopy {flex:1;font-size:13px;line-height:20px;white-space:normal;overflow:visible;text-overflow:clip;}
+:root .exhaustedAccountNoticeActions {gap:8px;}
+:root .exhaustedAccountNoticeActions button {box-sizing:border-box;min-height:36px;padding:8px 12px;font-size:14px;line-height:20px;font-weight:400;border-radius:10px;}
+@media(max-width:720px) {
+  :root {--dialog-text-size:15px;--dialog-text-line:22px;--dialog-title-size:16px;--dialog-title-line:24px;--dialog-control-height:44px;--dialog-control-pad-y:11px;--dialog-control-pad-x:14px;--dialog-control-radius:12px;}
+  :root .directoryDialog .directoryRow {min-height:44px;padding-block:11px;}
+  :root .skillPickerFooter {padding-bottom:max(12px,env(safe-area-inset-bottom));gap:8px;}
+  :root .exhaustedAccountNotice {left:12px;right:12px;width:auto;max-width:none;gap:10px;padding:8px 10px;}
+  :root .exhaustedAccountNoticeActions button {min-height:44px;padding:11px 12px;font-size:15px;line-height:22px;}
+  :root .taskNotificationSwitch {display:flex;align-items:center;width:44px;height:28px;}
+  :root .taskNotificationSwitch[aria-checked="true"] span {transform:translateX(19px);}
+  :root .taskNotificationSwitch::after {content:"";position:absolute;inset:-8px 0;border-radius:inherit;}
+}

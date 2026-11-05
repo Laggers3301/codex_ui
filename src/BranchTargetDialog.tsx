@@ -5,6 +5,7 @@ import type {CodexAccountPool,ModelProfile} from "./types";
 import {isReclaudeModel,modelIsAvailable} from "../shared/agentRuntime";
 import {runtimeModelLabel} from "./runtimeModelLabel";
 import {BranchChoice} from "./BranchChoice";
+import {effortDescending} from "./effortOrder";
 import type {ReasoningEffort} from "./types";
 import "./taskNotificationSettings.css";
 import "./runtimeMigration.css";
@@ -19,7 +20,7 @@ export function BranchTargetDialog(props:{sourceModel:string;sourceEffort?:Reaso
   const claude=destination==="claude"||(destination==="auto"&&isReclaudeModel(props.sourceModel));
   const models=props.profiles.filter(p=>isReclaudeModel(p.model)===claude&&(claude||p.model.startsWith("gpt-"))).filter((p,i,a)=>a.findIndex(q=>q.model===p.model)===i);
   const cross=destination!=="auto"&&isReclaudeModel(props.sourceModel)!==claude;
-  const efforts=[...new Set(props.profiles.filter(p=>p.model===model&&modelIsAvailable(p)).map(p=>p.effort))];
+  const efforts=[...new Set(props.profiles.filter(p=>p.model===model&&modelIsAvailable(p)).map(p=>p.effort))].sort(effortDescending);
   const selectedEffort=efforts.includes(effort)?effort:efforts[0];
   const showEffort=!claude||props.profiles.some(p=>p.model===model&&p.supportedEffortLevels?.length);
   function close(){if(pending||closing)return;setClosing(true);timer.current=setTimeout(props.onClose,220);}

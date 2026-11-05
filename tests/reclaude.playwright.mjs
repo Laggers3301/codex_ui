@@ -120,7 +120,7 @@ try {
     await dialog.evaluate(async node=>{await Promise.all(node.getAnimations({subtree:true}).filter(a=>a.effect?.getTiming().iterations!==Infinity).map(a=>a.finished.catch(()=>{})));});
     assert.equal(await dialog.evaluate(node=>{const r=node.getBoundingClientRect();return document.elementFromPoint(r.left+r.width/2,r.top+30)?.closest('[role="dialog"]')===node;}),true);
     assert.equal(await dialog.locator('select').count(),0);
-    assert.equal(await dialog.evaluate(n=>getComputedStyle(n).fontSize),'14px');
+    assert.equal(await dialog.evaluate(n=>getComputedStyle(n).fontSize),mobile?'15px':'14px');
     assert.equal(await page.locator('.branchTargetScrim').evaluate(n=>getComputedStyle(n).backdropFilter),'blur(5px)');
     for(const theme of ['light','dark']){
       await page.evaluate(t=>document.documentElement.dataset.theme=t,theme);

@@ -1,5 +1,24 @@
 /* Shared chrome for global dialogs; editor/document content keeps its own type. */
 :root { --dialog-surface:var(--bg); --dialog-menu-surface:var(--bg); }
+/* Match the actual directory-picker selector: its legacy !important glass
+   surface otherwise wins over the shared dialog theme. */
+.directoryPickerScrim > .directoryDialog.uiGlassSurface {
+  background:var(--dialog-surface)!important;
+  box-shadow:0 18px 60px rgb(0 0 0 / .2)!important;
+}
+/* Real modal parent/child pairs beat the legacy light-theme popover rule
+   without changing embedded panes or the floating model/account menus. */
+:root[data-theme] .modalScrim > :is(.renameThreadDialog,.directoryDialog,.settingsDialog,.confirmDialog),
+:root[data-theme] .modalBackdrop > .settingsDialog,
+:root[data-theme] .workspaceFeatureScrim > .workspaceFeatureDialog,
+:root[data-theme] .globalSearchScrim > .globalSearchDialog,
+:root[data-theme] .feishuScrim > .feishuDialog,
+:root[data-theme] .petPickerScrim > .petPicker,
+:root[data-theme] .skillPickerScrim > .skillPickerPopover,
+:root[data-theme] .taskNotificationScrim > .taskNotificationDialog {
+  background:var(--dialog-surface)!important;
+  box-shadow:0 18px 60px rgb(0 0 0 / .2)!important;
+}
 :is(.modalScrim,.modalBackdrop,.globalSearchScrim,.workspaceFeatureScrim,.feishuScrim,.petPickerScrim,.skillPickerScrim,.taskNotificationScrim) {
   background:rgb(0 0 0 / .28)!important;
   backdrop-filter:blur(5px)!important;-webkit-backdrop-filter:blur(5px)!important;

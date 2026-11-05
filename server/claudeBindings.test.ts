@@ -6,6 +6,21 @@ import {describe,it,expect} from "vitest";
 import {ClaudeBindings,claudeModelEntries} from "./claudeBindings.js";
 
 describe("native Claude model catalogue",()=>{
+  it("bootstraps native identity in a new device root using auth status before resolving a model",async()=>{
+    const home=fs.mkdtempSync(path.join(os.tmpdir(),"claude-new-device-"));
+    try {
+      const workspace=path.join(home,"users","alice"),root=path.join(home,".rec/claude/accounts/42/config");
+      fs.mkdirSync(workspace,{recursive:true});fs.mkdirSync(root,{recursive:true});
+      fs.writeFileSync(path.join(path.dirname(root),"device.json"),JSON.stringify({sk:"fixture",org_id:1}));
+      const wrapper=path.join(home,"auth-wrapper");
+      fs.writeFileSync(wrapper,`#!${process.execPath}\nconst fs=require('node:fs'),path=require('node:path');if(JSON.stringify(process.argv.slice(2))!==JSON.stringify(['auth','status']))process.exit(1);const root=path.join(process.env.HOME,'.rec/claude/accounts/42/config');fs.writeFileSync(path.join(root,'.claude.json'),JSON.stringify({oauthAccount:{accountUuid:'fresh-account'}}));console.log(JSON.stringify({loggedIn:true,configDirectory:root}));\n`,{mode:0o700});
+      const bindings=new ClaudeBindings({home,executable:wrapper,storageDirectory:path.join(home,"state"),sharedUsers:{workspaceDirectory:path.join(home,"users"),orgIds:["1"]}});
+      expect(bindings.list("alice")).toEqual([]);
+      expect(await bindings.refreshOrganization("alice","1")).toMatchObject({userId:"alice",orgId:"1",configRoot:root});
+      expect(bindings.profiles("alice")).toHaveLength(3);
+      await expect(bindings.refreshOrganization("alice","2")).rejects.toMatchObject({code:"runtime_forbidden"});
+    }finally{fs.rmSync(home,{recursive:true,force:true});}
+  });
   it("shares an admin-authorized binding with separate existing user workspaces only",()=>{
     const home=fs.mkdtempSync(path.join(os.tmpdir(),"claude-shared-"));
     try {

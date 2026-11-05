@@ -4,7 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
-import { ClaudeSessionStorage, claudeConfigRoots, locateClaudeHistory, stageClaudeHistory } from "./claudeSessionStorage.js";
+import { ClaudeSessionStorage, claudeConfigRoots, locateClaudeHistory, stageClaudeHistory, type ClaudeConversation } from "./claudeSessionStorage.js";
 import { offlineFork } from "./claudeService.js";
 import {DatabaseSync} from "node:sqlite";
 
@@ -37,6 +37,22 @@ describe("global ReClaude session ledger", () => {
     expect(db.db.prepare("SELECT json_extract(body, '$.status') AS status, length(CAST(body AS BLOB)) AS bytes FROM turns WHERE id='oversize-turn'").get())
       .toMatchObject({status:"interrupted", bytes:expect.any(Number)});
     expect(db.turnCount("oversize")).toBe(1);
+  });
+  it("keeps native mappings and lineage atomic and retains a failed migration journal for recovery",()=>{
+    const root=temp(),storage=new ClaudeSessionStorage(root);databases.push(storage);
+    const before:ClaudeConversation={id:randomUUID(),userId:"alice",projectId:"project",cwd:"/fixture/alice",name:"history",model:"reclaude-sonnet@1",orgId:"1",accountKey:"old-account",configRoot:"/fixture/old",nativeSessionId:randomUUID(),initialized:true,archived:false,createdAt:1,updatedAt:1};
+    storage.save(before);
+    expect(()=>storage.save({...before,id:randomUUID()})).toThrow("属于另一条");
+    expect(storage.list()).toHaveLength(1);
+    const after={...before,nativeSessionId:randomUUID(),configRoot:"/fixture/new",accountKey:"new-account"};
+    const migration=storage.beginBindingMigration(before,after);
+    storage.db.exec("CREATE TRIGGER fail_lineage BEFORE INSERT ON lineage BEGIN SELECT RAISE(ABORT,'fixture interruption'); END");
+    expect(()=>storage.finishBindingMigration(migration)).toThrow("fixture interruption");
+    expect(storage.get(before.id)).toEqual(before);expect(storage.pendingBindingMigrations()).toHaveLength(1);
+    storage.db.exec("DROP TRIGGER fail_lineage");storage.finishBindingMigration(migration);
+    expect(storage.get(before.id)).toEqual(after);expect(storage.pendingBindingMigrations()).toEqual([]);
+    expect((storage.db.prepare("SELECT thread_id FROM lineage WHERE native_id=?").get(after.nativeSessionId) as any).thread_id).toBe(before.id);
+    expect(()=>storage.beginBindingMigration(after,{...after,userId:"bob"})).toThrow("不能更改用户");
   });
   it("shares all five slots across connections, retains them on restart, and expires on the rolling boundary", () => {
     const root = temp(); let now = 1_000_000;

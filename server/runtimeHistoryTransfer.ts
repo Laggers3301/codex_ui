@@ -150,7 +150,7 @@ export class RuntimeHistoryTransfer {
     row.archive=archive;row.sourceHash=hash.digest("hex");row.messageCount=0;row.warnings=[];
     this.claude.storage.db.prepare("DELETE FROM runtime_transfer_items WHERE transfer_id=?").run(row.id);
     const insert=this.claude.storage.db.prepare("INSERT INTO runtime_transfer_items VALUES (?,?,?,?)");
-    let turnId: string|null=null, skippedInternal=0, rawMessages=0;
+    let turnId: string|null=null, skippedInternal=0, rawMessages=0, codexIdentityVerified=false;
     let claudeCutoff:string|undefined, cutoffFound=false;
     if(row.sourceRuntime==="claude-code"&&row.sourceTurnId){
       const selected=this.claude.storage.turn(row.sourceTurnId);
@@ -165,7 +165,15 @@ export class RuntimeHistoryTransfer {
       const raw=record(JSON.parse(line));
       if (row.sourceRuntime==="codex") {
         const p=record(raw.payload);
-        if (raw.type==="session_meta" && p.id && p.id!==row.sourceThreadId) throw new AppError("migration_identity_mismatch", "历史文件与源会话不一致。");
+        // Native forks prepend their own session header, then retain headers
+        // from inherited rollouts. Only the first record identifies the source;
+        // ancestor headers are history, not another source selection.
+        if (!codexIdentityVerified) {
+          if (raw.type!=="session_meta" || p.id!==row.sourceThreadId) throw new AppError("migration_identity_mismatch", "历史文件与源会话不一致。");
+          codexIdentityVerified=true;
+          continue;
+        }
+        if (raw.type==="session_meta") continue;
         if (raw.type==="turn_context" && typeof p.turn_id==="string") turnId=p.turn_id;
         if (raw.type==="event_msg" && p.type==="task_started") turnId=p.turn_id;
         if (raw.type==="event_msg" && p.type==="thread_rolled_back") {
