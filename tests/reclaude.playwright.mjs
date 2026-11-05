@@ -39,6 +39,7 @@ try {
   for(const mobile of [false,true]) {
     await page.setViewportSize(mobile?{width:393,height:852}:{width:1440,height:1000});
     const collapse=page.getByRole("button",{name:"折叠侧边栏",exact:true});if(mobile&&await collapse.isVisible())await collapse.click();
+    if (mobile) await page.locator(".conversation > .composer .composerRichInput").click();
     await page.locator(".groupedModelPicker .polishedSelectTrigger").click();
     const dialog=page.getByRole("dialog",{name:"选择模型和推理档位"});
     await dialog.getByRole("button",{name:"Claude",exact:true}).click();

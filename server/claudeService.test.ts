@@ -12,6 +12,7 @@ import type { CodexBridge } from "./codexBridge.js";
 import type { ClaudeIntegrationConfig } from "./claudeBindings.js";
 import { registerRoutes } from "./routes.js";
 import { locateClaudeHistory } from "./claudeSessionStorage.js";
+import * as claudeStorage from "./claudeSessionStorage.js";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => { cleanup.splice(0).reverse().forEach(fn => fn()); vi.restoreAllMocks(); });
@@ -55,6 +56,15 @@ function fixture(rateLimitInfo?: Record<string,unknown>) {
   return {home,cwd,project,store,service,config,rootA,rootB,binding,events,calls,start,turn};
 }
 describe("Claude conversation switching",()=>{
+  it("does not hash and archive the entire native history on ordinary follow-ups", async () => {
+    const f = fixture(), id = await f.start();
+    const stage = vi.spyOn(claudeStorage, "stageClaudeHistory");
+    await f.turn(id); await f.turn(id);
+    expect(stage).not.toHaveBeenCalled();
+    expect(f.service.history(id).thread.turns).toHaveLength(2);
+    expect(f.service.storage.get(id)?.historyArchive).toBeUndefined();
+    expect(locateClaudeHistory(f.service.storage.get(id)!.nativeSessionId, [f.rootA])).toBeTruthy();
+  });
   it("keeps inherited history contiguous when a page reaches its byte budget", async () => {
     const f = fixture(), parent = await f.start(), child = await f.start();
     const text = "x".repeat(2 * 1024 ** 2);
@@ -67,6 +77,20 @@ describe("Claude conversation switching",()=>{
     const second = f.service.history(child, first.history.nextBefore);
     expect(second.thread.turns.map(turn=>turn.id)).toEqual(["parent-0", "parent-1", "child-0"]);
     expect(second.history.hasOlder).toBe(false);
+    const page = await f.service.request("thread/turns/list", {threadId:child}) as any;
+    expect(page.data.map((turn:any)=>turn.id)).toEqual(["child-3", "child-2", "child-1"]);
+    const older = await f.service.request("thread/turns/list", {threadId:child, cursor:page.nextCursor}) as any;
+    expect(older.data.map((turn:any)=>turn.id)).toEqual(["child-0", "parent-1", "parent-0"]);
+    expect(older.nextCursor).toBeNull();
+  });
+  it("finds a branch cutoff beyond a byte-limited history page without skipping turns", async () => {
+    const f = fixture(), id = await f.start(), turnId = await f.turn(id);
+    const original = f.service.storage.turn(turnId)!;
+    const text = "x".repeat(2 * 1024 ** 2);
+    for (let i = 0; i < 6; i++) f.service.storage.saveTurn(id, {...original, id:`extra-${i}`, text});
+    const result = await f.service.request("thread/fork", {threadId:id, lastTurnId:turnId}) as any;
+    expect(f.service.storage.get(result.thread.id)?.inheritedTurnCount).toBe(1);
+    expect(f.service.history(result.thread.id).thread.turns[0].id).toBe(turnId);
   });
   it("ignores late callbacks and rejections after shutdown without invoking a queued model call", async () => {
     const f = fixture(), first = await f.start();
@@ -82,7 +106,7 @@ describe("Claude conversation switching",()=>{
     const run = vi.spyOn(ClaudeRuntime.prototype, "runTurn").mockImplementation(()=>pending);
     await f.service.request("turn/start", {threadId:id, input:[{type:"text", text:"pending"}]});
     await vi.waitFor(()=>expect(run).toHaveBeenCalledOnce());
-    const runtime = run.mock.contexts[0];
+    const runtime = run.mock.contexts[0] as ClaudeRuntime;
     f.service.close();
     expect(()=>{
       runtime.emit("nativeSession", {sessionId:"late"});

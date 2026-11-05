@@ -223,8 +223,13 @@ export class RuntimeHistoryTransfer {
     if(!row.targetThreadId)throw new Error("Codex 未返回目标会话标识。");
     row.phase="importing";this.save(row);
     // No turn/start is issued. inject_items only appends local model history.
+    let turnId = `migration-${row.id}-0`;
     for(const message of this.messages(row.id)) {
+      if (message.role === "user") turnId = `migration-${row.id}-${row.importedCount}`;
       await this.bridge.request("thread/inject_items",{threadId:row.targetThreadId,items:[{type:"message",role:message.role,
+        // Native injection updates prompt history, not thread/read's turns.
+        // Keep web pagination/search aware of these historical messages too.
+        internal_chat_message_metadata_passthrough:{turn_id:turnId},
         content:[{type:message.role==="assistant"?"output_text":"input_text",text:message.text}]}]},60_000);
       row.importedCount++;this.save(row);
     }

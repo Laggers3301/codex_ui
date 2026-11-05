@@ -9,6 +9,7 @@ import { ClaudeService,offlineFork } from "./claudeService.js";
 import { RuntimeHistoryTransfer,portableCodexItem,portableClaudeMessage } from "./runtimeHistoryTransfer.js";
 import { locateClaudeHistory } from "./claudeSessionStorage.js";
 import type { CodexBridge } from "./codexBridge.js";
+import { readThreadFromJsonl } from "./threadFallback.js";
 
 const paths=vi.hoisted(()=>new Map<string,string>());
 vi.mock("./threadFallback.js",async(importOriginal)=>({...await importOriginal<typeof import("./threadFallback.js")>(),findThreadJsonlPathById:async(id:string)=>paths.get(id)??null}));
@@ -58,6 +59,8 @@ describe("bidirectional runtime history transfer",()=>{
     expect(f.request.mock.calls.some(([method])=>method==="turn/start")).toBe(false);
     expect(fs.readFileSync(paths.get(first.threadId)!,"utf8")).toContain("TRANSFER-5520");
     expect(fs.readFileSync(paths.get(first.threadId)!,"utf8")).toContain("历史工具调用");
+    const imported = await readThreadFromJsonl(paths.get(first.threadId)!, first.threadId, f.home);
+    expect(JSON.stringify(imported.thread.turns)).toContain("TRANSFER-5520");
     const calls=f.request.mock.calls.length;
     expect((await f.migrate(f.id,"gpt-6.1-sol",operationId)).threadId).toBe(first.threadId);
     expect(f.request.mock.calls).toHaveLength(calls);expect(f.service.storage.quota().used).toBe(0);

@@ -167,7 +167,9 @@ export class ClaudeService {
         const target = locateClaudeHistory(row.nativeSessionId, [binding.configRoot]);
         if (target) this.rememberArchive(row, target);
         this.emit("notification", { method: "runtime/accountSwitched", params: { threadId: row.id, mode: "offline-fork", orgId: binding.orgId } });
-      } else {
+      } else if (!locateClaudeHistory(row.nativeSessionId, [binding.configRoot])) {
+        // The current account's native history is already authoritative. Only
+        // stage when relocating it, not on every ordinary follow-up turn.
         const target = stageClaudeHistory(this.source(row), binding.configRoot, row.nativeSessionId, path.join(this.config.storageDirectory, "archive"));
         this.rememberArchive(row, target);
       }
@@ -192,8 +194,14 @@ export class ClaudeService {
       return { thread: this.summary(row) };
     }
     const row = this.row(String(p.threadId ?? ""));
-    if(method==="thread/turns/list")return {data:this.turns(row,Math.min(100,Math.max(1,Number(p.limit)||50))).reverse()
-      .map(turn=>({...turn,...(p.itemsView==="notLoaded"?{items:[]}:{})})),nextCursor:null};
+    if (method === "thread/turns/list") {
+      if (p.cursor && !/^claude-turns:\d+$/.test(String(p.cursor))) throw new AppError("invalid_cursor", "历史分页位置无效，请重新打开会话。");
+      const before = p.cursor ? Number(String(p.cursor).split(":")[1]) : 0;
+      const turns = this.turns(row, Math.min(100, Math.max(1, Number(p.limit) || 50)), before);
+      const next = before + turns.length;
+      return {data: turns.reverse().map(turn=>({...turn,...(p.itemsView==="notLoaded"?{items:[]}:{})})),
+        nextCursor: next < this.count(row) ? `claude-turns:${next}` : null};
+    }
     if (method === "thread/read") return { thread: { ...this.summary(row), turns: p.includeTurns === false ? [] : this.turns(row, 50) } };
     if (method === "thread/resume") return this.locked(row.id, async () => {
       await this.prepare(row, p.model ?? row.model);
@@ -212,9 +220,11 @@ export class ClaudeService {
         // Locate the requested UI turn in the inherited chain without loading
         // the entire native JSONL into the web process.
         let found = false;
-        for (let before = 0; before < this.count(row); before += 100) {
+        for (let before = 0; before < this.count(row);) {
           const turns = this.turns(row, 100, before), index = turns.findIndex(turn => turn.id === p.lastTurnId);
           if (index >= 0) { cutoff = turns[index].nativeMessageId; inheritedTurnCount = this.count(row) - before - turns.length + index + 1; found = true; break; }
+          if (!turns.length) break;
+          before += turns.length;
         }
         if (!found || !cutoff) throw new Error("所选轮次尚无原生分支位置，不能悄悄改为其他分支点。");
         // A preceding automatic fork remaps message UUIDs. Only the complete
@@ -275,12 +285,11 @@ export class ClaudeService {
           params.turn.items = [userItem, ...params.turn.items];
           this.storage.saveTurn(row.id, { ...params.turn, nativeMessageId: checkpoint, nativeSessionId: row.nativeSessionId });
           row.updatedAt = Date.now();
-          if (row.initialized) {
-            try {
-              const source = locateClaudeHistory(row.nativeSessionId, [row.configRoot]);
-              if (source) { stageClaudeHistory(source, row.configRoot, row.nativeSessionId, path.join(this.config.storageDirectory, "archive")); this.rememberArchive(row, source); }
-            } catch { /* Keep original files; never substitute an older archive. */ }
-          }
+          // Native history is already persisted by the SDK. Hashing/copying the
+          // growing file synchronously every turn blocks all account streams and
+          // creates quadratic disk growth. Archive only for explicit fork/move.
+          // An older fork snapshot is not a recovery substitute for new turns.
+          if (row.initialized) delete row.historyArchive;
           this.storage.save(row);
           this.active.delete(row.id);
           for (const [id, pending] of this.approvals) if (pending.runtime === runtime) this.approvals.delete(id);
