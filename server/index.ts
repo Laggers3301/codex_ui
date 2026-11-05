@@ -1,3 +1,4 @@
+import { withClaudeService, getClaudeService } from "./claudeService.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
@@ -115,9 +116,12 @@ app.addHook("onRequest", async (request, reply) => {
 });
 
 const store = new ProjectStore();
-const bridge = serverConfig.accountPoolFile
+const nativeBridge = serverConfig.accountPoolFile
   ? AccountPoolBridge.fromFile(serverConfig.accountPoolFile)
   : new CodexBridge();
+const claudeConfigFile = process.env.CODEX_WEB_CLAUDE_CONFIG;
+const bridge = withClaudeService(nativeBridge as CodexBridge, store, claudeConfigFile ? JSON.parse(fs.readFileSync(claudeConfigFile, "utf8")) : undefined);
+app.addHook("onClose", async () => { getClaudeService(bridge)?.close(); });
 const authDiagnosticLog=new AuthDiagnosticLog(path.join(serverConfig.dataDir,"auth-diagnostics","events.jsonl"));
 const recordAuthDiagnostic=(row:AuthDiagnostic)=>{
   try{authDiagnosticLog.append(row);}catch{app.log.warn("Auth diagnostic storage unavailable; credentials unchanged");}

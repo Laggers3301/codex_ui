@@ -27,6 +27,35 @@ describe("approval protocol", () => {
     expect(isApprovalRequest("item/tool/requestUserInput")).toBe(false);
     expect(() => approvalResponse({ ...permission, params: {} }, { decision: "accept" })).toThrow();
   });
+  const mcp: ApprovalRequest = { id: "mcp", method: "mcpServer/elicitation/request", params: {
+    threadId: "thread-a", turnId: null, serverName: "codex_browser", mode: "form",
+    message: 'Allow the codex_browser MCP server to run tool "browser_action"?',
+    requestedSchema: { type: "object", properties: {} },
+    _meta: { codex_approval_kind: "mcp_tool_call", tool_params: { action: "snapshot" } }
+  } };
+  it("handles native MCP tool consent with the elicitation response protocol", () => {
+    expect(isApprovalRequest(mcp.method)).toBe(true);
+    expect(approvalDecisions(mcp)).toEqual(["decline", "cancel", "accept"]);
+    expect(approvalResponse(mcp, { decision: "accept", action: "cancel", content: { extraGrant: true } })).toEqual({ action: "accept", content: {} });
+    expect(approvalResponse(mcp, { decision: "decline" })).toEqual({ action: "decline", content: null });
+    expect(approvalResponse(mcp, { decision: "cancel" })).toEqual({ action: "cancel", content: null });
+    expect(() => approvalResponse(mcp, { decision: "acceptForSession" })).toThrow();
+  });
+  it("allows refusing unsupported MCP forms without approving missing input or device proof", () => {
+    for (const params of [
+      { ...mcp.params, requestedSchema: { type: "object", properties: { code: { type: "string" } }, required: ["code"] } },
+      { ...mcp.params, requestedSchema: { type: "object", properties: {}, not: {} } },
+      { ...mcp.params, requestedSchema: undefined },
+      { ...mcp.params, message: "" },
+      { ...mcp.params, mode: "url", url: "https://example.com/authorize" },
+      { ...mcp.params, mode: "openai/userVerification", challenge: "device-proof-required" }
+    ]) {
+      const request = { ...mcp, params };
+      expect(approvalDecisions(request)).toEqual(["decline", "cancel"]);
+      expect(() => approvalResponse(request, { decision: "accept", content: {} })).toThrow();
+      expect(approvalResponse(request, { decision: "cancel" })).toEqual({ action: "cancel", content: null });
+    }
+  });
   it("preserves both native and pool pending requests when writing a decision fails", () => {
     const bridge = new CodexBridge({ command: "unused", args: [] });
     const pending = { id: 7, method: "item/commandExecution/requestApproval", params: { threadId: "thread-a" }, receivedAt: "now" };

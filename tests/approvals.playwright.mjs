@@ -71,6 +71,21 @@ try {
   await command.getByRole("button", { name: "拒绝", exact: true }).click(); await expect(command).toHaveCount(0);
   assert.deepEqual((await state()).approvalResponses[1].result, { decision: "decline" });
 
+  await post("approval", { threadId: "main-a", kind: "mcpTool", emit: false });
+  await approvals.getByRole("button", { name: "重新核对批准请求", exact: true }).click();
+  const mcp = page.getByRole("alert", { name: "批准MCP 工具调用", exact: true });
+  await expect(mcp).toContainText("codex_browser"); await expect(mcp).toContainText("snapshot");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.locator('[data-thread-id="main-a"] .threadSelectButton').click();
+  await expect(mcp).toBeVisible();
+  await mcp.getByRole("button", { name: "仅批准这次", exact: true }).click(); await expect(mcp).toHaveCount(0);
+  assert.deepEqual((await state()).approvalResponses[2].result, { action: "accept", content: {} });
+  await post("approval", { threadId: "main-a", kind: "mcpForm" });
+  await expect(mcp).toContainText("当前页面暂不支持完成");
+  await expect(mcp.getByRole("button", { name: "仅批准这次", exact: true })).toHaveCount(0);
+  await mcp.getByRole("button", { name: "取消操作", exact: true }).click(); await expect(mcp).toHaveCount(0);
+  assert.deepEqual((await state()).approvalResponses[3].result, { action: "cancel", content: null });
+
   await post("approval-state", { threadId: "main-a", waiting: true, clearRequests: true });
   await approvals.getByRole("button", { name: "重新核对批准请求", exact: true }).click();
   await expect(approvals).toContainText("未返回可操作的批准请求");
@@ -98,10 +113,16 @@ try {
   await post("approval", { threadId: sideThreadId, kind: "commandExecution" });
   const sideCommand = page.locator(".temporaryAskComposer").getByRole("alert", { name: "批准命令执行", exact: true });
   await expect(sideCommand).toContainText("git fetch origin lzc");
+  await post("approval", { threadId: sideThreadId, kind: "mcpTool" });
+  const sideMcp = page.locator(".temporaryAskComposer").getByRole("alert", { name: "批准MCP 工具调用", exact: true });
+  await expect(sideMcp).toContainText("snapshot");
+  await sideMcp.getByRole("button", { name: "拒绝", exact: true }).click(); await expect(sideMcp).toHaveCount(0);
+  await expect(sideCommand).toBeVisible();
+  assert.deepEqual((await state()).approvalResponses[4].result, { action: "decline", content: null });
   await sideCommand.getByRole("button", { name: "拒绝", exact: true }).click(); await expect(sideCommand).toHaveCount(0);
   assert.equal((await state()).starts.length, 2, "inspections and approval choices must never start extra model turns");
   assert.deepEqual(errors, []);
-  const result = { missingDetailsExplained: true, readOnlyRefresh: true, permissionRequestRestoredAfterReload: true, secondApprovalPreserved: true, turnScopedPermissionGrant: true, failedResponseRetainsCard: true, staleWaitCleared: true, sideChatApprovalVisible: true, noExtraModelTurns: true, layouts, errors };
+  const result = { nativeMcpConsentRestored: true, nativeMcpResponseProtocol: true, unsupportedMcpFormNeverApproved: true, sideMcpConsentVisible: true, missingDetailsExplained: true, readOnlyRefresh: true, permissionRequestRestoredAfterReload: true, secondApprovalPreserved: true, turnScopedPermissionGrant: true, failedResponseRetainsCard: true, staleWaitCleared: true, sideChatApprovalVisible: true, noExtraModelTurns: true, layouts, errors };
   await fs.writeFile(`${evidence}/results.json`, JSON.stringify(result, null, 2) + "\n"); console.log(JSON.stringify(result, null, 2));
 } finally {
   await browser?.close();

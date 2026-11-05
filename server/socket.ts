@@ -1,4 +1,6 @@
-import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
+import { assertRuntimeModel, getClaudeService } from "./claudeService.js";
+import { getRuntimeHistoryTransfer } from "./runtimeHistoryTransfer.js";
+import { isReclaudeModel } from "../shared/agentRuntime.js";
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import fs, { type FileHandle } from "node:fs/promises";
@@ -1271,7 +1273,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         }
         return { threadId, turnId: tracked?.turnId ?? expectedTurnId, pendingServerRequests: requests,
           message: requests.some(pending => isApprovalRequest(pending.method)) ? "已重新取得待批准操作。"
-            : phaseFromProbe(status.activeFlags) === "waiting_approval" ? "运行时仍报告等待批准，但未返回可操作的批准请求。不能据此判断或批准具体操作。"
+            : phaseFromProbe(status.activeFlags) === "waiting_approval" ? "运行时仍报告等待批准，但未返回可操作的批准请求。不能据此判断或批准具体操作。若重新核对后仍无请求，可停止本轮，再发送继续指令；历史记录会保留。"
             : status.type ? "当前未发现待批准操作，已更新运行状态。" : "暂时无法确认运行状态，请稍后重新核对。" };
       });
     });
@@ -1364,7 +1366,6 @@ async function handleClientMessage(
 
       case "thread.start": {
         const project = getProjectOrThrow(store, message.projectId, sessionUserId);
-        assertCodexModelRequest({ model: message.model ?? project.defaultModel });
         const question = pickString(message.prompt).trim();
         const sideChatId = pickString(message.sideChatId);
         const storedSide = sideChatId ? store.sideChats.byId(sideChatId, sessionUserId) : null;
@@ -1393,8 +1394,10 @@ async function handleClientMessage(
           reasoningEffort,
           async () => {
             if (sideChatId) store.sideChats.begin(sideChatId, sessionUserId, project.id, requestId, question, null, pickString(message.sideChatModelProfileId));
+            assertRuntimeModel(bridge, sessionUserId, {model});
             const browserMcp = browserService ? mintBrowserMcpConfig(sessionUserId, project.id) : null;
             const startParams = {
+              ...(isReclaudeModel(model) ? { userId: sessionUserId, projectId: project.id } : {}),
               ...requestedServiceTier(message.serviceTier),
               cwd: project.rootPath,
               model,
@@ -1516,13 +1519,13 @@ async function handleClientMessage(
       case "turn.start": {
         await assertTrackedUserQuotaAvailable(bridge, store, sessionUserId, pickString(message.threadId));
         const project = getProjectOrThrow(store, message.projectId, sessionUserId);
-        const threadId = pickString(message.threadId);
+        let threadId = pickString(message.threadId);
         const prompt = pickString(message.prompt).trim();
         if (!threadId || !prompt) {
           throw new Error("threadId and prompt are required.");
         }
         assertThreadOwnedBy(store, threadId, sessionUserId, project.id, isUserWorkspaceProject(project, sessionUserId));
-        const owner = store.getThreadOwner(threadId);
+        let owner = store.getThreadOwner(threadId);
         const ownerProject = owner ? store.getProject(owner.projectId, sessionUserId) : null;
         const modelDefaults = ownerProject ?? project;
         const sideChatId = pickString(message.sideChatId);
@@ -1533,7 +1536,8 @@ async function handleClientMessage(
         const previousEffort = owner?.reasoningEffortOverride ?? modelDefaults.defaultReasoningEffort;
         const model = boundSide ? pickString(message.model, previousModel).trim() || previousModel : previousModel;
         const reasoningEffort = boundSide ? pickReasoningEffort(message.reasoningEffort, previousEffort) : previousEffort;
-        if (boundSide && isAccountPoolBridge(bridge)) {
+        const crossRuntime=!!boundSide&&!!getClaudeService(bridge)?.owns(threadId)!==isReclaudeModel(model);
+        if (boundSide && !crossRuntime && !isReclaudeModel(model) && isAccountPoolBridge(bridge)) {
           await bridge.resolveThreadAccount(threadId);
           if (!bridge.canThreadUseModel(threadId, model)) throw new SideChatError('所选模型不属于侧边会话供应商。请先在主会话创建跨供应商分支，再使用侧边提问。');
         }
@@ -1551,6 +1555,23 @@ async function handleClientMessage(
           async () => {
             assertNoActiveTurn(guards, threadId);
             if (sideChatId) store.sideChats.begin(sideChatId, sessionUserId, owner?.projectId ?? project.id, requestId, prompt, threadId, pickString(message.sideChatModelProfileId));
+            assertRuntimeModel(bridge,sessionUserId,{model},crossRuntime?undefined:threadId);
+            let switchedThread:unknown;
+            if(crossRuntime){
+              const transfers=getRuntimeHistoryTransfer(bridge,store);
+              if(!transfers)throw new SideChatError("跨引擎侧边会话尚未配置。");
+              const previousThreadId=threadId;
+              const migrated=await transfers.migrate({operationId:randomUUID(),sourceThreadId:threadId,userId:sessionUserId,projectId:owner?.projectId??project.id,targetModel:model}) as {threadId:string};
+              threadId=migrated.threadId;
+              if(!store.sideChats.retarget(sideChatId,sessionUserId,requestId,threadId)){
+                await settleClosedSideChat(bridge,store,sideChatId,sessionUserId,threadId,null);
+                throw new SideChatError("侧边会话已关闭，本次切换已取消。");
+              }
+              message.threadId=threadId;
+              store.softDeleteThread(previousThreadId,sessionUserId,project.id);
+              owner=store.getThreadOwner(threadId);
+              switchedThread=await bridge.request("thread/read",{threadId,includeTurns:false});
+            }
             guards.retries?.cancel(sessionUserId, threadId);
             guards.startingThreads.add(threadId);
             try {
@@ -1582,7 +1603,7 @@ async function handleClientMessage(
                 ...requestedTurnServiceTier(message.serviceTier),
                 threadId,
                 input: await promptInput(bridge, threadId, project.rootPath, prompt, message.skillNames, message.documentReference),
-                collaborationMode: requestedCollaborationMode(message.collaborationMode, model, reasoningEffort),
+                collaborationMode: requestedCollaborationMode(message.collaborationMode ?? (boundSide?"default":undefined), model, reasoningEffort),
                 cwd: project.rootPath,
                 approvalPolicy: executionApproval,
                 sandboxPolicy: sandboxPolicy(project, executionSandbox),
@@ -1608,7 +1629,7 @@ async function handleClientMessage(
                 store.setThreadModelConfig(threadId, sessionUserId, model, reasoningEffort);
               }
               store.touchThreadOwner(threadId);
-              return { turn };
+              return { turn, ...(switchedThread?{thread:switchedThread}:{}) };
             } finally {
               guards.startingThreads.delete(threadId);
             }

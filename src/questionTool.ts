@@ -2,6 +2,7 @@ export interface ToolQuestion {
   id?: string;
   title: string;
   options: string[];
+  multiSelect?: boolean;
 }
 
 /** Display-only receipt decoding. accepted:true is never a user's answer. */
@@ -44,7 +45,7 @@ export function parseQuestionTool(toolName: string, input: unknown): ToolQuestio
     return null;
   }
   if (!Array.isArray(root.questions)) return null;
-  const questions = root.questions.slice(0, 3).map((raw): ToolQuestion | null => {
+  const questions = root.questions.slice(0, 4).map((raw): ToolQuestion | null => {
     const question = record(raw);
     const title = [question.title, question.question].find((value) => typeof value === "string" && value.trim());
     const options = Array.isArray(question.options)
@@ -56,7 +57,8 @@ export function parseQuestionTool(toolName: string, input: unknown): ToolQuestio
       : [];
     // Async questions may intentionally omit options: they are free-text prompts.
     // The tool's {accepted:true} receipt is not an answer and is not parsed here.
-    return typeof title === "string" && title.trim() ? { ...(typeof question.id === "string" ? { id: question.id } : {}), title: title.trim(), options } : null;
+    return typeof title === "string" && title.trim() ? { ...(typeof question.id === "string" ? { id: question.id } : {}), title: title.trim(), options,
+      ...(question.multiSelect===true?{multiSelect:true}:{}) } : null;
   }).filter((question): question is ToolQuestion => question !== null);
   return questions.length ? questions : null;
 }

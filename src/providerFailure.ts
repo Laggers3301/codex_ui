@@ -1,25 +1,29 @@
 import { modelErrorDetails, modelErrorSummary } from "../shared/modelError";
+import type { ReclaudeLimitCode } from "../shared/reclaudeUsage";
 export type ProviderFailureNotice = {
   kind: "capacity" | "unavailable" | "auth" | "limit" | "stream" | "request";
   model: string;
   httpStatusCode: number | null;
   detail?: string;
   limitType?: "quota" | "rate" | "unknown";
+  claudeLimitCode?: ReclaudeLimitCode;
 };
 
 export function classifyProviderFailure(model: string, rawError: unknown): ProviderFailureNotice | null {
   if (!model) return null;
   const { message, status: httpStatusCode, signature: classification } = modelErrorDetails(rawError);
+  const claudeLimitCode = classification.match(/\bclaude_(?:five_hour|weekly)_limit\b/)?.[0] as ReclaudeLimitCode | undefined;
   // Session gating is a local error, not a failed model/credit request.
   if (/尚未卸载运行时|会话仍在运行或等待批准|取消订阅不等于立即卸载/.test(classification)) return null;
   const limit = /UsageLimitExceeded|insufficient.quota|quota.exceeded|balance.insufficient|billing|额度|余额不足|配额|限流|频率限制/i.test(classification)
-    || httpStatusCode === 402 || httpStatusCode === 429;
+    || httpStatusCode === 402 || httpStatusCode === 429 || Boolean(claudeLimitCode);
   const disconnected = /ResponseStreamDisconnected|ResponseStreamConnectionFailed|stream disconnected|stream closed before response.completed/i.test(classification);
   const capacity = /model.{0,30}(?:at capacity|overloaded)|model_at_capacity|capacity_exceeded|Please use another model/i.test(classification);
   const unavailable = httpStatusCode === 503 || /service unavailable|temporarily unavailable/i.test(classification);
   const auth = httpStatusCode === 401 || /refresh_token_reused|refresh_token_invalidated|authentication_token|unauthorized/i.test(classification);
   return { kind: capacity ? "capacity" : auth ? "auth" : limit ? "limit" : unavailable ? "unavailable" : disconnected ? "stream" : "request", model, httpStatusCode,
-    ...(limit ? { limitType: /AccountQuotaExceeded|QuotaExceeded|UsageLimitExceeded|insufficient[_ .]quota|balance.insufficient/i.test(classification) ? "quota" as const : /RequestBurstTooFast|RateLimitExceeded|SessionQuotaExceeded|rate_limited|(?:rpm|tpm|concurrency)[_ .]?limit/i.test(classification) ? "rate" as const : "unknown" as const } : {}),
+    ...(limit ? { limitType: claudeLimitCode || /AccountQuotaExceeded|QuotaExceeded|UsageLimitExceeded|insufficient[_ .]quota|balance.insufficient/i.test(classification) ? "quota" as const : /RequestBurstTooFast|RateLimitExceeded|SessionQuotaExceeded|rate_limited|(?:rpm|tpm|concurrency)[_ .]?limit/i.test(classification) ? "rate" as const : "unknown" as const } : {}),
+    ...(claudeLimitCode ? { claudeLimitCode } : {}),
     ...(message ? { detail: message.slice(0, 2000) } : {}) };
 }
 
@@ -39,6 +43,10 @@ function fallbackProviderFailureCopy(notice: ProviderFailureNotice): { title: st
 }
 
 export function providerFailureCopy(notice: ProviderFailureNotice): { title: string; message: string } {
+  if (notice.claudeLimitCode) return {
+    title: notice.claudeLimitCode === "claude_weekly_limit" ? "Claude 周用量达到停用阈值" : "Claude 5 小时额度已达上限",
+    message: notice.detail ? modelErrorSummary(notice.detail) : "此 Claude 账号已暂停使用，请等待额度重置或切换账号。"
+  };
   const copy = fallbackProviderFailureCopy(notice);
   if (!notice.detail) return copy;
   const detail = modelErrorSummary(notice.detail);

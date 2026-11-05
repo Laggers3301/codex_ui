@@ -1,6 +1,8 @@
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { RpcEnvelope } from "./types.js";
 import { redactModelError } from "../shared/modelError.js";
+import { claudeQuestions } from "./claudeUserInput.js";
+import { AppError } from "./appErrors.js";
 
 type RecordValue = Record<string, unknown>;
 const record = (v: unknown): RecordValue => v && typeof v === "object" && !Array.isArray(v) ? v as RecordValue : {};
@@ -41,14 +43,19 @@ export class ClaudeStreamAdapter {
     if (type === "agentMessage") item.text = "";
     else if (type === "reasoning") item.summary = [];
     else {
-      item.tool = string(block.name);
-      item.arguments = block.input ?? {};
+      item.tool = block.name === "AskUserQuestion" ? "request_user_input" : string(block.name);
+      if(block.name==="AskUserQuestion")item.callId=string(block.id);
+      item.arguments = this.toolInput(item,block.input ?? {});
       item.status = "inProgress";
       this.tools.set(`${parent}:${string(block.id)}`, item);
     }
     this.items.set(id, item);
     this.notify("item/started", { item: { ...item } });
     return item;
+  }
+
+  private toolInput(item: Item, input: unknown) {
+    return item.tool==="request_user_input"?{...record(input),questions:claudeQuestions(record(input),string(item.callId))}:input;
   }
 
   private complete(item: Item): void {
@@ -105,7 +112,7 @@ export class ClaudeStreamAdapter {
         if (!b) return;
         if (b.item.type === "dynamicToolCall") {
           if (b.json) {
-            try { b.item.arguments = JSON.parse(b.json); } catch { /* Full assistant snapshot supplies the validated input. */ }
+            try { b.item.arguments = this.toolInput(b.item,JSON.parse(b.json)); } catch { /* Full assistant snapshot supplies the validated input. */ }
           }
           this.notify("item/started", { item: { ...b.item } });
         } else this.complete(b.item);
@@ -121,7 +128,7 @@ export class ClaudeStreamAdapter {
         const id = b.type === "tool_use" ? `claude-tool:${parent}:${string(b.id)}` : `claude-message:${parent}:${string(full.id)}:${index}`;
         const item = this.upsert(id, b, parent);
         if (item.type === "dynamicToolCall") {
-          item.arguments = b.input ?? {};
+          item.arguments = this.toolInput(item,b.input ?? {});
           if (!this.completedItems.has(id)) this.notify("item/started", { item: { ...item } });
         } else {
           // The final snapshot replaces streamed content, never appends it.
@@ -170,7 +177,7 @@ export class ClaudeStreamAdapter {
     }
   }
 
-  finish(status: "completed" | "failed" | "interrupted", error?: string, usage?: unknown): void {
+  finish(status: "completed" | "failed" | "interrupted", error?: string | AppError, usage?: unknown): void {
     if (this.finished) return;
     this.finished = true;
     for (const item of this.items.values()) {
@@ -183,7 +190,7 @@ export class ClaudeStreamAdapter {
     }
     this.notify("turn/completed", { turn: {
       id: this.turnId, status, items: [...this.items.values()],
-      error: error ? { message: redactModelError(error) } : null,
+      error: error instanceof AppError ? error.toPublic() : error ? { message: redactModelError(error) } : null,
       ...(usage ? { usage } : {})
     } });
   }

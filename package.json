@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "setup:claude": "npm ci --prefix integrations/claude-session-tools --ignore-scripts --omit=optional --no-audit --no-fund",
     "dev": "concurrently -n server,client -c cyan,magenta \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "tsx watch server/index.ts",
     "dev:client": "vite --host 127.0.0.1",

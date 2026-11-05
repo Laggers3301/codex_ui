@@ -1,5 +1,6 @@
-import { claudePendingProfiles } from "../shared/agentRuntime.js";
-import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
+import { claudePendingProfiles, isReclaudeModel } from "../shared/agentRuntime.js";
+import { assertRuntimeModel, getClaudeService } from "./claudeService.js";
+import { getRuntimeHistoryTransfer } from "./runtimeHistoryTransfer.js";
 import fs from "node:fs";
 import { ProviderUsageTracker } from "./providerUsage.js";
 import { registerProviderQuotaRoutes } from "./providerQuota.js";
@@ -2459,6 +2460,9 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 }
 
 function errorStatus(error: unknown): number {
+  if (error instanceof Error && "code" in error && error.code === "claude_session_rate_limit") return 429;
+  if (error instanceof Error && "code" in error && ["claude_weekly_limit", "claude_five_hour_limit"].includes(String(error.code))) return 429;
+  if (error instanceof Error && "code" in error && String(error.code).startsWith("migration_")) return 409;
   if (error instanceof Error && "code" in error && error.code === "runtime_not_connected") return 409;
   if (error instanceof HistoryMemoryLimitError) return 413;
   if (error instanceof LegacyRollbackConflictError || error instanceof ScheduleConflictError || error instanceof BranchConflictError) return 409;
@@ -3000,6 +3004,8 @@ function deferLargeToolOutputs(threadValue: unknown): void {
 
 export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore, options: { backgroundIndexing?: boolean; browserTools?: boolean } = {}): void {
   const availableModelProfiles = () => listModelProfiles(isAccountPoolBridge(bridge) ? bridge.modelCatalogTargets().map(target => target.catalogPath) : []);
+  const claudeService = getClaudeService(bridge);
+  const historyTransfers = getRuntimeHistoryTransfer(bridge,store);
   registerProviderQuotaRoutes(app, request => userIdFromRequest(request, store));
   registerSideChatRoutes(app, bridge, store, request => userIdFromRequest(request, store));
   const predictions=isAccountPoolBridge(bridge)?new ComposerPredictions(bridge):null;
@@ -3253,11 +3259,28 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     defaults
   }));
 
-  app.get("/api/models", async () => ({
-    data: [...availableModelProfiles(), ...claudePendingProfiles()],
+  app.get("/api/models", async (request,reply) => {
+    reply.header("Cache-Control","private, no-store");
+    const userId=userIdFromRequest(request,store);
+    // Return the cached catalogue immediately. CLI discovery can take 30s;
+    // it must not hold up the shared model menu (including GPT and Ark).
+    void claudeService?.bindings.refreshModels(userId).catch(error => {
+      request.log.warn({ err: error }, "Claude model catalogue refresh failed");
+    });
+    const profiles=claudeService?.profiles(userId)??[];
+    return {
+    data: [...availableModelProfiles(), ...(profiles.length ? profiles : claudePendingProfiles())],
+    reclaudeQuota: getClaudeService(bridge)?.storage.quota(),
     defaultModel: defaults.model,
     defaultReasoningEffort: defaults.reasoningEffort
-  }));
+  };});
+
+  app.get("/api/reclaude/usage", async (request, reply) => {
+    reply.header("Cache-Control", "no-store");
+    const service = getClaudeService(bridge);
+    if (!service) return reply.code(404).send({ error: "ReClaude 尚未配置。" });
+    return { data: service.usageStatus(userIdFromRequest(request, store)) };
+  });
 
   app.get<{ Querystring: { refresh?: string } }>("/api/codex/quota", async (request, reply) => {
     try {
@@ -3661,7 +3684,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
   app.post("/api/projects", async (request, reply) => {
     try {
       const input = createProjectSchema.parse(request.body);
-      assertCodexModelRequest(input);
+      assertRuntimeModel(bridge, userIdFromRequest(request, store), input);
       const userId = userIdFromRequest(request, store);
       if (!store.getUser(userId)) {
         return reply.code(404).send({ error: "User not found." });
@@ -3726,7 +3749,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
   app.patch<{ Params: { id: string } }>("/api/projects/:id", async (request, reply) => {
     try {
       const input = updateProjectSchema.parse(request.body);
-      assertCodexModelRequest(input);
+      assertRuntimeModel(bridge, userIdFromRequest(request, store), input);
       const project = store.updateProject(request.params.id, input, userIdFromRequest(request, store));
       if (!project) {
         return reply.code(404).send({ error: "Project not found." });
@@ -3959,7 +3982,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           const summaries = await readOwnedThreadSummariesFromJsonl(visibleOwnedThreadIds);
           if (summaries) {
             return {
-              data: sortThreadsForUser(store, userId, summaries),
+              data: sortThreadsForUser(store, userId, [...summaries, ...(getClaudeService(bridge)?.list(userId, project.id) ?? []).filter(row => visibleOwnedThreadIds.has(row.id))]),
               hiddenThreadIds,
               nextCursor: null,
               backwardsCursor: null
@@ -3998,6 +4021,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
           }
         }
         let data = nativeData.filter(item => archived || !locallyArchivedIds.has(threadIdFromListItem(item) ?? ""));
+        const listedIds = new Set(data.map(threadIdFromListItem));
+        data.push(...(getClaudeService(bridge)?.list(userId, project.id) ?? []).filter(row => !listedIds.has(row.id) && ownedThreadIds.has(row.id) && (archived === locallyArchivedIds.has(row.id))));
         if (archived && locallyArchivedIds.size) {
           const localData = await readOwnedThreadSummariesFromJsonl(locallyArchivedIds)
             ?? await filterOwnedThreadList(bridge, [], locallyArchivedIds, "", true);
@@ -4227,13 +4252,15 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(404).send({ error: "Thread not found." });
       }
       const input = threadModelProfileSchema.parse(request.body);
-      assertCodexModelRequest(input);
-      const supported = availableModelProfiles().some((profile) => profile.model === input.model && profile.effort === input.reasoningEffort);
+      assertRuntimeModel(bridge, userIdFromRequest(request, store), input);
+      assertRuntimeModel(bridge, userId, input, request.params.threadId);
+      if (getClaudeService(bridge)?.owns(request.params.threadId)) await bridge.request("thread/resume", { threadId: request.params.threadId, model: input.model, excludeTurns: true });
+      const supported = [...availableModelProfiles(), ...(getClaudeService(bridge)?.bindings.profiles(userId) ?? [])].some((profile) => profile.model === input.model && profile.effort === input.reasoningEffort);
       if (!supported) {
         return reply.code(400).send({ error: "Selected model profile is not available." });
       }
       const poolBridge = isAccountPoolBridge(bridge) ? bridge : null;
-      if (poolBridge && !poolBridge.canThreadUseModel(request.params.threadId, input.model)) {
+      if (poolBridge && !isReclaudeModel(input.model) && !poolBridge.canThreadUseModel(request.params.threadId, input.model)) {
         return reply.code(409).send({ error: "当前会话绑定的运行时尚不支持所选模型。请等待该账号空闲后自动更新模型目录，或从上一轮回答创建分支，选择支持此模型的账号；跨供应商也须通过分支切换。" });
       }
       const data = store.setThreadModelConfig(request.params.threadId, userId, input.model, input.reasoningEffort);
@@ -4309,6 +4336,33 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     }catch(error){return reply.code(errorStatus(error)).send({error:error instanceof Error?error.message:String(error)});}
   });
 
+  app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/migrate-runtime", async (request, reply) => {
+    try {
+      const userId=userIdFromRequest(request,store);
+      if(!store.userCanAccessThread(request.params.threadId,userId,request.params.id))return reply.code(403).send({error:"无权迁移此会话。"});
+      if(!historyTransfers||!claudeService)return reply.code(409).send({error:"ReClaude 尚未配置。"});
+      const input=z.object({operationId:z.string().uuid(),model:z.string().min(1).max(120)}).strict().parse(request.body);
+      if(![...availableModelProfiles(),...claudeService.profiles(userId)].some(profile=>profile.model===input.model))return reply.code(400).send({error:"目标模型不可用。"});
+      const result=await historyTransfers.migrate({operationId:input.operationId,sourceThreadId:request.params.threadId,userId,
+        projectId:request.params.id,targetModel:input.model,targetAccountId:allowedAccountForUser(userId)??undefined});
+      return {data:result};
+    } catch(error) {
+      const code=error instanceof Error&&"code"in error?String(error.code):"migration_failed";
+      const quota=claudeService?.storage.quota();
+      if(code==="claude_session_rate_limit"&&quota)reply.header("Retry-After",String(quota.retryAfterSeconds));
+      return reply.code(errorStatus(error)).send({error:error instanceof Error?error.message:String(error),code,
+        ...(code==="claude_session_rate_limit"&&quota?{retryAfterSeconds:quota.retryAfterSeconds,retryAt:quota.retryAt}:{})});
+    }
+  });
+  app.get<{Params:{id:string;threadId:string;operationId:string}}>("/api/projects/:id/threads/:threadId/migration-source/:operationId",async(request,reply)=>{
+    const userId=userIdFromRequest(request,store);
+    if(!store.userCanAccessThread(request.params.threadId,userId,request.params.id))return reply.code(403).send({error:"无权读取此历史。"});
+    const file=historyTransfers?.archive(request.params.operationId,userId,request.params.threadId);
+    if(!file)return reply.code(404).send({error:"迁移源记录不存在。"});
+    return reply.header("Cache-Control","private, no-store").header("X-Content-Type-Options","nosniff")
+      .header("Content-Disposition",'attachment; filename="migration-source.jsonl"').type("application/x-ndjson").send(fs.createReadStream(file));
+  });
+
   app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/branch", async (request, reply) => {
     let releaseBranch: (() => void) | undefined;
     try {
@@ -4321,6 +4375,20 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const input = threadBranchSchema.parse(request.body ?? {});
       const targetProject = input.targetProjectId ? store.getProject(input.targetProjectId, userId) : project;
       if (!targetProject) return reply.code(404).send({ error: "Target project not found." });
+      const claude = getClaudeService(bridge);
+      if (claude?.owns(request.params.threadId)) {
+        if (input.prompt) throw new Error("离线 fork 不接受模型消息；请创建分支后再发送任务。");
+        if (input.archiveToolOutputs) throw new Error("Claude 分支保留完整原生历史，不支持精简工具历史。");
+        const source = claude.storage.get(request.params.threadId)!;
+        const model = input.model ?? source.model;
+        assertRuntimeModel(bridge, userId, { model });
+        const result = asRecord(await bridge.request("thread/fork", { threadId: source.id, model, projectId: targetProject.id, lastTurnId: input.turnId }));
+        const thread = asRecord(result.thread);
+        store.updateThreadDisplayName(String(thread.id), userId, String(thread.name));
+        return { data: { thread, turn: null, sourceThreadId: source.id, sourceTurnId: input.turnId,
+          targetAccount: { id: model.split("@")[1], label: "ReClaude" }, branchMode: "claude-offline" } };
+      }
+      if (isReclaudeModel(input.model)) throw new Error("Codex 原生会话不能作为 Claude 会话续接，请新建 Claude 会话。");
       const sourceExecution = targetProject.id === project.id ? store.getThreadExecutionSettings(request.params.threadId, userId) : null;
       const branchExecution = sourceExecution ?? { sandbox: targetProject.defaultSandbox, approvalPolicy: targetProject.defaultApprovalPolicy };
       releaseBranch = branchGate.enter();
@@ -4793,6 +4861,14 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         project?.id
       )) {
         return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
+      }
+
+      const claude = getClaudeService(bridge);
+      if (claude?.owns(request.params.threadId)) {
+        const page=claude.history(request.params.threadId,input.before,input.limit);
+        return {...page,thread:{...page.thread,
+          answeredQuestionItemIds:store.answeredQuestionItemIds(request.params.threadId,userId),
+          questionAnswers:questionAnswersForPage(store,request.params.threadId,userId,page.thread)}};
       }
 
       const presentation = store.getThreadPresentation(userId, [request.params.threadId]).get(request.params.threadId);

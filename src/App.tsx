@@ -1,4 +1,9 @@
 import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
+import { RuntimeMigrationDialog } from "./RuntimeMigrationDialog";
+import { ReclaudeUsage, useReclaudeUsage } from "./ReclaudeUsage";
+import { ReclaudeQuotaDetails, reclaudeRemainingLabel } from "./reclaudeQuota";
+import type { ReclaudeUsageStatus } from "../shared/reclaudeUsage";
+import {runtimeModelLabel,runtimeModelTriggerLabel} from "./runtimeModelLabel";
 import { accountPoolNeedsQuotaRetry, quotaHasUsableRateLimits } from "./quotaRefreshPolicy";
 import { Children, cloneElement, Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -562,7 +567,7 @@ function modelPickerGroup(model: string): ModelPickerSection {
 }
 
 function modelPickerLabel(profile: ModelProfile): string {
-  return profile.model.endsWith('-ark-api') ? profile.label.replace(' · Ark API 按量', '') : profile.label;
+  return runtimeModelLabel(profile);
 }
 
 function MobileModelPage({ active, children }: { active: boolean; children: ReactNode }) {
@@ -573,13 +578,14 @@ function MobileModelPage({ active, children }: { active: boolean; children: Reac
 }
 
 export function ModelGroupedSelect({
-  value, profiles, onChange, disabled = false, title
+  value, profiles, onChange, disabled = false, title, onOpen
 }: {
   value: string;
   profiles: ModelProfile[];
   onChange: (value: string) => void;
   disabled?: boolean;
   title?: string;
+  onOpen?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const pickerRef = useRef<HTMLDivElement>(null);
@@ -645,24 +651,24 @@ export function ModelGroupedSelect({
     setProvider(next);
   };
   const branchTitle = lastBranch === "gpt" ? "GPT" : lastBranch === "claude" ? "Claude" : "国产模型";
-  const claudeNotice = lastBranch === "claude" ? <p className="groupedModelConnectionNote" role="status">尚未连接 ReClaude。以下为模型系列预览，可用型号将在账号连接后验证。</p> : null;
+  const claudeNotice = lastBranch === "claude" && !profiles.some(profile => isReclaudeModel(profile.model) && modelIsAvailable(profile)) ? <p className="groupedModelConnectionNote" role="status">{profiles.find(profile=>isReclaudeModel(profile.model)&&profile.availability==="disabled")?.unavailableReason??"尚未连接 ReClaude。以下为模型系列预览，可用型号将在账号连接后验证。"}</p> : null;
   const profileOptions = (group: ModelPickerSection) => visibleProfiles.filter((profile) => modelPickerGroup(profile.model) === group).map((profile) => (
     <button className={`polishedSelectOption groupedModelProfile${profile.id === value ? " selected" : ""}`}
       type="button" role="option" aria-selected={profile.id === value} key={profile.id}
       disabled={!modelIsAvailable(profile)} title={profile.unavailableReason}
       onClick={() => { if (modelIsAvailable(profile)) { onChange(profile.id); setOpen(false); } }}>
-      <span><strong>{modelPickerLabel(profile)}</strong>{!modelIsAvailable(profile) ? <small className="groupedModelConnectionStatus">待连接</small> : null}</span>
+      <span><strong>{modelPickerLabel(profile)}</strong>{!modelIsAvailable(profile) ? <small className="groupedModelConnectionStatus">{profile.availability==="disabled"?"已停用":"待连接"}</small> : null}</span>
       <span className="polishedSelectCheck" aria-hidden="true">{profile.id === value ? "✓" : ""}</span>
     </button>
   ));
   return (
-    <div ref={pickerRef} className={`polishedSelect v2ModelPicker groupedModelPicker ${open ? "open" : ""}`}
+    <div ref={pickerRef} data-runtime={selected&&isReclaudeModel(selected.model)?"claude-code":"codex"} className={`polishedSelect v2ModelPicker groupedModelPicker ${open ? "open" : ""}`}
       style={mobile ? { "--mobile-model-menu-left": `${mobileMenuLeft}px` } as CSSProperties : undefined}
       onBlur={(event) => { if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget as Node)) setOpen(false); }}>
-      <button className="polishedSelectTrigger" type="button" disabled={disabled} title={title}
+      <button className="polishedSelectTrigger" type="button" disabled={disabled} title={[title,selected?modelPickerLabel(selected):undefined].filter(Boolean).join(" · ")}
         aria-haspopup="dialog" aria-expanded={open}
-        onClick={() => { if (!open) { setBranch(null); setProvider(null); } setOpen((current) => !current); }}>
-        <span>{selected ? modelPickerLabel(selected) : "选择模型"}</span>
+        onClick={() => { if (!open) { onOpen?.();setBranch(null); setProvider(null); } setOpen((current) => !current); }}>
+        <span>{selected ? runtimeModelTriggerLabel(selected,mobile) : "选择模型"}</span>
         <span className="polishedSelectChevron" aria-hidden="true" />
       </button>
       {menuPresence.present ? (
@@ -3905,20 +3911,26 @@ function accountRemainingLabel(account: CodexAccountPoolAccount): string {
   return remaining === null ? "--" : `${percentText(remaining)}%`;
 }
 
-function QuotaPopover({ quota, pool, loading, closing, userId }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean; userId: string }) {
+function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, currentClaudeOrgId }: { quota: CodexQuota | null; pool: CodexAccountPool | null; loading: boolean; closing: boolean; userId: string; reclaudeStatus: ReclaudeUsageStatus | null; currentClaudeOrgId?: string }) {
   const providerQuotas = useProviderQuotas(userId);
   const quotaAccounts = pool?.accounts.filter((entry) => entry.kind !== "api-provider") ?? [];
+  const claudeAccounts = reclaudeStatus?.accounts ?? [];
+  const accountCount = quotaAccounts.length + providerQuotas.length + claudeAccounts.length;
   const defaultAccount = quotaAccounts.find((entry) => entry.selectedForNewThreads) ?? quotaAccounts[0] ?? null;
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(defaultAccount?.id ?? null);
-  const selectedProvider = providerQuotas.find(item => `provider:${item.id}` === selectedAccountId);
-  const selectedAccount = quotaAccounts.find((entry) => entry.id === selectedAccountId) ?? defaultAccount;
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
+  const ids = [...quotaAccounts.map(account => account.id), ...providerQuotas.map(account => `provider:${account.id}`), ...claudeAccounts.map(account => `reclaude:${account.orgId}`)];
+  const defaultId = claudeAccounts.some(account => account.orgId === currentClaudeOrgId) ? `reclaude:${currentClaudeOrgId}` : defaultAccount?.id ?? ids[0];
+  const activeId = selectedAccountId && ids.includes(selectedAccountId) ? selectedAccountId : defaultId;
+  const selectedProvider = providerQuotas.find(item => `provider:${item.id}` === activeId);
+  const selectedClaude = claudeAccounts.find(account => `reclaude:${account.orgId}` === activeId);
+  const selectedAccount = quotaAccounts.find((entry) => entry.id === activeId);
   const currentThreadAccount = quotaAccounts.find((entry) => entry.id === pool?.currentThreadAccountId) ?? null;
   const selectedQuota = selectedAccount?.quota ?? quota;
   return (
-    <section className={`quotaPopover accountPoolPopover ${closing ? "closing" : ""}`} role="status" aria-label="Codex 多账号额度详情" aria-hidden={closing} inert={closing}>
-      {pool && quotaAccounts.length ? (
+    <section className={`quotaPopover accountPoolPopover ${closing ? "closing" : ""}`} role="status" aria-label="多账号额度详情" aria-hidden={closing} inert={closing}>
+      {accountCount ? (
         <>
-          <div className="accountPoolTabs" style={{ "--account-columns": Math.min(3, quotaAccounts.length) } as CSSProperties} role="tablist" aria-label="Codex 账号额度">
+          <div className="accountPoolTabs" style={{ "--account-columns": Math.min(3, accountCount) } as CSSProperties} role="tablist" aria-label="账号额度">
             {[...quotaAccounts].sort((left,right)=>left.id.localeCompare(right.id,"en",{numeric:true})).map((account) => (
               <button
                 className={`accountPoolTab ${account.id === selectedAccount?.id ? "active" : ""} ${accountQuotaStatus(account) === "unavailable" ? "degraded" : ""} ${account.id === currentThreadAccount?.id ? "current" : ""} ${(remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent) ?? 100) <= 10 ? "lowQuota" : ""}`}
@@ -3938,8 +3950,14 @@ function QuotaPopover({ quota, pool, loading, closing, userId }: { quota: CodexQ
               aria-selected={item === selectedProvider} title={`${item.name} · ${item.stale ? "缓存用量" : "套餐用量"}`}
               className={`accountPoolTab ${item === selectedProvider ? "active" : ""} ${item.status !== "ready" ? "degraded" : ""}`}
               onClick={() => setSelectedAccountId(`provider:${item.id}`)}><span>{item.name}</span><strong>{providerRemaining(item)}</strong></button>)}
+            {claudeAccounts.map(account => <button type="button" role="tab" key={`reclaude:${account.orgId}`} data-account-id={`reclaude:${account.orgId}`}
+              aria-selected={account === selectedClaude} title={`${account.label} · ${account.message}`}
+              className={`accountPoolTab ${account === selectedClaude ? "active" : ""} ${account.orgId === currentClaudeOrgId ? "current" : ""} ${account.state === "disabled" ? "lowQuota" : ""}`}
+              onClick={() => setSelectedAccountId(`reclaude:${account.orgId}`)}>
+              <span className="reclaudeAccountName">{account.label}</span><strong>{reclaudeRemainingLabel(account)}</strong>
+            </button>)}
           </div>
-          {selectedProvider ? <ProviderQuotaDetails key={selectedProvider.id} item={selectedProvider} formatPeriod={period => rateWindowText({ usedPercent: period.usedPercent, windowDurationMins: null, resetsAt: period.resetsAt ? Date.parse(period.resetsAt) / 1000 : null }, ({ session: "5小时", weekly: "7天", monthly: "月度" } as Record<string, string>)[period.label] ?? period.label)} /> : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
+          {selectedClaude ? <ReclaudeQuotaDetails key={selectedClaude.orgId} account={selectedClaude} cacheError={reclaudeStatus?.cacheError}/> : selectedProvider ? <ProviderQuotaDetails key={selectedProvider.id} item={selectedProvider} formatPeriod={period => rateWindowText({ usedPercent: period.usedPercent, windowDurationMins: null, resetsAt: period.resetsAt ? Date.parse(period.resetsAt) / 1000 : null }, ({ session: "5小时", weekly: "7天", monthly: "月度" } as Record<string, string>)[period.label] ?? period.label)} /> : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
           {!selectedProvider && selectedAccount ? (
             <div className="accountPoolSelectedMeta">
               {accountQuotaStatus(selectedAccount) === "cached" ? <span>额度查询暂时失败 · 显示缓存，后台重试中</span> : null}
@@ -4713,6 +4731,7 @@ export function App() {
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
   const [pendingDeleteThreadId, setPendingDeleteThreadId] = useState<string | null>(null);
   const [threadContextMenu, setThreadContextMenu] = useState<ThreadContextMenu | null>(null);
+  const [runtimeMigration,setRuntimeMigration]=useState<{thread:ThreadSummary;projectId:string;initialModel?:string}|null>(null);
   const threadContextMenuSnapshot = useRef<ThreadContextMenu | null>(null);
   if (threadContextMenu) threadContextMenuSnapshot.current = threadContextMenu;
   const threadContextMenuPresence = useExitPresence(Boolean(threadContextMenu), 180);
@@ -4842,6 +4861,16 @@ export function App() {
   const [newThreadContextConfig, setNewThreadContextConfig] = useState<ThreadContextConfig>(() => emptyThreadContextConfig());
   const [contextPinSaving, setContextPinSaving] = useState(false);
   const [modelProfiles, setModelProfiles] = useState<ModelProfile[]>(fallbackModelProfiles);
+  const {status:reclaudeUsage,receive:receiveReclaudeUsage}=useReclaudeUsage(selectedUserId);
+  useEffect(()=>{
+    if(!reclaudeUsage)return;
+    setModelProfiles(current=>current.map(profile=>{
+      if(!isReclaudeModel(profile.model)||profile.availability==="not-connected")return profile;
+      const account=reclaudeUsage.accounts.find(account=>account.orgId===profile.model.split("@")[1]);
+      if(!account)return profile;
+      return {...profile,availability:account.state==="disabled"?"disabled":"ready",unavailableReason:account.state==="disabled"?account.message:undefined};
+    }));
+  },[reclaudeUsage]);
   const [newThreadModelProfileId, setNewThreadModelProfileId] = useState(defaultModelProfileId);
   const [savingThreadModel, setSavingThreadModel] = useState(false);
   const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
@@ -5279,6 +5308,7 @@ export function App() {
     const requestId = `temp-${requestToken()}`;
     const next = sideChatController.begin(current.userId, current.parentThreadId, requestId, text);
     if (!next) return;
+    setError(current => current.startsWith("侧边提问失败：") ? "" : current);
     try {
       codexSocket.send(current.threadId ? {
         type: "turn.start",
@@ -5309,9 +5339,9 @@ export function App() {
         approvalPolicy,
       });
     } catch (caught) {
-      const failed = { ...next, status: "error" as const };
+      const failed = { ...next, status: "error" as const, error:caught instanceof Error?caught.message:String(caught) };
       sideChatController.updateAsk(failed);
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setError(`侧边提问失败：${caught instanceof Error ? caught.message : String(caught)}`);
     }
   }
 
@@ -6034,7 +6064,7 @@ export function App() {
     setThreadContextMenu({
       thread,
       x: Math.max(8, Math.min(event.clientX, window.innerWidth - 184)),
-      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 136))
+      y: Math.max(8, Math.min(event.clientY, window.innerHeight - 184))
     });
   }
 
@@ -7888,6 +7918,9 @@ export function App() {
     }
     const previousModel = thread.configuredModel ?? selectedProject?.defaultModel ?? profile.model;
     const previousEffort = thread.configuredReasoningEffort ?? selectedProject?.defaultReasoningEffort ?? profile.effort;
+    if(isReclaudeModel(previousModel)!==isReclaudeModel(profile.model)) {
+      setRuntimeMigration({thread,projectId,initialModel:profile.model});return;
+    }
     setError("");
     setSavingThreadModel(true);
     if(turnRecoveries[`${selectedUserId}:${thread.id}`]?.job?.status==='waiting') {
@@ -9112,7 +9145,7 @@ export function App() {
   }
 
   async function sendPrompt(mode: "queue" | "steer" = "queue", questionAnswer?: string, predictedPrompt?: string): Promise<boolean> {
-    if (!modelIsAvailable(selectedModelProfile) || isReclaudeModel(selectedModelProfile.model)) {
+    if (!modelIsAvailable(selectedModelProfile)) {
       setError(selectedModelProfile.unavailableReason ?? CLAUDE_NOT_CONNECTED);
       return false;
     }
@@ -9877,6 +9910,7 @@ export function App() {
       return;
     }
     if (message.type === "hello") {
+      void refreshModels();
       const data = message.data as { liveState?: LiveStateSnapshot; turnProgress?: unknown[]; turnRecoveries?: TurnRecoveryView[]; pendingServerRequests?: Array<{ id: string | number; method: string; params: Record<string, unknown> }> } | undefined;
       setTurnRecoveries(current => ({ ...Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${selectedUserId}:`))),
         ...Object.fromEntries((data?.turnRecoveries ?? []).map(state => [`${selectedUserId}:${state.threadId}`, state])) }));
@@ -10113,7 +10147,7 @@ export function App() {
         }
         if (!message.ok) {
           if (interruptQueued) clearQueuedInterrupt(message.requestId);
-          const failed = { ...temporary, status: "error" as const };
+          const failed = { ...temporary, status: "error" as const, error:message.error??"发送失败，请修改后重试。" };
           sideChatController.updateAsk(failed);
           if (temporary.parentThreadId === selectedThreadRef.current?.id && temporary.userId === selectedUserId) setError(`侧边提问失败：${message.error ?? "Codex 未接受请求。"}`);
           return;
@@ -10267,7 +10301,7 @@ export function App() {
           promptRequestContextsRef.current.delete(message.requestId);
         }
         const providerNotice = isPromptRequest && !isStalePromptAck
-          ? classifyProviderFailure(requestContext?.model ?? selectedModelProfile.model, errorMessage)
+          ? classifyProviderFailure(requestContext?.model ?? selectedModelProfile.model, isRecord(message.data) && isRecord(message.data.appError) ? message.data.appError : errorMessage)
           : null;
         if (providerNotice) {
           setProviderFailure(providerNotice);
@@ -10403,6 +10437,10 @@ export function App() {
         return;
       }
       const params = notification.params ?? {};
+      if (notification.method === "runtime/reclaudeUsage") {
+        if(isRecord(params.usage)&&Array.isArray(params.usage.accounts))receiveReclaudeUsage(params.usage as unknown as ReclaudeUsageStatus);
+        return;
+      }
       const recoveryChanges = recoverAgentStreams(liveAgentBasesRef.current, notification);
       if (recoveryChanges.length) {
         for (const [id, entry] of recoveryChanges) {
@@ -11850,6 +11888,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         )}
       />
 
+      {runtimeMigration?<RuntimeMigrationDialog key={runtimeMigration.thread.id} threadId={runtimeMigration.thread.id} projectId={runtimeMigration.projectId}
+        name={runtimeMigration.thread.name??runtimeMigration.thread.preview??"会话"} sourceClaude={isReclaudeModel(runtimeMigration.thread.configuredModel??selectedProject?.defaultModel)}
+        profiles={modelProfiles} usageStatus={reclaudeUsage} initialModel={runtimeMigration.initialModel} onClose={()=>setRuntimeMigration(null)}
+        onComplete={async result=>{const projectId=runtimeMigration.projectId;setRuntimeMigration(null);await refreshThreads(projectId);await openThread(result.threadId,projectId,undefined,{skipCache:true,requireFresh:true});
+          addLocalMessage(`已迁移 ${result.messageCount} 条对话记录，原会话保留。[下载完整源记录](${result.historySourceUrl})\n\n${result.warnings.join("\n")}`,"会话迁移");}}/>:null}
+
       {threadContextMenuPresence.present && displayedThreadContextMenu ? createPortal(
         <div
           key={`${displayedThreadContextMenu.thread.id}:${displayedThreadContextMenu.x}:${displayedThreadContextMenu.y}`}
@@ -11871,6 +11915,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <PencilLine size={15} />
             重命名会话
           </button>
+          {modelProfiles.some(profile=>isReclaudeModel(profile.model)&&modelIsAvailable(profile))||isReclaudeModel(displayedThreadContextMenu.thread.configuredModel)?<button type="button" role="menuitem" onClick={()=>{
+            const projectId=threadProjectIdsRef.current.get(displayedThreadContextMenu.thread.id)??selectedProjectIdRef.current;
+            if(projectId)setRuntimeMigration({thread:displayedThreadContextMenu.thread,projectId});setThreadContextMenu(null);
+          }}><GitBranch size={15}/>迁移会话</button>:null}
           <button type="button" role="menuitem" onClick={() => void toggleThreadPin(displayedThreadContextMenu.thread)}>
             <Pin size={15} />
             {displayedThreadContextMenu.thread.pinned ? "取消置顶" : "置顶会话"}
@@ -12559,7 +12607,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 {quotaLoading ? "额度..." : quotaSummaryLabel(quota, accountPool)}
                 <ComposerGlassMaterial variant="topbar" />
               </button>
-              {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} /> : null}
+              {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} reclaudeStatus={reclaudeUsage} currentClaudeOrgId={isReclaudeModel(selectedModelProfile.model)?selectedModelProfile.model.split("@")[1]:undefined} /> : null}
             </div>
             <button
               className="leaderboardButton"
@@ -13043,6 +13091,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 </select>
               </label>
             </div>
+            {isReclaudeModel(selectedModelProfile.model)?<ReclaudeUsage key={`${selectedUserId}:${selectedModelProfile.model}`} model={selectedModelProfile.model} status={reclaudeUsage}/>:null}
             {exhaustedAccountNoticePresence.present
               && exhaustedAccountNotice
               && exhaustedAccountNotice.threadId === selectedThread?.id ? (
@@ -13316,6 +13365,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           <ModelGroupedSelect
                             value={temporaryModelProfileId}
                             onChange={setTemporaryModelProfileId}
+                            onOpen={()=>void refreshModels()}
                             disabled={["starting", "running", "closing"].includes(temporaryAsk.status)}
                             profiles={modelProfiles}
                           />
@@ -13777,6 +13827,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <ModelGroupedSelect
                     value={activeModelProfileId}
                     onChange={(profileId) => void changeConversationModelProfile(profileId)}
+                    onOpen={()=>void refreshModels()}
                     disabled={savingThreadModel || conversationRunState === "running" || Boolean(selectedThread && turnRecoveries[`${selectedUserId}:${selectedThread.id}`]?.job?.status === "running")}
                     title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
                     profiles={selectableModelProfiles}
@@ -13813,7 +13864,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <button className="iconTextButton skillsButton" type="button" onClick={() => void openSkillsPicker(true)} disabled={!selectedProject || skillsLoading}>
                     {skillsLoading ? "加载技能..." : `技能 ${skills.length || ""}`}
                   </button>
-                  <button className="v2PlanModeBridge v2MovedIntoPlus" type="button" aria-pressed={planMode} aria-hidden="true" tabIndex={-1} onClick={() => setPlanMode((current) => !current)} title={planMode ? "关闭计划模式，下次发送可执行改动" : "开启 Codex 原生计划模式：先给出方案，不执行改动"}>{planMode ? "计划模式已开启" : "计划模式"}</button>
+                  <button className="v2PlanModeBridge v2MovedIntoPlus" type="button" aria-pressed={planMode} aria-hidden="true" tabIndex={-1} onClick={() => setPlanMode((current) => !current)} title={planMode ? "关闭计划模式，下次发送可执行改动" : "开启原生计划模式：先给出方案，不执行改动"}>{planMode ? "计划模式已开启" : "计划模式"}</button>
                   <select
                     className="skillSelect"
                     value=""

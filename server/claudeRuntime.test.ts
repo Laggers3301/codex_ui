@@ -11,7 +11,7 @@ import { CodexBridge } from "./codexBridge.js";
 import { approvalResponse } from "../shared/approvals.js";
 
 const directories: string[] = [];
-afterEach(() => { for (const p of directories.splice(0)) fs.rmSync(p, { recursive: true, force: true }); vi.restoreAllMocks(); });
+afterEach(() => { for (const p of directories.splice(0)) fs.rmSync(p, { recursive: true, force: true }); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 function workspace() { const p = fs.mkdtempSync(path.join(os.tmpdir(), "claude-adapter-")); directories.push(p); return p; }
 const init = { type: "system", subtype: "init", session_id: "native-session", model: "sonnet", tools: ["Read", "Bash", "Skill"], skills: ["pdf"], mcp_servers: [{name: "fixture", status: "connected", secret: "not-public"}], apiKeySource: "not-public" };
 const success = { type: "result", subtype: "success", is_error: false, result: "检查完成", session_id: "native-session", usage: { input_tokens: 10, output_tokens: 5 } };
@@ -50,12 +50,16 @@ describe("Claude runtime boundaries", () => {
   });
 
   it("retains native skills/tool configuration and resumes only the adapter's own session mapping", async () => {
+    for (const key of ["OPENAI_API_KEY", "ARK_PAY_API_KEY", "MIMO_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CODEX_WEB_PRIVATE_CONFIG"]) vi.stubEnv(key, "fixture-backend-secret");
+    vi.stubEnv("HTTPS_PROXY", "http://fixture-proxy:8080");
     const factory = vi.fn(async () => query([init,success])); const {runtime,input,notifications} = fixture(factory);
     await runtime.runTurn(input);
     await runtime.runTurn({...input,turnId:"turn-b"});
     const options = (factory.mock.calls as unknown as Array<[string, Options]>).map(c=>c[1]);
     expect(options[0]).toMatchObject({cwd:input.cwd,model:"sonnet",permissionMode:"default",includePartialMessages:true,settingSources:["user","project","local"],tools:{type:"preset",preset:"claude_code"},env:{RECLAUDE_ORG:"org-1"}});
     expect(options[0].resume).toBeUndefined(); expect(options[1].resume).toBe("native-session");
+    expect(JSON.stringify(options[0].env)).not.toContain("fixture-backend-secret");
+    expect(options[0].env?.HTTPS_PROXY).toBe("http://fixture-proxy:8080");
     expect(JSON.stringify(notifications)).not.toContain("not-public");
     expect(notifications.find(e=>e.method==="runtime/initialized")?.params).toMatchObject({skills:["pdf"],tools:["Read","Bash","Skill"]});
     expect(()=>runtime.sessionForThread("bob",input.threadId)).toThrow();
@@ -105,6 +109,53 @@ describe("Claude runtime boundaries", () => {
       await runtime.runTurn(input);
       expect(notifications.at(-1)?.params).toMatchObject({turn:{status:"failed"}});
     }
+  });
+
+  it("sends four native questions through the user-input protocol and returns only the user's validated answers", async () => {
+    const questions=Array.from({length:4},(_,index)=>({question:`问题 ${index+1}？`,header:`Q${index}`,options:[{label:"A",description:"第一项"},{label:"B",description:"第二项"}],multiSelect:index===3}));
+    let result:unknown;
+    const factory:ClaudeQueryFactory=async(_,options)=>({close:vi.fn(),async *[Symbol.asyncIterator](){
+      yield sdk(init);
+      yield sdk({type:"assistant",message:{id:"questions-message",content:[{type:"tool_use",id:"ask-1",name:"AskUserQuestion",input:{questions}}]}});
+      result=await options.canUseTool!("AskUserQuestion",{questions},{signal:options.abortController!.signal,toolUseID:"ask-1"});
+      yield sdk(success);
+    }});
+    const {runtime,input,notifications}=fixture(factory);
+    runtime.on("serverRequest",request=>{
+      expect(request).toMatchObject({method:"item/tool/requestUserInput",params:{itemId:"ask-1",isBlocking:true}});
+      expect(request.params.questions).toHaveLength(4);
+      expect(()=>runtime.answerApproval("alice",request.id,"accept")).toThrow();
+      expect(()=>runtime.answerUserInput("bob",request.id,{})).toThrow();
+      expect(()=>runtime.answerUserInput("alice",request.id,{answers:{}})).toThrow();
+      const answers=Object.fromEntries(request.params.questions.map((question:any,index:number)=>[question.id,{answers:[index===3?"A, B":"A"]}]));
+      request.params.questions[0].question="客户端不得改写的问题";
+      runtime.answerUserInput("alice",request.id,{answers});
+      expect(()=>runtime.answerUserInput("alice",request.id,{answers})).toThrow();
+    });
+    await runtime.runTurn(input);
+    expect(result).toEqual({behavior:"allow",updatedInput:{questions,answers:{"问题 1？":"A","问题 2？":"A","问题 3？":"A","问题 4？":"A, B"}}});
+    const tool=notifications.filter(event=>event.method==="item/started").map(event=>(event.params as any).item).find(item=>item.tool==="request_user_input");
+    expect(tool).toMatchObject({callId:"ask-1",arguments:{questions:[{id:"claude:ask-1:0"},{id:"claude:ask-1:1"},{id:"claude:ask-1:2"},{id:"claude:ask-1:3",multiSelect:true}]}});
+  });
+
+  it("selects native plan mode and can turn it off explicitly on the next turn", async () => {
+    const factory=vi.fn(async()=>query([init,success]));const {runtime,input}=fixture(factory);
+    await runtime.runTurn({...input,collaborationMode:"plan"});
+    await runtime.runTurn({...input,turnId:"execute",collaborationMode:"default"});
+    const calls=factory.mock.calls as unknown as Array<[string,Options]>;
+    expect(calls[0][1].permissionMode).toBe("plan");expect(calls[1][1].permissionMode).toBe("default");
+  });
+
+  it("cancels an unanswered question without granting tool permission", async()=>{
+    let result:unknown;
+    const factory:ClaudeQueryFactory=async(_,options)=>({close:vi.fn(),async *[Symbol.asyncIterator](){
+      result=await options.canUseTool!("AskUserQuestion",{questions:[{question:"选择？",options:[{label:"A"},{label:"B"}]}]},
+        {signal:options.abortController!.signal,toolUseID:"cancel-question"});
+    }});
+    const {runtime,input,notifications}=fixture(factory);
+    runtime.on("serverRequest",()=>runtime.interrupt("alice",input.threadId));
+    await runtime.runTurn(input);expect(result).toMatchObject({behavior:"deny"});
+    expect(notifications.at(-1)?.params).toMatchObject({turn:{status:"interrupted"}});
   });
 });
 
