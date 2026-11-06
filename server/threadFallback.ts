@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import {rolloutPreviewRecords,previewImageMarkers} from './rolloutPreview.js';
 import { toolDescription } from "../shared/toolDescription.js";
 import { createReadStream, readFileSync } from "node:fs";
 import os from "node:os";
@@ -126,7 +127,7 @@ function toolOutputText(output: unknown): string {
   if (typeof output === "string") {
     return output;
   }
-  const content = textFromContent(output);
+  const content = [textFromContent(output),...previewImageMarkers(output)].filter(Boolean).join('\n');
   if (content.trim()) {
     return content;
   }
@@ -705,15 +706,15 @@ async function parseThreadFromJsonl(
     const handle = await openReadableRollout(filePath);
     try {
       const headBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, fileStat.size));
-      const bodyBuffer = Buffer.allocUnsafe(endOffset - startOffset);
       await handle.read(headBuffer, 0, headBuffer.length, 0);
-      if (bodyBuffer.length) await handle.read(bodyBuffer, 0, bodyBuffer.length, startOffset);
+      const bodyParts:string[]=[];let previewBytes=0;
+      if(endOffset>startOffset)for await(const row of rolloutPreviewRecords(filePath,{start:startOffset,end:endOffset})){previewBytes+=Buffer.byteLength(row.text)+1;if(previewBytes>32*1024*1024)throw new HistoryMemoryLimitError();bodyParts.push(row.text);}
       const firstLineEnd = headBuffer.indexOf(10);
       const firstLine = headBuffer.subarray(0, firstLineEnd >= 0 ? firstLineEnd : headBuffer.length).toString("utf8").trimEnd();
       const syntheticTurn = options.syntheticTurnId
         ? `${JSON.stringify({ type: "turn_context", payload: { turn_id: options.syntheticTurnId } })}\n`
         : "";
-      raw = `${firstLine}\n${syntheticTurn}${bodyBuffer.toString("utf8")}`;
+      raw = `${firstLine}\n${syntheticTurn}${bodyParts.join('\n')}`;
       truncated = startOffset > 0 || endOffset < fileStat.size;
     } finally {
       await handle.close();

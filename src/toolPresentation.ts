@@ -2,6 +2,10 @@ import { toolDescription } from "../shared/toolDescription";
 import type { ThreadItem } from "./types";
 
 export type ToolIconKind = "web" | "file" | "search" | "agent" | "terminal" | "image" | "tool";
+export function toolDisplayName(item:ThreadItem):string{
+  const name=String(item.tool??'');
+  return ({Bash:'exec',Read:'读取文件',Edit:'修改文件',Write:'写入文件',WebFetch:'访问网页',WebSearch:'联网搜索',ToolSearch:'查找工具',mcp__codex_web_history__search:'检索历史',mcp__codex_web_history__read:'读取历史',mcp__codex_documents__read_docx:'读取文档',mcp__codex_browser__browser_action:'浏览器',mcp__codex_feishu__feishu_office:'飞书办公',mcp__codex_schedules__scheduled_tasks:'定时任务',mcp__codex_communication__session_communication:'会话通信'} as Record<string,string>)[name]??name;
+}
 
 function parsed(value: unknown): unknown {
   if (typeof value !== "string" || value.length > 64000) return value;
@@ -14,14 +18,14 @@ function webQuery(item: ThreadItem): string | undefined {
   const data = value as Record<string, unknown>;
   const searches = data.search_query ?? data.searchQuery;
   const first = Array.isArray(searches) ? searches[0] : undefined;
-  const query = typeof data.query === "string" ? data.query : first && typeof first === "object" ? (first as Record<string, unknown>).q : undefined;
+  const query = typeof data.query === "string" ? data.query : typeof data.pattern==='string'?data.pattern:first && typeof first === "object" ? (first as Record<string, unknown>).q : undefined;
   if (typeof query !== "string") return;
   const text = query.replace(/\s+/g, " ").trim();
   return text && text.length <= 100 ? text : undefined;
 }
 
 function changedFile(item: ThreadItem): { name: string; action: string } | undefined {
-  const input = parsed(item.input ?? item.command ?? item.changes);
+  const input = parsed(item.input ?? item.arguments ?? item.command ?? item.changes);
   let path: unknown;
   let action = "变更";
   if (typeof input === "string") {
@@ -30,7 +34,7 @@ function changedFile(item: ThreadItem): { name: string; action: string } | undef
     action = match?.[1] === "Add" ? "新增" : match?.[1] === "Delete" ? "删除" : "修改";
   }
   else if (Array.isArray(input)) path = (input[0] as Record<string, unknown> | undefined)?.path;
-  else if (input && typeof input === "object") path = (input as Record<string, unknown>).path;
+  else if (input && typeof input === "object") path = (input as Record<string, unknown>).path ?? (input as Record<string, unknown>).file_path;
   if (typeof path !== "string") return;
   const name = path.replace(/\\/g, "/").split("/").pop()?.trim();
   return name && name.length <= 100 && !/[\r\n]/.test(name) ? { name, action } : undefined;
@@ -53,7 +57,8 @@ function commandSummary(command: string): string | undefined {
 }
 
 export function toolPresentation(item: ThreadItem): { description?: string; icon: ToolIconKind } {
-  const name = String(item.tool ?? item.type ?? "").toLowerCase();
+  const rawName = String(item.tool ?? item.type ?? "").toLowerCase();
+  const name=({bash:'exec',read:'read_file',write:'write_file',edit:'edit_file',notebookedit:'edit_file',webfetch:'fetch_url',grep:'search',glob:'find_files'} as Record<string,string>)[rawName]??rawName;
   const supplied = toolDescription(item, item.input, item.arguments);
   if (/web.?search|web__run|browser|search_query|fetch_url/.test(name)) {
     const query = webQuery(item);
@@ -65,10 +70,10 @@ export function toolPresentation(item: ThreadItem): { description?: string; icon
     const file = changedFile(item);
     return { description: supplied ?? (file ? `${file.action} ${file.name}` : "文件变更"), icon: "file" };
   }
-  if (/read_file|readfile/.test(name)) return { description: supplied ?? "读取文件", icon: "file" };
-  if (/search|find_files/.test(name)) return { description: supplied ?? "搜索内容", icon: "search" };
+  if (/read_file|readfile/.test(name)) { const file=changedFile(item);return { description: supplied ?? (file?`读取 ${file.name}`:"读取文件"), icon: "file" }; }
+  if (/search|find_files/.test(name)) {const query=webQuery(item);return { description: supplied ?? (query?`搜索：${query}`:"搜索内容"), icon: "search" };}
   if (/^(?:.*[./])?(?:exec|exec_command|commandexecution|shell)$/.test(name)) {
-    let value = parsed(item.command ?? item.input);
+    let value = parsed(item.command ?? item.input ?? item.arguments);
     if (value && typeof value === 'object' && !Array.isArray(value)) value = (value as Record<string,unknown>).cmd ?? (value as Record<string,unknown>).command;
     let command = typeof value === "string" ? value.trim() : "";
     const shell = command.match(/^(?:\/[^\s]+\/)?(?:bash|sh|zsh)\s+-[a-z]*c\s+['"]([\s\S]*)['"]$/);

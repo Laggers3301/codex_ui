@@ -10,6 +10,10 @@ import { RuntimeHistoryTransfer,portableCodexItem,portableClaudeMessage } from "
 import { locateClaudeHistory } from "./claudeSessionStorage.js";
 import type { CodexBridge } from "./codexBridge.js";
 import { readThreadFromJsonl } from "./threadFallback.js";
+import { createInterface } from "node:readline";
+import {prepareMigratedContext} from './claudeContextPreparation.js';
+import {execFile as runFile} from 'node:child_process';
+import {promisify} from 'node:util';
 
 const paths=vi.hoisted(()=>new Map<string,string>());
 vi.mock("./threadFallback.js",async(importOriginal)=>({...await importOriginal<typeof import("./threadFallback.js")>(),findThreadJsonlPathById:async(id:string)=>paths.get(id)??null}));
@@ -52,6 +56,99 @@ function fixture(){
     migrate:(source=id,model="gpt-6.1-sol",operationId=randomUUID())=>transfers.migrate({sourceThreadId:source,userId:"admin",projectId:project.id,targetModel:model,operationId})as Promise<any>};
 }
 describe("bidirectional runtime history transfer",()=>{
+  it('bounds migrated model context, reuses the source compact summary and preserves complete history and cutoffs',async()=>{
+    const f=fixture(),first=await f.migrate(),file=paths.get(first.threadId)!;
+    const rows=[{type:'turn_context',payload:{turn_id:'kept'}},{type:'compacted',payload:{message:'COMPACT-KEEP：当前任务为物理后验校准，不重复运行旧实验。'}},
+      ...Array.from({length:30},(_,i)=>({type:'response_item',payload:{type:'custom_tool_call_output',call_id:'old-'+i,output:'OLD-RESULT-'+i+'x'.repeat(18000)}})),
+      {type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text:'LATEST-KEEP：继续检查真实任务的执行闭环。'}]}},
+      {type:'event_msg',payload:{type:'task_complete',turn_id:'kept'}},{type:'turn_context',payload:{turn_id:'future'}},{type:'compacted',payload:{message:'FUTURE-DO-NOT-INHERIT'}},
+      {type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text:'FUTURE-DO-NOT-INHERIT'}]}}];
+    fs.appendFileSync(file,rows.map(row=>JSON.stringify(row)).join('\n')+'\n');
+    const child=await f.transfers.migrate({sourceThreadId:first.threadId,userId:'admin',projectId:f.project.id,targetModel:'reclaude-sonnet@1',sourceTurnId:'kept',operationId:randomUUID()}) as any;
+    const row=f.service.storage.get(child.threadId)!,native=locateClaudeHistory(row.nativeSessionId,[row.configRoot])!;
+    const original=fs.readFileSync(native),archive=f.transfers.archive(child.operationId,'admin',first.threadId)!,archiveBefore=fs.readFileSync(archive);
+    const turns=f.service.storage.turnCount(row.id),used=f.service.storage.quota().used;
+    await prepareMigratedContext(f.service.storage,row);
+    expect(row.contextHandoff?.summaryFound).toBe(true);expect(row.contextHandoff?.bytes).toBeLessThanOrEqual(128*1024);
+    expect(fs.readFileSync(row.contextHandoff!.sourceFile)).toEqual(original);expect(row.nativeSessionId).not.toBe(row.contextHandoff?.sourceSessionId);
+    const working=fs.readFileSync(locateClaudeHistory(row.nativeSessionId,[row.configRoot])!,'utf8');
+    expect(working).toContain('COMPACT-KEEP');expect(working).toContain('LATEST-KEEP');expect(working).not.toContain('FUTURE-DO-NOT-INHERIT');
+    expect(fs.readFileSync(native)).toEqual(original);expect(fs.readFileSync(archive)).toEqual(archiveBefore);expect(f.service.storage.turnCount(row.id)).toBe(turns);
+    expect(f.service.storage.quota().used).toBe(used+1);const current=row.nativeSessionId;
+    const sdkPath=new URL('../integrations/claude-session-tools/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs',import.meta.url).href;
+    const verified=await promisify(runFile)(process.execPath,['--input-type=module','-e',`import{getSessionMessages}from ${JSON.stringify(sdkPath)};const rows=await getSessionMessages(${JSON.stringify(current)},{dir:${JSON.stringify(row.cwd)}});console.log(JSON.stringify({messages:rows.length}));`],{env:{...process.env,CLAUDE_CONFIG_DIR:row.configRoot},timeout:15000,maxBuffer:16384});
+    expect(JSON.parse(verified.stdout).messages).toBe(1);
+    await prepareMigratedContext(f.service.storage,row);expect(row.nativeSessionId).toBe(current);expect(f.service.storage.quota().used).toBe(used+1);
+    const oldTurns=f.service.storage.turns(row.id,100),cutoff=oldTurns.at(-2)!;
+    const fork=await f.service.request('thread/fork',{threadId:row.id,lastTurnId:cutoff.id}) as any;
+    const forkRow=f.service.storage.get(fork.thread.id)!;expect(forkRow.contextHandoff?.rebuildFromNative).toBe(true);
+    await prepareMigratedContext(f.service.storage,forkRow);
+    const forkInput=fs.readFileSync(locateClaudeHistory(forkRow.nativeSessionId,[forkRow.configRoot])!,'utf8');
+    expect(forkInput).not.toContain('LATEST-KEEP');expect(forkInput).not.toContain('FUTURE-DO-NOT-INHERIT');
+    expect(forkRow.contextHandoff?.bytes).toBeLessThanOrEqual(128*1024);
+    expect(f.request.mock.calls.some(([method])=>method==='turn/start')).toBe(false);
+  },20000);
+  it("renders migrated Codex tool structure from the snapshot, keeps pagination and appends only new Claude turns",async()=>{
+    const f=fixture(),first=await f.migrate(),file=paths.get(first.threadId)!;
+    fs.appendFileSync(file,[{type:'turn_context',payload:{turn_id:'structured-turn'}},{type:'response_item',payload:{id:'user-real',type:'message',role:'user',content:[{type:'input_text',text:'A real question'}]}},{type:'response_item',payload:{id:'tool-original',call_id:'tool-call',type:'function_call',name:'exec_command',arguments:JSON.stringify({cmd:'echo hello'})}},{type:'response_item',payload:{call_id:'tool-call',type:'function_call_output',output:[{type:'input_text',text:'hello'}]}},{type:'response_item',payload:{id:'answer-real',type:'message',role:'assistant',content:[{type:'output_text',text:'A real answer'}]}},{type:'event_msg',payload:{type:'task_complete',turn_id:'structured-turn'}}].map(v=>JSON.stringify(v)).join('\n')+'\n');
+    const child=await f.migrate(first.threadId,'reclaude-sonnet@1');
+    const page=await f.service.readHistory(child.threadId,0,100);
+    const all=page.thread.turns.flatMap((t:any)=>t.items);
+    expect(all.every((i:any)=>i.historicalImport===true)).toBe(true);
+    expect(all.some((i:any)=>i.type==='toolCall')).toBe(true);expect(all.some((i:any)=>i.type==='toolCallOutput'&&i.aggregatedOutput==='hello')).toBe(true);
+    expect(JSON.stringify(page.thread.turns.filter((t:any)=>t.sourceTurnId==='structured-turn'))).not.toContain('[历史工具调用');
+    expect(all.filter((i:any)=>i.type==='userMessage').some((i:any)=>i.content[0].text==='A real question')).toBe(true);
+    const structured=page.thread.turns.find((t:any)=>t.sourceTurnId==='structured-turn')!;
+    expect(f.service.storage.turn(String(structured.id))?.nativeMessageId).toBeTruthy();
+    f.service.storage.saveTurn(child.threadId,{id:'new-native-turn',status:'completed',items:[{id:'new-answer',type:'agentMessage',text:'New Claude answer'}]});
+    const latest=await f.service.readHistory(child.threadId,0,100);
+    expect(latest.thread.turns.map((t:any)=>t.id)).toEqual(['new-native-turn']);expect(latest.history.hasOlder).toBe(true);
+    const older=await f.service.readHistory(child.threadId,latest.history.nextBefore,100);
+    expect(older.thread.turns.some((t:any)=>t.items.some((i:any)=>i.id==='answer-real'))).toBe(true);
+    expect(older.thread.turns.some((t:any)=>t.id==='new-native-turn')).toBe(false);
+    const request=await f.service.request('thread/read',{threadId:child.threadId,includeTurns:true}) as any;
+    expect(request.thread.turns.map((t:any)=>t.id)).toEqual(['new-native-turn']);
+  });
+  it.skipIf(!process.env.TRANSFER_BENCH_SOURCE)("replays an existing large snapshot in an isolated offline runtime",async()=>{
+    const f=fixture(),source=process.env.TRANSFER_BENCH_SOURCE!;
+    const fd=fs.openSync(source,'r'),header=Buffer.alloc(65536);let bytes:number;
+    try{bytes=fs.readSync(fd,header);}finally{fs.closeSync(fd);}
+    const id=JSON.parse(header.subarray(0,header.indexOf(10,0)).toString()).payload.id;
+    paths.set(id,source);f.summaries.set(id,{id,status:{type:'idle'}});
+    f.store.registerThreadOwner({threadId:id,userId:'admin',projectId:f.project.id,rootPath:f.cwd,model:'gpt-6.1-sol',reasoningEffort:'high'});
+    f.store.setThreadExecutionSettings(id,'admin','danger-full-access','never');
+    const phaseMs:Record<string,number>={};
+    for(const method of ['snapshot','importClaude'] as const){
+      const original=(f.transfers as any)[method].bind(f.transfers);
+      vi.spyOn(f.transfers as any,method).mockImplementation(async(...args:unknown[])=>{const start=performance.now();try{return await original(...args);}finally{phaseMs[method]=Math.round(performance.now()-start);}});
+    }
+    const started=performance.now();let last=started,maxTimerLagMs=0;
+    const timer=setInterval(()=>{const now=performance.now();maxTimerLagMs=Math.max(maxTimerLagMs,now-last-10);last=now;},10);
+    try{
+      const result=await f.migrate(id,'reclaude-sonnet@1');
+      const durationMs=Math.round(performance.now()-started);clearInterval(timer);
+      const actual=f.service.storage.turnCount(result.threadId);
+      expect(actual).toBe(result.messageCount);expect(actual).toBeGreaterThan(10000);
+      expect(f.request.mock.calls.some(([method])=>method==='turn/start')).toBe(false);
+      expect(f.store.getThreadExecutionSettings(result.threadId,'admin')).toMatchObject({sandbox:'danger-full-access',approvalPolicy:'never'});
+      expect(f.service.storage.db.isTransaction).toBe(false);
+      const expected=f.service.storage.db.prepare('SELECT body FROM runtime_transfer_items WHERE transfer_id=? ORDER BY seq').iterate(result.operationId);
+      const displayed=f.service.storage.db.prepare('SELECT body FROM turns WHERE thread_id=? ORDER BY created_at,rowid').iterate(result.threadId);
+      const native=locateClaudeHistory(f.service.storage.get(result.threadId)!.nativeSessionId,[f.root])!;
+      const lines=createInterface({input:fs.createReadStream(native),crlfDelay:Infinity});let checked=0,mismatches=0;
+      try{for await(const line of lines){if(!line.trim())continue;const n=JSON.parse(line),e=expected.next(),d=displayed.next();if(e.done||d.done){mismatches++;break;}const message=JSON.parse(e.value.body as string),item=JSON.parse(d.value.body as string).items[0];const role=item.type==='userMessage'?'user':'assistant',text=role==='user'?item.content[0].text:item.text;if(message.role!==n.type||message.text!==n.message.content[0].text||message.role!==role||message.text!==text)mismatches++;checked++;}expect(expected.next().done).toBe(true);expect(displayed.next().done).toBe(true);}finally{lines.close();expected.return?.();displayed.return?.();}
+      expect(checked).toBe(actual);expect(mismatches).toBe(0);
+      console.log(JSON.stringify({benchmark:'offline-full-history',sourceBytes:fs.statSync(source).size,messageCount:actual,checked,mismatches,durationMs,phaseMs,maxTimerLagMs:Math.round(maxTimerLagMs),maxRssMiB:Math.round(process.resourceUsage().maxRSS/1024),productionWrites:0,modelRequests:0}));
+    }finally{clearInterval(timer);}
+  },180000);
+  it("flushes pending rows before a rollback even across batch boundaries",async()=>{
+    const f=fixture(),first=await f.migrate(),file=paths.get(first.threadId)!;
+    const rows=[{type:'turn_context',payload:{turn_id:'discarded'}},...Array.from({length:140},(_,i)=>({type:'response_item',payload:{type:'message',role:'assistant',content:[{type:'output_text',text:`ROLLED-BACK-${i}`}]}})),{type:'event_msg',payload:{type:'thread_rolled_back',num_turns:1}},{type:'turn_context',payload:{turn_id:'kept'}},{type:'response_item',payload:{type:'message',role:'assistant',content:[{type:'output_text',text:'FINAL-KEPT'}]}}];
+    fs.appendFileSync(file,rows.map(row=>JSON.stringify(row)).join('\n')+'\n');
+    const child=await f.migrate(first.threadId,'reclaude-sonnet@1');
+    expect(child.messageCount).toBe(3);expect(JSON.stringify(f.service.history(child.threadId))).not.toContain('ROLLED-BACK-');
+    expect(JSON.stringify(f.service.history(child.threadId))).toContain('FINAL-KEPT');
+  });
   it("accepts native fork ancestry headers after verifying the source header without modifying history",async()=>{
     const f=fixture(),first=await f.migrate(),file=paths.get(first.threadId)!;
     const rows=fs.readFileSync(file,'utf8').trim().split('\n');
@@ -83,6 +180,8 @@ describe("bidirectional runtime history transfer",()=>{
     const input={operationId,sourceThreadId:first.threadId,userId:"admin",projectId:f.project.id,targetModel:"reclaude-sonnet@1",sourceTurnId:"cutoff-a"};
     const child=await f.transfers.migrate(input) as any;
     const text=JSON.stringify(f.service.history(child.threadId));
+    const presentation=JSON.stringify(await f.service.readHistory(child.threadId,0,100));
+    expect(presentation).toContain('SELECTED-ANSWER');expect(presentation).not.toContain('FUTURE-MUST-NOT-IMPORT');
     expect(text).toContain("SELECTED-ANSWER");expect(text).not.toContain("FUTURE-MUST-NOT-IMPORT");
     expect(fs.readFileSync(source)).toEqual(before);
     await expect(f.transfers.migrate({...input,sourceTurnId:"future-b"})).rejects.toMatchObject({code:"migration_conflict"});

@@ -1,7 +1,8 @@
 import { claudePendingProfiles, isReclaudeModel } from "../shared/agentRuntime.js";
-import { assertRuntimeModel, getClaudeService } from "./claudeService.js";
+import { assertRuntimeModel, effectiveRuntimeModel, getClaudeService } from "./claudeService.js";
 import { getRuntimeHistoryTransfer } from "./runtimeHistoryTransfer.js";
 import fs from "node:fs";
+import {historyImageStream} from './historyImage.js';
 import { ProviderUsageTracker } from "./providerUsage.js";
 import { registerProviderQuotaRoutes } from "./providerQuota.js";
 import { overlayJournal } from "./timelineJournal.js";
@@ -27,6 +28,7 @@ import { authenticatedUserFromHeaders, deletedWebUserIds, isDeletedWebUser } fro
 import { AppError } from "./appErrors.js";
 import { memberRealName } from "../shared/memberDirectory.js";
 import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
+import {claudeSubagentDirectory,claudeSubagentPage} from './claudeSubagents.js';
 import { registerScheduledTaskMcp } from "./scheduledTaskMcp.js";
 import { isLegacyGeneratedBranchPin } from "./branchContext.js";
 import { defaults, serverConfig } from "./config.js";
@@ -71,7 +73,7 @@ import { executionSettingsOverrides, queueScheduledPrompt, resumeThreadIfUnloade
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
 // Default Codex cwd per logged-in user. This prevents generated artifacts from
-// accumulating in /home/example while retaining historical shared-home projects.
+// accumulating in /home/example-user while retaining historical shared-home projects.
 const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
@@ -1082,7 +1084,7 @@ export function userIdFromSessionCwd(cwd: string | null, isKnownUser?: (userId: 
     const [firstSegment] = path.relative(normalizedRoot, normalizedCwd).split(path.sep);
     return firstSegment?.trim() || null;
   }
-  // Some existing users run Codex directly in /home/example/<login> rather than
+  // Some existing users run Codex directly in /home/example-user/<login> rather than
   // the managed users root. Only trust this layout for a registered login.
   const homeRoot = path.dirname(path.dirname(normalizedRoot));
   if (isKnownUser && normalizedCwd.startsWith(`${homeRoot}${path.sep}`)) {
@@ -1691,7 +1693,7 @@ async function leaderboardAccountSources(bridge: CodexBridge, forceRefresh: bool
     id: serverConfig.leaderboardAccountLabel,
     label: serverConfig.leaderboardAccountLabel,
     kind: "codex-account",
-    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/example", ".codex"), "sessions"),
+    sessionsRoot: path.join(process.env.CODEX_HOME ?? path.join(process.env.HOME ?? "/home/example-user", ".codex"), "sessions"),
     quota: await readCachedCodexQuota(bridge, forceRefresh)
   }];
 }
@@ -2881,7 +2883,7 @@ async function filterOwnedThreadList(
       continue;
     }
     const fullThread = await readOwnedThreadForList(bridge, threadId);
-    // Ownership is the access boundary. A legacy session may retain /home/example as
+    // Ownership is the access boundary. A legacy session may retain /home/example-user as
     // its historical cwd after the user's default workspace is moved.
     if (fullThread) {
       byId.set(threadId, listItemSummaryFromThread(fullThread));
@@ -2957,7 +2959,7 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
   const rootPath = ensureUserWorkspaceDirectory(userId);
 
   // List the personal workspace first: a newly opened page selects it by
-  // default. Existing projects (including historical /home/example conversations)
+  // default. Existing projects (including historical /home/example-user conversations)
   // are deliberately retained below it.
   const workspace = store.getProjectByRootPath(rootPath, userId) ?? store.createProject({
     name: "我的工作区",
@@ -3289,6 +3291,22 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     reply.header("Cache-Control", "private, no-store");
     if (!claudeService) return { data: { enabled: false, organizations: [], operation: null } };
     return { data: claudeService.authorization.status(userIdFromRequest(request, store)) };
+  });
+  app.get<{Params:{threadId:string};Querystring:{start?:string;end?:string}}>("/api/threads/:threadId/history-image",async(request,reply)=>{
+    const user=userIdFromRequest(request,store),id=request.params.threadId;
+    if(!store.userCanAccessThread(id,user))return reply.code(403).send({error:'无权查看此会话的原图。'});
+    try{
+    let file:string|null=null;
+    if(claudeService?.owns(id)){
+      const hasTransfers=claudeService.storage.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_transfers'").get();
+      const found=hasTransfers&&claudeService.storage.db.prepare("SELECT body FROM runtime_transfers WHERE json_extract(body,'$.targetThreadId')=? AND json_extract(body,'$.phase')='completed' AND json_extract(body,'$.sourceRuntime')='codex' LIMIT 1").get(id);
+      if(found){const transfer=JSON.parse(String(found.body));const expected=path.join(fs.realpathSync(claudeService.config.storageDirectory),'transfers',transfer.id,'source.jsonl');if(transfer.userId===user&&transfer.archive&&fs.realpathSync(transfer.archive)===expected)file=expected;}
+    }else file=await findThreadJsonlPathById(id);
+    if(!file)return reply.code(404).send({error:'原图来源暂不可用。'});
+      const image=await historyImageStream(file,Number(request.query.start),Number(request.query.end));
+      reply.header('Cache-Control','private, no-store').header('X-Content-Type-Options','nosniff').header('Content-Security-Policy',"default-src 'none'; sandbox").header('Content-Disposition',`inline; filename="history-image.${image.mime.split('/')[1]}"`).type(image.mime);
+      return reply.send(image.stream);
+    }catch{return reply.code(400).send({error:'原图位置或编码无法确认，历史未修改。'});}
   });
   app.post<{Body:{orgId?:string;requestId?:string}}>("/api/reclaude/authorization/start", async (request, reply) => {
     reply.header("Cache-Control", "private, no-store");
@@ -4132,7 +4150,9 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const config = store.getThreadContextConfig(request.params.threadId, userId)
         ?? defaultThreadContextConfig(request.params.threadId);
       const [usage, pin] = await Promise.all([
-        readThreadContextUsage(request.params.threadId, config),
+        claudeService?.owns(request.params.threadId)
+          ? claudeService.contextUsage.read(claudeService.storage.get(request.params.threadId)!)
+          : readThreadContextUsage(request.params.threadId, config),
         Promise.resolve(store.getThreadContextPin(request.params.threadId, userId))
       ]);
       return {
@@ -4164,6 +4184,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       }
       const limit = query.limit === undefined ? 40 : Number(query.limit);
       if (limit < 1 || limit > 100) return reply.code(400).send({ error: "limit must be between 1 and 100." });
+      if(claudeService?.owns(request.params.threadId)){const row=claudeService.storage.get(request.params.threadId)!;return await claudeSubagentDirectory(claudeService.storage,row,{...query,limit,activeRuntime:claudeService.summary(row).status.type==='active'});}
       try {
         return await readSubagentDirectoryPage(request.params.threadId, configuredSubagentRuntimeHomes(request.params.threadId), {
           view: view as "all" | "active" | "history", q: query.q, cursor: query.cursor, limit,
@@ -4188,6 +4209,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
       }
       const input = threadReadQuerySchema.parse(request.query ?? {});
+      if(claudeService?.owns(request.params.threadId))return await claudeSubagentPage(claudeService.storage,claudeService.storage.get(request.params.threadId)!,request.params.agentThreadId,Number(input.cursor??input.before??0),input.limit);
       const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId))
         ?? store.getInheritedSubagents(request.params.threadId,userId).find(row=>row.id===request.params.agentThreadId);
       if (!record) return reply.code(404).send({ error: "Subagent thread not found." });
@@ -4242,6 +4264,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       if (!project || !store.userCanAccessThread(request.params.threadId, userId, project.id)) {
         return reply.code(404).send({ error: "Thread not found." });
       }
+      if(claudeService?.owns(request.params.threadId))return reply.code(409).send({error:'Claude 上下文窗口由原生模型决定，不应用 Codex 的窗口覆盖参数。'});
       const input = threadContextConfigSchema.parse(request.body ?? {});
       const resolved = threadContextFeatureEnabled
         ? resolveThreadContextConfig(request.params.threadId, input)
@@ -4287,6 +4310,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(404).send({ error: "Thread not found." });
       }
       const input = threadModelProfileSchema.parse(request.body);
+      input.model = effectiveRuntimeModel(bridge,userId,input.model);
       assertRuntimeModel(bridge, userIdFromRequest(request, store), input);
       assertRuntimeModel(bridge, userId, input, request.params.threadId);
       if (getClaudeService(bridge)?.owns(request.params.threadId)) await bridge.request("thread/resume", { threadId: request.params.threadId, model: input.model, excludeTurns: true });
@@ -4361,11 +4385,13 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const userId=userIdFromRequest(request,store);
       if(!store.userCanAccessThread(request.params.threadId,userId,request.params.id))return reply.code(403).send({error:"Thread is not visible for this logged-in user."});
       const root=toolArchiveRoot(serverConfig.dataDir,userId);
-      const summary=await readToolArchiveSummary(root,z.string().uuid().parse(request.params.threadId));
+      const id=z.string().uuid().parse(request.params.threadId),claude=getClaudeService(bridge);
+      const nativeArchive=claude?.owns(id)?claude.toolArchive(userId,id):null;
+      const summary=nativeArchive?.summary??await readToolArchiveSummary(root,id);
       reply.header("Cache-Control","private, no-store");
       if(request.query.download==="1"){
         if(!summary)return reply.code(404).send({error:"工具结果附件不存在。"});
-        return reply.type("application/gzip").header("X-Content-Type-Options","nosniff").header("Content-Disposition",`attachment; filename="tool-results-${request.params.threadId}.jsonl.gz"`).header("Content-Length",String(summary.archiveBytes)).send(fs.createReadStream(toolArchivePath(root,request.params.threadId)));
+        return reply.type("application/gzip").header("X-Content-Type-Options","nosniff").header("Content-Disposition",`attachment; filename="tool-results-${request.params.threadId}.jsonl.gz"`).header("Content-Length",String(summary.archiveBytes)).send(fs.createReadStream(nativeArchive?.path??toolArchivePath(root,request.params.threadId)));
       }
       return {data:summary};
     }catch(error){return reply.code(errorStatus(error)).send({error:error instanceof Error?error.message:String(error)});}
@@ -4434,7 +4460,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         if (input.prompt) throw new Error("离线 fork 不接受模型消息；请创建分支后再发送任务。");
         if (input.archiveToolOutputs) throw new Error("Claude 分支保留完整原生历史，不支持精简工具历史。");
         const source = claude.storage.get(request.params.threadId)!;
-        const model = input.model ?? source.model;
+        const model = effectiveRuntimeModel(bridge,userId,input.model ?? source.model);
         assertRuntimeModel(bridge, userId, { model });
         const effort=claude.bindings.effort(userId,model,input.reasoningEffort??store.getThreadOwner(source.id)?.reasoningEffortOverride);
         const result = asRecord(await bridge.request("thread/fork", { threadId: source.id, model, effort, projectId: targetProject.id, lastTurnId: input.turnId }));
@@ -4924,7 +4950,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
 
       const claude = getClaudeService(bridge);
       if (claude?.owns(request.params.threadId)) {
-        const page=claude.history(request.params.threadId,input.before,input.limit);
+        const page=await claude.readHistory(request.params.threadId,input.before,input.limit,input.cursor);
+        deferLargeToolOutputs(page.thread);
         return {...page,thread:{...page.thread,
           answeredQuestionItemIds:store.answeredQuestionItemIds(request.params.threadId,userId),
           questionAnswers:questionAnswersForPage(store,request.params.threadId,userId,page.thread)}};
@@ -5001,9 +5028,11 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       if (!store.userCanAccessThread(request.params.threadId, userId, project?.id)) {
         return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
       }
-      const filePath = await findThreadJsonlPathById(request.params.threadId);
-      const indexedItem = filePath ? await readBranchHistoryItem(filePath, request.params.threadId, request.params.itemId, parentId => store.getThreadOwner(parentId)?.userId === userId) : null;
-      const item = indexedItem ?? store.readTimelineItem(request.params.threadId, request.params.itemId);
+      const claude=getClaudeService(bridge);
+      const timelineItem=store.readTimelineItem(request.params.threadId, request.params.itemId);
+      const filePath=claude?.owns(request.params.threadId)?null:await findThreadJsonlPathById(request.params.threadId);
+      const indexedItem=filePath?await readBranchHistoryItem(filePath,request.params.threadId,request.params.itemId,parentId=>store.getThreadOwner(parentId)?.userId===userId):null;
+      const item=indexedItem??timelineItem??(claude?.owns(request.params.threadId)?await claude.historyItem(request.params.threadId,request.params.itemId):null);
       if (!item) return reply.code(404).send({ error: "Tool output was not found in the thread index." });
       const output = typeof item.aggregatedOutput === "string"
         ? item.aggregatedOutput

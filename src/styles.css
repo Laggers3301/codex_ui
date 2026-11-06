@@ -2182,6 +2182,8 @@ body.v2ThreadDragActive * {
 }
 
 pre,
+.historyToolImages { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.historyToolImages .iconTextButton { font-size: inherit; text-decoration: none; }
 .outputBlock {
   overflow: auto;
   margin: 8px 0 0;
@@ -10823,6 +10825,10 @@ textarea:focus {
 .threadStatusPopover header button { display: grid; width: 26px; height: 26px; place-items: center; border: 0; border-radius: 8px; background: transparent; color: var(--ui-content-muted); cursor: pointer; }
 .threadStatusPopover header button:hover { background: var(--ui-hover); color: var(--ui-content); }
 .threadStatusPopover dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px 14px; margin: 0; font-size: 13px; }
+.claudeContextTokenDetails { display:grid; grid-template-columns:auto minmax(0,1fr); gap:8px 14px; font-size:inherit; }
+.claudeContextTokenDetails dt { color:var(--ui-content-muted); }
+.claudeContextTokenDetails dd { margin:0; overflow-wrap:anywhere; }
+.threadStatusPopover:has(dt:nth-of-type(8)) { max-height: min(65dvh, 600px); overflow-y: auto; }
 .threadStatusPopover dt { color: var(--ui-content-muted); }
 .threadStatusPopover dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
 

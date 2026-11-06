@@ -13,6 +13,9 @@ import type { ClaudeIntegrationConfig } from "./claudeBindings.js";
 import { registerRoutes } from "./routes.js";
 import { locateClaudeHistory } from "./claudeSessionStorage.js";
 import * as claudeStorage from "./claudeSessionStorage.js";
+import { gzipSync } from "node:zlib";
+import * as authentication from "./auth.js";
+import {resumeThreadIfUnloaded} from './scheduledTasks.js';
 
 const cleanup: Array<() => void> = [];
 afterEach(() => { cleanup.splice(0).reverse().forEach(fn => fn()); vi.restoreAllMocks(); });
@@ -62,6 +65,91 @@ function fixture(rateLimitInfo?: Record<string,unknown>, options: {shared?:boole
   return {home,cwd,project,store,service,config,rootA,rootB,binding,events,calls,start,turn,runtimeFactory};
 }
 describe("Claude conversation switching",()=>{
+  it('routes native steering without removing ordinary queued messages and persists the steered user text',async()=>{
+    const f=fixture();f.service.close();let release!:()=>void,steerId='';const gate=new Promise<void>(r=>release=r),send=vi.fn(async(_content,id)=>{steerId=id;release();});let initialized=false;
+    const service=new ClaudeService(f.config,f.store,()=>{},binding=>new ClaudeRuntime(binding,async(_prompt,options)=>{
+      const session=String(options.resume??options.extraArgs?.['session-id']);
+      return {close(){},send,async *[Symbol.asyncIterator](){
+        initialized=true;yield {type:'system',subtype:'init',session_id:session,model:'sonnet',tools:[],skills:[],mcp_servers:[]} as any;
+        await gate;yield {type:'assistant',uuid:randomUUID(),session_id:session,user_message_uuid:steerId,message:{id:randomUUID(),content:[{type:'text',text:'新方向回答'}]}} as any;
+        yield {type:'result',subtype:'success',is_error:false,result:'新方向回答',user_message_uuids:[steerId],session_id:session} as any;
+      }};
+    }));cleanup.push(()=>service.close());vi.spyOn(service.bindings,'refresh').mockImplementation(async(user,model)=>service.bindings.resolve(user,model));
+    const id=(await service.request('thread/start',{userId:'admin',projectId:f.project.id,cwd:f.cwd,model:'reclaude-sonnet@1'}) as any).thread.id;
+    const started=await service.request('turn/start',{threadId:id,input:[{type:'text',text:'原问题'}]}) as any;await vi.waitFor(()=>expect(initialized).toBe(true));
+    const queued=await service.request('thread/queue/add',{threadId:id,input:[{type:'text',text:'普通排队保留'}]}) as any;
+    const steer={threadId:id,expectedTurnId:started.turn.id,clientUserMessageId:'steer-once',input:[{type:'text',text:'改方向'}]};
+    await Promise.all([service.request('turn/steer',steer),service.request('turn/steer',steer)]);
+    await vi.waitFor(()=>expect(service.storage.turn(started.turn.id)?.status).toBe('completed'));
+    expect(send).toHaveBeenCalledOnce();expect(service.storage.queued(id)[0].id).toBe(queued.queuedSubmission.id);
+    expect(JSON.stringify(service.storage.turn(started.turn.id))).toContain('改方向');
+  });
+  it('retains received pre-tool prose across running-history refreshes without loading tool payloads or altering native turns',async()=>{
+    const f=fixture(),id=await f.start(),turnId=randomUUID();
+    const original={id:turnId,status:'inProgress',items:[{id:'u',type:'userMessage',content:[{type:'text',text:'question'}]}]};
+    f.service.storage.saveTurn(id,original);
+    f.store.saveTimelineItem(id,turnId,{id:'claude-message::m:1',type:'agentMessage',text:'工具前的完整说明',completed:true,timelineAt:'2026-11-06T10:00:00Z'});
+    f.store.saveTimelineItem(id,turnId,{id:'tool',type:'toolCall',output:'x'.repeat(300000)});
+    const first=await f.service.readHistory(id,0,100),again=await f.service.readHistory(id,0,100);
+    expect(first.thread.turns[0].items).toEqual(again.thread.turns[0].items);
+    expect(first.thread.turns[0].items).toContainEqual(expect.objectContaining({text:'工具前的完整说明'}));
+    expect(first.thread.turns[0].items).toHaveLength(3);
+    const tool=first.thread.turns[0].items.find((i:any)=>i.id==='tool');expect(tool).toMatchObject({outputDeferred:true,outputBytes:300000});expect(tool.aggregatedOutput.length).toBeLessThanOrEqual(4096);
+    expect(f.service.storage.turn(turnId)).toEqual(original);
+  });
+  it('restores an earlier tool group beyond the 48-item live cache on every active-history reload',async()=>{
+    const f=fixture(),id=await f.start(),turnId=randomUUID();
+    f.service.storage.saveTurn(id,{id:turnId,status:'inProgress',items:[{id:'u',type:'userMessage',text:'query'}]});
+    for(let i=0;i<99;i++)f.store.saveTimelineItem(id,turnId,{id:`claude-tool::tool-${i}`,type:'toolCall',tool:'Read',input:'{}',aggregatedOutput:'完整结果'.repeat(2000),completed:i!==98,timelineAt:new Date(Date.parse('2026-11-06T11:00:00Z')+i*1000).toISOString()});
+    for(let i=0;i<2;i++){
+      let page=await f.service.readHistory(id,0,20),tools:any[]=[];
+      expect(page.history.nextCursor).toBeTruthy();expect(page.thread.turns[0].items.at(-1).completed).toBe(false);
+      for(let pages=0;pages<10;pages++){tools.unshift(...page.thread.turns[0].items.filter((item:any)=>item.type==='toolCall'));expect(JSON.stringify(page).length).toBeLessThan(100000);if(!page.history.nextCursor)break;page=await f.service.readHistory(id,page.history.nextBefore,20,page.history.nextCursor);}
+      expect(tools).toHaveLength(99);expect(new Set(tools.map(t=>t.id)).size).toBe(99);expect(tools[0].id).toBe('claude-tool::tool-0');
+    }
+    expect(f.store.readTimelineItem(id,'claude-tool::tool-0')?.aggregatedOutput).toBe('完整结果'.repeat(2000));
+    const first=await f.service.readHistory(id,0,20);
+    f.service.storage.saveTurn(id,{id:turnId,status:'completed',items:[{id:'u',type:'userMessage',text:'query'}]});
+    const continued=await f.service.readHistory(id,first.history.nextBefore,20,first.history.nextCursor!);
+    expect(continued.thread.turns[0].items).toHaveLength(21);
+    const other=await f.start();await expect(f.service.readHistory(other,0,20,first.history.nextCursor!)).rejects.toMatchObject({code:'invalid_cursor'});
+  });
+  it('resumes a cold Claude queue through the shared helper and executes its input only once with saved permissions',async()=>{
+    const f=fixture(),id=await f.start();
+    const bridge={request:(method:string,p:unknown={})=>f.service.request(method,p as Record<string,unknown>),requestOnThreadAccount:(threadId:string,method:string,p:unknown={})=>f.service.request(method,{...(p as Record<string,unknown>),threadId})};
+    expect(await resumeThreadIfUnloaded(bridge,id,f.cwd,{}, {permissions:':danger-full-access',approvalPolicy:'never'})).toBe(true);
+    await bridge.request('thread/settings/update',{threadId:id,serviceTier:null});
+    const queued=await bridge.request('thread/queue/add',{threadId:id,input:[{type:'text',text:'队列仅执行一次'}],clientUserMessageId:'fixture-queue-once'}) as any;
+    const started=await bridge.request('thread/queue/start',{threadId:id,queuedSubmissionId:queued.queuedSubmission.id}) as any;
+    await vi.waitFor(()=>expect(f.service.storage.turn(started.turn.id)?.status).toBe('completed'));
+    expect(f.calls).toHaveLength(1);expect(f.calls[0].prompt).toBe('队列仅执行一次');
+    expect(f.calls[0].options).toMatchObject({permissionMode:'bypassPermissions',sandbox:{enabled:false}});
+    expect(await bridge.request('thread/queue/list',{threadId:id})).toMatchObject({data:[]});
+    await expect(bridge.request('thread/queue/start',{threadId:id,queuedSubmissionId:queued.queuedSubmission.id})).rejects.toThrow('排队消息不存在');
+    expect(f.calls).toHaveLength(1);
+  });
+  it('applies settings updates, exposes unsupported goal semantics and routes manual compact through the native command',async()=>{
+    const f=fixture(),id=await f.start();
+    await f.service.request('thread/settings/update',{threadId:id,permissions:':read-only',approvalPolicy:'never'});
+    await f.service.request('thread/settings/update',{threadId:id,serviceTier:null});
+    expect(await f.service.request('thread/loaded/list',{threadId:id})).toEqual({data:[]});
+    expect(f.store.getThreadExecutionSettings(id,'admin')).toMatchObject({sandbox:'read-only',approvalPolicy:'never'});
+    expect(await f.service.request('thread/goal/get',{threadId:id})).toMatchObject({supported:false});
+    await expect(f.service.request('thread/goal/set',{threadId:id,objective:'test'})).rejects.toThrow('原生持续目标');
+    const result=await f.service.request('thread/compact/start',{threadId:id}) as any;
+    await vi.waitFor(()=>expect(f.service.storage.turn(result.turn.id)?.status).toBe('completed'));
+    expect(f.calls.at(-1).prompt).toBe('/compact');
+  });
+  it('passes saved execution settings on old-session follow-ups, inherits them on forks and never overwrites manual approval',async()=>{
+    const f=fixture(),id=await f.start();
+    f.store.setThreadExecutionSettings(id,'admin','danger-full-access','never');
+    await f.turn(id);expect(f.calls.at(-1).options).toMatchObject({permissionMode:'bypassPermissions',allowDangerouslySkipPermissions:true,sandbox:{enabled:false}});
+    const branch=await f.service.request('thread/fork',{threadId:id,model:'reclaude-sonnet@1'}) as any;
+    expect(f.store.getThreadExecutionSettings(branch.thread.id,'admin')).toMatchObject({sandbox:'danger-full-access',approvalPolicy:'never'});
+    await f.turn(branch.thread.id);expect(f.calls.at(-1).options.permissionMode).toBe('bypassPermissions');
+    f.store.setThreadExecutionSettings(id,'admin','danger-full-access','on-request');
+    await f.turn(id);expect(f.calls.at(-1).options.permissionMode).toBe('default');
+  });
   it("passes client-advertised effort to the native SDK and persists the selected tier",async()=>{
     const f=fixture(),binding=f.service.bindings.resolve("admin","reclaude-sonnet@1");
     const dir=path.join(f.config.storageDirectory,"model-catalog");fs.mkdirSync(dir,{recursive:true});
@@ -70,6 +158,7 @@ describe("Claude conversation switching",()=>{
     const result=await f.service.request("turn/start",{threadId:id,model:"reclaude-sonnet@1",effort:"max",input:[{type:"text",text:"test"}]}) as any;
     await vi.waitFor(()=>expect(f.service.storage.turn(result.turn.id)?.status).toBe("completed"));
     expect(f.calls.at(-1).options.effort).toBe("max");
+    f.config.organizationRedirects={"2":"1"};expect(f.service.bindings.effort("admin","reclaude-sonnet@2","max")).toBe("max");delete f.config.organizationRedirects;
     expect(f.service.summary(f.service.storage.get(id)!).configuredReasoningEffort).toBe("max");
     const count=f.calls.length;
     await expect(f.service.request("turn/start",{threadId:id,effort:"xhigh",input:[{type:"text",text:"test"}]})).rejects.toThrow(/不支持/);
@@ -101,6 +190,41 @@ describe("Claude conversation switching",()=>{
     const older = await f.service.request("thread/turns/list", {threadId:child, cursor:page.nextCursor}) as any;
     expect(older.data.map((turn:any)=>turn.id)).toEqual(["child-0", "parent-1", "parent-0"]);
     expect(older.nextCursor).toBeNull();
+  });
+  it("lazily moves every shared user's old-org conversation on the next input, including new threads with old defaults",async()=>{
+    const f=fixture(undefined,{shared:true});
+    const members=["alice","bob"].map(userId=>{f.store.ensureUser(userId);const cwd=path.join(f.home,"users",userId);fs.mkdirSync(cwd);return{userId,cwd,project:f.store.createProject({name:userId,rootPath:cwd,userId})};});
+    const ids:string[]=[];
+    for(const member of members){const result=await f.service.request("thread/start",{userId:member.userId,projectId:member.project.id,cwd:member.cwd,model:"reclaude-sonnet@1"})as any;ids.push(result.thread.id);await f.turn(result.thread.id);}
+    const before=ids.map(id=>({...f.service.storage.get(id)!}));
+    f.config.organizationRedirects={"1":"2"};fs.unlinkSync(path.join(path.dirname(f.rootA),"device.json"));
+    for(const id of ids){await f.service.request("thread/resume",{threadId:id,model:"reclaude-sonnet@1"});await f.service.request("thread/read",{threadId:id});}
+    expect(f.service.storage.quota().used).toBe(2);expect(f.calls).toHaveLength(2);
+    for(let i=0;i<ids.length;i++){
+      expect(f.service.storage.get(ids[i])).toEqual(before[i]);await f.turn(ids[i]);
+      const after=f.service.storage.get(ids[i])!;
+      expect(after).toMatchObject({id:before[i].id,userId:before[i].userId,projectId:before[i].projectId,cwd:before[i].cwd,orgId:"2",model:"reclaude-sonnet@2",parentSessionId:before[i].nativeSessionId});
+      expect(after.nativeSessionId).not.toBe(before[i].nativeSessionId);
+      expect(f.store.getThreadOwner(ids[i])).toMatchObject({userId:after.userId,projectId:after.projectId,modelOverride:after.model});
+    }
+    expect(f.service.storage.quota().used).toBe(4);await f.turn(ids[0]);expect(f.service.storage.quota().used).toBe(4);
+    const fresh=await f.service.request("thread/start",{userId:members[0].userId,projectId:members[0].project.id,cwd:members[0].cwd,model:"reclaude-sonnet@1"})as any;
+    expect(f.service.storage.get(fresh.thread.id)).toMatchObject({orgId:"2",model:"reclaude-sonnet@2"});
+  });
+  it("retains a durable prepared fork across a failure before the database mapping journal is written",async()=>{
+    const f=fixture(),id=await f.start();await f.turn(id);const before={...f.service.storage.get(id)!};
+    f.config.organizationRedirects={"1":"2"};
+    const save=f.service.storage.beginBindingMigration.bind(f.service.storage);
+    vi.spyOn(f.service.storage,"beginBindingMigration").mockImplementationOnce(()=>{throw new Error("before journal failure");}).mockImplementation(save);
+    await expect(f.turn(id)).rejects.toThrow("before journal failure");
+    expect(f.service.storage.get(id)).toEqual(before);expect(f.service.storage.pendingBindingMigrations()).toHaveLength(0);expect(f.service.storage.quota().used).toBe(2);
+    const operation=f.service.storage.db.prepare("SELECT body FROM native_forks").get()as{body:string};const native=JSON.parse(operation.body).nativeSessionId;
+    await f.turn(id);expect(f.service.storage.get(id)?.nativeSessionId).toBe(native);expect(f.service.storage.quota().used).toBe(2);expect(f.calls).toHaveLength(2);
+  });
+  it("checks the new shared account's weekly stop before migrating an old-org conversation",async()=>{
+    const f=fixture(),id=await f.start();await f.turn(id);const before={...f.service.storage.get(id)!};f.config.organizationRedirects={"1":"2"};
+    const target=f.service.bindings.resolve("admin","reclaude-sonnet@2");f.service.usage.observeResponse(target.accountKey,{rateLimitType:"seven_day",utilization:.99,resetsAt:Math.floor(Date.now()/1000)+3600});
+    await expect(f.turn(id)).rejects.toMatchObject({code:"claude_weekly_limit"});expect(f.service.storage.get(id)).toEqual(before);expect(f.service.storage.quota().used).toBe(1);expect(f.calls).toHaveLength(1);
   });
   it("rediscovers history returned to ~/.claude and lazily resumes the same real account in its new device directory",async()=>{
     const f=fixture(),id=await f.start();await f.turn(id);
@@ -291,7 +415,9 @@ describe("Claude conversation switching",()=>{
     vi.spyOn(service.bindings,"refresh").mockImplementation(async(user,model)=>service.bindings.resolve(user,model));
     const result=await bridge.request("thread/start",{userId:"admin",projectId:f.project.id,cwd:f.cwd,model:"reclaude-sonnet@1"}) as any;
     const id=result.thread.id;
-    service.storage.saveTurn(id,{id:randomUUID(),status:"completed",items:[{id:"message",type:"agentMessage",text:"已持久化"},
+    const largeOutput='完整工具结果'.repeat(25000),storedTurnId=randomUUID();
+    service.storage.saveTurn(id,{id:storedTurnId,status:"completed",items:[{id:"message",type:"agentMessage",text:"已持久化"},
+      {id:'claude-tool::large-read',type:'dynamicToolCall',tool:'Read',arguments:{file_path:'/fixture'},output:largeOutput,status:'completed'},
       {id:"claude-tool::q1",callId:"q1",type:"dynamicToolCall",tool:"request_user_input",arguments:{questions:[{id:"one",question:"选择？",options:["A","B"]}]},status:"completed"}]});
     f.store.recordQuestionAnswer(id,"q1","admin",{answers:{one:{answers:["B"]}}});
     const app=Fastify();registerRoutes(app,bridge,f.store,{backgroundIndexing:false});
@@ -300,12 +426,21 @@ describe("Claude conversation switching",()=>{
       vi.spyOn(service.bindings,"refreshModels").mockImplementation(()=>new Promise<void>(()=>{}));
       const models=await app.inject({method:"GET",url:"/api/models"});expect(models.json().data.some((p:any)=>p.model==="reclaude-sonnet@1"&&p.availability==="ready")).toBe(true);
       const response=await app.inject({method:"GET",url:`/api/threads/${id}?projectId=${f.project.id}`});expect(response.statusCode).toBe(200);expect(response.json().thread.turns[0].items[0].text).toBe("已持久化");
+      const preview=response.json().thread.turns[0].items.find((item:any)=>item.id==='claude-tool::large-read');
+      expect(preview.outputDeferred).toBe(true);expect(preview.output.length).toBeLessThan(5000);
+      const full=await app.inject({method:'GET',url:`/api/threads/${id}/items/${encodeURIComponent('claude-tool::large-read')}/output?projectId=${f.project.id}`});
+      expect(full.statusCode).toBe(200);expect(full.json().data.output).toBe(largeOutput);
+      expect((service.storage.turn(storedTurnId)?.items as Array<Record<string,unknown>>)[1].output).toBe(largeOutput);
       expect(response.json().thread).toMatchObject({configuredModel:"reclaude-sonnet@1",configuredReasoningEffort:"medium"});
       expect(response.json().thread.answeredQuestionItemIds).toContain("q1");
       expect(response.json().thread.questionAnswers["claude-tool::q1"]).toEqual({answers:{one:{answers:["B"]}}});
       const list=await app.inject({method:"GET",url:`/api/projects/${f.project.id}/threads`});expect(list.json().data.some((row:any)=>row.id===id)).toBe(true);
       const usage=await app.inject({method:"GET",url:"/api/reclaude/usage"});
       expect(usage.json().data).toMatchObject({thresholdPercent:99,monitoring:"response-events",creations:{used:1,remaining:4}});
+      service.contextUsage.save(id,service.storage.get(id)!.nativeSessionId,{model:"claude-opus-5-5",messageId:"request",inputTokens:2,cacheReadTokens:12947,cacheWriteTokens:20044,outputTokens:244,thinkingTokens:60,contextWindow:1000000,windowSource:"runtime",at:new Date().toISOString()});
+      const context=await app.inject({method:"GET",url:`/api/projects/${f.project.id}/threads/${id}/context`});
+      expect(context.statusCode).toBe(200);expect(context.json().data).toMatchObject({runtime:"claude-code",usedTokens:33237,contextWindow:1000000,claudeUsage:{inputTokens:2,outputTokens:244}});
+      expect((await app.inject({method:"PUT",url:`/api/projects/${f.project.id}/threads/${id}/context-config`,payload:{contextWindow:500000}})).statusCode).toBe(409);
       const auth=await app.inject({method:"GET",url:"/api/reclaude/authorization"});
       expect(auth.statusCode).toBe(200);expect(auth.headers["cache-control"]).toContain("no-store");
       expect(auth.json().data).toMatchObject({enabled:false,operation:null,organizations:expect.arrayContaining([expect.objectContaining({orgId:"1",connected:true})])});
@@ -313,6 +448,15 @@ describe("Claude conversation switching",()=>{
       expect((await app.inject({method:"POST",url:"/api/reclaude/authorization/start",payload:{orgId:"999",requestId:randomUUID()}})).statusCode).toBe(403);
       expect((await app.inject({method:"POST",url:"/api/reclaude/authorization/start",headers:{"sec-fetch-site":"cross-site"},payload:{orgId:"1",requestId:randomUUID()}})).statusCode).toBe(403);
       expect((await app.inject({method:"POST",url:"/api/reclaude/authorization/cancel",payload:{id:randomUUID()}})).statusCode).toBe(403);
+      const archiveFile=path.join(service.config.storageDirectory,"fixture-tools.gz"),archiveBody=gzipSync('full-native-tool-record\n');fs.writeFileSync(archiveFile,archiveBody,{mode:0o600});
+      const conversation=service.storage.get(id)!;conversation.toolOutputArchive={path:archiveFile,summary:{version:1,threadId:id,sourceThreadId:id,keptRecentTurnIds:[],archivedRecords:1,archivedBytes:24,originalBranchBytes:200000000,branchBytes:1000,archiveBytes:archiveBody.length,createdAt:new Date().toISOString()}};service.storage.save(conversation);
+      const attachment=await app.inject({method:"GET",url:`/api/projects/${f.project.id}/threads/${id}/tool-output-archive`});expect(attachment.statusCode).toBe(200);expect(attachment.json().data).toMatchObject({threadId:id,archivedRecords:1});expect(JSON.stringify(attachment.json())).not.toContain(archiveFile);
+      const download=await app.inject({method:"GET",url:`/api/projects/${f.project.id}/threads/${id}/tool-output-archive?download=1`});expect(download.statusCode).toBe(200);expect(download.rawPayload).toEqual(archiveBody);
+      f.store.ensureUser("outsider");const authUser=vi.spyOn(authentication,"authenticatedUserFromHeaders").mockReturnValue("outsider");
+      try{const denied=await app.inject({method:"GET",url:`/api/projects/${f.project.id}/threads/${id}/tool-output-archive?download=1`});expect(denied.statusCode).toBe(403);
+        expect((await app.inject({method:'GET',url:`/api/threads/${id}/items/claude-tool%3A%3Alarge-read/output`})).statusCode).toBe(403);
+        expect((await app.inject({method:"GET",url:`/api/projects/${f.project.id}/threads/${id}/context`})).statusCode).toBe(404);
+      }finally{authUser.mockRestore();}
       for(let i=0;i<4;i++)service.storage.reserve(randomUUID());
       // Pure Codex starts and forks still go to the native bridge at a full Claude quota.
       await bridge.request("thread/start",{model:"gpt-6.1-sol",cwd:f.cwd});

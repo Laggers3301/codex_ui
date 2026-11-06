@@ -29,7 +29,7 @@ export function newReclaudeAuthorizationRequestId(): string {
 export function reclaudeAuthorizationUrl(value: string): string | null {
   try {
     const url = new URL(value);
-    if (url.protocol !== "https:" || url.hostname !== "reclaude.ai" || url.port || url.username || url.password
+    if (url.protocol !== "https:" || !["reclaude.ai", "www.recode.cat"].includes(url.hostname) || url.port || url.username || url.password
       || url.pathname !== "/cli/auth" || !url.searchParams.get("state")) return null;
     if ([...url.searchParams.keys()].some(key => /token|secret|device_code|api.?key/i.test(key))) return null;
     return url.toString();

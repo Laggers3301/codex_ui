@@ -13,5 +13,27 @@
   font-size:var(--tool-reading-size)!important;
 }
 :root[data-theme] .v2ThinkingLine { font-size:14px!important; }
+/* Reasoning uses the same transcript rail and heading metrics as tool rows.
+   The former 4px desktop / 3px mobile inset shifted only the thinking icon. */
+:root[data-theme] :is(.reasoningSummaryRow,.reasoningDisclosureTrigger) {
+  padding-inline-start:0!important;
+  grid-template-columns:16px auto minmax(0,1fr);
+  font-family:inherit!important;
+  font-weight:400!important;
+  line-height:18px!important;
+}
+:root[data-theme] :is(.reasoningLabel,.reasoningSummaryPreview,.toolBundleTitle,.toolBundleTitleLabel) {
+  font-size:var(--tool-reading-size)!important;
+  font-family:inherit!important;
+  font-weight:400!important;
+  line-height:18px!important;
+}
+:root[data-theme] :is(.reasoningSummaryRow,.reasoningDisclosureTrigger)>.reasoningGlyph {
+  width:16px;height:16px;justify-self:start;
+}
 .messageItem.toolBundle.reasoningOnlyBundle::before { display:none!important; }
 .messageItem.toolBundle.reasoningOnlyBundle > .reasoningGlyph { position:absolute; left:1px; top:5px; pointer-events:none; }
+/* The nested rail is indented like tool entries; standalone thinking stays flush. */
+:root[data-theme] .toolBundleReasoningEntry :is(.reasoningSummaryRow,.reasoningDisclosureTrigger) {
+  padding-inline-start:5px!important;
+}

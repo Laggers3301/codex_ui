@@ -4,6 +4,9 @@ export interface AgentTextState {
   completed?: boolean; streamState?: "streaming" | "completed" | "interrupted" | "superseded";
 }
 export type AgentWireUpdate = Omit<AgentTextState, 'text'> & { text?: string; delta?: string; textOffset?: number };
+export function keepSnapshotAgent(message:{text?:string;completed?:boolean;streamState?:string;threadId?:string|null;turnId?:string|null},activeTurns:Record<string,string>):boolean {
+  return Boolean(message.text&&message.streamState!=='superseded'&&(!message.completed||message.threadId&&message.turnId&&activeTurns[message.threadId]===message.turnId));
+}
 /** Offsets detect a missing base; recover via live.state instead of corrupting text. */
 export function applyLiveAgentUpdate(base: AgentTextState | undefined, wire: AgentWireUpdate): AgentTextState | null {
   // Completion/supersession is monotonic within an item. A late draft packet
@@ -15,5 +18,7 @@ export function applyLiveAgentUpdate(base: AgentTextState | undefined, wire: Age
     if (typeof wire.delta !== 'string' || wire.textOffset !== (base?.text.length ?? 0)) return null;
     text = (base?.text ?? '') + wire.delta;
   }
-  return { threadId: wire.threadId, turnId: wire.turnId, text, startedAt: wire.startedAt, sequence: wire.sequence, sourceItemId: wire.sourceItemId, completed: wire.completed, streamState: wire.streamState };
+  const next={ threadId: wire.threadId, turnId: wire.turnId, text, startedAt: wire.startedAt, sequence: wire.sequence, sourceItemId: wire.sourceItemId, completed: wire.completed, streamState: wire.streamState };
+  if(base&&Object.keys(next).every(key=>base[key as keyof AgentTextState]===next[key as keyof AgentTextState]))return base;
+  return next;
 }

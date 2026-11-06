@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import { toolPresentation } from "./toolPresentation";
 
 describe("tool presentation", () => {
+  it('reuses existing tool categories for native Claude calls, without changing raw arguments',()=>{
+    expect(toolPresentation({id:'c1',type:'dynamicToolCall',tool:'Bash',arguments:{command:'rg example',description:'查找配置'}})).toEqual({icon:'terminal',description:'查找配置'});
+    expect(toolPresentation({id:'c2',type:'dynamicToolCall',tool:'Read',arguments:{file_path:'/repo/README.md'}})).toEqual({icon:'file',description:'读取 README.md'});
+    expect(toolPresentation({id:'c3',type:'dynamicToolCall',tool:'Edit',arguments:{file_path:'/repo/app.ts'}}).icon).toBe('file');
+    expect(toolPresentation({id:'c4',type:'dynamicToolCall',tool:'WebFetch',arguments:{url:'https://example.com'}}).icon).toBe('web');
+  });
   it("prefers an explicit description without modifying input", () => {
     const input = JSON.stringify({ cmd: "rg example", description: "查找配置" });
     expect(toolPresentation({ id: "1", type: "toolCall", tool: "exec", input })).toEqual({ description: "查找配置", icon: "terminal" });

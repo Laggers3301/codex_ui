@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import {responseStyleInstructions} from './agent-response-style.mjs';
 
 export const delegationContextInstructions = [
   '## 子代理上下文预算 / Subagent context budget',
@@ -24,11 +25,12 @@ export function ensureDelegationPolicy(home) {
   const override = path.join(home, 'AGENTS.override.md');
   const file = read(override).trim() ? override : path.join(home, 'AGENTS.md');
   const text = read(file);
-  if (text.includes(delegationContextInstructions)) return 'unchanged';
+  const missing=[delegationContextInstructions,responseStyleInstructions].filter(block=>!text.includes(block));
+  if (!missing.length) return 'unchanged';
   const start = '<!-- codex-web:response-language:start -->';
   const end = '<!-- codex-web:response-language:end -->';
   if (!text.includes(start) || !text.includes(end) || text.indexOf(start) > text.indexOf(end)) return 'missing_managed_block';
-  const next = text.replace(end, `${delegationContextInstructions}\n${end}`);
+  const next = text.replace(end, `${missing.join('\n\n')}\n${end}`);
   const temporary = `${file}.delegation-${randomUUID()}`;
   try {
     fs.writeFileSync(temporary, next, { flag: 'wx', mode: fs.statSync(file).mode & 0o777 });

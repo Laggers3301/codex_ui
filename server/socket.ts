@@ -1,4 +1,4 @@
-import { assertRuntimeModel, getClaudeService } from "./claudeService.js";
+import { assertRuntimeModel, effectiveRuntimeModel, getClaudeService } from "./claudeService.js";
 import { getRuntimeHistoryTransfer } from "./runtimeHistoryTransfer.js";
 import { isReclaudeModel } from "../shared/agentRuntime.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -635,7 +635,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const entry = queued.data?.find((item) => item.id === queuedSubmissionId);
       const prompt = entry?.input?.filter((part) => part.type === "text").map((part) => part.text ?? "").join(" ").trim();
       if (!prompt) throw new Error("排队消息已不存在或没有文字内容。");
-      const result = await bridge.request("turn/steer", { threadId, expectedTurnId, input: entry?.input ?? textInput(prompt) });
+      const result = await bridge.request("turn/steer", { threadId, expectedTurnId, ...(getClaudeService(bridge)?.owns(threadId)?{clientUserMessageId:`queued:${queuedSubmissionId}`}:{ }),input: entry?.input ?? textInput(prompt) });
       await bridge.request("thread/queue/delete", { threadId, queuedSubmissionId });
       store.touchThreadOwner(threadId);
       return result;
@@ -821,6 +821,11 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       turnWatchdog.start(owner, accountId, threadIdForWatchdog, turnId);
     }
     const progressMethod = meaningfulTurnProgressMethod(message);
+    if(turnId&&threadIdForWatchdog&&['runtime/claudeBackgroundWait','runtime/claudeTasks','runtime/claudeTaskProgress'].includes(message.method??'')){
+      const params=asRecord(message.params),tasks=Array.isArray(params.tasks)?params.tasks.map(asRecord):[];
+      turnWatchdog.progress(owner,accountId,threadIdForWatchdog,turnId,message.method!);
+      if(message.method!=='runtime/claudeTaskProgress')turnWatchdog.setPhase(owner,accountId,threadIdForWatchdog,turnId,Number(params.pendingTasks)>0||tasks.some(task=>task.background&&task.status==='running')?'waiting_subagents':'running');
+    }
     if (turnId && threadIdForWatchdog && progressMethod) {
       const progress = turnWatchdog.progress(owner, accountId, threadIdForWatchdog, turnId, progressMethod);
       const pendingPhase = pendingRequestPhase(bridge.getPendingServerRequests(), threadIdForWatchdog, turnId);
@@ -1376,7 +1381,7 @@ async function handleClientMessage(
         if (!question) {
           throw new Error("Prompt is required.");
         }
-        const model = pickString(message.model, project.defaultModel).trim() || project.defaultModel;
+        const model = effectiveRuntimeModel(bridge,sessionUserId,pickString(message.model, project.defaultModel).trim() || project.defaultModel);
         const reasoningEffort = pickReasoningEffort(message.reasoningEffort, project.defaultReasoningEffort);
         const requestedContextConfig = !threadContextFeatureEnabled || message.contextConfig === undefined
           ? null
@@ -1534,7 +1539,7 @@ async function handleClientMessage(
         if (boundSide) await reconcileSideChat(bridge, store, boundSide);
         const previousModel = owner?.modelOverride ?? modelDefaults.defaultModel;
         const previousEffort = owner?.reasoningEffortOverride ?? modelDefaults.defaultReasoningEffort;
-        const model = boundSide ? pickString(message.model, previousModel).trim() || previousModel : previousModel;
+        const model = effectiveRuntimeModel(bridge,sessionUserId,boundSide ? pickString(message.model, previousModel).trim() || previousModel : previousModel);
         const reasoningEffort = boundSide ? pickReasoningEffort(message.reasoningEffort, previousEffort) : previousEffort;
         const crossRuntime=!!boundSide&&!!getClaudeService(bridge)?.owns(threadId)!==isReclaudeModel(model);
         if (boundSide && !crossRuntime && !isReclaudeModel(model) && isAccountPoolBridge(bridge)) {
@@ -1660,6 +1665,7 @@ async function handleClientMessage(
             const value = await bridge.request("turn/steer", {
               threadId,
               expectedTurnId,
+              ...(getClaudeService(bridge)?.owns(threadId)?{clientUserMessageId:requestId}:{}),
               input: await promptInput(bridge, threadId, store.getThreadOwner(threadId)?.rootPath ?? "", prompt, message.skillNames, message.documentReference)
             });
             store.touchThreadOwner(threadId);

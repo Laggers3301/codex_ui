@@ -8,6 +8,13 @@ const account:ReclaudeAccountUsage={orgId:"1",label:"组织名",state:"available
   {kind:"five_hour",percent:19,resetsAt:now+3600000,observedAt:now-10000,source:"response"},
   {kind:"seven_day",percent:41,resetsAt:now+604800000,observedAt:now-10000,source:"response"}
 ]};
+it("keeps creation limits in quota details and distinguishes them from token windows",()=>{
+  const creations={limit:5,used:1,remaining:4,windowSeconds:3600,retryAt:null,retryAfterSeconds:0};
+  const html=renderToStaticMarkup(<ReclaudeQuotaDetails account={account} creations={creations} now={now}/>);
+  expect(html).toContain('>新建</span>');expect(html).toContain('本小时剩余 4/5 次');
+  expect(html).toContain('不影响已有会话继续回答');expect(html).not.toContain('全部 Claude 账号共用每小时');
+  expect(renderToStaticMarkup(<ReclaudeQuotaDetails account={account} creations={{...creations,remaining:0,retryAfterSeconds:60}} now={now}/>)).toContain('后可重试');
+});
 it("shows both account windows and their reset times from the existing observation",()=>{
   const html=renderToStaticMarkup(<ReclaudeQuotaDetails account={account} now={now}/>);
   expect(html).toContain("ReClaude 额度");expect(html).not.toContain(account.label);expect(html).toContain("5 小时");expect(html).toContain("周限");

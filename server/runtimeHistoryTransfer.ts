@@ -7,11 +7,13 @@ import type { CodexBridge } from "./codexBridge.js";
 import type { ProjectStore } from "./db.js";
 import { getClaudeService, type ClaudeService } from "./claudeService.js";
 import { AppError } from "./appErrors.js";
-import { isReclaudeModel } from "../shared/agentRuntime.js";
+import { isReclaudeModel,claudeBranchName } from "../shared/agentRuntime.js";
 import { findThreadJsonlPathById } from "./threadFallback.js";
 import { rolloutLines, rolloutReadStream, rolloutLogicalStat } from "./rolloutStorage.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import type { ClaudeConversation } from "./claudeSessionStorage.js";
+import { HistoryWriteBatch } from "./historyWriteBatch.js";
+import { setImmediate as yieldToRequests } from "node:timers/promises";
 
 type Row = Record<string, any>;
 type TransferEffort="low"|"medium"|"high"|"xhigh"|"max"|"ultra";
@@ -91,6 +93,8 @@ export class RuntimeHistoryTransfer {
     let row = this.get(input.operationId);
     if (row?.phase === "completed") return this.result(row);
     if (row && ["creating", "importing", "uncertain"].includes(row.phase)) throw new AppError("migration_uncertain", "此前迁移的提交结果尚未确认，已阻止重复创建或重复导入。原会话完整保留，请查看迁移记录。");
+    if (isReclaudeModel(input.targetModel)) input={...input,targetModel:this.claude.bindings.effectiveModel(input.userId,input.targetModel)};
+    if (row && isReclaudeModel(row.targetModel)) { row.targetModel=this.claude.bindings.effectiveModel(row.userId,row.targetModel);this.save(row); }
     if(isReclaudeModel(input.targetModel))this.claude.storage.assertCapacity(input.operationId);
     const sourceRuntime = this.claude.owns(input.sourceThreadId) ? "claude-code" : "codex";
     if ((sourceRuntime === "claude-code") === isReclaudeModel(input.targetModel)) throw new AppError("migration_target", "请选择另一运行引擎；同引擎请使用原生分支。");
@@ -131,7 +135,7 @@ export class RuntimeHistoryTransfer {
       const execution=this.store.getThreadExecutionSettings(input.sourceThreadId,input.userId);
       this.store.setThreadExecutionSettings(row.targetThreadId!,input.userId,execution?.sandbox??project.defaultSandbox,execution?.approvalPolicy??project.defaultApprovalPolicy);
       row.phase = "completed"; this.save(row);
-      this.store.updateThreadDisplayName(row.targetThreadId!, row.userId, `${row.sourceName} · 迁移`);
+      this.store.updateThreadDisplayName(row.targetThreadId!, row.userId, isReclaudeModel(row.targetModel)?claudeBranchName(row.sourceName):`${row.sourceName} · 迁移`);
       return this.result(row);
     } catch (error) {
       if (["creating","importing"].includes(row.phase)) { row.phase="uncertain";this.save(row); }
@@ -150,6 +154,7 @@ export class RuntimeHistoryTransfer {
     row.archive=archive;row.sourceHash=hash.digest("hex");row.messageCount=0;row.warnings=[];
     this.claude.storage.db.prepare("DELETE FROM runtime_transfer_items WHERE transfer_id=?").run(row.id);
     const insert=this.claude.storage.db.prepare("INSERT INTO runtime_transfer_items VALUES (?,?,?,?)");
+    const batch=new HistoryWriteBatch<[string,number,string|null,string]>(this.claude.storage.db,values=>insert.run(...values));
     let turnId: string|null=null, skippedInternal=0, rawMessages=0, codexIdentityVerified=false;
     let claudeCutoff:string|undefined, cutoffFound=false;
     if(row.sourceRuntime==="claude-code"&&row.sourceTurnId){
@@ -159,7 +164,9 @@ export class RuntimeHistoryTransfer {
       claudeCutoff=selected.nativeMessageId;
     }
     const seen = new Set<string>();
+    let scanned=0;
     for await (const line of rolloutLines(archive)) {
+      if(++scanned%512===0)await yieldToRequests();
       if(cutoffFound)break;
       if (!line.trim()) continue;
       const raw=record(JSON.parse(line));
@@ -177,6 +184,7 @@ export class RuntimeHistoryTransfer {
         if (raw.type==="turn_context" && typeof p.turn_id==="string") turnId=p.turn_id;
         if (raw.type==="event_msg" && p.type==="task_started") turnId=p.turn_id;
         if (raw.type==="event_msg" && p.type==="thread_rolled_back") {
+          batch.flush();
           const count=Number(p.num_turns);
           if (!Number.isSafeInteger(count)||count<1) throw new AppError("migration_unsupported", "无法确认历史撤回范围，原记录未改动。");
           const turns=this.claude.storage.db.prepare("SELECT turn_id,MAX(seq) AS n FROM runtime_transfer_items WHERE transfer_id=? AND turn_id IS NOT NULL GROUP BY turn_id ORDER BY n DESC LIMIT ?").all(row.id,count) as Array<{turn_id:string}>;
@@ -188,7 +196,8 @@ export class RuntimeHistoryTransfer {
         const message=portableCodexItem(p);
         if(!message){if(p.type!=="message")skippedInternal++;continue;}
         if(p.id&&seen.has(p.id))continue;if(p.id)seen.add(p.id);
-        insert.run(row.id,rawMessages++,turnId,JSON.stringify(message));
+        const body=JSON.stringify(message);
+        if(batch.add([row.id,rawMessages++,turnId,body],Buffer.byteLength(body)))await yieldToRequests();
       } else {
         if(raw.sessionId && raw.sessionId!==this.claude.storage.get(row.sourceThreadId)?.nativeSessionId) throw new AppError("migration_identity_mismatch","Claude 历史标识不一致。");
         if(raw.isSidechain===true)continue;
@@ -197,9 +206,11 @@ export class RuntimeHistoryTransfer {
         if(raw.uuid&&seen.has(raw.uuid))continue;if(raw.uuid)seen.add(raw.uuid);
         const message=portableClaudeMessage(raw);
         if(!message){skippedInternal++;continue;}
-        insert.run(row.id,rawMessages++,null,JSON.stringify(message));
+        const body=JSON.stringify(message);
+        if(batch.add([row.id,rawMessages++,null,body],Buffer.byteLength(body)))await yieldToRequests();
       }
     }
+    batch.flush();
     if(row.sourceTurnId&&row.sourceRuntime==="codex"){
       const cutoff=this.claude.storage.db.prepare("SELECT MAX(seq) AS n FROM runtime_transfer_items WHERE transfer_id=? AND turn_id=?").get(row.id,row.sourceTurnId)?.n;
       if(cutoff===null||cutoff===undefined)throw new AppError("migration_cutoff_missing","未找到所选分支轮次，未创建目标会话。");
@@ -224,6 +235,7 @@ export class RuntimeHistoryTransfer {
     if(!fs.realpathSync(folder).startsWith(fs.realpathSync(binding.configRoot)+path.sep))throw new Error("迁移目录越界。");
     const nativeFile=path.join(folder,`${row.nativeSessionId}.jsonl`),fd=fs.openSync(nativeFile,"wx",0o600);
     let parent:string|null=null;
+    const turns=new HistoryWriteBatch<Record<string,unknown>>(this.claude.storage.db,turn=>this.claude.storage.saveTurn(row.targetThreadId!,turn));
     try {
       for (const message of this.messages(row.id)) {
         const uuid=randomUUID(),timestamp=new Date(row.createdAt).toISOString();
@@ -232,15 +244,18 @@ export class RuntimeHistoryTransfer {
             ...(message.role==="assistant"?{id:randomUUID(),type:"message",model:"historical-import",stop_reason:"end_turn",usage:{input_tokens:0,output_tokens:0}}:{})}};
         fs.writeSync(fd,JSON.stringify(native)+"\n");parent=uuid;
         const id=randomUUID();
-        this.claude.storage.saveTurn(row.targetThreadId,{id,status:"completed",nativeMessageId:uuid,nativeSessionId:row.nativeSessionId,items:[message.role==="user"
+        const turn={id,status:"completed",nativeMessageId:uuid,nativeSessionId:row.nativeSessionId,items:[message.role==="user"
           ?{id:`import:${id}`,type:"userMessage",content:[{type:"text",text:message.text}]}
-          :{id:`import:${id}`,type:"agentMessage",text:message.text}]});
-        row.importedCount++;
+          :{id:`import:${id}`,type:"agentMessage",text:message.text}]};
+        const committed=turns.add(turn,Buffer.byteLength(JSON.stringify(turn)));
+        row.importedCount+=committed;
+        if(committed)await yieldToRequests();
       }
+      row.importedCount+=turns.flush();
       fs.fsyncSync(fd);
     } finally {fs.closeSync(fd);}
     const conversation:ClaudeConversation={id:row.targetThreadId,nativeSessionId:row.nativeSessionId,userId:row.userId,projectId:row.projectId,cwd,
-      name:`${row.sourceName} · 迁移`,model:row.targetModel,orgId:binding.orgId,accountKey:binding.accountKey,configRoot:binding.configRoot,
+      name:claudeBranchName(row.sourceName),model:row.targetModel,orgId:binding.orgId,accountKey:binding.accountKey,configRoot:binding.configRoot,
       initialized:true,archived:false,createdAt:Date.now(),updatedAt:Date.now()};
     this.claude.storage.save(conversation);
     this.store.registerThreadOwner({threadId:row.targetThreadId,userId:row.userId,projectId:row.projectId,rootPath:cwd,model:row.targetModel,reasoningEffort:effort??"medium"});

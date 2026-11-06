@@ -14,11 +14,13 @@ export function BranchToolArchive({userId,projectId,threadId}:{userId:string;pro
     setState(null);setClosing(false);
     if(!projectId||!threadId||wasShown(noticeKey(userId,threadId)))return;
     const abort=new AbortController();
-    void fetch(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/tool-output-archive`,{credentials:"same-origin",cache:"no-store",signal:abort.signal}).then(async response=>{
+    const read=()=>{if(wasShown(noticeKey(userId,threadId)))return;void fetch(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/tool-output-archive`,{credentials:"same-origin",cache:"no-store",signal:abort.signal}).then(async response=>{
       if(!response.ok)return;
       const data=await response.json();if(!abort.signal.aborted&&data.data?.threadId===threadId)setState({scope,summary:data.data});
-    }).catch(()=>{});
-    return()=>abort.abort();
+    }).catch(()=>{});};
+    const archived=(event:Event)=>{if((event as CustomEvent<{threadId:string}>).detail?.threadId===threadId)read();};
+    void read();window.addEventListener("claude-history-archived",archived);
+    return()=>{abort.abort();window.removeEventListener("claude-history-archived",archived);};
   },[scope,projectId,threadId]);
   // Mark after the notice actually renders, not while its request is pending.
   // Closing is optional: refresh/re-entry must never repeat the notification.

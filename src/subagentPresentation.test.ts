@@ -3,6 +3,15 @@ import { collectAgents, isActiveAgent, parseAgentOperation, reconcileSubagents }
 import { mergeTimelineItems } from "./conversationTimeline";
 
 describe("subagent presentation", () => {
+  it('renders native Claude task metadata without replacing original tool arguments',()=>{
+    const input={prompt:'original task',subagent_type:'general-purpose'};
+    const operation=parseAgentOperation({id:'native-agent',type:'dynamicToolCall',tool:'Agent',arguments:input,collaboration:{type:'collabAgentToolCall',tool:'spawn_agent',agentsStates:{child:{name:'核查项目',status:'completed'}}}});
+    expect(operation?.agents[0]).toMatchObject({id:'child',state:'completed',name:'核查项目'});expect(input.prompt).toBe('original task');
+  });
+  it('does not parse native non-agent tool output during transcript updates',()=>{
+    const parse=vi.spyOn(JSON,'parse');
+    try{for(const tool of ['Read','Bash','WebFetch','ToolSearch'])expect(parseAgentOperation({id:tool,type:'toolCall',tool,input:'{}',output:'{"data":[{"text":"large file"}]}'})).toBeNull();expect(parse).not.toHaveBeenCalled();}finally{parse.mockRestore();}
+  });
   it('keeps inherited and new agents distinct even when their task names match',()=>{
     const result=reconcileSubagents([{id:'new',name:'/root/worker',state:'running'}],[{id:'old',name:'/root/worker',parentThreadId:'source',inherited:true,state:'unknown'}]);
     expect(result.map(row=>row.id)).toEqual(['new','old']);expect(result[1].inherited).toBe(true);

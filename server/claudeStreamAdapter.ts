@@ -3,12 +3,15 @@ import type { RpcEnvelope } from "./types.js";
 import { redactModelError } from "../shared/modelError.js";
 import { claudeQuestions } from "./claudeUserInput.js";
 import { AppError } from "./appErrors.js";
+import {isClaudeSubagentText} from '../shared/claudeItems.js';
 
 type RecordValue = Record<string, unknown>;
 const record = (v: unknown): RecordValue => v && typeof v === "object" && !Array.isArray(v) ? v as RecordValue : {};
 const string = (v: unknown): string => typeof v === "string" ? v : "";
 const textContent = (v: unknown): string => typeof v === "string" ? v : Array.isArray(v)
   ? v.map(b => string(record(b).text) || JSON.stringify(b)).join("\n") : JSON.stringify(v ?? "");
+
+export {claudeVisibleItems} from '../shared/claudeItems.js';
 
 interface Item extends RecordValue { id: string; type: string; }
 
@@ -24,15 +27,32 @@ export class ClaudeStreamAdapter {
   finished = false;
   sessionId: string | null = null;
   capabilities: { model: string; tools: string[]; skills: string[]; mcpServers: Array<{name: string; status: string}> } | null = null;
+  private resultInfo: RecordValue | undefined;
 
   constructor(readonly threadId: string, readonly turnId: string, private emit: (event: RpcEnvelope) => void) {}
 
   private notify(method: string, params: RecordValue): void {
+    if(method.startsWith('item/')){
+      const item=record(params.item),known=typeof params.itemId==='string'?this.items.get(params.itemId):undefined;
+      if(isClaudeSubagentText(known??item))return;
+    }
     this.emit({ method, params: { threadId: this.threadId, turnId: this.turnId, ...params } });
   }
 
   start(): void {
     this.notify("turn/started", { turn: { id: this.turnId, status: "inProgress", items: [] } });
+  }
+  recordUserInput(id:string,content:unknown[]){
+    const item={id:`claude-user:${id}`,type:'userMessage',content,timelineAt:new Date().toISOString()};
+    this.items.set(item.id,item);this.notify('item/started',{item});
+  }
+  updateTasks(tasks:import('./claudeSessionInput.js').ClaudeNativeTask[]){
+    for(const task of tasks){
+      if(task.kind!=='agent'||!task.toolUseId)continue;
+      const item=[...this.tools.values()].find(item=>item.id.endsWith(':'+task.toolUseId));if(!item)continue;
+      item.collaboration={type:'collabAgentToolCall',tool:'spawn_agent',agentsStates:{[task.id]:{name:task.description||task.id,status:task.status==='stopped'?'interrupted':task.status}}};
+      if(this.completedItems.has(item.id))this.complete(item,true);else this.notify('item/started',{item:{...item}});
+    }
   }
 
   private upsert(id: string, block: RecordValue, parent: string): Item {
@@ -58,8 +78,8 @@ export class ClaudeStreamAdapter {
     return item.tool==="request_user_input"?{...record(input),questions:claudeQuestions(record(input),string(item.callId))}:input;
   }
 
-  private complete(item: Item): void {
-    if (this.completedItems.has(item.id)) return;
+  private complete(item: Item, updated=false): void {
+    if (this.completedItems.has(item.id)&&!updated) return;
     this.completedItems.add(item.id);
     this.notify("item/completed", { item: { ...item } });
   }
@@ -125,7 +145,14 @@ export class ClaudeStreamAdapter {
       full.content.forEach((v: unknown, index: number) => {
         const b = record(v);
         if (!["text", "thinking", "tool_use"].includes(string(b.type))) return;
-        const id = b.type === "tool_use" ? `claude-tool:${parent}:${string(b.id)}` : `claude-message:${parent}:${string(full.id)}:${index}`;
+        const body=string(b.type==='thinking'?b.thinking:b.text);
+        if(b.type!=='tool_use'&&!body)return; // Empty SDK pre-snapshots are not visible reasoning.
+        const prefix=`claude-message:${parent}:${string(full.id)}:`,kind=b.type==='thinking'?'reasoning':'agentMessage';
+        const candidates=b.type==='tool_use'?[]:[...this.items.values()].filter(item=>item.id.startsWith(prefix)&&item.type===kind);
+        const value=(item:Item)=>item.type==='reasoning'?String((item.summary as string[])[0]??''):string(item.text);
+        const matching=candidates.find(item=>value(item)===body)??candidates.find(item=>!this.completedItems.has(item.id)&&value(item)&&body.startsWith(value(item)));
+        let id = b.type === "tool_use" ? `claude-tool:${parent}:${string(b.id)}` : matching?.id??`${prefix}${index}`;
+        if(b.type!=='tool_use'&&!matching&&this.items.has(id))id=`${prefix}${string(m.uuid)||this.items.size}`;
         const item = this.upsert(id, b, parent);
         if (item.type === "dynamicToolCall") {
           item.arguments = this.toolInput(item,b.input ?? {});
@@ -134,7 +161,7 @@ export class ClaudeStreamAdapter {
           // The final snapshot replaces streamed content, never appends it.
           if (item.type === "agentMessage") item.text = string(b.text);
           else item.summary = [string(b.thinking)];
-          this.complete(item);
+          this.complete(item,true);
         }
       });
       return;
@@ -157,6 +184,13 @@ export class ClaudeStreamAdapter {
     if (m.type === "result") {
       if (!this.sessionId) this.sessionId = string(m.session_id) || null;
       const success = m.subtype === "success" && m.is_error === false;
+      this.resultInfo = Object.fromEntries(['subtype','is_error','api_error_status','num_turns','stop_reason','terminal_reason','result_index','queued_turn_count','local_command'].filter(key=>typeof m[key]==='string'||typeof m[key]==='number'||typeof m[key]==='boolean'||m[key]===null).map(key=>[key,m[key]]));
+      this.resultInfo.resultLength=string(m.result).length;
+      for(const key of ['duration_ms','duration_api_ms','ttft_ms','ttft_stream_ms','time_to_request_ms','time_to_request_from_spawn_ms','first_content_frame_ms'])if(typeof m[key]==='number'&&Number.isFinite(m[key]))this.resultInfo[key]=m[key];
+      if(success&&!string(m.result).trim()&&this.items.size===0&&!string(m.local_command)){
+        this.finish('failed',new AppError('claude_empty_response','Claude 客户端返回了空结果，没有收到回答。请重新发送；本轮未记录到工具执行。'),m.usage);
+        return;
+      }
       // Some runtimes produce only a result, with no assistant snapshot.
       if (success && string(m.result) && ![...this.items.values()].some(i => i.type === "agentMessage" && !i.parentToolUseId)) {
         const item = this.upsert(`claude-result:${this.turnId}`, { type: "text" }, "");
@@ -192,6 +226,7 @@ export class ClaudeStreamAdapter {
       id: this.turnId, status, items: [...this.items.values()],
       error: error instanceof AppError ? error.toPublic() : error ? { message: redactModelError(error) } : null,
       ...(usage ? { usage } : {})
+      ,...(this.resultInfo ? { nativeResult: this.resultInfo } : {})
     } });
   }
 }

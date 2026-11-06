@@ -9,9 +9,10 @@ import {effortDescending} from "./effortOrder";
 import type {ReasoningEffort} from "./types";
 import "./taskNotificationSettings.css";
 import "./runtimeMigration.css";
+import { remainingTime, type ReclaudeUsageStatus } from "../shared/reclaudeUsage";
 
 export interface BranchTarget {targetAccountId?:string;model?:string;operationId?:string;reasoningEffort?:ReasoningEffort}
-export function BranchTargetDialog(props:{sourceModel:string;sourceEffort?:ReasoningEffort;pool:CodexAccountPool|null;profiles:ModelProfile[];onClose():void;onConfirm(target:BranchTarget):Promise<boolean>}){
+export function BranchTargetDialog(props:{sourceModel:string;sourceEffort?:ReasoningEffort;pool:CodexAccountPool|null;profiles:ModelProfile[];usageStatus?:ReclaudeUsageStatus|null;onClose():void;onConfirm(target:BranchTarget):Promise<boolean>}){
   const [destination,setDestination]=useState("auto"),[model,setModel]=useState(props.sourceModel),[pending,setPending]=useState(false),[error,setError]=useState(""),[closing,setClosing]=useState(false);
   const operation=useRef(crypto.randomUUID());
   const [effort,setEffort]=useState(props.sourceEffort??"medium");
@@ -37,7 +38,7 @@ export function BranchTargetDialog(props:{sourceModel:string;sourceEffort?:Reaso
         ]}/>
         {destination!=="auto"?<BranchChoice label="目标模型" value={model} disabled={pending} onChange={value=>{setModel(value);operation.current=crypto.randomUUID();}} options={models.map(p=>({value:p.model,label:runtimeModelLabel(p).replace(/\s+(?:low|medium|high|xhigh|max|ultra)$/,""),disabled:!modelIsAvailable(p)}))}/>:null}
         {showEffort&&efforts.length?<BranchChoice label="推理级别" value={selectedEffort} disabled={pending} onChange={value=>{setEffort(value as ReasoningEffort);operation.current=crypto.randomUUID();}} options={efforts.map(value=>({value,label:value}))}/>:null}
-        <p className="branchTargetNote">{cross?"保留此回答及之前的对话与工具记录，不重放工具。":"保留此回答及之前的历史，原会话不变。"}{claude?" 计入 ReClaude 会话创建限额。":""}</p>
+        <p className="branchTargetNote">{cross?"保留此回答及之前的对话与工具记录，不重放工具。":"保留此回答及之前的历史，原会话不变。"}{claude ? props.usageStatus ? props.usageStatus.creations.remaining ? ` 本小时还可创建 ${props.usageStatus.creations.remaining} 次 Claude 会话。` : ` Claude 新建名额已用完，${remainingTime(props.usageStatus.creations.retryAfterSeconds)}后可重试。` : " 计入 ReClaude 会话创建限额。" : ""}</p>
         {error?<p className="runtimeMigrationError" role="alert">{error}</p>:null}
       </div>
       <footer><button type="button" className="taskNotificationTest" disabled={pending||closing||(destination!=="auto"&&!models.some(p=>p.model===model&&modelIsAvailable(p)))} onClick={()=>void submit()}>{pending?"正在创建…":"创建并打开"}</button></footer>

@@ -1,11 +1,11 @@
-import { createReadStream } from "node:fs";
+import {rolloutPreviewRecords} from "./rolloutPreview.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { serverConfig } from "./config.js";
 import { isInternalUserMessageText } from "./internalUserMessage.js";
 import { readThreadFromJsonl, readThreadSummaryFromJsonl } from "./threadFallback.js";
-import {rolloutLogicalStat, rolloutStat,openReadableRollout,rolloutReadStream} from './rolloutStorage.js';
+import {rolloutLogicalStat, rolloutStat,openReadableRollout} from './rolloutStorage.js';
 import { HistoryReadScheduler } from './historyReadScheduler.js';
 
 type JsonRecord = Record<string, unknown>;
@@ -274,7 +274,6 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
   let metadataLine = state?.metadataLine ?? null;
   let ordinal = mustReset ? 1 : nextOrdinal(threadId);
   let lineStart = state?.indexedOffset ?? 0;
-  let pending = Buffer.alloc(0);
   let operations: Array<() => void> = [];
   let resetPending = mustReset;
 
@@ -318,16 +317,8 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
   // Parse the JSONL before opening a transaction. File streaming is asynchronous;
   // keeping BEGIN open across `await` lets another request enter the same sqlite
   // connection and caused intermittent "transaction within a transaction" 502s.
-  for await (const chunkValue of await rolloutReadStream(filePath, { start: lineStart })) {
-    const chunk = Buffer.isBuffer(chunkValue) ? chunkValue : Buffer.from(chunkValue);
-    pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-    for (;;) {
-      const newlineIndex = pending.indexOf(10);
-      if (newlineIndex < 0) break;
-      const lineBuffer = pending.subarray(0, newlineIndex);
-      const lineEnd = lineStart + newlineIndex + 1;
-      const line = lineBuffer.toString("utf8").replace(/\r$/, "");
-      pending = pending.subarray(newlineIndex + 1);
+  for await (const preview of rolloutPreviewRecords(filePath,{start:lineStart})) {
+      const line=preview.text,lineEnd=preview.end;
       if (line.trim()) {
         let record: JsonRecord | null = null;
         try { record = asRecord(JSON.parse(line)); } catch { record = null; }
@@ -438,7 +429,6 @@ async function updateThreadIndex(filePath: string, threadId: string): Promise<vo
       }
       lineStart = lineEnd;
       if (operations.length >= 256) flushIndexBatch(lineStart, false);
-    }
   }
   flushIndexBatch(lineStart, true);
 }
@@ -517,6 +507,11 @@ export const THREAD_PAGE_BYTE_BUDGET = 8 * 1024 * 1024;
 const MAX_SINGLE_RECORD_BYTES = 32 * 1024 * 1024;
 const historyReads = new HistoryReadScheduler();
 
+export async function indexedHistoryEnd(filePath:string,threadId:string,turnId?:string):Promise<number>{
+  await warmThreadIndex(filePath,threadId);
+  const row=turnId?db.prepare('SELECT MAX(end_offset) AS n FROM thread_records WHERE thread_id=? AND turn_id=?').get(threadId,turnId):db.prepare('SELECT MAX(end_offset) AS n FROM thread_records WHERE thread_id=?').get(threadId);
+  const end=Number(row?.n);if(!Number.isSafeInteger(end)||end<=0)throw new Error('迁移历史分支位置尚未找到，原记录未修改。');return end;
+}
 export async function indexedBranchCutoffTime(filePath: string, threadId: string, turnId?: string): Promise<number> {
   await warmThreadIndex(filePath, threadId);
   const row = turnId
@@ -537,7 +532,7 @@ export async function indexedBranchCutoffTime(filePath: string, threadId: string
 export function readIndexedThreadPage(
   filePath: string,
   threadId: string,
-  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number }
+  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number; sessionsRoot?:string }
 ) {
   return historyReads.run(async () => {
     const state = fileState(threadId);
@@ -555,7 +550,7 @@ export function readIndexedThreadPage(
 async function readIndexedThreadPageUnlocked(
   filePath: string,
   threadId: string,
-  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number }
+  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number; sessionsRoot?:string }
 ) {
   const collaborationMode = await indexedCollaborationMode(filePath, threadId);
   const withMode = (thread: JsonRecord) => collaborationMode ? { ...thread, collaborationMode } : thread;
@@ -566,7 +561,7 @@ async function readIndexedThreadPageUnlocked(
   const totalItems = Number(totalRow.value ?? 0);
   const maxOrdinal = Number(totalRow.max_ordinal ?? 0);
   if (!totalItems) {
-    const summary = await readThreadSummaryFromJsonl(filePath, threadId);
+    const summary = await readThreadSummaryFromJsonl(filePath, threadId,options.sessionsRoot);
     return {
       thread: withMode(summary),
       history: { totalItems: 0, returnedItems: 0, before: 0, nextBefore: 0, hasOlder: false, nextCursor: null, indexState: "fresh" as const }
@@ -584,7 +579,7 @@ async function readIndexedThreadPageUnlocked(
       startOffset: Number(row.start_offset), endOffset: Number(row.end_offset), searchText: String(row.search_text ?? "")
     })).reverse();
   if (!rows.length) {
-    const summary = await readThreadSummaryFromJsonl(filePath, threadId);
+    const summary = await readThreadSummaryFromJsonl(filePath, threadId,options.sessionsRoot);
     return {
       thread: { ...withMode(summary), turns: [] },
       history: { totalItems, returnedItems: 0, before: totalItems, nextBefore: totalItems, hasOlder: false, nextCursor: null, indexState: "fresh" as const }
@@ -617,7 +612,7 @@ async function readIndexedThreadPageUnlocked(
   const possibleTurnEnd = Math.min(maxEndOffset, Math.max(rangeEnd, Number(turnEnd?.end_offset ?? 0)));
   const endOffset = possibleTurnEnd - first.startOffset <= Math.max(THREAD_PAGE_BYTE_BUDGET, rangeEnd - first.startOffset)
     ? possibleTurnEnd : rangeEnd;
-  const parsed = await readThreadFromJsonl(filePath, threadId, undefined, {
+  const parsed = await readThreadFromJsonl(filePath, threadId, options.sessionsRoot, {
     startOffset: first.startOffset,
     endOffset,
     syntheticTurnId: first.turnId

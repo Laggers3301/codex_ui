@@ -1,6 +1,6 @@
 import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
 import { RuntimeMigrationDialog } from "./RuntimeMigrationDialog";
-import { ReclaudeUsage, useReclaudeUsage } from "./ReclaudeUsage";
+import { useReclaudeUsage } from "./ReclaudeUsage";
 import { ReclaudeAuthorizationDialog } from "./ReclaudeAuthorization";
 import { ReclaudeQuotaDetails, reclaudeRemainingLabel } from "./reclaudeQuota";
 import type { ReclaudeUsageStatus } from "../shared/reclaudeUsage";
@@ -27,8 +27,9 @@ import { installMobileClickHaptics } from "./mobileHaptics";
 import { useMobileComposerMotion } from "./useMobileComposerMotion";
 import { useMobileComposerControls } from "./useMobileComposerControls";
 import { isUsableThreadPage } from "./threadPageCache";
-import { applyLiveAgentUpdate, type AgentWireUpdate } from "./liveAgentUpdates";
+import { applyLiveAgentUpdate, keepSnapshotAgent, type AgentWireUpdate } from "./liveAgentUpdates";
 import { recoverAgentStreams } from "./agentStreamRecovery";
+import {readableToolImageLog} from './toolImageLog';
 import {BranchToolArchive} from "./BranchToolArchive";
 import { X as PanelClose, FileText as PanelFile, ChevronDown as PanelDown, MoreHorizontal as PanelMore, Copy as ActionCopy, Branch as ActionBranch, Trash as ActionTrash, Plus as WorkspaceCreateIcon } from "./PanelIcons";
 import { RemoteFolderSidebar, fileReferenceText } from "./RemoteFolderSidebar";
@@ -115,7 +116,8 @@ import {profilesByDescendingEffort} from "./effortOrder";
 import { isToolSummaryClick, recordToolDisclosurePointerDown } from "./toolDisclosure";
 import { ToolArrivalRegistry } from "./toolArrivalRegistry";
 import { skillReadSummary } from "./skillReadSummary";
-import { toolPresentation } from "./toolPresentation";
+import { toolPresentation,toolDisplayName } from "./toolPresentation";
+import {claudeVisibleItems} from '../shared/claudeItems';
 import { activityBundleSummary } from "./activityBundle";
 import { restoreSubmittedText } from "./composerSendDraft";
 import { localizedSkill, skillSection } from "./skillLocalization";
@@ -1109,6 +1111,7 @@ function displayOutputText(value: unknown, maxLength = 60000): string {
       }
     } catch { /* A streaming/truncated output is not necessarily JSON yet. */ }
   }
+  text=readableToolImageLog(text);
   if (text.length <= maxLength) {
     return text;
   }
@@ -1220,7 +1223,9 @@ export const DeferredToolOutput = memo(function DeferredToolOutput({
   const [loadError, setLoadError] = useState("");
   const loadingRef = useRef(false);
   const outputScopeRef = useRef({ deferred, itemId, projectId, text, threadId });
-  const output = useMemo(() => displayOutputText(loadedOutput ?? text), [loadedOutput, text]);
+  const rawOutput = useMemo(() => displayOutputText(loadedOutput ?? text), [loadedOutput, text]);
+  const historyImages=useMemo(()=>[...rawOutput.matchAll(/__codex_history_image__:(\d+):(\d+):(png|jpeg|webp|gif)/g)].map(match=>({start:match[1],end:match[2]})),[rawOutput]);
+  const output=useMemo(()=>rawOutput.replace(/__codex_history_image__:\d+:\d+:(png|jpeg|webp|gif)/g,'[图片已折叠，原图按需查看]'),[rawOutput]);
   const preview = useMemo(() => {
     const lines = output.split(/\r?\n/).filter((line) => line.trim()).slice(0, 2).join("\n");
     return lines.length > 420 ? `${lines.slice(0, 420)}...` : lines;
@@ -1273,7 +1278,7 @@ export const DeferredToolOutput = memo(function DeferredToolOutput({
     element.textContent = element.closest(".toolExpanded") ? output : preview;
   }, [loadError, output, preview]);
 
-  return <pre ref={outputRef} className="outputBlock" data-deferred-tool-output>{preview}</pre>;
+  return <><pre ref={outputRef} className="outputBlock" data-deferred-tool-output>{preview}</pre>{threadId&&historyImages.length?<div className="historyToolImages">{historyImages.map((image,index)=><a key={`${image.start}:${image.end}`} className="iconTextButton" href={`/api/threads/${encodeURIComponent(threadId)}/history-image?start=${image.start}&end=${image.end}`} target="_blank" rel="noopener noreferrer" onClick={event=>event.stopPropagation()}>查看原图{historyImages.length>1?` ${index+1}`:''}</a>)}</div>:null}</>;
 });
 
 function normalizedToken(value: unknown): string {
@@ -3227,7 +3232,7 @@ function imageTargetFromToolValue(value: unknown, depth = 0): string | null {
 
 function viewImageTargetFromToolItem(item: ThreadItem): string | null {
   const tool = safeText(item.tool ?? item.name ?? item.type).toLowerCase().replace(/[^a-z0-9]+/g, "");
-  if (!tool.includes("viewimage") && !tool.includes("imageview")) return null;
+  if (tool!=='read'&&!tool.includes("viewimage") && !tool.includes("imageview")) return null;
   return imageTargetFromToolValue(item);
 }
 
@@ -3962,7 +3967,7 @@ function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, c
               className={`accountPoolTab ${item === selectedProvider ? "active" : ""} ${item.status !== "ready" ? "degraded" : ""}`}
               onClick={() => setSelectedAccountId(`provider:${item.id}`)}><span>{item.name}</span><strong>{providerRemaining(item)}</strong></button>)}
           </div>
-          {selectedClaude ? <ReclaudeQuotaDetails key={selectedClaude.orgId} account={selectedClaude} cacheError={reclaudeStatus?.cacheError}/> : selectedProvider ? <ProviderQuotaDetails key={selectedProvider.id} item={selectedProvider} formatPeriod={period => rateWindowText({ usedPercent: period.usedPercent, windowDurationMins: null, resetsAt: period.resetsAt ? Date.parse(period.resetsAt) / 1000 : null }, ({ session: "5小时", weekly: "7天", monthly: "月度" } as Record<string, string>)[period.label] ?? period.label)} /> : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
+          {selectedClaude ? <ReclaudeQuotaDetails key={selectedClaude.orgId} account={selectedClaude} cacheError={reclaudeStatus?.cacheError} creations={reclaudeStatus?.creations}/> : selectedProvider ? <ProviderQuotaDetails key={selectedProvider.id} item={selectedProvider} formatPeriod={period => rateWindowText({ usedPercent: period.usedPercent, windowDurationMins: null, resetsAt: period.resetsAt ? Date.parse(period.resetsAt) / 1000 : null }, ({ session: "5小时", weekly: "7天", monthly: "月度" } as Record<string, string>)[period.label] ?? period.label)} /> : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>暂未读取到额度</p>}
           {!selectedProvider && selectedAccount ? (
             <div className="accountPoolSelectedMeta">
               {accountQuotaStatus(selectedAccount) === "cached" ? <span>额度查询暂时失败 · 显示缓存，后台重试中</span> : null}
@@ -3983,7 +3988,7 @@ function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, c
           ) : null}
         </>
       ) : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>{loading ? "正在读取额度…" : "暂未读取到额度"}</p>}
-      {selectedClaude ? <button className="reclaudeAuthEntry" type="button" onClick={() => onReauthenticate(selectedClaude.orgId)}>重新认证 ReClaude</button> : null}
+      {selectedClaude || (reclaudeStatus && !claudeAccounts.length) ? <button className="reclaudeAuthEntry" type="button" onClick={() => onReauthenticate(selectedClaude?.orgId)}>重新认证 ReClaude</button> : null}
     </section>
   );
 }
@@ -4204,7 +4209,7 @@ function liveDeltasFromSnapshot(
 ): Record<string, LiveDeltaEntry> {
   return Object.fromEntries(
     recentLiveSnapshotItems(snapshot.agentMessages, LIVE_RECONNECT_AGENT_LIMIT)
-      .filter((message) => message.itemId && message.text && !message.completed)
+      .filter((message) => message.itemId && keepSnapshotAgent(message, activeTurns))
       .map((message) => [
         message.itemId,
         {
@@ -4316,7 +4321,7 @@ const modelPreferenceStorageKey = (userId: string, projectId: string) => `codex-
 const threadModelPreferenceStorageKey = (userId: string, threadId: string) => `codex-v2-thread-model-${encodeURIComponent(userId)}-${encodeURIComponent(threadId)}`;
 const codexFastModeStorageKey = (userId: string) => `codex-v2-codex-fast-mode-${encodeURIComponent(userId)}`;
 
-function resolveServiceTier(enabled: boolean): "fast" | null {
+function resolveNativeServiceTier(enabled: boolean): "fast" | null {
   return enabled ? "fast" : null;
 }
 
@@ -5197,6 +5202,7 @@ export function App() {
     () => modelProfileById(activeModelProfileId, selectableModelProfiles),
     [activeModelProfileId, selectableModelProfiles]
   );
+  const resolveServiceTier=(enabled:boolean)=>resolveNativeServiceTier(enabled&&!isReclaudeModel(selectedModelProfile.model));
   const temporaryModelProfile = useMemo(
     () => modelProfileById(temporaryModelProfileId, modelProfiles),
     [temporaryModelProfileId, modelProfiles]
@@ -8996,6 +9002,7 @@ export function App() {
       return true;
     }
     if (command === "goal") {
+      if(isReclaudeModel(selectedModelProfile.model)){setError('Claude 原生持续目标尚未接入号池管理接口；可使用定时任务或普通任务。');return true;}
       if (!selectedThread?.id) {
         setError("请先打开一个会话，再设置其持续目标。");
         setPrompt("");
@@ -10075,7 +10082,9 @@ export function App() {
           liveTimelineOrderRef.current.set(`agent:${item.itemId}`, item.sequence);
           liveTimelineSequenceRef.current = Math.max(liveTimelineSequenceRef.current, item.sequence);
         }
-        const next = applyLiveAgentUpdate(liveAgentBasesRef.current.get(item.itemId), item);
+        const previous=liveAgentBasesRef.current.get(item.itemId);
+        const next = applyLiveAgentUpdate(previous, item);
+        if(next===previous)return;
         if (next) {
           liveAgentBasesRef.current.set(item.itemId,next);
           enqueueLiveAgentSnapshot(item.itemId, next);
@@ -10484,8 +10493,27 @@ export function App() {
         return;
       }
       const params = notification.params ?? {};
+      if(notification.method==='runtime/initialized'&&params.runtime==='claude-code'&&typeof params.threadId==='string'&&Array.isArray(params.tools)&&Array.isArray(params.mcpServers)){
+        const runtimeCapabilities={model:String(params.model??''),tools:params.tools as string[],skills:Array.isArray(params.skills)?params.skills as string[]:[],mcpServers:params.mcpServers as Array<{name:string;status:string}>};
+        setSelectedThread(previous=>previous&&previous.id===params.threadId?{...previous,runtimeCapabilities}:previous);
+        return;
+      }
+      if (notification.method === "runtime/accountSwitched") {
+        if (typeof params.threadId === "string" && typeof params.model === "string") {
+          applyThreadModelProfile(params.threadId, params.model, isReasoningEffort(params.reasoningEffort) ? params.reasoningEffort : "medium");
+          if (params.toolOutputArchived) window.dispatchEvent(new CustomEvent("claude-history-archived", {detail:{threadId:params.threadId}}));
+        }
+        return;
+      }
       if (notification.method === "runtime/reclaudeUsage") {
         if(isRecord(params.usage)&&Array.isArray(params.usage.accounts))receiveReclaudeUsage(params.usage as unknown as ReclaudeUsageStatus);
+        return;
+      }
+      if(notification.method==='runtime/claudeContextUsage'){
+        if(params.threadId===selectedThreadRef.current?.id&&isRecord(params.context)&&params.context.runtime==='claude-code'){
+          const context=params.context as unknown as ThreadContextStatus;
+          setThreadContextStatus(previous=>({...previous,...context,config:previous?.config??emptyThreadContextConfig(String(params.threadId)),pin:previous?.pin??{threadId:String(params.threadId),text:'',updatedAt:null},compactedAt:previous?.compactedAt??context.compactedAt}));
+        }
         return;
       }
       const recoveryChanges = recoverAgentStreams(liveAgentBasesRef.current, notification);
@@ -10898,6 +10926,7 @@ export function App() {
     contextTurnId?: string,
     historyContext?: { readOnly: boolean; loadOutput?: () => Promise<string> }
   ) => {
+    if(entries.some(item=>item.historicalImport===true))historyContext={...historyContext,readOnly:true};
     const entryKey = `${bundleId}:item:${entries[0].id}`;
     if (entries.length === 1 && itemKind(entries[0]) === "reasoning") {
       const reasoningText = reasoningItemDisplayText(entries[0]);
@@ -10909,8 +10938,8 @@ export function App() {
     }
     const expanded = Boolean(expandedToolEntries[entryKey]);
     const call = entries.find((entry) => safeText(entry.type).toLowerCase() === "toolcall") ?? entries[0];
-    const toolName = safeText(call.tool).trim() || (safeText(call.type).toLowerCase() === "filechange" ? "文件变更" : "tool");
-    const inputText = safeText(call.input) || safeText(call.command);
+    const toolName = toolDisplayName(call).trim() || (safeText(call.type).toLowerCase() === "filechange" ? "文件变更" : "tool");
+    const inputText = safeText(call.input) || safeText(call.command) || safeText(call.arguments);
     const agentOperation = parseAgentOperation(call);
     const questions = parseQuestionToolItem(call);
     const presentation = toolPresentation(call);
@@ -10957,7 +10986,7 @@ export function App() {
         }}
       >
         <ToolIcon className="toolBundleTypeIcon" size={16} aria-hidden="true" />
-        <div className="messageMeta"><span className="toolBundleEntryLabel">调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
+        <div className="messageMeta"><span className="toolBundleEntryLabel" title={safeText(call.tool)}>调用工具 · {toolName}</span>{toolSummary ? <span className="toolBundleEntrySummary"> {toolSummary}</span> : null}</div>
         <ToolReveal open={expanded}>
         {agentOperation ? <SubagentToolCard item={call} onOpenAgent={openSubagentReview} /> : questions && !historyContext?.readOnly ? <ToolQuestionCard questions={questions} onChoose={(answer, answers) => chooseToolQuestion(call.id, answer, answers, contextThreadId, contextProjectId)} /> : inputText ? <pre className="toolBundleInput">{inputText}</pre> : null}
         <MessageImagePreviews item={call} projectId={contextProjectId} onOpenFileLink={openFilePreview} />
@@ -10988,7 +11017,7 @@ export function App() {
     keepShimmering?: boolean,
     historyContext?: { readOnly: boolean; renderEntry: (entries: ThreadItem[], groupIndex: number) => ReactNode }
   ) => {
-    const hasRunningTool = bundleItems.some((item) => safeText(item.type).toLowerCase() === "toolcall" && item.completed === false);
+    const hasRunningTool = bundleItems.some((item) => /^(?:dynamic)?toolcall$/i.test(safeText(item.type)) && (item.completed === false||item.status==='inProgress'));
     // Keep the entire activity bundle alive through tool-to-answer gaps. The
     // caller clears this only when the next assistant body actually appears.
     const shimmering = keepShimmering ?? hasRunningTool;
@@ -11121,7 +11150,7 @@ export function App() {
             >
               <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="2.2" width="8.3" height="9.2" rx="1.4" /><path d="M10.8 13.8H3.9a1.4 1.4 0 0 1-1.4-1.4V5.6" /></svg>
             </button>
-            {(turn.items ?? []).filter((entry) => itemKind(entry) === "user").length < 2 && (!selectedActiveTurnId || (turn.id === displayedConversationTurns.at(-1)?.id && lastStoppedTurnForEdit?.threadId === selectedThread?.id && lastStoppedTurnForEdit?.turnId === turn.id)) && (Boolean(turn.completedAt) || ["completed", "succeeded", "interrupted", "failed", "cancelled", "canceled", "aborted"].some((status) => normalizedToken(turn.status).includes(status)) || (lastStoppedTurnForEdit?.threadId === selectedThread?.id && lastStoppedTurnForEdit?.turnId === turn.id)) ? <button
+            {item.historicalImport!==true && (turn.items ?? []).filter((entry) => itemKind(entry) === "user").length < 2 && (!selectedActiveTurnId || (turn.id === displayedConversationTurns.at(-1)?.id && lastStoppedTurnForEdit?.threadId === selectedThread?.id && lastStoppedTurnForEdit?.turnId === turn.id)) && (Boolean(turn.completedAt) || ["completed", "succeeded", "interrupted", "failed", "cancelled", "canceled", "aborted"].some((status) => normalizedToken(turn.status).includes(status)) || (lastStoppedTurnForEdit?.threadId === selectedThread?.id && lastStoppedTurnForEdit?.turnId === turn.id)) ? <button
               type="button"
               title={turn.id === displayedConversationTurns.at(-1)?.id ? "编辑最后一条提问" : "编辑此条提问（发送后撤回后续问答）"}
               aria-label="编辑提问"
@@ -11130,7 +11159,7 @@ export function App() {
             >
               <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3 11.7-.5 2.1 2.1-.5L12.8 5 11 3.2 3 11.7Z" /><path d="m9.9 4.3 1.8 1.8" /></svg>
             </button> : null}
-            {turn.id === displayedConversationTurns.at(-1)?.id && !selectedActiveTurnId ? <button
+            {!turn.historicalImport && turn.id === displayedConversationTurns.at(-1)?.id && !selectedActiveTurnId ? <button
               type="button"
               title="撤回最后一轮问答（不撤销文件改动）"
               aria-label="撤回最后一轮问答"
@@ -11936,7 +11965,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         )}
       />
 
-      {branchTarget?<BranchTargetDialog sourceModel={selectedThread?.configuredModel??selectedModelProfile.model} sourceEffort={selectedThread?.configuredReasoningEffort??selectedModelProfile.effort} pool={accountPool} profiles={modelProfiles} onClose={()=>setBranchTarget(null)} onConfirm={async target=>{
+      {branchTarget?<BranchTargetDialog sourceModel={selectedThread?.configuredModel??selectedModelProfile.model} sourceEffort={selectedThread?.configuredReasoningEffort??selectedModelProfile.effort} pool={accountPool} profiles={modelProfiles} usageStatus={reclaudeUsage} onClose={()=>setBranchTarget(null)} onConfirm={async target=>{
         if(selectedThreadRef.current?.id!==branchTarget.threadId||selectedProject?.id!==branchTarget.projectId){setError("源会话已切换，请回到原会话重新选择分支点。");return false;}
         return createBranchFromTurn({id:branchTarget.turnId},false,target);
       }}/>:null}
@@ -12343,7 +12372,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <div className="dialogHeader">
               <div>
                 <h2 id="context-dialog-title">{selectedThread ? "会话上下文" : "新会话上下文"}</h2>
-                <p>{selectedThread
+                <p>{threadContextStatus?.runtime==='claude-code'?'实际模型与最近一次请求用量。':selectedThread
                   ? "监控当前活跃上下文，并保存 compact 后仍需保留的关键信息。"
                   : "只为下一条新会话选择独立的上下文窗口；创建后不会影响其他会话。"}</p>
               </div>
@@ -12356,7 +12385,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 <div className="contextUsageSummary">
                   <strong>{threadContextStatus?.usedPercent === null || threadContextStatus?.usedPercent === undefined ? "等待下一轮统计" : `已使用 ${threadContextStatus.usedPercent.toFixed(1)}%`}</strong>
                   <span>{threadContextStatus?.usedTokens === null || threadContextStatus?.usedTokens === undefined
-                    ? threadContextStatus?.effectiveCompactTokenLimit
+                    ? threadContextStatus?.runtime==='claude-code'?'等待 Claude 原生用量快照':threadContextStatus?.effectiveCompactTokenLimit
                       ? `自动 compact：${formatNumber(threadContextStatus.effectiveCompactTokenLimit)} token`
                       : "自动 compact：Codex 默认"
                     : `${formatNumber(threadContextStatus.usedTokens)} / ${formatNumber(threadContextStatus.contextWindow)} token`}</span>
@@ -12364,12 +12393,21 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 <div className="contextUsageMeter" aria-hidden="true">
                   <span style={{ width: `${Math.min(100, Math.max(0, threadContextStatus?.usedPercent ?? 0))}%` }} />
                 </div>
-                <p>{threadContextStatus?.effectiveCompactTokenLimit
+                {threadContextStatus?.runtime==='claude-code'&&threadContextStatus.claudeUsage?<dl className="claudeContextTokenDetails">
+                  <dt>实际模型</dt><dd>{threadContextStatus.claudeUsage.model}</dd>
+                  <dt>窗口来源</dt><dd>{threadContextStatus.claudeUsage.windowSource==='runtime'?'运行时上报':'官方模型默认值，链路上限待上报'}</dd>
+                  <dt>未缓存输入</dt><dd>{formatNumber(threadContextStatus.claudeUsage.inputTokens)}</dd>
+                  <dt>缓存写入</dt><dd>{formatNumber(threadContextStatus.claudeUsage.cacheWriteTokens)}</dd>
+                  <dt>缓存命中</dt><dd>{formatNumber(threadContextStatus.claudeUsage.cacheReadTokens)}</dd>
+                  <dt>输出</dt><dd>{formatNumber(threadContextStatus.claudeUsage.outputTokens)}{threadContextStatus.claudeUsage.thinkingTokens!==null?`（含思考 ${formatNumber(threadContextStatus.claudeUsage.thinkingTokens)}）`:''}</dd>
+                  <dt>统计时间</dt><dd>{new Date(threadContextStatus.claudeUsage.at).toLocaleString()}</dd>
+                </dl>:null}
+                <p>{threadContextStatus?.runtime==='claude-code'?'最近一次主模型请求快照，包含缓存输入和输出，不是累计用量；自动整理跟随 Claude 原生策略。':threadContextStatus?.effectiveCompactTokenLimit
                   ? `当前安全 compact 阈值 ${formatNumber(threadContextStatus.effectiveCompactTokenLimit)} token${threadContextStatus.compactAtPercent ? `（最近有效窗口约 ${threadContextStatus.compactAtPercent.toFixed(1)}%）` : ""}。`
                   : "当前会话未覆盖参数，跟随 Codex 对所选模型的默认调优。"} 比例来自最近一次 token 统计，不改变原会话记录。</p>
               </section> : null}
 
-              <section className="contextConfigEditor" aria-label="当前会话上下文参数">
+              {threadContextStatus?.runtime!=='claude-code'?<><section className="contextConfigEditor" aria-label="当前会话上下文参数">
                 <div className="contextSectionHeading">
                   <div>
                     <strong>{selectedThread ? "当前会话策略" : "下一条新会话策略"}</strong>
@@ -12463,6 +12501,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   : "内容将在创建会话时注入，并在创建后保存到这个新会话。"}</small>
               </label>
 
+              </>:null}
               {selectedThread ? <section className="contextCompactHistory">
                 <strong>自动 compact 时间</strong>
                 {contextDialogLoading ? <span>读取中…</span> : threadContextStatus?.compactedAt.length ? (
@@ -12477,11 +12516,11 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               <button
                 className="iconTextButton primary"
                 type="button"
-                onClick={() => void saveContextPin()}
+                onClick={() => threadContextStatus?.runtime==='claude-code'?closeContextPinDialog():void saveContextPin()}
                 disabled={contextPinSaving || Boolean(selectedThread && contextDialogLoading)}
               >
-                <Pin size={15} />
-                {contextPinSaving
+                {threadContextStatus?.runtime!=='claude-code'?<Pin size={15} />:null}
+                {threadContextStatus?.runtime==='claude-code'?'完成':contextPinSaving
                   ? "保存中…"
                   : selectedThread && contextDialogLoading
                     ? "正在读取会话设置…"
@@ -13147,7 +13186,6 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 </select>
               </label>
             </div>
-            {isReclaudeModel(selectedModelProfile.model)?<ReclaudeUsage key={`${selectedUserId}:${selectedModelProfile.model}`} model={selectedModelProfile.model} status={reclaudeUsage}/>:null}
             {exhaustedAccountNoticePresence.present
               && exhaustedAccountNotice
               && exhaustedAccountNotice.threadId === selectedThread?.id ? (
@@ -13469,7 +13507,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   // Merge identities and chronology before introducing message boundaries.
                   const pendingSteers = visiblePendingUserMessages.filter(entry => entry.turnId === turn.id && entry.steerBoundary);
                   const mergedItems = mergeTimelineItems(coalesceToolOutputs(historyItems, true), liveItems);
-                  const items = collapseCodeModeWrappers(coalesceToolOutputs(mergeSteerTimelineItems(mergedItems, pendingSteers.map(entry => entry.steerBoundary!), (item, boundary) => userTextsMatch(itemText(item), boundary.submittedText ?? boundary.text))));
+                  const items = claudeVisibleItems(collapseCodeModeWrappers(coalesceToolOutputs(mergeSteerTimelineItems(mergedItems, pendingSteers.map(entry => entry.steerBoundary!), (item, boundary) => userTextsMatch(itemText(item), boundary.submittedText ?? boundary.text)))));
                   const hasAgentAnswerFromIndex = new Array<boolean>(items.length + 1).fill(false);
                   for (let index = items.length - 1; index >= 0; index -= 1) {
                     const item = items[index];
@@ -13539,13 +13577,13 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     // sends no public summary. An invisible reservation must
                     // never flush/split the visible activity group.
                     if (kind === "reasoning" && !reasoningItemDisplayText(item).trim()) continue;
-                    const inlineQuestions = kind === "tool" ? parseQuestionToolItem(item) : null;
+                    const inlineQuestions = kind === "tool" && item.historicalImport!==true ? parseQuestionToolItem(item) : null;
                     if (inlineQuestions) {
                       toolGroupIndex = flushToolGroup(toolGroupIndex, true);
                       renderedHistoryItems.push(<ToolQuestionMessage key={`${turn.id}-${item.id}-question`} open={!questionIsAnswered(item.id, turn.id, items)} questions={inlineQuestions} answers={displayedQuestionAnswers(item.id, inlineQuestions, item.aggregatedOutput ?? item.output)} onChoose={(answer, answers) => chooseToolQuestion(item.id, answer, answers)} />);
                       continue;
                     }
-                    if (kind === "tool" && isQuestionToolName(item.tool)) {
+                    if (kind === "tool" && item.historicalImport!==true && isQuestionToolName(item.tool)) {
                       toolGroupIndex = flushToolGroup(toolGroupIndex, true);
                       if (!questionIsAnswered(item.id, turn.id, items) && questionIsGenerating(item)) {
                         renderedHistoryItems.push(<div className="v2ThinkingLine" role="status" key={`${turn.id}-${item.id}-question-pending`}>正在生成问题…</div>);
@@ -13630,7 +13668,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                               ? <span className="branchCreatingSpinner" role="status" aria-label="正在创建分支" />
                               : <ActionBranch size={15} />}
                           </button>
-                          {turn.id === displayedConversationTurns.at(-1)?.id ? <button type="button" title="撤回最后一轮问答（不撤销文件改动）" aria-label="撤回最后一轮问答" disabled={editingLastPrompt || Boolean(editingPromptDraft)} onClick={() => void deleteLatestTurn(turn)}><ActionTrash size={15} /></button> : null}
+                          {!turn.historicalImport && turn.id === displayedConversationTurns.at(-1)?.id ? <button type="button" title="撤回最后一轮问答（不撤销文件改动）" aria-label="撤回最后一轮问答" disabled={editingLastPrompt || Boolean(editingPromptDraft)} onClick={() => void deleteLatestTurn(turn)}><ActionTrash size={15} /></button> : null}
                           {answerSentTime ? <time className="messageSentTime" dateTime={answerSentTime.dateTime}>{answerSentTime.label}</time> : null}
                         </div>
                       ]
@@ -13734,6 +13772,17 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                     <dt>会话</dt><dd>{selectedThread.name || selectedThread.preview || selectedThread.id}</dd>
                     <dt>模型</dt><dd>{selectedModelProfile.model} / {selectedModelProfile.effort}</dd>
                     <dt>上下文</dt><dd>{threadContextStatus?.usedTokens == null || threadContextStatus.contextWindow == null ? "等待下一轮 token 统计" : `${formatNumber(threadContextStatus.usedTokens)} / ${formatNumber(threadContextStatus.contextWindow)} token（${threadContextStatus.usedPercent?.toFixed(1) ?? "--"}%）`}</dd>
+                    {threadContextStatus?.runtime==='claude-code'&&threadContextStatus.claudeUsage?<>
+                      <dt>实际模型</dt><dd>{threadContextStatus.claudeUsage.model}</dd>
+                      <dt>窗口来源</dt><dd>{threadContextStatus.claudeUsage.windowSource==='runtime'?'运行时上报':threadContextStatus.claudeUsage.windowSource==='model_default'?'官方模型默认值，链路上限待上报':'尚未上报'}</dd>
+                      <dt>未缓存输入</dt><dd>{formatNumber(threadContextStatus.claudeUsage.inputTokens)}</dd>
+                      <dt>缓存写入</dt><dd>{formatNumber(threadContextStatus.claudeUsage.cacheWriteTokens)}</dd>
+                      <dt>缓存命中</dt><dd>{formatNumber(threadContextStatus.claudeUsage.cacheReadTokens)}</dd>
+                      <dt>输出</dt><dd>{formatNumber(threadContextStatus.claudeUsage.outputTokens)}{threadContextStatus.claudeUsage.thinkingTokens!==null?`（含思考 ${formatNumber(threadContextStatus.claudeUsage.thinkingTokens)}）`:''}</dd>
+                      <dt>统计时间</dt><dd>{new Date(threadContextStatus.claudeUsage.at).toLocaleString()}</dd>
+                      <dt>统计口径</dt><dd>最近一次主模型请求，非历史累计；含缓存与输出。</dd>
+                      <dt>工具状态</dt><dd title={selectedThread.runtimeCapabilities?.mcpServers.map(s=>`${s.name}: ${s.status}`).join('\n')}>{selectedThread.runtimeCapabilities?`${selectedThread.runtimeCapabilities.tools.length} 个原生工具 · MCP ${selectedThread.runtimeCapabilities.mcpServers.filter(s=>s.status==='connected').length}/${selectedThread.runtimeCapabilities.mcpServers.length} 已连接`:'等待本轮初始化'}</dd>
+                    </>:null}
                     <dt>运行</dt><dd>{getRunningTurnIdForThread(selectedThread) ? "进行中" : "空闲"}</dd>
                   </dl>
                 </aside>
@@ -13755,7 +13804,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         <>
                           <span className="queuedSubmissionLabel">{entry.id.startsWith("pending:") ? "排队中" : "已排队"}{queuedSubmissions.length > 1 ? ` · ${queuedSubmissions.length} 条` : ""}</span>
                           <span className="queuedSubmissionText" title={queuedSubmissionText(entry)}>{queuedSubmissionText(entry)}</span>
-                          {selectedActiveTurnId ? <button className="queuedSteerButton" type="button" disabled={entry.id.startsWith("pending:")} onClick={() => steerQueuedSubmission(entry)}>调整方向</button> : null}
+                          {selectedActiveTurnId&&(!isReclaudeModel(selectedModelProfile.model)||selectedThread?.runtimeFeatures?.steer===true) ? <button className="queuedSteerButton" type="button" disabled={entry.id.startsWith("pending:")} onClick={() => steerQueuedSubmission(entry)}>调整方向</button> : null}
                           {!entry.id.startsWith("pending:") ? <button className="queuedIconButton" type="button" aria-label="移除排队消息" title="移除排队消息" onClick={() => codexSocket.send({ type: "turn.queue.delete", requestId: `queue-delete-${requestToken()}`, threadId: selectedThread.id, queuedSubmissionId: entry.id })}><X size={13} /></button> : null}
                           {!entry.id.startsWith("pending:") ? <button className="queuedIconButton" type="button" aria-label="更多排队操作" aria-expanded={queuedMenuOpen} onClick={() => setQueuedMenuOpen((open) => !open)}>⋯</button> : null}
                         </>
@@ -13869,6 +13918,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   <button
                     className={`iconTextButton v2FastModeButton ${codexFastModeEnabled ? "v2FastModeButtonActive" : ""}`}
                     type="button"
+                    disabled={isReclaudeModel(selectedModelProfile.model)}
                     onClick={() => {
                       const next = !codexFastModeEnabled;
                       setCodexFastModeEnabled(next);
@@ -13876,9 +13926,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         window.localStorage.setItem(codexFastModeStorageKey(selectedUserId), String(next));
                       }
                     }}
-                    title={codexFastModeEnabled ? "已开启 Fast 模式（下次请求会带 service_tier: fast）" : "开启 Fast 模式"}
+                    title={isReclaudeModel(selectedModelProfile.model)?'尚未验证此账号的 Claude Fast 资格与计费，暂不启用':codexFastModeEnabled ? "已开启 Fast 模式（下次请求会带 service_tier: fast）" : "开启 Fast 模式"}
                   >
-                    <span>{codexFastModeEnabled ? "Fast On" : "Fast Off"}</span>
+                    <span>{isReclaudeModel(selectedModelProfile.model)?'Fast —':codexFastModeEnabled ? "Fast On" : "Fast Off"}</span>
                   </button>
                   <ModelGroupedSelect
                     value={activeModelProfileId}

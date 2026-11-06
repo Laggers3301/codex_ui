@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { defaultAgentLanguageInstructions, ensureDefaultAgentLanguage } from "./agentLanguage.js";
+import {responseStyleInstructions} from '../scripts/agent-response-style.mjs';
 
 const roots: string[] = [];
 const temporary = () => { const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-language-")); roots.push(directory); return directory; };
@@ -17,6 +18,7 @@ describe("native default response language", () => {
       const result = ensureDefaultAgentLanguage(root);
       expect(result.changed).toBe(true);
       expect(fs.readFileSync(result.path, "utf8")).toContain(defaultAgentLanguageInstructions);
+      expect(fs.readFileSync(result.path, "utf8")).toContain(responseStyleInstructions);
       expect(fs.readFileSync(path.join(root, "config.toml"), "utf8")).toBe(`model_provider = "${kind}"\n`);
       expect(fs.readFileSync(path.join(root, "auth.json"), "utf8")).toBe("fixture credentials");
     }

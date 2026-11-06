@@ -2,6 +2,13 @@ import { expect, it } from "vitest";
 import { AppError } from "./appErrors.js";
 import { modelErrorDetails } from "../shared/modelError.js";
 
+it("recognizes native stream failure enum spellings without readable English text", () => {
+  for (const info of ["ResponseStreamDisconnected", "ResponseStreamConnectionFailed", "response_stream_disconnected", { responseStreamDisconnected: { httpStatusCode: 503 } }, { responseStreamConnectionFailed: {} }]) {
+    expect(AppError.from({ message: "连接异常", codexErrorInfo: info })).toMatchObject({ code: "stream_disconnected", retryable: true });
+  }
+  expect(AppError.from(new Error("Timed out waiting for Codex response to turn/start.")).retryable).toBe(false);
+});
+
 it("shows native structured HTTP 429 without object coercion or guessing quota exhaustion", () => {
   const error = AppError.from({ message: "exceeded retry limit, last status: 429 Too Many Requests, request id: example-id", codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 429 } } }).toPublic();
   expect(error).toMatchObject({ code: "upstream_http_429", retryable: false });

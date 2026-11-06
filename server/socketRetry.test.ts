@@ -22,12 +22,17 @@ class FakeBridge extends EventEmitter {
   }
   parameters: Array<{ method: string; params: any }> = [];
   rejectNextStart = false;
+  readStatus = "idle";
+  startHook?: (turnId: string) => Promise<unknown>;
   async request(method: string, params: any = {}) {
     this.calls.push(method); this.parameters.push({ method, params });
-    if (method === "thread/read") return { thread: { status: { type: "idle" } } };
+    if (method === "thread/read") return { thread: { status: { type: this.readStatus } } };
     if (method === "thread/queue/list") return { data: [] };
     if (method === "turn/start" && this.rejectNextStart) { this.rejectNextStart = false; throw { message: "Selected model is at capacity.", codexErrorInfo: "server_overloaded" }; }
-    if (method === "turn/start") return { turn: { id: "turn-" + this.parameters.filter(row => row.method === method).length } };
+    if (method === "turn/start") {
+      const turnId = "turn-" + this.parameters.filter(row => row.method === method).length;
+      return this.startHook ? this.startHook(turnId) : { turn: { id: turnId } };
+    }
     return {};
   }
 }
@@ -54,6 +59,110 @@ async function client(port: number, user: string) {
 }
 
 describe("socket overload recovery", () => {
+  it("keeps checking an active native actor without interrupting or duplicating it, then recovers when it is idle", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "socket-retry-preflight-"));
+    const store = new ProjectStore(path.join(temporary, "store.sqlite"));
+    const project = store.createProject({ name: "test", rootPath: temporary });
+    store.registerThreadOwner({ threadId: "thread-a", userId: "admin", projectId: project.id, rootPath: temporary });
+    const bridge = new FakeBridge(), server = http.createServer(), wss = attachSocketServer(server, bridge as unknown as CodexBridge, store);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const sockets: WebSocket[] = [];
+    const due = () => { const state = store.getTurnRecoveryState("thread-a")!; state.job!.nextRetryAt = Date.now() - 1; store.setTurnRecoveryState(state); };
+    try {
+      const first = await client((server.address() as { port: number }).port, "admin"); sockets.push(first.socket);
+      first.send({ type: "turn.start", requestId: "preflight", projectId: project.id, threadId: "thread-a", prompt: "fixture" });
+      expect((await first.wait(message => message.requestId === "preflight")).ok).toBe(true);
+      bridge.emit("notification", { method: "turn/completed", params: { threadId: "thread-a", turn: { id: "turn-1", status: "failed", error: { codexErrorInfo: "ResponseStreamDisconnected" } } } });
+      bridge.readStatus = "active"; due();
+      await vi.waitFor(() => expect(bridge.calls).toContain("thread/read"), { timeout: 4_000 });
+      await vi.waitFor(() => expect(store.getTurnRecoveryState("thread-a")?.job).toMatchObject({ status: "waiting", attempts: 0 }));
+      expect(bridge.calls.filter(method => method === "turn/start")).toHaveLength(1);
+      expect(bridge.calls).not.toContain("turn/interrupt");
+      bridge.readStatus = "idle"; due();
+      await vi.waitFor(() => expect(bridge.calls.filter(method => method === "turn/start")).toHaveLength(2), { timeout: 4_000 });
+    } finally {
+      sockets.forEach(socket => socket.terminate());
+      await new Promise<void>(resolve => wss.close(() => server.close(() => resolve()))); store.close(); fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  it("automatically continues a terminal disconnected stream once with the browser offline, without touching another task", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "socket-auto-retry-"));
+    const store = new ProjectStore(path.join(temporary, "store.sqlite"));
+    const project = store.createProject({ name: "test", rootPath: temporary, defaultModel: "gpt-6.1-sol" });
+    for (const threadId of ["thread-a", "thread-b"]) store.registerThreadOwner({ threadId, userId: "admin", projectId: project.id, rootPath: temporary });
+    const bridge = new FakeBridge(), server = http.createServer(), wss = attachSocketServer(server, bridge as unknown as CodexBridge, store);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port, sockets: WebSocket[] = [];
+    const emit = (method: string, params: Record<string, unknown>) => bridge.emit("notification", { method, params });
+    try {
+      const first = await client(port, "admin"); sockets.push(first.socket);
+      first.send({ type: "turn.start", requestId: "once", projectId: project.id, threadId: "thread-a", prompt: "original must only be sent once" });
+      expect((await first.wait(message => message.requestId === "once")).ok).toBe(true);
+      emit("turn/started", { threadId: "thread-a", turn: { id: "turn-1" } });
+      emit("turn/started", { threadId: "thread-b", turn: { id: "unrelated-turn" } });
+      emit("error", { threadId: "thread-a", turnId: "turn-1", willRetry: true, error: { codexErrorInfo: "ResponseStreamDisconnected" } });
+      expect(store.getTurnRecoveryState("thread-a")?.job).toBeNull();
+      expect(bridge.calls.filter(method => method === "turn/start")).toHaveLength(1);
+      const failure = { threadId: "thread-a", turn: { id: "turn-1", status: "failed", error: { message: "连接中断", codexErrorInfo: { responseStreamConnectionFailed: {} } } } };
+      emit("turn/completed", failure);
+      const pending = await first.wait(message => message.type === "turn.recovery" && message.data?.job?.status === "waiting");
+      expect(pending.data.error.code).toBe("stream_disconnected");
+      expect(pending.data.job.nextRetryAt - Date.now()).toBeGreaterThan(4_000);
+      const job = store.getTurnRecoveryState("thread-a")?.job;
+      emit("turn/completed", failure);
+      expect(store.getTurnRecoveryState("thread-a")?.job?.id).toBe(job?.id);
+      first.socket.terminate();
+      // No retry button, new prompt, or page refresh: the backend timer alone
+      // resumes the same task while every browser connection is closed.
+      await vi.waitFor(() => expect(bridge.calls.filter(method => method === "turn/start")).toHaveLength(2), { timeout: 9_000 });
+      const retry = bridge.parameters.filter(row => row.method === "turn/start")[1].params;
+      expect(JSON.stringify(retry.input)).toContain("模型连接中断");
+      expect(JSON.stringify(retry.input)).not.toContain("original must only be sent once");
+      expect(bridge.parameters.filter(row => row.method === "thread/resume").at(-1)?.params.excludeTurns).toBe(true);
+      const restored = await client(port, "admin"); sockets.push(restored.socket);
+      const hello = await restored.wait(message => message.type === "hello");
+      expect(hello.data.turnRecoveries[0].job.status).toBe("running");
+      expect(hello.data.liveState.activeTurns).toContainEqual(expect.objectContaining({ threadId: "thread-b", turnId: "unrelated-turn" }));
+      emit("turn/completed", failure);
+      expect(store.getTurnRecoveryState("thread-a")?.job?.status).toBe("running");
+      emit("turn/completed", { threadId: "thread-a", turn: { id: "turn-2", status: "completed" } });
+      await vi.waitFor(() => expect(store.getTurnRecoveryState("thread-a")?.job).toBeNull());
+      expect(bridge.calls.filter(method => method === "turn/start")).toHaveLength(2);
+      expect(bridge.calls).not.toContain("turn/interrupt");
+      expect(bridge.parameters.filter(row => row.method === "turn/start").every(row => row.params.threadId === "thread-a")).toBe(true);
+    } finally {
+      sockets.forEach(socket => socket.terminate()); wss.clients.forEach(socket => socket.terminate());
+      await new Promise<void>(resolve => wss.close(() => server.close(() => resolve()))); store.close(); fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("does not resurrect an already completed turn when the RPC reply arrives late", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "socket-late-reply-"));
+    const store = new ProjectStore(path.join(temporary, "store.sqlite"));
+    const project = store.createProject({ name: "test", rootPath: temporary });
+    store.registerThreadOwner({ threadId: "thread-a", userId: "admin", projectId: project.id, rootPath: temporary });
+    const bridge = new FakeBridge(), server = http.createServer(), wss = attachSocketServer(server, bridge as unknown as CodexBridge, store);
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const sockets: WebSocket[] = [];
+    try {
+      bridge.startHook = async turnId => {
+        bridge.emit("notification", { method: "turn/started", params: { threadId: "thread-a", turn: { id: turnId } } });
+        bridge.emit("notification", { method: "turn/completed", params: { threadId: "thread-a", turn: { id: turnId, status: "completed" } } });
+        return { turn: { id: turnId } };
+      };
+      const first = await client((server.address() as { port: number }).port, "admin"); sockets.push(first.socket);
+      first.send({ type: "turn.start", requestId: "quick", projectId: project.id, threadId: "thread-a", prompt: "quick fixture" });
+      expect((await first.wait(message => message.requestId === "quick")).ok).toBe(true);
+      const second = await client((server.address() as { port: number }).port, "admin"); sockets.push(second.socket);
+      expect((await second.wait(message => message.type === "hello")).data.liveState.activeTurns).toEqual([]);
+      expect(store.getTurnRecoveryState("thread-a")?.job).toBeNull();
+    } finally {
+      sockets.forEach(socket => socket.terminate());
+      await new Promise<void>(resolve => wss.close(() => server.close(() => resolve()))); store.close(); fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
   it("reconnects with error details, scopes controls to the owner, and resumes the same task once", async () => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "socket-retry-"));
     const store = new ProjectStore(path.join(temporary, "store.sqlite"));

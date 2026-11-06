@@ -14,4 +14,7 @@ describe('activity bundle labels',()=>{
     expect(activityBundleSummary([...thoughts,{id:'f',type:'fileChange'}])).toMatchObject({hasTools:true,count:1});
     expect(activityBundleSummary([])).toMatchObject({hasTools:false,bundle:false,count:0});
   });
+  it('counts native Claude calls and uses the same terminal label as Codex',()=>{
+    expect(activityBundleSummary([...thoughts,{id:'c',type:'dynamicToolCall',tool:'Bash'}])).toMatchObject({hasTools:true,count:1,toolLabel:'exec'});
+  });
 });

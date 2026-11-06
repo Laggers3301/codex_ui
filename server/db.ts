@@ -352,6 +352,36 @@ export class ProjectStore {
       .all(threadId, turnId) as { item_json: string }[]).map((row) => JSON.parse(row.item_json));
   }
 
+  /** Recover received prose without loading potentially huge tool results. */
+  readTimelineTextItems(threadId:string,turnId:string):Record<string,unknown>[] {
+    const result:Record<string,unknown>[]=[];let bytes=0;
+    for(const row of this.db.prepare("SELECT item_json FROM conversation_timeline WHERE thread_id=? AND turn_id=? AND json_extract(item_json,'$.type')='agentMessage' AND length(CAST(item_json AS BLOB))<=262144 ORDER BY rowid LIMIT 128").iterate(threadId,turnId)){
+      const text=String(row.item_json);bytes+=Buffer.byteLength(text);if(bytes>1024*1024)break;
+      result.push(JSON.parse(text));
+    }
+    return result;
+  }
+
+  /** Restore active-turn activity after live-cache eviction, with bounded tool previews. */
+  readTimelinePreviewItems(threadId:string,turnId:string):Record<string,unknown>[] {
+    return this.readTimelinePreviewPage(threadId,turnId,Number.MAX_SAFE_INTEGER,512).items;
+  }
+
+  readTimelinePreviewPage(threadId:string,turnId:string,beforeRowid:number,limit:number){
+    const result:Array<{rowid:number;item:Record<string,unknown>}>=[];let bytes=0;
+    const output="COALESCE(json_extract(item_json,'$.aggregatedOutput'),json_extract(item_json,'$.output'),'')";
+    const query=`SELECT rowid, CASE WHEN json_extract(item_json,'$.type') IN ('toolCall','dynamicToolCall') AND length(CAST(${output} AS BLOB))>4096
+      THEN json_set(json_remove(item_json,'$.output','$.aggregatedOutput'),'$.aggregatedOutput',substr(${output},1,4096),'$.outputDeferred',json('true'),'$.outputBytes',length(CAST(${output} AS BLOB))) ELSE item_json END AS preview
+      FROM conversation_timeline WHERE thread_id=? AND turn_id=? AND rowid<? AND json_extract(item_json,'$.type') IN ('userMessage','agentMessage','reasoning','toolCall','dynamicToolCall') ORDER BY rowid DESC LIMIT ?`;
+    for(const row of this.db.prepare(query).iterate(threadId,turnId,beforeRowid,Math.max(1,Math.min(512,limit)))){
+      const text=String(row.preview);bytes+=Buffer.byteLength(text);if(bytes>2*1024*1024){if(!result.length)throw Error('单条历史预览超过读取预算，原记录保留。');break;}
+      result.push({rowid:Number(row.rowid),item:JSON.parse(text)});
+    }
+    const oldest=result.at(-1)?.rowid;
+    const hasOlder=oldest!==undefined&&!!this.db.prepare("SELECT 1 FROM conversation_timeline WHERE thread_id=? AND turn_id=? AND rowid<? AND json_extract(item_json,'$.type') IN ('userMessage','agentMessage','reasoning','toolCall','dynamicToolCall') LIMIT 1").get(threadId,turnId,oldest);
+    return {items:result.reverse().map(row=>row.item),nextRowid:hasOlder?oldest:null};
+  }
+
   readTimelineItem(threadId: string, itemId: string): Record<string, unknown> | null {
     const row = this.db.prepare("SELECT item_json FROM conversation_timeline WHERE thread_id = ? AND item_id = ? LIMIT 1")
       .get(threadId, itemId) as { item_json: string } | undefined;

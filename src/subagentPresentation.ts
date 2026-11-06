@@ -68,6 +68,9 @@ export function parseAgentOperation(item: ThreadItem): AgentOperation | null {
   const tool = String(item.tool ?? item.name ?? "").toLowerCase().split(/[./]/).pop() ?? "";
   const native = String(item.type).toLowerCase() === "collabagenttoolcall";
   const actionKey = native ? String(item.tool ?? item.action ?? "").toLowerCase().split(/[./]/).pop() ?? "" : tool;
+  // These native file/shell/web tools never carry collaboration receipts.
+  // Do not repeatedly parse their large JSON outputs during unrelated updates.
+  if(!native&&!item.collaboration&&['bash','read','write','edit','glob','grep','webfetch','websearch','notebookedit','toolsearch'].includes(actionKey))return null;
   const input = object(item.input ?? item.arguments ?? item.command);
   const output = object(item.aggregatedOutput ?? item.output ?? item.result);
   // A code-mode cell wait is not a collaboration wait.
@@ -89,7 +92,7 @@ export function parseAgentOperation(item: ThreadItem): AgentOperation | null {
   const rawAgents = output.agents ?? output.data ?? input.agents;
   if (Array.isArray(rawAgents)) for (const row of rawAgents.slice(0, 48)) { const agent = entry(row); if (agent) agents.push(agent); }
   for (const [id, value] of Object.entries(object(item.agentsStates ?? output.agentsStates ?? output.agent_states)).slice(0, 48)) {
-    const state = object(value); const agent = entry({ ...state, status: state.status ?? state.state ?? value }, id); if (agent) agents.push(agent);
+    const state = object(value); const agent = entry({ ...state, id:state.id??id,status: state.status ?? state.state ?? value }, id); if (agent) agents.push(agent);
   }
   if (!agents.length) {
     const receivers = Array.isArray(input.ids) ? input.ids : Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds : [];

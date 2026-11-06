@@ -261,6 +261,8 @@ export interface DirectoryListResponse {
 }
 
 export interface ThreadSummary {
+  runtimeCapabilities?:{model:string;tools:string[];skills:string[];mcpServers:Array<{name:string;status:string}>}|null;
+  runtimeFeatures?:{steer?:boolean;[key:string]:boolean|undefined};
   id: string;
   answeredQuestionItemIds?: string[];
   questionAnswers?: Record<string, unknown>;
@@ -321,6 +323,8 @@ export interface ThreadContextConfig {
 }
 
 export interface ThreadContextStatus {
+  runtime?:'claude-code';
+  claudeUsage?:{model:string;inputTokens:number;cacheReadTokens:number;cacheWriteTokens:number;outputTokens:number;thinkingTokens:number|null;contextWindow:number|null;windowSource:'runtime'|'model_default'|'unknown';at:string}|null;
   usedTokens: number | null;
   contextWindow: number | null;
   usedPercent: number | null;

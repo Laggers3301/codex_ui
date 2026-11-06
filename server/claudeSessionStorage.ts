@@ -5,11 +5,15 @@ import { DatabaseSync } from "node:sqlite";
 import { AppError } from "./appErrors.js";
 import { remainingTime } from "../shared/reclaudeUsage.js";
 import { HistoryMemoryLimitError, MAX_FULL_HISTORY_BYTES } from "./rolloutStorage.js";
+import type { ClaudeToolArchive } from "./claudeForkHistory.js";
 
 const HOUR = 3_600_000;
 const LIMIT = 5;
 const sessionIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export interface ClaudeConversation {
+  inheritedAgentCutoff?:number|null;
+  runtimeCapabilities?:{model:string;tools:string[];skills:string[];mcpServers:Array<{name:string;status:string}>};
+  nativeTasks?:import('./claudeSessionInput.js').ClaudeNativeTask[];
   id: string; userId: string; projectId: string; cwd: string; name: string; model: string;
   orgId: string; accountKey: string; configRoot: string; nativeSessionId: string;
   parentThreadId?: string; parentSessionId?: string; resumeSessionId?: string;
@@ -17,8 +21,15 @@ export interface ClaudeConversation {
   historyArchive?: string;
   inheritedTurnCount?: number;
   collaborationMode?: "plan" | "default";
+  contextHandoff?: {version:number;sourceSessionId:string;sourceFile:string;archive:string;summaryFound:boolean;bytes:number;records:number;preparedAt:string;rebuildFromNative?:boolean};
+  toolOutputArchive?: ClaudeToolArchive;
 }
 export interface ClaudeBindingMigration { id: string; before: ClaudeConversation; after: ClaudeConversation; }
+export interface ClaudeNativeFork {
+  id: string; key: string; sourceThreadId: string; userId: string; sourceNativeId: string;
+  sourceDigest: string; targetOrgId: string; targetAccountKey: string;
+  stagedDigest?: string; nativeSessionId?: string; toolOutputArchive?: ClaudeToolArchive;
+}
 
 /** One database for every bound user/account/organization, including forks.
  * A failed or uncertain creation keeps its slot: restarting cannot reset the
@@ -40,6 +51,7 @@ export class ClaudeSessionStorage {
       CREATE TABLE IF NOT EXISTS lineage (native_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS queue (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, created_at INTEGER NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS binding_migrations (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL UNIQUE, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS native_forks (operation_key TEXT PRIMARY KEY, body TEXT NOT NULL);
     `);
     const columns=this.db.prepare("PRAGMA table_info(creations)").all() as Array<{name:string}>;
     if(!columns.some(column=>column.name==="runtime"))this.db.exec("ALTER TABLE creations ADD COLUMN runtime TEXT NOT NULL DEFAULT 'claude-code'");
@@ -84,6 +96,19 @@ export class ClaudeSessionStorage {
     this.db.prepare("INSERT INTO lineage VALUES (?,?,?) ON CONFLICT(native_id) DO UPDATE SET body=excluded.body").run(row.nativeSessionId, row.id, JSON.stringify(row));
   }
   save(row: ClaudeConversation) { this.transaction(() => this.write(row)); }
+  nativeFork(key: string): ClaudeNativeFork | null {
+    const row = this.db.prepare("SELECT body FROM native_forks WHERE operation_key=?").get(key) as {body:string}|undefined;
+    return row ? JSON.parse(row.body) : null;
+  }
+  createNativeFork(row: ClaudeNativeFork): ClaudeNativeFork {
+    this.db.prepare("INSERT OR IGNORE INTO native_forks VALUES(?,?)").run(row.key, JSON.stringify(row));
+    return this.nativeFork(row.key)!;
+  }
+  saveNativeFork(row: ClaudeNativeFork) {
+    const previous = this.nativeFork(row.key);
+    if (!previous || previous.id !== row.id) throw new AppError("claude_history_conflict", "分支操作记录已变化，未覆盖会话。");
+    this.db.prepare("UPDATE native_forks SET body=? WHERE operation_key=?").run(JSON.stringify(row), row.key);
+  }
   beginBindingMigration(before: ClaudeConversation, after: ClaudeConversation): ClaudeBindingMigration {
     if (["id", "userId", "projectId", "cwd"].some(key => before[key as keyof ClaudeConversation] !== after[key as keyof ClaudeConversation])) {
       throw new AppError("runtime_forbidden", "会话迁移不能更改用户、项目或网页会话归属。");
@@ -119,10 +144,10 @@ export class ClaudeSessionStorage {
     this.db.prepare("UPDATE turns SET body=json_set(body, '$.status', 'interrupted', '$.error', json(?)) WHERE json_extract(body, '$.status')='inProgress'")
       .run(JSON.stringify({ message: "服务重启，本轮结果尚未确认。请检查记录后继续。" }));
   }
-  turns(threadId: string, limit = 50, before = 0, maxBytes = MAX_FULL_HISTORY_BYTES): Record<string, unknown>[] {
+  turns(threadId: string, limit = 50, before = 0, maxBytes = MAX_FULL_HISTORY_BYTES, afterRowid = 0): Record<string, unknown>[] {
     // Size metadata first: never fetch all bodies and truncate after parsing.
-    const rows = this.db.prepare("SELECT id, length(CAST(body AS BLOB)) AS bytes FROM turns WHERE thread_id=? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?")
-      .all(threadId, Math.min(100, Math.max(1, limit)), Math.max(0, before)) as Array<{ id: string; bytes: number }>;
+    const rows = this.db.prepare("SELECT id, length(CAST(body AS BLOB)) AS bytes FROM turns WHERE thread_id=? AND rowid>? ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?")
+      .all(threadId, afterRowid, Math.min(100, Math.max(1, limit)), Math.max(0, before)) as Array<{ id: string; bytes: number }>;
     const selected: string[] = [];
     let bytes = 0;
     for (const row of rows) {
@@ -135,8 +160,8 @@ export class ClaudeSessionStorage {
     const read = this.db.prepare("SELECT body FROM turns WHERE id=?");
     return selected.reverse().map(id => JSON.parse((read.get(id) as { body: string }).body));
   }
-  turnCount(threadId: string): number {
-    return (this.db.prepare("SELECT COUNT(*) AS n FROM turns WHERE thread_id=?").get(threadId) as { n: number }).n;
+  turnCount(threadId: string, afterRowid = 0): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM turns WHERE thread_id=? AND rowid>?").get(threadId, afterRowid) as { n: number }).n;
   }
   turn(id: string): Record<string, unknown> | null {
     const size = this.db.prepare("SELECT length(CAST(body AS BLOB)) AS bytes FROM turns WHERE id=?").get(id) as { bytes: number } | undefined;

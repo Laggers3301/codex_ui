@@ -1,4 +1,5 @@
 import { isReclaudeWeeklyWindow, reclaudeWindowActive, type ReclaudeAccountUsage, type ReclaudeUsageWindow } from "../shared/reclaudeUsage";
+import { remainingTime, type ReclaudeQuota } from "../shared/reclaudeUsage";
 
 const percent = (value: number) => new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
 const remaining = (window: ReclaudeUsageWindow) => percent(Math.max(0, 100 - window.percent));
@@ -22,7 +23,7 @@ function windowLabel(kind: string): string {
   return "模型周限";
 }
 
-export function ReclaudeQuotaDetails({ account, cacheError, now = Date.now() }: { account: ReclaudeAccountUsage; cacheError?: string; now?: number }) {
+export function ReclaudeQuotaDetails({ account, cacheError, creations, now = Date.now() }: { account: ReclaudeAccountUsage; cacheError?: string; creations?: ReclaudeQuota; now?: number }) {
   const kinds = ["five_hour", "seven_day", ...account.windows.filter(window => isReclaudeWeeklyWindow(window.kind) && window.kind !== "seven_day").map(window => window.kind)];
   const observedAt = Math.max(0, ...account.windows.map(window => window.observedAt));
   return <div className="providerQuotaDetails reclaudeQuotaDetails" role="tabpanel" aria-label="ReClaude 额度">
@@ -39,6 +40,7 @@ export function ReclaudeQuotaDetails({ account, cacheError, now = Date.now() }: 
           </>}</strong>
         </div>;
       })}
+      {creations ? <div data-quota-window="creations"><span title="全部 Claude 账号共用；仅新建、分支和迁入 Claude 计数，不影响已有会话继续回答。">新建</span><strong>本小时剩余 {creations.remaining}/{creations.limit} 次{creations.remaining === 0 ? <span className="providerQuotaReset">{remainingTime(creations.retryAfterSeconds)}后可重试</span> : null}</strong></div> : null}
       <div className="providerQuotaUpdated"><span>数据时间</span><strong>{observedAt ? dateTime(observedAt) : "待更新"}</strong></div>
     </div>
     {account.state === "disabled" ? <p>{account.message}</p> : null}

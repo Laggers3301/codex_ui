@@ -6,6 +6,24 @@ import {describe,it,expect} from "vitest";
 import {ClaudeBindings,claudeModelEntries} from "./claudeBindings.js";
 
 describe("native Claude model catalogue",()=>{
+  it("redirects legacy organization model ids for all shared users and rejects invalid mappings",()=>{
+    const home=fs.mkdtempSync(path.join(os.tmpdir(),"claude-org-switch-"));
+    try{
+      const users=path.join(home,"users");for(const user of ["alice","bob"])fs.mkdirSync(path.join(users,user),{recursive:true});
+      const root=path.join(home,".rec/claude/accounts/22/config");fs.mkdirSync(root,{recursive:true});
+      fs.writeFileSync(path.join(path.dirname(root),"device.json"),JSON.stringify({sk:"fixture",org_id:2}));
+      fs.writeFileSync(path.join(root,".claude.json"),JSON.stringify({oauthAccount:{accountUuid:"new-shared-account"}}));
+      const bindings=new ClaudeBindings({home,executable:"/bin/true",storageDirectory:path.join(home,"state"),sharedUsers:{workspaceDirectory:users,orgIds:["1","2"]},organizationRedirects:{"1":"2"}});
+      for(const user of ["alice","bob"]){
+        expect(bindings.effectiveModel(user,"reclaude-sonnet@1")).toBe("reclaude-sonnet@2");
+        expect(bindings.resolve(user,"reclaude-sonnet@1")).toMatchObject({orgId:"2",userId:user,workspaceRoot:path.join(users,user)});
+        expect(bindings.profiles(user).every(profile=>profile.model.endsWith("@2"))).toBe(true);
+      }
+      bindings.config.organizationRedirects={"1":"3"};expect(()=>bindings.resolve("alice","reclaude-sonnet@1")).toThrow(/目标组织/);
+      bindings.config.organizationRedirects={"1":"2","2":"1"};expect(()=>bindings.resolve("alice","reclaude-sonnet@1")).toThrow(/映射无效/);
+      expect(()=>bindings.resolve("missing","reclaude-sonnet@1")).toThrow();
+    }finally{fs.rmSync(home,{recursive:true,force:true});}
+  });
   it("bootstraps native identity in a new device root using auth status before resolving a model",async()=>{
     const home=fs.mkdtempSync(path.join(os.tmpdir(),"claude-new-device-"));
     try {
