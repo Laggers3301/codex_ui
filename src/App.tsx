@@ -4,6 +4,7 @@ import { useReclaudeUsage } from "./ReclaudeUsage";
 import { ReclaudeAuthorizationDialog } from "./ReclaudeAuthorization";
 import { ReclaudeQuotaDetails, reclaudeRemainingLabel } from "./reclaudeQuota";
 import type { ReclaudeUsageStatus } from "../shared/reclaudeUsage";
+import {claudeFiveHourRemaining} from './claudeTotalQuota';
 import {runtimeModelLabel,runtimeModelTriggerLabel} from "./runtimeModelLabel";
 import { accountPoolNeedsQuotaRetry, quotaHasUsableRateLimits } from "./quotaRefreshPolicy";
 import { Children, cloneElement, Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
@@ -118,6 +119,7 @@ import { ToolArrivalRegistry } from "./toolArrivalRegistry";
 import { skillReadSummary } from "./skillReadSummary";
 import { toolPresentation,toolDisplayName } from "./toolPresentation";
 import {claudeVisibleItems} from '../shared/claudeItems';
+import {presentClaudeCommandReceipt} from './claudeCommandReceipt';
 import { activityBundleSummary } from "./activityBundle";
 import { restoreSubmittedText } from "./composerSendDraft";
 import { localizedSkill, skillSection } from "./skillLocalization";
@@ -3822,13 +3824,13 @@ function rateLimitSnapshotText(snapshot: CodexRateLimitSnapshot | null | undefin
   return parts.join("；") || "-";
 }
 
-function quotaSummaryLabel(quota: CodexQuota | null, pool: CodexAccountPool | null): string {
+function quotaSummaryLabel(quota: CodexQuota | null, pool: CodexAccountPool | null, claude:ReclaudeUsageStatus|null): string {
   if (pool?.accounts.length) {
     const codexAccounts = pool.accounts.filter((account) => account.kind !== "api-provider");
     if (!codexAccounts.length) return "外部模型";
     const totalRemaining = codexAccounts.reduce((sum, account) => {
       return sum + (remainingQuotaPercent(account.quota.rateLimits?.primary?.usedPercent) ?? 0);
-    }, 0);
+    }, 0) + claudeFiveHourRemaining(claude);
     return `总额度 ${percentText(totalRemaining)}%`;
   }
   const primary = remainingQuotaPercent(quota?.rateLimits?.primary?.usedPercent);
@@ -4102,7 +4104,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
       <section className={`trackedQuotaSummary ${usage.blocked ? "blocked" : usage.todayQuotaPercent >= usage.dailyLimitPercent ? "warning" : "healthy"}`}>
         <div>
           <span>{usage.today} · {usage.timeZone}</span>
-          <strong>今日估算占用 {percentText(usage.todayQuotaPercent)}%</strong>
+          <strong>今日 GPT 估算占用 {percentText(usage.todayQuotaPercent)}%</strong>
         </div>
         <em>{usage.dailyLimitEnforced
           ? usage.blocked ? `已达每日合计 ${percentText(usage.dailyLimitPercent)}% 上限，今日暂停新回答` : `每日合计上限 ${percentText(usage.dailyLimitPercent)}%，不限账号`
@@ -4114,26 +4116,26 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
           <article className="trackedQuotaAccount" key={account.accountId}>
             <header>
               <strong>{account.accountLabel}</strong>
-              <span>账号剩余 {account.accountRemainingPercent === null ? "--" : `${percentText(account.accountRemainingPercent)}%`}</span>
+              <span>{account.independentTokens?'独立用量':`账号剩余 ${account.accountRemainingPercent === null ? "--" : `${percentText(account.accountRemainingPercent)}%`}`}</span>
             </header>
             <div className="trackedQuotaMetrics">
-              <div><span>lzc 今日</span><strong>{percentText(account.todayQuotaPercent)}%</strong><small>{formatNumber(account.todayTokens)} token</small></div>
-              <div><span>本周期累计</span><strong>{percentText(account.userCycleQuotaPercent)}%</strong><small>{formatNumber(account.userCycleTokens)} token</small></div>
+              <div><span>lzc 今日</span><strong>{account.independentTokens?formatNumber(account.todayTokens):`${percentText(account.todayQuotaPercent)}%`}</strong><small>{account.independentTokens?'token':`${formatNumber(account.todayTokens)} token`}</small></div>
+              <div><span>{account.independentTokens?'累计':'本周期累计'}</span><strong>{account.independentTokens?formatNumber(account.userCycleTokens):`${percentText(account.userCycleQuotaPercent)}%`}</strong><small>{account.independentTokens?'token':`${formatNumber(account.userCycleTokens)} token`}</small></div>
             </div>
             <p>{account.cycleStartAt && account.resetAt
               ? `额度周期 ${formatResetTime(account.cycleStartAt)} 至 ${formatResetTime(account.resetAt)}`
-              : "尚未读取到额度重置周期"}</p>
+              : account.independentTokens?'不折算 GPT 额度':"尚未读取到额度重置周期"}</p>
           </article>
         ))}
       </div>
 
       <section className="trackedQuotaDays">
-        <header><strong>自然日统计</strong><span>当前额度周期内</span></header>
+        <header><strong>自然日统计</strong><span>按自然日</span></header>
         {usage.days.length ? usage.days.map((day) => (
           <article key={day.date}>
             <div><strong>{day.date}</strong><span>{formatNumber(day.userTokens)} token</span></div>
             <em>{percentText(day.quotaPercent)}%</em>
-            <small>{day.accounts.map((account) => `${account.accountLabel} ${percentText(account.quotaPercent)}%`).join(" · ")}</small>
+            <small>{day.accounts.map((account) => account.accountId==='reclaude'?`ReClaude ${formatNumber(account.userTokens)} token`:`${account.accountLabel} ${percentText(account.quotaPercent)}%`).join(" · ")}</small>
           </article>
         )) : <div className="emptyState">当前额度周期暂无 lzc token 记录。</div>}
       </section>
@@ -12698,7 +12700,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 disabled={quotaLoading}
                 title="悬停查看；点击可固定或收起额度详情"
               >
-                {quotaLoading ? "额度..." : quotaSummaryLabel(quota, accountPool)}
+                {quotaLoading ? "额度..." : quotaSummaryLabel(quota, accountPool, reclaudeUsage)}
                 <ComposerGlassMaterial variant="topbar" />
               </button>
               {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} reclaudeStatus={reclaudeUsage} currentClaudeOrgId={isReclaudeModel(selectedModelProfile.model)?selectedModelProfile.model.split("@")[1]:undefined}
@@ -13507,7 +13509,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   // Merge identities and chronology before introducing message boundaries.
                   const pendingSteers = visiblePendingUserMessages.filter(entry => entry.turnId === turn.id && entry.steerBoundary);
                   const mergedItems = mergeTimelineItems(coalesceToolOutputs(historyItems, true), liveItems);
-                  const items = claudeVisibleItems(collapseCodeModeWrappers(coalesceToolOutputs(mergeSteerTimelineItems(mergedItems, pendingSteers.map(entry => entry.steerBoundary!), (item, boundary) => userTextsMatch(itemText(item), boundary.submittedText ?? boundary.text)))));
+                  const items = claudeVisibleItems(collapseCodeModeWrappers(coalesceToolOutputs(mergeSteerTimelineItems(mergedItems, pendingSteers.map(entry => entry.steerBoundary!), (item, boundary) => userTextsMatch(itemText(item), boundary.submittedText ?? boundary.text))))).map(presentClaudeCommandReceipt);
                   const hasAgentAnswerFromIndex = new Array<boolean>(items.length + 1).fill(false);
                   for (let index = items.length - 1; index >= 0; index -= 1) {
                     const item = items[index];

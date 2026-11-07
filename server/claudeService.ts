@@ -193,9 +193,22 @@ export class ClaudeService {
   async readHistory(id:string,before=0,limit=50,cursor?:string){
     const row=this.row(id);
     const activityCursor=cursor?.match(/^claude-activity:([a-f0-9-]{36}):(\d+)$/i);
-    if(cursor&&!activityCursor)throw new AppError('invalid_cursor','历史分页位置无效，请重新打开会话。');
-    const current=activityCursor?this.storage.db.prepare("SELECT rowid,id,created_at,json_extract(body,'$.status') AS status,json_extract(body,'$.items[0]') AS user_item FROM turns WHERE thread_id=? AND id=?").get(row.id,activityCursor[1]):this.storage.db.prepare("SELECT rowid,id,created_at,json_extract(body,'$.status') AS status,json_extract(body,'$.items[0]') AS user_item FROM turns WHERE thread_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1 OFFSET ?").get(row.id,Math.max(0,before));
-    if(activityCursor&&!current)throw new AppError('invalid_cursor','历史分页不属于当前会话。');
+    const itemCursor=cursor?.match(/^claude-items:([a-f0-9-]{36}):(\d+)$/i),cursorMatch=activityCursor??itemCursor;
+    if(cursor&&!cursorMatch)throw new AppError('invalid_cursor','历史分页位置无效，请重新打开会话。');
+    const columns="rowid,id,created_at,length(CAST(body AS BLOB)) AS bytes,json_array_length(body,'$.items') AS item_count,json_extract(body,'$.status') AS status,json_extract(body,'$.items[0]') AS user_item";
+    const current=cursorMatch?this.storage.db.prepare(`SELECT ${columns} FROM turns WHERE thread_id=? AND id=?`).get(row.id,cursorMatch[1]):this.storage.db.prepare(`SELECT ${columns} FROM turns WHERE thread_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1 OFFSET ?`).get(row.id,Math.max(0,before));
+    if(cursorMatch&&!current)throw new AppError('invalid_cursor','历史分页不属于当前会话。');
+    if(current&&current.status!=='inProgress'&&!activityCursor&&(itemCursor||Number(current.bytes)>MAX_FULL_HISTORY_BYTES||Number(current.item_count)>Math.max(1,limit))){
+      const boundary=itemCursor?Number(itemCursor[2]):Number.MAX_SAFE_INTEGER;
+      if(!Number.isSafeInteger(boundary)||boundary<1)throw new AppError('invalid_cursor','历史分页位置无效。');
+      const page=this.storage.turnItemPreviewPage(row.id,String(current.id),boundary,limit);
+      const metadata=this.storage.db.prepare("SELECT json_remove(body,'$.items') AS header FROM turns WHERE thread_id=? AND id=?").get(row.id,current.id);
+      const header=JSON.parse(String(metadata!.header)),userItem=current.user_item?JSON.parse(String(current.user_item)):null;
+      const entries=[...(userItem?.type==='userMessage'?[userItem]:[]),...page.items];
+      const items=claudeVisibleItems([...new Map(entries.map(item=>[item.id,item])).values()]);
+      const position=Number(this.storage.db.prepare('SELECT COUNT(*) AS n FROM turns WHERE thread_id=? AND (created_at>? OR (created_at=? AND rowid>?))').get(row.id,current.created_at,current.created_at,current.rowid)?.n??0),next=position+1,total=this.count(row);
+      return {thread:{...this.summary(row),turns:[{...header,items}]},history:{totalItems:total,returnedItems:1,before,nextBefore:next,hasOlder:page.nextIndex!==null||next<total,nextCursor:page.nextIndex!==null?`claude-items:${current.id}:${page.nextIndex}`:null}};
+    }
     if(current&&(current.status==='inProgress'||activityCursor)){
       const boundary=activityCursor?Number(activityCursor[2]):Number.MAX_SAFE_INTEGER;
       if(!Number.isSafeInteger(boundary)||boundary<1)throw new AppError('invalid_cursor','历史分页位置无效。');
@@ -446,7 +459,8 @@ export class ClaudeService {
         if (event.method === "turn/completed") {
           try {
           params.turn.items = [userItem, ...params.turn.items];
-          this.storage.saveTurn(row.id, { ...params.turn, nativeMessageId: checkpoint, nativeSessionId: row.nativeSessionId });
+          this.storage.saveTurn(row.id, { ...params.turn, nativeMessageId: checkpoint, nativeSessionId: row.nativeSessionId,
+            billingModel:row.runtimeCapabilities?.model??row.model,billingEffort:this.store.getThreadOwner(row.id)?.reasoningEffortOverride??null });
           row.updatedAt = Date.now();
           // Native history is already persisted by the SDK. Hashing/copying the
           // growing file synchronously every turn blocks all account streams and

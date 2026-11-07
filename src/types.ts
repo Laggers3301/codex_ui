@@ -128,6 +128,7 @@ export interface TrackedQuotaDay {
 }
 
 export interface TrackedQuotaAccount {
+  independentTokens?: boolean;
   accountId: string;
   accountLabel: string;
   cycleStartAt: number | null;

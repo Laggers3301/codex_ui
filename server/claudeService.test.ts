@@ -65,6 +65,46 @@ function fixture(rateLimitInfo?: Record<string,unknown>, options: {shared?:boole
   return {home,cwd,project,store,service,config,rootA,rootB,binding,events,calls,start,turn,runtimeFactory};
 }
 describe("Claude conversation switching",()=>{
+  it('pages a completed oversized turn from durable items without full-turn reads or a live journal',async()=>{
+    const f=fixture(),id=await f.start(),older=randomUUID(),turnId=randomUUID();
+    f.service.storage.saveTurn(id,{id:older,status:'completed',items:[{id:'old-reply',type:'agentMessage',text:'上一轮回答'}]});
+    const items:any[]=[{id:'original-user',type:'userMessage',text:'长轮次问题'}];
+    for(let i=0;i<96;i++)items.push({id:`claude-tool::completed-${i}`,type:'dynamicToolCall',tool:'Read',arguments:{file_path:'/fixture/log'},output:'x'.repeat(100000),status:'completed'});
+    items.push({id:'claude-message::final:0',type:'agentMessage',text:'完整最终回答'});
+    f.service.storage.saveTurn(id,{id:turnId,status:'completed',nativeMessageId:'native-checkpoint',nativeSessionId:'fixture-native',items});
+    const original=String(f.service.storage.db.prepare('SELECT body FROM turns WHERE id=?').get(turnId)?.body);
+    expect(Buffer.byteLength(original)).toBeGreaterThan(8*1024*1024);
+    expect(f.store.readTimelineItems(id,turnId)).toEqual([]);
+    const fullRead=vi.spyOn(f.service.storage,'turns');
+    let page=await f.service.readHistory(id,0,17),all:any[]=[],cursors:string[]=[],pages=0;
+    expect(page.thread.turns[0]).toMatchObject({status:'completed',nativeMessageId:'native-checkpoint',nativeSessionId:'fixture-native'});
+    expect(page.thread.turns[0].items).toContainEqual(expect.objectContaining({text:'完整最终回答'}));
+    const first=await f.service.readHistory(id,0,17);expect(first).toEqual(page);
+    for(;pages<20;pages++){
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(2*1024*1024);
+      all.unshift(...page.thread.turns[0].items.filter((item:any)=>item.type!=='userMessage'));
+      if(!page.history.nextCursor)break;
+      expect(cursors).not.toContain(page.history.nextCursor);cursors.push(page.history.nextCursor);
+      page=await f.service.readHistory(id,page.history.nextBefore,17,page.history.nextCursor!);
+    }
+    expect(pages).toBeGreaterThan(1);expect(all.map(i=>i.id)).toEqual(items.slice(1).map(i=>i.id));
+    expect(new Set(all.map(i=>i.id)).size).toBe(97);expect(all[0]).toMatchObject({outputDeferred:true,outputBytes:100000});
+    expect(all[0].aggregatedOutput).toHaveLength(4096);expect(fullRead).not.toHaveBeenCalled();
+    expect(String(f.service.storage.db.prepare('SELECT body FROM turns WHERE id=?').get(turnId)?.body)).toBe(original);
+    const other=await f.start();await expect(f.service.readHistory(other,0,17,cursors[0])).rejects.toMatchObject({code:'invalid_cursor'});
+    const previous=await f.service.readHistory(id,page.history.nextBefore,17);expect(previous.thread.turns[0].id).toBe(older);
+  });
+  it('retains an active journal cursor when a turn completes, then uses immutable items on refresh',async()=>{
+    const f=fixture(),id=await f.start(),turnId=randomUUID(),user={id:'u',type:'userMessage',text:'query'};
+    f.service.storage.saveTurn(id,{id:turnId,status:'inProgress',items:[user]});
+    const tools=Array.from({length:30},(_,i)=>({id:`claude-tool::t${i}`,type:'dynamicToolCall',tool:'Read',output:'done',status:'completed'}));
+    for(const item of tools)f.store.saveTimelineItem(id,turnId,item);
+    const running=await f.service.readHistory(id,0,10);expect(running.history.nextCursor).toMatch(/^claude-activity:/);
+    f.service.storage.saveTurn(id,{id:turnId,status:'completed',items:[user,...tools]});
+    const continued=await f.service.readHistory(id,running.history.nextBefore,10,running.history.nextCursor!);expect(continued.thread.turns[0].status).toBe('completed');
+    const refreshed=await f.service.readHistory(id,0,10);expect(refreshed.history.nextCursor).toMatch(/^claude-items:/);
+    expect(refreshed.thread.turns[0].items.at(-1).id).toBe(tools.at(-1)!.id);
+  });
   it('routes native steering without removing ordinary queued messages and persists the steered user text',async()=>{
     const f=fixture();f.service.close();let release!:()=>void,steerId='';const gate=new Promise<void>(r=>release=r),send=vi.fn(async(_content,id)=>{steerId=id;release();});let initialized=false;
     const service=new ClaudeService(f.config,f.store,()=>{},binding=>new ClaudeRuntime(binding,async(_prompt,options)=>{

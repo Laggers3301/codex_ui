@@ -1988,6 +1988,8 @@ body.v2ThreadDragActive * {
 
 .markdownCopyFrame {
   position: relative;
+  min-width: 0;
+  max-width: 100%;
   margin: 10px 0 0;
 }
 
@@ -1996,7 +1998,9 @@ body.v2ThreadDragActive * {
 }
 
 .messageMarkdown .markdownCodeCopyFrame > pre {
+  box-sizing: border-box;
   min-height: 0;
+  overflow-wrap: anywhere;
   padding: 13px 48px 13px 10px;
 }
 
@@ -2182,8 +2186,6 @@ body.v2ThreadDragActive * {
 }
 
 pre,
-.historyToolImages { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
-.historyToolImages .iconTextButton { font-size: inherit; text-decoration: none; }
 .outputBlock {
   overflow: auto;
   margin: 8px 0 0;
@@ -2197,6 +2199,9 @@ pre,
   line-height: 1.45;
   white-space: pre-wrap;
 }
+
+.historyToolImages { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.historyToolImages .iconTextButton { font-size: inherit; text-decoration: none; }
 
 .composer {
   position: relative;

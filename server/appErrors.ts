@@ -31,7 +31,11 @@ export class AppError extends Error {
     if (/runtime_terminated|app-server exited/i.test(signature)) return new AppError("runtime_terminated", "运行进程意外退出，请查看错误详情后继续。", original);
     if (/usage_?limit|quota|credits|rate limit/i.test(signature)) return new AppError("quota_or_rate_limit", "服务额度或请求频率受限，请查看错误详情。", original);
     if (/401\b/i.test(signature)) return new AppError("authentication_failed", "账号认证失败，请查看错误详情。", original);
-    if (/context.*(exhaust|exceed|full)|CONTEXT_EXHAUSTED/i.test(signature)) return new AppError("context_exhausted", "会话上下文已满，请使用续接会话。", original);
+    // Go's "context deadline exceeded" refers to an HTTP/RPC deadline, not
+    // model context. A timeout also doesn't prove a submitted turn wasn't run,
+    // so classify it without automatically resending the user's operation.
+    if (/\bcontext deadline exceeded\b|\bETIMEDOUT\b|\bECONNABORTED\b|\b(?:connect(?:ion)?|request|tls|handshake|socket)[_ -]?timeout\b|\b(?:connect(?:ion)?|request|tls|handshake|socket)\b.{0,80}\b(?:timed? out|deadline exceeded)\b|\btimed out waiting for\b/i.test(signature)) return new AppError("request_timeout", "服务请求超时，请稍后重试。", original, false, "connection");
+    if (/\bcontext[_ -](?:exhausted|full)\b|\bcontext[_ -]?(?:window|length|limit).{0,80}(?:exceed|exhaust|full)|(?:exceed|exhaust).{0,50}context[_ -]?(?:window|length|limit)|\bprompt is too long\b|会话上下文已满|上下文(?:长度|窗口).{0,20}(?:超限|超过|已满)/i.test(signature)) return new AppError("context_exhausted", "会话上下文已满，请使用续接会话。", original);
     if (/response[_ ]?stream[_ ]?(?:disconnected|connection[_ ]?failed)|stream[_ ]disconnected|stream.*before completion|stream closed before response\.completed|peer closed connection/i.test(signature)) return new AppError("stream_disconnected", "模型连接意外中断，正在按重试策略尝试恢复；已完成的步骤会保留。", original, true);
     return new AppError(nativeCode || "request_failed", "本轮处理失败，请查看错误详情。", original);
   }

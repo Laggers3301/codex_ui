@@ -15,7 +15,7 @@ export function normalizeProviderUsage(value: unknown): ProviderUsage {
   const anthropic = u.cache_read_input_tokens !== undefined || u.cache_creation_input_tokens !== undefined;
   const input = (rawInput ?? 0) + (anthropic ? cached + write : 0);
   const output = count(u.outputTokens, u.output_tokens, u.completion_tokens) ?? 0;
-  const reasoning = count(u.reasoningOutputTokens, u.reasoning_output_tokens, u.reasoning_tokens, outputDetails.reasoning_tokens) ?? 0;
+  const reasoning = count(u.reasoningOutputTokens, u.reasoning_output_tokens, u.reasoning_tokens, outputDetails.reasoning_tokens, outputDetails.thinking_tokens) ?? 0;
   return { inputTokens: input, cachedInputTokens: Math.min(cached, input), cacheWriteInputTokens: Math.min(write, Math.max(0, input - Math.min(cached, input))),
     outputTokens: output, reasoningOutputTokens: Math.min(reasoning, output),
     totalTokens: count(u.totalTokens, u.total_tokens) ?? input + output };

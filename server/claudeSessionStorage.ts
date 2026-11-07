@@ -163,6 +163,21 @@ export class ClaudeSessionStorage {
   turnCount(threadId: string, afterRowid = 0): number {
     return (this.db.prepare("SELECT COUNT(*) AS n FROM turns WHERE thread_id=? AND rowid>?").get(threadId, afterRowid) as { n: number }).n;
   }
+  /** Page an immutable completed turn in SQLite, never parsing its full body in JS. */
+  turnItemPreviewPage(threadId:string,turnId:string,beforeIndex:number,limit:number){
+    const budget=2*1024*1024,result:Array<{index:number;item:Record<string,unknown>}>=[];let bytes=0;
+    const output="COALESCE(json_extract(j.value,'$.aggregatedOutput'),json_extract(j.value,'$.output'),'')";
+    const query=`SELECT CAST(j.key AS INTEGER) AS idx,CASE WHEN json_extract(j.value,'$.type') IN ('toolCall','dynamicToolCall') AND length(CAST(${output} AS BLOB))>4096
+      THEN json_set(json_remove(j.value,'$.output','$.aggregatedOutput'),'$.aggregatedOutput',substr(${output},1,4096),'$.outputDeferred',json('true'),'$.outputBytes',length(CAST(${output} AS BLOB))) ELSE j.value END AS preview
+      FROM turns t,json_each(t.body,'$.items') j WHERE t.thread_id=? AND t.id=? AND CAST(j.key AS INTEGER)<? ORDER BY CAST(j.key AS INTEGER) DESC LIMIT ?`;
+    for(const row of this.db.prepare(query).iterate(threadId,turnId,beforeIndex,Math.max(1,Math.min(512,limit)))){
+      const text=String(row.preview);bytes+=Buffer.byteLength(text);
+      if(bytes>budget){if(!result.length)throw new HistoryMemoryLimitError('单条 Claude 历史预览超过读取预算，原始记录未修改。');break;}
+      result.push({index:Number(row.idx),item:JSON.parse(text)});
+    }
+    const oldest=result.at(-1)?.index;
+    return {items:result.reverse().map(r=>r.item),nextIndex:oldest!==undefined&&oldest>0?oldest:null};
+  }
   turn(id: string): Record<string, unknown> | null {
     const size = this.db.prepare("SELECT length(CAST(body AS BLOB)) AS bytes FROM turns WHERE id=?").get(id) as { bytes: number } | undefined;
     if (!size) return null;

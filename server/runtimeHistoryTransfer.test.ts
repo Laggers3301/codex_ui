@@ -9,6 +9,7 @@ import { ClaudeService,offlineFork } from "./claudeService.js";
 import { RuntimeHistoryTransfer,portableCodexItem,portableClaudeMessage } from "./runtimeHistoryTransfer.js";
 import { locateClaudeHistory } from "./claudeSessionStorage.js";
 import type { CodexBridge } from "./codexBridge.js";
+import {CodexBridge as NativeCodexBridge} from './codexBridge.js';
 import { readThreadFromJsonl } from "./threadFallback.js";
 import { createInterface } from "node:readline";
 import {prepareMigratedContext} from './claudeContextPreparation.js';
@@ -56,6 +57,64 @@ function fixture(){
     migrate:(source=id,model="gpt-6.1-sol",operationId=randomUUID())=>transfers.migrate({sourceThreadId:source,userId:"admin",projectId:project.id,targetModel:model,operationId})as Promise<any>};
 }
 describe("bidirectional runtime history transfer",()=>{
+  it.skipIf(!process.env.TRANSFER_NATIVE_CODEX)('round-trips through a real isolated Codex app-server and Claude filesystem SDK without model requests',async()=>{
+    const f=fixture(),nativeHome=path.join(f.home,'native-codex');fs.mkdirSync(nativeHome);
+    const native=new NativeCodexBridge({command:process.env.TRANSFER_NATIVE_CODEX!,args:['app-server','--listen','stdio://'],env:{HOME:f.home,CODEX_HOME:nativeHome,PATH:process.env.PATH}});
+    try{
+      await native.start();f.request.mockImplementation(async(method,p)=>await native.request(method,p) as any);
+      const first=await f.migrate();
+      const meta=await native.request('thread/read',{threadId:first.threadId,includeTurns:false}) as any;
+      const rollout=meta.thread.path;expect(typeof rollout).toBe('string');paths.set(first.threadId,rollout);
+      const page=await readThreadFromJsonl(rollout,first.threadId,nativeHome);expect(JSON.stringify(page.thread.turns)).toContain('TRANSFER-5520');
+      await native.request('thread/resume',{threadId:first.threadId,excludeTurns:true});
+      const second=await f.migrate(first.threadId,'reclaude-sonnet@1');
+      const row=f.service.storage.get(second.threadId)!;
+      const sdk=new URL('../integrations/claude-session-tools/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs',import.meta.url).href;
+      const actual=await promisify(runFile)(process.execPath,['--input-type=module','-e',`import{getSessionMessages}from ${JSON.stringify(sdk)};const rows=await getSessionMessages(${JSON.stringify(row.nativeSessionId)},{dir:${JSON.stringify(row.cwd)}});console.log(JSON.stringify(rows));`],{env:{...process.env,CLAUDE_CONFIG_DIR:row.configRoot},timeout:15000,maxBuffer:65536});
+      expect(actual.stdout).toContain('TRANSFER-5520');
+      const portable=f.service.storage.db.prepare('SELECT body FROM runtime_transfer_items WHERE transfer_id=? ORDER BY seq').all(second.operationId).map(r=>JSON.parse(String(r.body)));
+      expect(portable.filter(m=>m.text.includes('TRANSFER-5520'))).toHaveLength(first.messageCount);
+      const additions=portable.filter(m=>!m.text.includes('TRANSFER-5520'));
+      expect(additions.every(m=>m.role==='user'&&m.text.includes('<environment_context>'))).toBe(true);
+      console.log(JSON.stringify({nativeRoundTrip:true,sourceMessages:first.messageCount,preservedMessages:portable.length-additions.length,nativeEnvironmentMessages:additions.length,modelRequests:0,productionWrites:0}));
+      expect(f.request.mock.calls.some(([method])=>method==='turn/start')).toBe(false);
+    }finally{await native.stopAndWait();}
+  },30000);
+  it('branches a large Claude turn using only owned checkpoint metadata',async()=>{
+    const f=fixture(),rows=fs.readFileSync(f.file,'utf8').trim().split('\n').map(l=>JSON.parse(l));
+    f.service.storage.saveTurn(f.id,{id:'large-selected',status:'completed',nativeMessageId:rows[1].uuid,nativeSessionId:f.native,items:[{id:'large-output',type:'dynamicToolCall',output:'x'.repeat(9*1024*1024)}]});
+    const read=vi.spyOn(f.service.storage,'turn');
+    const input={operationId:randomUUID(),sourceThreadId:f.id,userId:'admin',projectId:f.project.id,targetModel:'gpt-6.1-sol',sourceTurnId:'large-selected'};
+    const child=await f.transfers.migrate(input) as any;expect(child.messageCount).toBe(2);expect(read).not.toHaveBeenCalled();
+    const other=randomUUID();f.service.storage.saveTurn(other,{id:'foreign-checkpoint',nativeMessageId:rows[1].uuid,nativeSessionId:f.native,items:[]});
+    const calls=f.request.mock.calls.length;
+    await expect(f.transfers.migrate({...input,operationId:randomUUID(),sourceTurnId:'foreign-checkpoint'})).rejects.toMatchObject({code:'migration_cutoff_missing'});
+    expect(f.request.mock.calls).toHaveLength(calls);
+  });
+  it('restores full history after a Claude model-input handoff in a round trip, without importing its synthetic seed',async()=>{
+    const f=fixture(),codex=await f.migrate(),file=paths.get(codex.threadId)!;
+    fs.appendFileSync(file,[...Array.from({length:20},(_,i)=>({type:'response_item',payload:{type:'message',role:'assistant',content:[{type:'output_text',text:`ORIGINAL-${i}:`+'x'.repeat(18000)}]}}))].map(r=>JSON.stringify(r)).join('\n')+'\n');
+    f.store.setThreadExecutionSettings(codex.threadId,'admin','workspace-write','on-request');
+    const child=await f.migrate(codex.threadId,'reclaude-sonnet@1'),row=f.service.storage.get(child.threadId)!;
+    const full=locateClaudeHistory(row.nativeSessionId,[row.configRoot])!,original=fs.readFileSync(full);
+    await prepareMigratedContext(f.service.storage,row);expect(row.contextHandoff).toBeTruthy();
+    const current=locateClaudeHistory(row.nativeSessionId,[row.configRoot])!,seed=JSON.parse(fs.readFileSync(current,'utf8').trim());
+    const uuid=randomUUID();fs.appendFileSync(current,JSON.stringify({type:'assistant',uuid,parentUuid:seed.uuid,sessionId:row.nativeSessionId,message:{role:'assistant',content:[{type:'text',text:'NEW-CLAUDE-CONTINUATION'}]}})+'\n');
+    f.service.storage.saveTurn(row.id,{id:'continued',status:'completed',nativeMessageId:uuid,nativeSessionId:row.nativeSessionId,items:[]});
+    const before=fs.readFileSync(current),input={operationId:randomUUID(),sourceThreadId:row.id,userId:'admin',projectId:f.project.id,targetModel:'gpt-6.1-terra',targetReasoningEffort:'high' as const,sourceTurnId:'continued'};
+    const back=await f.transfers.migrate(input) as any,text=fs.readFileSync(paths.get(back.threadId)!,'utf8');
+    expect(back.messageCount).toBe(23);for(let i=0;i<20;i++)expect(text).toContain(`ORIGINAL-${i}:`);
+    expect(text).toContain('NEW-CLAUDE-CONTINUATION');expect(text).not.toContain(seed.message.content[0].text.slice(0,50));
+    const display=await readThreadFromJsonl(paths.get(back.threadId)!,back.threadId,f.home);expect(JSON.stringify(display.thread.turns)).toContain('NEW-CLAUDE-CONTINUATION');
+    expect(f.store.getThreadOwner(back.threadId)).toMatchObject({modelOverride:'gpt-6.1-terra',reasoningEffortOverride:'high'});
+    expect(f.store.getThreadExecutionSettings(back.threadId,'admin')).toMatchObject({sandbox:'workspace-write',approvalPolicy:'on-request'});
+    const calls=f.request.mock.calls.length;expect((await f.transfers.migrate(input) as any).threadId).toBe(back.threadId);expect(f.request.mock.calls).toHaveLength(calls);
+    const oldCheckpoint=f.service.storage.db.prepare("SELECT id FROM turns WHERE thread_id=? AND json_extract(body,'$.nativeSessionId')=? ORDER BY created_at,rowid LIMIT 1 OFFSET 1").get(row.id,row.contextHandoff!.sourceSessionId)!;
+    const historical=await f.transfers.migrate({...input,operationId:randomUUID(),sourceTurnId:String(oldCheckpoint.id)}) as any;
+    expect(historical.messageCount).toBe(2);expect(fs.readFileSync(paths.get(historical.threadId)!,'utf8')).not.toContain('NEW-CLAUDE-CONTINUATION');
+    expect(fs.readFileSync(full)).toEqual(original);expect(fs.readFileSync(current)).toEqual(before);
+    expect(f.request.mock.calls.some(([m])=>m==='turn/start')).toBe(false);
+  },20000);
   it('bounds migrated model context, reuses the source compact summary and preserves complete history and cutoffs',async()=>{
     const f=fixture(),first=await f.migrate(),file=paths.get(first.threadId)!;
     const rows=[{type:'turn_context',payload:{turn_id:'kept'}},{type:'compacted',payload:{message:'COMPACT-KEEP：当前任务为物理后验校准，不重复运行旧实验。'}},

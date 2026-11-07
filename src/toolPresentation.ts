@@ -4,6 +4,7 @@ import type { ThreadItem } from "./types";
 export type ToolIconKind = "web" | "file" | "search" | "agent" | "terminal" | "image" | "tool";
 export function toolDisplayName(item:ThreadItem):string{
   const name=String(item.tool??'');
+  if(name==='claude_goal_set')return '设置持续目标';
   return ({Bash:'exec',Read:'读取文件',Edit:'修改文件',Write:'写入文件',WebFetch:'访问网页',WebSearch:'联网搜索',ToolSearch:'查找工具',mcp__codex_web_history__search:'检索历史',mcp__codex_web_history__read:'读取历史',mcp__codex_documents__read_docx:'读取文档',mcp__codex_browser__browser_action:'浏览器',mcp__codex_feishu__feishu_office:'飞书办公',mcp__codex_schedules__scheduled_tasks:'定时任务',mcp__codex_communication__session_communication:'会话通信'} as Record<string,string>)[name]??name;
 }
 
@@ -58,6 +59,7 @@ function commandSummary(command: string): string | undefined {
 
 export function toolPresentation(item: ThreadItem): { description?: string; icon: ToolIconKind } {
   const rawName = String(item.tool ?? item.type ?? "").toLowerCase();
+  if(rawName==='claude_goal_set')return {icon:'agent'};
   const name=({bash:'exec',read:'read_file',write:'write_file',edit:'edit_file',notebookedit:'edit_file',webfetch:'fetch_url',grep:'search',glob:'find_files'} as Record<string,string>)[rawName]??rawName;
   const supplied = toolDescription(item, item.input, item.arguments);
   if (/web.?search|web__run|browser|search_query|fetch_url/.test(name)) {

@@ -4,6 +4,7 @@ import { getRuntimeHistoryTransfer } from "./runtimeHistoryTransfer.js";
 import fs from "node:fs";
 import {historyImageStream} from './historyImage.js';
 import { ProviderUsageTracker } from "./providerUsage.js";
+import {readClaudeBilling,cachedClaudeBilling,type ClaudeBillingEntry} from './claudeBilling.js';
 import { registerProviderQuotaRoutes } from "./providerQuota.js";
 import { overlayJournal } from "./timelineJournal.js";
 import { questionAnswersForPage } from "./questionAnswers.js";
@@ -73,7 +74,7 @@ import { executionSettingsOverrides, queueScheduledPrompt, resumeThreadIfUnloade
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
 // Default Codex cwd per logged-in user. This prevents generated artifacts from
-// accumulating in /home/example-user while retaining historical shared-home projects.
+// accumulating in the shared home while retaining historical projects.
 const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
@@ -883,6 +884,7 @@ export type PublicTrackedQuotaDay = {
 };
 
 export type PublicTrackedQuotaAccount = {
+  independentTokens?: boolean;
   accountId: string;
   accountLabel: string;
   cycleStartAt: number | null;
@@ -1084,7 +1086,7 @@ export function userIdFromSessionCwd(cwd: string | null, isKnownUser?: (userId: 
     const [firstSegment] = path.relative(normalizedRoot, normalizedCwd).split(path.sep);
     return firstSegment?.trim() || null;
   }
-  // Some existing users run Codex directly in /home/example-user/<login> rather than
+  // Some existing users run Codex directly in a shared home/<login> rather than
   // the managed users root. Only trust this layout for a registered login.
   const homeRoot = path.dirname(path.dirname(normalizedRoot));
   if (isKnownUser && normalizedCwd.startsWith(`${homeRoot}${path.sep}`)) {
@@ -1199,6 +1201,22 @@ function finalizeLeaderboardScope(
     quotaUsedPercent: options.totalQuotaUsedPercent,
     users
   };
+}
+
+export function claudeTokenLeaderboard(entries:ClaudeBillingEntry[],window:LeaderboardCycleWindow):PublicCodexLeaderboard{
+  const lifetime=new Map<string,AggregateBucket>(),cycle=new Map<string,AggregateBucket>();let first:number|null=null;
+  for(const entry of entries){
+    const at=Math.floor(entry.at/1000);first=first===null?at:Math.min(first,at);
+    recordUsage(lifetime,entry.userId,entry.threadId,entry.model,entry.effort,entry);
+    if(at>=window.startAt&&(window.resetAt===null||at<window.resetAt))recordUsage(cycle,entry.userId,entry.threadId,entry.model,entry.effort,entry);
+  }
+  return{currentCycle:finalizeLeaderboardScope(cycle,{totalQuotaUsedPercent:null,...window}),
+    lifetime:finalizeLeaderboardScope(lifetime,{totalQuotaUsedPercent:null,startAt:first,resetAt:null,resetWindowMins:null}),updatedAt:new Date().toISOString(),errors:[]};
+}
+function mergeClaudeTokens(boards:PublicCodexLeaderboard[],sources:LeaderboardAccountSource[],entries:ClaudeBillingEntry[],window:LeaderboardCycleWindow){
+  if(!entries.length)return mergeAccountLeaderboards(boards,sources);
+  return mergeAccountLeaderboards([...boards,claudeTokenLeaderboard(entries,window)],[...sources,
+    {id:'reclaude',label:'ReClaude',kind:'api-provider',sessionsRoot:'',quota:{} as PublicCodexQuota}]);
 }
 
 function sharedNumericValue(values: Array<number | null>): number | null {
@@ -1642,7 +1660,8 @@ async function readCachedCodexLeaderboard(
   sources: LeaderboardAccountSource[],
   store: ProjectStore,
   forceRefresh = false,
-  includePeers = true
+  includePeers = true,
+  claudeDirectory?:string
 ): Promise<PublicCodexLeaderboard> {
   const now = Date.now();
   const resetKey = sources.map((source) => `${source.id}:${source.quota.rateLimits?.primary?.resetsAt ?? "none"}`).join("|");
@@ -1653,6 +1672,8 @@ async function readCachedCodexLeaderboard(
     return leaderboardRefreshInFlight;
   }
   const refresh = (async () => {
+    let claudeEntries=cachedClaudeBilling(claudeDirectory),claudeError='';
+    try{claudeEntries=await readClaudeBilling(claudeDirectory);}catch(error){claudeError=error instanceof Error?error.message:String(error);}
     const apiCycleWindow = apiLeaderboardCycleWindow(
       sources.filter((source) => source.kind !== "api-provider").map((source) => ({
         resetAt: source.quota.rateLimits?.primary?.resetsAt ?? null,
@@ -1662,7 +1683,8 @@ async function readCachedCodexLeaderboard(
     );
     const boards: PublicCodexLeaderboard[] = [];
     for (const source of sources) boards.push(await readCodexLeaderboard(source, store, apiCycleWindow));
-    const local = mergeAccountLeaderboards(boards, sources);
+    const local = mergeClaudeTokens(boards, sources,claudeEntries,apiCycleWindow);
+    if(claudeError)local.errors.push(claudeError);
     return { ...applyAccruedTrackedQuota(local, sources, readTrackedQuotaLedger(), serverConfig.trackedQuotaUser),
       quotaAccountCount: sources.filter(source => source.kind !== "api-provider").length };
   })()
@@ -1734,7 +1756,8 @@ async function buildTrackedQuotaUsage(
   const ledgerAccounts = readTrackedQuotaLedger();
   // Share the single background billing scan with the leaderboard. Quota
   // viewers must not each replay the same multi-gigabyte corpus in parallel.
-  void readCachedCodexLeaderboard(sources,store,false,false).catch(error=>console.warn('trackedQuota.background',error instanceof Error?error.message:String(error)));
+  const claudeDirectory=getClaudeService(bridge)?.config.storageDirectory;
+  void readCachedCodexLeaderboard(sources,store,false,false,claudeDirectory).catch(error=>console.warn('trackedQuota.background',error instanceof Error?error.message:String(error)));
   const previousDisplay = trackedQuotaCache?.data ?? (() => {
     try {
       return JSON.parse(fs.readFileSync(trackedQuotaCachePath, "utf8")) as PublicTrackedQuotaUsage;
@@ -1820,6 +1843,15 @@ async function buildTrackedQuotaUsage(
     });
   }
 
+  let claudeEntries=cachedClaudeBilling(claudeDirectory);
+  try{claudeEntries=await readClaudeBilling(claudeDirectory);}catch(error){errors.push(error instanceof Error?error.message:String(error));}
+  const claudeUser=claudeEntries.filter(entry=>sameTrackedUser(entry.userId,trackedUser));
+  if(claudeEntries.length){
+    const daily=new Map<string,number>();for(const entry of claudeUser){const day=naturalDayKey(Math.floor(entry.at/1000));daily.set(day,(daily.get(day)??0)+entry.totalTokens);}
+    for(const [date,tokens]of daily){const list=dayAccounts.get(date)??[];list.push({accountId:'reclaude',accountLabel:'ReClaude',userTokens:tokens,quotaPercent:0});dayAccounts.set(date,list);}
+    accounts.push({accountId:'reclaude',accountLabel:'ReClaude',independentTokens:true,cycleStartAt:null,resetAt:null,accountUsedPercent:null,accountRemainingPercent:null,
+      userCycleTokens:claudeUser.reduce((sum,entry)=>sum+entry.totalTokens,0),userCycleQuotaPercent:0,todayTokens:daily.get(today)??0,todayQuotaPercent:0});
+  }
   persistTrackedQuotaLedger(ledgerAccounts);
 
   const days = Array.from(dayAccounts.entries())
@@ -2883,7 +2915,7 @@ async function filterOwnedThreadList(
       continue;
     }
     const fullThread = await readOwnedThreadForList(bridge, threadId);
-    // Ownership is the access boundary. A legacy session may retain /home/example-user as
+    // Ownership is the access boundary. A legacy session may retain a shared home as
     // its historical cwd after the user's default workspace is moved.
     if (fullThread) {
       byId.set(threadId, listItemSummaryFromThread(fullThread));
@@ -2959,7 +2991,7 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
   const rootPath = ensureUserWorkspaceDirectory(userId);
 
   // List the personal workspace first: a newly opened page selects it by
-  // default. Existing projects (including historical /home/example-user conversations)
+  // default. Existing projects (including historical shared-home conversations)
   // are deliberately retained below it.
   const workspace = store.getProjectByRootPath(rootPath, userId) ?? store.createProject({
     name: "我的工作区",
@@ -3407,14 +3439,14 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       // Never merge peer boards into the normal endpoint. A peer can expose
       // historical JSONL records for the same login, which is useful for an
       // audit but misleading as a current-service quota view.
-      const refresh=readCachedCodexLeaderboard(sources, store, forceRefresh, false);
+      const refresh=readCachedCodexLeaderboard(sources, store, forceRefresh, false,claudeService?.config.storageDirectory);
       let timer:ReturnType<typeof setTimeout>|undefined;
       const data=await Promise.race([refresh,new Promise<null>(resolve=>{timer=setTimeout(()=>resolve(null),2000);})]).finally(()=>{if(timer)clearTimeout(timer);});
       if(data)return {data:presentLeaderboard(data)};
       const window=apiLeaderboardCycleWindow(sources.filter(s=>s.kind!=="api-provider").map(s=>({resetAt:s.quota.rateLimits?.primary?.resetsAt??null,resetWindowMins:s.quota.rateLimits?.primary?.windowDurationMins??null})),Math.floor(Date.now()/1000));
       const boards=[];
       for(const source of sources)boards.push(await readCodexLeaderboard(source,store,window,false,true));
-      const cached=mergeAccountLeaderboards(boards,sources);
+      const cached=mergeClaudeTokens(boards,sources,cachedClaudeBilling(claudeService?.config.storageDirectory),window);
       cached.errors=[...new Set([...cached.errors,"完整统计正在后台更新，当前显示已缓存用量"] )];
       return {data:presentLeaderboard(cached)};
     } catch (error) {

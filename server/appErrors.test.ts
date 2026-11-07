@@ -2,6 +2,29 @@ import { expect, it } from "vitest";
 import { AppError } from "./appErrors.js";
 import { modelErrorDetails } from "../shared/modelError.js";
 
+it.each([
+  'Command failed: claude-launch-reclaude auth status; Syncing config...; Get "https://cloudfront.reclaude.ai/client/account": context deadline exceeded',
+  'context deadline exceeded (Client.Timeout exceeded while awaiting headers)',
+  {code:'ETIMEDOUT',message:'connect timeout'},
+  'TLS handshake timed out',
+  'Timed out waiting for Codex response to turn/start.'
+])('classifies request deadlines as connection timeouts, without replaying an uncertain submission: %j',raw=>{
+  const error=AppError.from(raw).toPublic();
+  expect(error).toMatchObject({code:'request_timeout',source:'connection',retryable:false});
+  expect(error.message).toContain('请求超时');expect(error.message).not.toContain('上下文已满');
+  expect(error.originalMessage).toBe(modelErrorDetails(raw).message);
+  expect(AppError.from(JSON.parse(JSON.stringify(error))).toPublic()).toMatchObject({code:'request_timeout',source:'connection',retryable:false});
+});
+it('corrects a previously serialized context misclassification when the original reason is a deadline',()=>{
+  expect(AppError.from({code:'context_exhausted',message:'会话上下文已满，请使用续接会话。',originalMessage:'Get "https://example.test/account": context deadline exceeded'})).toMatchObject({code:'request_timeout',source:'connection',retryable:false});
+});
+it.each(['CONTEXT_EXHAUSTED','ContextWindowExceeded','context_length_exceeded','maximum context length exceeded','context window is full','Prompt is too long','上下文长度超过上限'])('retains genuine context overflow classification: %s',message=>{
+  expect(AppError.from({message})).toMatchObject({code:'context_exhausted',retryable:false});
+});
+it('does not infer a full model context from an unrelated context and exceeded pair',()=>{
+  expect(AppError.from({message:'context: connection attempt exceeded its deadline'}).code).not.toBe('context_exhausted');
+});
+
 it("recognizes native stream failure enum spellings without readable English text", () => {
   for (const info of ["ResponseStreamDisconnected", "ResponseStreamConnectionFailed", "response_stream_disconnected", { responseStreamDisconnected: { httpStatusCode: 503 } }, { responseStreamConnectionFailed: {} }]) {
     expect(AppError.from({ message: "连接异常", codexErrorInfo: info })).toMatchObject({ code: "stream_disconnected", retryable: true });

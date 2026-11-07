@@ -4,7 +4,7 @@ export function errorSource(code: string): ErrorSource {
   if (code === "runtime_terminated") return "runtime";
   if (code === "backend_restarted") return "backend";
   if (code === "memory_pressure") return "resource";
-  if (code === "stream_disconnected") return "connection";
+  if (code === "stream_disconnected" || code === "request_timeout") return "connection";
   if (["quota_exceeded", "claude_five_hour_limit", "claude_weekly_limit", "authentication_failed", "rate_limited", "model_overloaded", "upstream_http_429", "quota_or_rate_limit", "context_exhausted"].includes(code)) return "provider";
   return "unknown";
 }

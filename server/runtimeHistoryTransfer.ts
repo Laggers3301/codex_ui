@@ -146,10 +146,24 @@ export class RuntimeHistoryTransfer {
     const dir = path.join(this.claude.config.storageDirectory, "transfers", row.id);
     fs.mkdirSync(dir, {recursive:true,mode:0o700});
     const archive = path.join(dir, "source.jsonl"), partial = path.join(dir, `source-${randomUUID()}.partial`);
-    const before = await rolloutLogicalStat(source), hash = createHash("sha256");
-    await pipeline(await rolloutReadStream(source, {}, 0), new Transform({transform(chunk, _encoding, done) {hash.update(chunk);done(null,chunk);}}), fs.createWriteStream(partial,{flags:"wx",mode:0o600}));
-    const after = await rolloutLogicalStat(source);
-    if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) throw new AppError("migration_source_busy", "源历史在读取期间发生变化，未创建目标会话，请稍后重试。");
+    const conversation=row.sourceRuntime==='claude-code'?this.claude.storage.get(row.sourceThreadId):null;
+    const handoff=conversation?.contextHandoff?.rebuildFromNative?undefined:conversation?.contextHandoff;
+    // A handoff replaces model input, not the user's history. Restore its
+    // archived prefix before appending the current native continuation.
+    const sources=handoff?[handoff.sourceFile,source]:[source];
+    const hash = createHash("sha256");
+    for(const [index,file] of sources.entries()){
+      const before=await rolloutLogicalStat(file);
+      await pipeline(await rolloutReadStream(file, {}, 0), new Transform({transform(chunk, _encoding, done) {hash.update(chunk);done(null,chunk);}}), fs.createWriteStream(partial,{flags:index?'a':'wx',mode:0o600}));
+      const after=await rolloutLogicalStat(file);
+      if(before.size!==after.size||before.mtimeMs!==after.mtimeMs)throw new AppError("migration_source_busy", "源历史在读取期间发生变化，未创建目标会话，请稍后重试。");
+      // JSONL files may lack a terminal LF. Separate immutable source records.
+      if(index<sources.length-1){
+        const fd=fs.openSync(partial,'r'),tail=Buffer.alloc(1);let read=0;
+        try{const size=fs.fstatSync(fd).size;if(size)read=fs.readSync(fd,tail,0,1,size-1);}finally{fs.closeSync(fd);}
+        if(read&&tail[0]!==10){fs.appendFileSync(partial,'\n');hash.update('\n');}
+      }
+    }
     fs.renameSync(partial, archive);
     row.archive=archive;row.sourceHash=hash.digest("hex");row.messageCount=0;row.warnings=[];
     this.claude.storage.db.prepare("DELETE FROM runtime_transfer_items WHERE transfer_id=?").run(row.id);
@@ -157,9 +171,11 @@ export class RuntimeHistoryTransfer {
     const batch=new HistoryWriteBatch<[string,number,string|null,string]>(this.claude.storage.db,values=>insert.run(...values));
     let turnId: string|null=null, skippedInternal=0, rawMessages=0, codexIdentityVerified=false;
     let claudeCutoff:string|undefined, cutoffFound=false;
+    const nativeIds=new Set([conversation?.nativeSessionId,handoff?.sourceSessionId].filter(Boolean));
     if(row.sourceRuntime==="claude-code"&&row.sourceTurnId){
-      const selected=this.claude.storage.turn(row.sourceTurnId);
-      if(typeof selected?.nativeMessageId!=="string"||!selected.nativeMessageId||selected.nativeSessionId!==this.claude.storage.get(row.sourceThreadId)?.nativeSessionId)
+      // Read only the checkpoint, even when the selected turn is many MiB.
+      const selected=this.claude.storage.db.prepare("SELECT json_extract(body,'$.nativeMessageId') nativeMessageId,json_extract(body,'$.nativeSessionId') nativeSessionId FROM turns WHERE thread_id=? AND id=?").get(row.sourceThreadId,row.sourceTurnId);
+      if(typeof selected?.nativeMessageId!=="string"||!selected.nativeMessageId||!nativeIds.has(String(selected.nativeSessionId)))
         throw new AppError("migration_cutoff_missing","所选轮次没有可确认的原生分支位置，未创建目标会话。");
       claudeCutoff=selected.nativeMessageId;
     }
@@ -199,8 +215,11 @@ export class RuntimeHistoryTransfer {
         const body=JSON.stringify(message);
         if(batch.add([row.id,rawMessages++,turnId,body],Buffer.byteLength(body)))await yieldToRequests();
       } else {
-        if(raw.sessionId && raw.sessionId!==this.claude.storage.get(row.sourceThreadId)?.nativeSessionId) throw new AppError("migration_identity_mismatch","Claude 历史标识不一致。");
+        if(raw.sessionId && !nativeIds.has(raw.sessionId)) throw new AppError("migration_identity_mismatch","Claude 历史标识不一致。");
         if(raw.isSidechain===true)continue;
+        // prepareMigratedContext writes one synthetic user seed. Its original
+        // prefix is now restored above; don't re-import that summary as a user.
+        if(handoff&&raw.sessionId===conversation?.nativeSessionId&&raw.type==='user'&&raw.parentUuid===null)continue;
         if(claudeCutoff&&raw.uuid===claudeCutoff)cutoffFound=true;
         if(!["user","assistant"].includes(raw.type))continue;
         if(raw.uuid&&seen.has(raw.uuid))continue;if(raw.uuid)seen.add(raw.uuid);
