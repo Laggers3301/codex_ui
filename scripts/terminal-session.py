@@ -6,7 +6,9 @@ also identifies background jobs after reparenting or setsid (including ssh).
 import os
 from pathlib import Path
 import signal
+import shutil
 import sys
+import tempfile
 import time
 
 
@@ -23,7 +25,7 @@ def alive(pid, start):
     return current is not None and current[0] == start and current[2] != "Z"
 
 
-def reap(shell, parent, marker):
+def reap(shell, parent, marker, proxy_directory):
     os.setsid()
     # Never retain the PTY or app-server's output pipe after the shell exits.
     null = os.open(os.devnull, os.O_RDWR)
@@ -76,17 +78,32 @@ def reap(shell, parent, marker):
                 except ProcessLookupError:
                     pass
         time.sleep(delay)
+    if proxy_directory:
+        shutil.rmtree(proxy_directory, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    marker, *command = sys.argv[1:]
+    marker, proxy_source, *command = sys.argv[1:]
     if not marker or not command:
         raise SystemExit(2)
     shell_pid, parent_pid = os.getpid(), os.getppid()
     shell_start, parent_start = identity(shell_pid)[0], identity(parent_pid)[0]
+    proxy_directory = None
+    if proxy_source != "-":
+        # Only this terminal's PATH changes. The real ssh binary and host
+        # configuration are untouched; its login/command sessions get their
+        # own remote reaper so disconnect also ends remote detached children.
+        real_ssh = shutil.which("ssh")
+        if real_ssh:
+            proxy_directory = tempfile.mkdtemp(prefix="codex-terminal-ssh-")
+            proxy = Path(proxy_directory) / "ssh"
+            proxy.write_text("#!/usr/bin/python3\n" + proxy_source)
+            proxy.chmod(0o700)
+            os.environ["CODEX_WEB_REAL_SSH"] = real_ssh
+            os.environ["PATH"] = proxy_directory + os.pathsep + os.environ.get("PATH", "")
     if os.fork() == 0:
         try:
-            reap((shell_pid, shell_start), (parent_pid, parent_start), marker)
+            reap((shell_pid, shell_start), (parent_pid, parent_start), marker, proxy_directory)
         finally:
             os._exit(0)
     os.environ["CODEX_WEB_TERMINAL_SESSION"] = marker

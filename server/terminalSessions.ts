@@ -3,11 +3,12 @@ import { randomUUID } from "node:crypto";
 import type { WebSocket } from "ws";
 
 interface Transport { request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown>; }
-interface Session { id: string; userId: string; socket: WebSocket; stopping?: Promise<unknown>; cleanupFailed?: boolean; }
+interface Session { id: string; userId: string; socket: WebSocket; stopping?: Promise<unknown>; cleanupFailed?: boolean; finished?: boolean; }
 const reaper = fs.readFileSync(new URL("../scripts/terminal-session.py", import.meta.url), "utf8");
+const sshProxy = `REAPER_SOURCE = ${JSON.stringify(reaper)}\n${fs.readFileSync(new URL("../scripts/terminal-ssh.py", import.meta.url), "utf8")}`;
 
 export function terminalCommand(command: string[]): string[] {
-  return ["/usr/bin/python3", "-c", reaper, randomUUID(), ...command];
+  return ["/usr/bin/python3", "-c", reaper, randomUUID(), sshProxy, ...command];
 }
 
 /** Keep cleanup authority until termination is attempted, even if the long
@@ -28,7 +29,8 @@ export class TerminalSessions {
       // stop() may still be waiting for its native acknowledgement after exec
       // settles. Do not let a duplicate id replace this cleanup operation.
       if (session.stopping) await session.stopping.catch(() => {});
-      if (!session.cleanupFailed) { this.sessions.delete(id); this.owners.delete(id); }
+      session.finished = true;
+      if (!session.cleanupFailed) this.forget(session);
     }
   }
 
@@ -56,7 +58,7 @@ export class TerminalSessions {
   private stop(session: Session): Promise<unknown> {
     session.cleanupFailed = false;
     return session.stopping ??= this.bridge.request("command/exec/terminate", { processId: session.id }, 10_000)
-      .then(result => { this.sessions.delete(session.id); this.owners.delete(session.id); return result; })
+      .then(result => { if (session.finished) this.forget(session); return result; })
       .catch(error => {
         // The independent reaper still owns descendants if the native runtime
         // itself exited. Never reroute a lost process id to another account.
@@ -65,6 +67,11 @@ export class TerminalSessions {
         session.stopping = undefined;
         throw error;
       });
+  }
+
+  private forget(session: Session): void {
+    if (this.sessions.get(session.id) !== session) return;
+    this.sessions.delete(session.id); this.owners.delete(session.id);
   }
 
   sweep(userDeleted: (userId: string) => boolean = () => false): void {
