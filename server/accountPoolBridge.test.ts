@@ -914,6 +914,35 @@ describe("account-pool routing policy", () => {
     ]).id).toBe("known");
   });
 
+  it("uses Credits when subscriptions are exhausted but spends subscription allowance first", () => {
+    const spent = candidate("spent", 0);
+    const credits = candidate("credits", 0, { hasCredits: true, activeRequests: 8 });
+    expect(selectAccountCandidate([spent, credits]).id).toBe("credits");
+    expect(selectAccountCandidate([credits, candidate("subscription", 1)]).id).toBe("subscription");
+    expect(selectAccountCandidate([spent, { ...credits, health: "degraded" }]).id).toBe("spent");
+  });
+
+  it("routes a real new-thread request to cached Credits when all subscriptions are spent", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "credit-routing-"));
+    const runtimes: FakeCodexBridge[] = [];
+    class CreditsBridge extends FakeCodexBridge {
+      constructor(private credits: string) { super(); }
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        if (method === "account/rateLimits/read") return { rateLimits: { primary: { usedPercent: 100 }, secondary: { usedPercent: 100 }, credits: { balance: this.credits, hasCredits: Number(this.credits) > 0 } } };
+        return super.request(method, params);
+      }
+    }
+    for (const id of ["empty", "paid"]) fs.mkdirSync(path.join(root, id));
+    const pool = new AccountPoolBridge({ accounts: ["empty", "paid"].map(id => ({ id, label: id, codexHome: path.join(root, id) })), stateFile: "state.json" }, root,
+      () => { const runtime = new CreditsBridge(runtimes.length ? "12.5" : "0"); runtimes.push(runtime); return runtime as unknown as CodexBridge; });
+    try {
+      await pool.refreshAccountData(true);
+      await pool.request("thread/start", { model: "gpt-6.1-sol" });
+      expect(runtimes[0].requests.some(request => request.method === "thread/start")).toBe(false);
+      expect(runtimes[1].requests.some(request => request.method === "thread/start")).toBe(true);
+    } finally { pool.stop(); fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
   it("still chooses deterministically when every account is degraded", () => {
     expect(selectAccountCandidate([
       candidate("lower", 10, { health: "degraded" }),

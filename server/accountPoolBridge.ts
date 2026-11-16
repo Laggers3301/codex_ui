@@ -1,4 +1,5 @@
 import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
+import { codexHasCredits, codexRemainingPercent } from "../shared/codexAllowance.js";
 import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -181,27 +182,11 @@ function safeAbsoluteDirectory(value: unknown, field: string): string {
   return resolved;
 }
 
-function rawRateWindow(limits: unknown): JsonRecord {
-  const root = asRecord(limits);
-  const snapshot = asRecord(root.rateLimits);
-  const primary = asRecord(snapshot.primary);
-  if (Object.keys(primary).length) {
-    return primary;
-  }
-  return asRecord(root.primary);
-}
-
-function remainingPercent(limits: unknown): number {
-  const used = rawRateWindow(limits).usedPercent;
-  return typeof used === "number" && Number.isFinite(used)
-    ? Math.max(0, Math.min(100, 100 - used))
-    : -1;
-}
-
 export interface AccountRoutingCandidate {
   id: string;
   health: "ready" | "degraded" | "starting";
   remainingPercent: number;
+  hasCredits?: boolean;
   activeRequests: number;
   assignedThreadCount: number;
 }
@@ -216,6 +201,11 @@ export function selectAccountCandidate<T extends AccountRoutingCandidate>(accoun
   const healthy = accounts.filter((account) => account.health !== "degraded");
   const candidates = healthy.length ? healthy : accounts;
   return [...candidates].sort((left, right) => {
+    // Spend subscription allowance first, then use Credits before exhausted
+    // accounts. Credits are money, so never compare their amount to a percent.
+    const tier = (account: AccountRoutingCandidate) => account.remainingPercent > 0 ? 3 : account.hasCredits ? 2 : account.remainingPercent >= 0 ? 1 : 0;
+    const tierDifference = tier(right) - tier(left);
+    if (tierDifference) return tierDifference;
     const remainingDifference = right.remainingPercent - left.remainingPercent;
     if (remainingDifference) return remainingDifference;
     if (left.activeRequests !== right.activeRequests) return left.activeRequests - right.activeRequests;
@@ -1352,7 +1342,8 @@ export class AccountPoolBridge extends EventEmitter {
     const selected = selectAccountCandidate(compatibleAccounts.map((account) => ({
       id: account.id,
       health: account.health,
-      remainingPercent: remainingPercent(account.cache?.limits),
+      remainingPercent: codexRemainingPercent(account.cache?.limits),
+      hasCredits: codexHasCredits(account.cache?.limits),
       activeRequests: account.activeRequests,
       assignedThreadCount: this.assignedThreadCount(account.id)
     })));
@@ -1530,7 +1521,7 @@ export class AccountPoolBridge extends EventEmitter {
       const eligible = (account: AccountRuntime) => {
         if (account.kind !== "codex-account" || account.health !== "ready" || account.authFailureCode
           || model && account.supportedModels && !account.supportedModels.has(model)
-          || remainingPercent(account.cache?.limits) === 0) return false;
+          || codexRemainingPercent(account.cache?.limits) === 0 && !codexHasCredits(account.cache?.limits)) return false;
         const available = account.bridge.getMemoryHeadroom();
         return available !== null && Number.isFinite(available) && available >= requiredMemoryBytes;
       };
@@ -1540,7 +1531,7 @@ export class AccountPoolBridge extends EventEmitter {
         const alternatives = forcedTargetAccountId ? [] : this.accounts.filter(eligible);
         if (!alternatives.length) throw new BranchConflictError("当前没有支持同一模型且内存余量足够的 GPT 账号，已安全停止分支；原会话未修改。");
         const selected = selectAccountCandidate(alternatives.map(account => ({ id: account.id, health: account.health,
-          remainingPercent: remainingPercent(account.cache?.limits), activeRequests: account.activeRequests,
+          remainingPercent: codexRemainingPercent(account.cache?.limits), hasCredits: codexHasCredits(account.cache?.limits), activeRequests: account.activeRequests,
           assignedThreadCount: this.assignedThreadCount(account.id) })));
         target = this.accountsById.get(selected.id)!;
       }

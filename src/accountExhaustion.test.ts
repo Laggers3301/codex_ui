@@ -34,6 +34,13 @@ function account(id: string, usedPercent: number | null, health: CodexAccountPoo
 }
 
 describe("exhausted account suggestion", () => {
+  it("can suggest a Credits account and does not warn when the current account has Credits", () => {
+    const paid = account("paid", 100);
+    paid.quota.rateLimits!.credits = { balance: "12.5", hasCredits: true, unlimited: false };
+    const pool = { strategy: "highest-remaining-sticky-thread", currentThreadAccountId: "old", accounts: [account("old", 100), paid], updatedAt: "" } satisfies CodexAccountPool;
+    expect(exhaustedAccountSuggestion(pool, "thread-1")?.hasAvailableAlternative).toBe(true);
+    expect(exhaustedAccountSuggestion({ ...pool, currentThreadAccountId: "paid" }, "thread-1")).toBeNull();
+  });
   it("uses the selected thread's assigned account, not the account selected for new chats", () => {
     const pool = {
       strategy: "highest-remaining-sticky-thread",
