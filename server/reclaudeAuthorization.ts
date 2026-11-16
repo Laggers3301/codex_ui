@@ -12,6 +12,9 @@ import { reclaudeAuthorizationPending, reclaudeAuthorizationUrl, type ReclaudeAu
 interface Operation extends Omit<ReclaudeAuthorizationOperation, "owned"> { userId: string; }
 const messages: Record<string, string> = {
   bind_failed: "组织绑定未完成，请确认组织编号、账号成员资格及设备授权。当前默认组织未切换。",
+  switch_failed: "默认组织切换未完成，请刷新组织列表核对当前选择。",
+  switch_unverified: "客户端未确认目标组织，未执行历史同步，请刷新核对默认组织。",
+  sync_failed: "默认组织已切换，但历史同步未完成；请检查旧账号活跃进程及历史目录后重试。已有文件不会被覆盖。",
   logout_failed: "未能按组织退出登录，请检查 ReClaude 客户端版本后重试。",
   login_failed: "ReClaude 登录未完成，可重新发起认证。",
   client_start_failed: "ReClaude 登录程序未能启动。",
@@ -75,45 +78,57 @@ export class ReclaudeAuthorization {
     const operation = this.operation;
     const visible = operation && (ids.includes(operation.orgId) || operation.userId === userId);
     const owned = operation?.userId === userId;
+    const current = this.bindings.currentOrganization();
     return {
       enabled: !!this.config.reclaudeExecutable && this.bindings.canManageOrganizations(userId),
       organizations: [...new Set([...ids, ...(this.bindings.canManageOrganizations(userId) ? this.discovered.map(row => row.orgId) : [])])].filter(id => /^[0-9]+$/.test(id)).map(orgId => {
         const binding = bindings.find(binding => binding.orgId === orgId);
         const discovered = this.discovered.find(row => row.orgId === orgId);
-        return { orgId, label: binding?.label ?? discovered?.label ?? `组织 ${orgId}`, connected: !!binding, bound: discovered?.bound ?? !!binding, current: discovered?.current ?? false };
+        return { orgId, label: binding?.label ?? discovered?.label ?? `组织 ${orgId}`, connected: !!binding, bound: discovered?.bound ?? !!binding, current: current ? current.orgId === orgId : discovered?.current ?? false };
       }),
+      canSyncHistory: !!this.config.accountSyncExecutable && !!current && ids.includes(current.orgId),
       ...(this.organizationError ? { organizationError: this.organizationError } : {}),
-      operation: visible ? { id: operation.id, orgId: operation.orgId, action: operation.action, phase: operation.phase, startedAt: operation.startedAt,
+      operation: visible ? { id: operation.id, orgId: operation.orgId, action: operation.action, syncHistory: operation.syncHistory, phase: operation.phase, startedAt: operation.startedAt,
         expiresAt: operation.expiresAt, owned, ...(owned && operation.authorizationUrl ? { authorizationUrl: operation.authorizationUrl } : {}),
         ...(operation.message ? { message: owned ? operation.message : "共享账号的认证状态已更新。" } : {}) } : null
     };
   }
-  start(userId: string, orgId: string, requestId: string, action: ReclaudeAuthorizationAction = "reauthenticate"): ReclaudeAuthorizationStatus {
+  start(userId: string, orgId: string, requestId: string, action: ReclaudeAuthorizationAction = "reauthenticate", syncHistory = false): ReclaudeAuthorizationStatus {
     if (this.closed) throw new AppError("runtime_not_connected", "ReClaude 正在关闭，请稍后重试。");
-    if (!["reauthenticate", "bind"].includes(action)) throw new AppError("invalid_request", "组织操作无效。");
+    if (!["reauthenticate", "bind", "use"].includes(action) || syncHistory && action !== "use") throw new AppError("invalid_request", "组织操作无效。");
     if (!/^[0-9]{1,20}$/.test(orgId) || !this.bindings.canManageOrganizations(userId)
       || action !== "bind" && !this.bindings.orgIds(userId).includes(orgId)) throw new AppError("runtime_forbidden", "无权操作此组织。");
     if (!/^[0-9a-f-]{36}$/i.test(requestId)) throw new AppError("invalid_request", "重新认证请求缺少有效标识。");
     if (this.operation?.id === requestId) {
       if (this.operation.userId !== userId) throw new AppError("runtime_forbidden", "认证请求不属于当前用户。");
-      if (this.operation.orgId !== orgId || (this.operation.action ?? "reauthenticate") !== action) throw new AppError("invalid_request", "请求标识已用于另一项组织操作。");
+      if (this.operation.orgId !== orgId || (this.operation.action ?? "reauthenticate") !== action || !!this.operation.syncHistory !== syncHistory) throw new AppError("invalid_request", "请求标识已用于另一项组织操作。");
       return this.status(userId);
     }
     if (this.operation && reclaudeAuthorizationPending(this.operation.phase)) {
-      if (this.operation.userId === userId && this.operation.orgId === orgId && (this.operation.action ?? "reauthenticate") === action) return this.status(userId);
+      if (this.operation.userId === userId && this.operation.orgId === orgId && (this.operation.action ?? "reauthenticate") === action && !!this.operation.syncHistory === syncHistory) return this.status(userId);
       throw new AppError("reclaude_reauth_in_progress", "共享账号已有认证正在进行，请等待完成。");
     }
     const client = this.config.reclaudeExecutable;
     if (!client || !path.isAbsolute(client)) throw new AppError("runtime_not_connected", "尚未启用 ReClaude 网页认证。");
     fs.accessSync(client, fs.constants.X_OK);
+    if (action === "use" && this.bindings.list(userId).filter(binding => binding.orgId === orgId).length !== 1) throw new AppError("runtime_not_connected", "请先绑定并确认目标组织的 Claude 身份，再切换默认组织。");
     const release = this.lifecycle.acquireAuthorization();
     try {
+      // Read the previous *device directory* while holding the machine lease;
+      // claude-account-sync --from takes this id, not an organization id.
+      const previous = this.bindings.currentOrganization();
+      const syncClient = this.config.accountSyncExecutable;
+      if (syncHistory) {
+        if (!syncClient || !path.isAbsolute(syncClient) || !previous || !this.bindings.orgIds(userId).includes(previous.orgId)) throw new AppError("invalid_request", "未配置历史同步程序，或无法确认旧组织，请先完成配置。");
+        fs.accessSync(syncClient, fs.constants.X_OK);
+      }
       this.snapshotHistory(orgId);
       const now = Date.now();
-      this.operation = { id: requestId, orgId, userId, action, phase: "starting", startedAt: now, expiresAt: now + 10 * 60_000 };
+      this.operation = { id: requestId, orgId, userId, action, syncHistory, phase: "starting", startedAt: now, expiresAt: now + 10 * 60_000 };
       this.cancelRequested = false; this.release = release; this.save();
       const script = fileURLToPath(new URL("../scripts/reclaude-reauth.mjs", import.meta.url));
-      const child = spawn(process.execPath, [script, "--client", client, "--home", this.config.home, "--org", orgId, "--action", action],
+      const child = spawn(process.execPath, [script, "--client", client, "--home", this.config.home, "--org", orgId, "--action", action,
+        ...(syncHistory ? ["--account-sync", syncClient!, "--from-device", previous!.deviceId] : [])],
         { stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
       this.child = child;
       let buffer = "", failure: string | undefined;
@@ -124,7 +139,7 @@ export class ReclaudeAuthorization {
           try {
             const event = JSON.parse(line);
             if (!this.operation || this.operation.id !== requestId || this.cancelRequested || this.closed) continue;
-            if (event.type === "phase" && ["binding", "logging_out", "waiting_authorization", "verifying"].includes(event.phase)) this.operation.phase = event.phase;
+            if (event.type === "phase" && ["binding", "switching", "syncing", "logging_out", "waiting_authorization", "verifying"].includes(event.phase)) this.operation.phase = event.phase;
             if (event.type === "authorization") {
               const url = typeof event.url === "string" ? reclaudeAuthorizationUrl(event.url) : null;
               if (url) { this.operation.authorizationUrl = url; this.operation.phase = "waiting_authorization"; }
@@ -148,7 +163,7 @@ export class ReclaudeAuthorization {
     if (!this.operation || this.operation.id !== id || !this.release) return;
     try {
       if (this.closed) { this.operation.phase = "interrupted"; this.operation.message = "服务已重启，请重新发起认证。"; }
-      else if (this.cancelRequested) { this.operation.phase = "cancelled"; this.operation.message ??= "已取消认证，原会话记录仍保留。"; }
+      else if (this.cancelRequested) { this.operation.phase = "cancelled"; this.operation.message ??= this.operation.action === "use" ? "操作已取消，请刷新核对默认组织。已完成的切换或同步步骤不会回退。" : "已取消认证，原会话记录仍保留。"; }
       else if (!success) { this.operation.phase = "failed"; this.operation.message = failure ?? "ReClaude 登录未完成，可重新发起认证。"; }
       else {
         this.operation.phase = "verifying"; this.save();
@@ -160,12 +175,12 @@ export class ReclaudeAuthorization {
           await this.bindings.refreshModels(this.operation.userId);
           if (this.closed || this.cancelRequested) { this.operation.phase = this.closed ? "interrupted" : "cancelled"; return; }
           this.operation.phase = "completed";
-          this.operation.message = this.operation.action === "bind" ? "组织绑定完成，可在模型菜单中选择。当前默认组织保持不变。" : "认证完成，向原会话发送新内容时将自动接续。";
+          this.operation.message = this.operation.action === "use" ? `默认组织已切换${this.operation.syncHistory ? "，本机历史与记忆已同步" : ""}。已有网页会话继续沿用其原组织。` : this.operation.action === "bind" ? "组织绑定完成，可在模型菜单中选择。当前默认组织保持不变。" : "认证完成，向原会话发送新内容时将自动接续。";
           this.discovered = [];
         }
       }
     } catch {
-      this.operation.phase = "failed"; this.operation.message = "客户端登录结束，但新的组织或 Claude 身份尚未确认，请重试。";
+      this.operation.phase = "failed"; this.operation.message = this.operation.action === "use" ? "客户端切换后，目标 Claude 身份尚未确认。请刷新核对当前默认组织后重试；已完成的切换或同步步骤不会回退。" : "客户端登录结束，但新的组织或 Claude 身份尚未确认，请重试。";
     } finally {
       delete this.operation.authorizationUrl;
       try { this.save(); } finally {

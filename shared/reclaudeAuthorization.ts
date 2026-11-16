@@ -1,9 +1,10 @@
-export type ReclaudeAuthorizationAction = "reauthenticate" | "bind";
-export type ReclaudeAuthorizationPhase = "starting" | "binding" | "logging_out" | "waiting_authorization" | "verifying" | "completed" | "failed" | "cancelled" | "interrupted";
+export type ReclaudeAuthorizationAction = "reauthenticate" | "bind" | "use";
+export type ReclaudeAuthorizationPhase = "starting" | "binding" | "switching" | "syncing" | "logging_out" | "waiting_authorization" | "verifying" | "completed" | "failed" | "cancelled" | "interrupted";
 export interface ReclaudeAuthorizationOperation {
   id: string;
   orgId: string;
   action?: ReclaudeAuthorizationAction;
+  syncHistory?: boolean;
   phase: ReclaudeAuthorizationPhase;
   startedAt: number;
   expiresAt: number;
@@ -15,10 +16,11 @@ export interface ReclaudeAuthorizationStatus {
   enabled: boolean;
   organizations: Array<{ orgId: string; label: string; connected: boolean; bound?: boolean; current?: boolean }>;
   organizationError?: string;
+  canSyncHistory?: boolean;
   operation: ReclaudeAuthorizationOperation | null;
 }
 export const reclaudeAuthorizationPending = (phase: ReclaudeAuthorizationPhase) =>
-  ["starting", "binding", "logging_out", "waiting_authorization", "verifying"].includes(phase);
+  ["starting", "binding", "switching", "syncing", "logging_out", "waiting_authorization", "verifying"].includes(phase);
 
 export function newReclaudeAuthorizationRequestId(): string {
   if (typeof globalThis.crypto.randomUUID === "function") return globalThis.crypto.randomUUID();

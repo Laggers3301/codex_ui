@@ -14,6 +14,9 @@ export interface ClaudeIntegrationConfig {
   home: string; executable: string; storageDirectory: string;
   /** ReClaude CLI itself, not the Claude process wrapper. Enables web reauth. */
   reclaudeExecutable?: string;
+  /** Trusted local claude-account-sync, supporting its documented path env
+   * overrides. Optional: selecting an organization never implies a history copy. */
+  accountSyncExecutable?: string;
   /** Legacy bindings used only when a shared pool is not configured. */
   users?: Record<string, { workspaceRoot: string; orgIds: string[] }>;
   /** One account pool for every web user, with separate user workspaces. */
@@ -85,6 +88,16 @@ export class ClaudeBindings {
     return owner;
   }
   canManageOrganizations(userId: string): boolean { return !!this.owner(userId); }
+  currentOrganization(): { orgId: string; deviceId: string } | null {
+    try {
+      const root = path.join(this.config.home, ".rec", "claude");
+      const deviceId = fs.readFileSync(path.join(root, "current"), "utf8").trim();
+      if (!/^[0-9]+$/.test(deviceId)) return null;
+      const device = read(path.join(root, "accounts", deviceId, "device.json"));
+      const orgId = String(device.org_id);
+      return /^[0-9]+$/.test(orgId) ? { orgId, deviceId } : null;
+    } catch { return null; }
+  }
   private organizationScope(userId: string): string { return this.config.sharedUsers ? "shared" : `user:${userId}`; }
   private managedOrganizations(): Record<string, string[]> {
     const file = path.join(this.config.storageDirectory, "organizations.json");

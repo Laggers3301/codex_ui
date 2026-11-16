@@ -3349,15 +3349,16 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       return reply.send(image.stream);
     }catch{return reply.code(400).send({error:'原图位置或编码无法确认，历史未修改。'});}
   });
-  app.post<{Body:{orgId?:string;requestId?:string;action?:unknown}}>("/api/reclaude/authorization/start", async (request, reply) => {
+  app.post<{Body:{orgId?:string;requestId?:string;action?:unknown;syncHistory?:unknown}}>("/api/reclaude/authorization/start", async (request, reply) => {
     reply.header("Cache-Control", "private, no-store");
     if (request.headers["sec-fetch-site"] === "cross-site") return reply.code(403).send({error:"请从当前网页发起认证。"});
     if (!claudeService) return reply.code(404).send({error:"ReClaude 尚未配置。"});
     try {
       const body = request.body ?? {};
       if (typeof body.orgId !== "string" || typeof body.requestId !== "string") return reply.code(400).send({error:"缺少组织或认证请求标识。"});
-      if (body.action !== undefined && body.action !== "reauthenticate" && body.action !== "bind") return reply.code(400).send({ error: "组织操作无效。" });
-      return { data: claudeService.authorization.start(userIdFromRequest(request, store), body.orgId, body.requestId, body.action) };
+      if (body.action !== undefined && body.action !== "reauthenticate" && body.action !== "bind" && body.action !== "use") return reply.code(400).send({ error: "组织操作无效。" });
+      if (body.syncHistory !== undefined && typeof body.syncHistory !== "boolean") return reply.code(400).send({ error: "历史同步选项无效。" });
+      return { data: claudeService.authorization.start(userIdFromRequest(request, store), body.orgId, body.requestId, body.action, body.syncHistory) };
     } catch (error) {
       const known = error instanceof AppError;
       return reply.code(known && error.code === "runtime_forbidden" ? 403 : known && error.code === "invalid_request" ? 400 : 409)

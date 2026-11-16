@@ -19,8 +19,9 @@ const missingBinding = value => /(?:本机还没有绑定|未绑定组织|没有
 
 /** Only the client handles credentials. Its raw stdout/stderr is never exposed
  * to the web application: this adapter emits phases and one validated URL. */
-export async function reauthenticate({ client, home, orgId, signal, action = "reauthenticate" }, emit) {
-  if (!path.isAbsolute(client) || !path.isAbsolute(home) || !/^[0-9]+$/.test(orgId) || !["reauthenticate", "bind"].includes(action)) throw new Error("invalid_configuration");
+export async function reauthenticate({ client, home, orgId, signal, action = "reauthenticate", accountSyncClient, fromDeviceId }, emit) {
+  if (!path.isAbsolute(client) || !path.isAbsolute(home) || !/^[0-9]+$/.test(orgId) || !["reauthenticate", "bind", "use"].includes(action)) throw new Error("invalid_configuration");
+  if (accountSyncClient && (action !== "use" || !path.isAbsolute(accountSyncClient) || !/^[0-9]+$/.test(fromDeviceId ?? ""))) throw new Error("invalid_configuration");
   await fs.access(client, fs.constants.X_OK);
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "reclaude-browser-"));
   const captureFile = path.join(temporary, "authorization-url");
@@ -34,9 +35,9 @@ export async function reauthenticate({ client, home, orgId, signal, action = "re
     const url = authorizationUrl(value);
     if (url && !seen.has(url) && !signal?.aborted) { seen.add(url); emit({ type: "authorization", url }); }
   };
-  const run = (args, login) => new Promise((resolve, reject) => {
+  const run = (args, login, executable = client) => new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(new Error("cancelled"));
-    const child = spawn(client, args, { env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(executable, args, { env, stdio: ["ignore", "pipe", "pipe"] });
     let tail = "", killTimer;
     // Native browser openers may discard the helper's stdout. A private file
     // also delivers the URL while the login client waits for device approval.
@@ -67,6 +68,29 @@ export async function reauthenticate({ client, home, orgId, signal, action = "re
     });
   });
   try {
+    if (action === "use") {
+      emit({ type: "phase", phase: "switching" });
+      const selected = await run(["org", "use", orgId], false);
+      if (!selected.ok) throw new Error("switch_failed");
+      // Verify what the CLI actually selected before synchronizing any files.
+      const root = path.join(home, ".rec", "claude");
+      const current = (await fs.readFile(path.join(root, "current"), "utf8")).trim();
+      if (!/^[0-9]+$/.test(current)) throw new Error("switch_unverified");
+      const device = JSON.parse(await fs.readFile(path.join(root, "accounts", current, "device.json"), "utf8"));
+      if (String(device.org_id) !== orgId) throw new Error("switch_unverified");
+      if (accountSyncClient) {
+        emit({ type: "phase", phase: "syncing" });
+        // These overrides are supported by the A800-ks helper; never let its
+        // /root defaults redirect an isolated web instance to another HOME.
+        env.REC_CLAUDE_ROOT = root;
+        env.CLAUDE_PROJECTS_LINK = path.join(home, ".claude", "projects");
+        env.VSCODE_MACHINE_SETTINGS = path.join(home, ".vscode-server", "data", "Machine", "settings.json");
+        const synced = await run(["--from", fromDeviceId], false, accountSyncClient);
+        if (!synced.ok) throw new Error("sync_failed");
+      }
+      emit({ type: "phase", phase: "verifying" });
+      return;
+    }
     if (action === "bind") {
       emit({ type: "phase", phase: "binding" });
       const binding = await run(["org", "bind", orgId], true);
@@ -104,7 +128,8 @@ if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
     const stop = () => controller.abort();
     process.on("SIGTERM", stop); process.on("SIGINT", stop);
     const timeout = setTimeout(stop, 10 * 60_000);
-    reauthenticate({ client: read("--client"), home: read("--home"), orgId: read("--org"), action: process.argv.includes("--action") ? read("--action") : "reauthenticate", signal: controller.signal },
+    reauthenticate({ client: read("--client"), home: read("--home"), orgId: read("--org"), action: process.argv.includes("--action") ? read("--action") : "reauthenticate",
+      ...(process.argv.includes("--account-sync") ? {accountSyncClient:read("--account-sync"),fromDeviceId:read("--from-device")} : {}), signal: controller.signal },
       event => process.stdout.write(JSON.stringify(event) + "\n"))
       .then(() => process.stdout.write(JSON.stringify({ type: "complete" }) + "\n"))
       .catch(error => { process.stdout.write(JSON.stringify({ type: "failed", code: error.message }) + "\n"); process.exitCode = 1; })
