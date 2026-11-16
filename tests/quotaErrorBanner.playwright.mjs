@@ -71,6 +71,7 @@ try {
     const text=await banner.innerText();assert.ok(text.includes(expectedReset)&&text.includes('官方额度查询'));
     const box=await banner.boundingBox();assert.ok(box.x>=-1&&box.x+box.width<=page.viewportSize().width+1);
     await page.screenshot({path:`${evidence}/${mobile?'phone':'desktop'}-${theme}-banner.png`});
+    if (mobile) await page.locator('.mobileHeaderTitle').click();
     await page.locator('.quotaButton').click();const tab=page.locator('[data-account-id="provider:ark"]');await tab.waitFor();await page.waitForTimeout(300);
     if(process.env.QA_ACCOUNT_CACHE==='1'){
       assert.equal(await page.locator('.accountPoolTab.degraded[data-account-id]:not([data-account-id^="provider:"])').count(),0);
