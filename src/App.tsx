@@ -3979,7 +3979,7 @@ function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, c
           ) : null}
         </>
       ) : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>{loading ? "正在读取额度…" : "暂未读取到额度"}</p>}
-      {selectedClaude || (reclaudeStatus && !claudeAccounts.length) ? <button className="reclaudeAuthEntry" type="button" onClick={() => onReauthenticate(selectedClaude?.orgId)}>重新认证 ReClaude</button> : null}
+      {reclaudeStatus ? <button className="reclaudeAuthEntry" type="button" onClick={() => onReauthenticate(selectedClaude?.orgId)}>管理 ReClaude 组织</button> : null}
     </section>
   );
 }

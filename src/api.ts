@@ -341,8 +341,11 @@ export function readReclaudeUsage(signal?: AbortSignal): Promise<{data:import(".
 export function readReclaudeAuthorization(signal?: AbortSignal): Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
   return request("/api/reclaude/authorization", {signal,cache:"no-store"});
 }
-export function startReclaudeAuthorization(orgId:string,requestId:string):Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
-  return request("/api/reclaude/authorization/start", {method:"POST",body:JSON.stringify({orgId,requestId}),signal:AbortSignal.timeout(30000)});
+export function readReclaudeOrganizations(signal?:AbortSignal):Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
+  return request("/api/reclaude/organizations", {signal,cache:"no-store"});
+}
+export function startReclaudeAuthorization(orgId:string,requestId:string,action:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationAction="reauthenticate"):Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
+  return request("/api/reclaude/authorization/start", {method:"POST",body:JSON.stringify({orgId,requestId,action}),signal:AbortSignal.timeout(30000)});
 }
 export function cancelReclaudeAuthorization(id:string):Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
   return request("/api/reclaude/authorization/cancel", {method:"POST",body:JSON.stringify({id}),signal:AbortSignal.timeout(10000)});

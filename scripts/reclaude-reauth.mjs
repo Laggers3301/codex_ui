@@ -19,8 +19,8 @@ const missingBinding = value => /(?:本机还没有绑定|未绑定组织|没有
 
 /** Only the client handles credentials. Its raw stdout/stderr is never exposed
  * to the web application: this adapter emits phases and one validated URL. */
-export async function reauthenticate({ client, home, orgId, signal }, emit) {
-  if (!path.isAbsolute(client) || !path.isAbsolute(home) || !/^[0-9]+$/.test(orgId)) throw new Error("invalid_configuration");
+export async function reauthenticate({ client, home, orgId, signal, action = "reauthenticate" }, emit) {
+  if (!path.isAbsolute(client) || !path.isAbsolute(home) || !/^[0-9]+$/.test(orgId) || !["reauthenticate", "bind"].includes(action)) throw new Error("invalid_configuration");
   await fs.access(client, fs.constants.X_OK);
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "reclaude-browser-"));
   const captureFile = path.join(temporary, "authorization-url");
@@ -67,6 +67,13 @@ export async function reauthenticate({ client, home, orgId, signal }, emit) {
     });
   });
   try {
+    if (action === "bind") {
+      emit({ type: "phase", phase: "binding" });
+      const binding = await run(["org", "bind", orgId], true);
+      if (!binding.ok) throw new Error("bind_failed");
+      emit({ type: "phase", phase: "verifying" });
+      return;
+    }
     emit({ type: "phase", phase: "logging_out" });
     const logout = await run(["logout", "--org", orgId], false);
     if (!logout.ok && !logout.missingBinding) throw new Error("logout_failed");
@@ -97,7 +104,7 @@ if (path.resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
     const stop = () => controller.abort();
     process.on("SIGTERM", stop); process.on("SIGINT", stop);
     const timeout = setTimeout(stop, 10 * 60_000);
-    reauthenticate({ client: read("--client"), home: read("--home"), orgId: read("--org"), signal: controller.signal },
+    reauthenticate({ client: read("--client"), home: read("--home"), orgId: read("--org"), action: process.argv.includes("--action") ? read("--action") : "reauthenticate", signal: controller.signal },
       event => process.stdout.write(JSON.stringify(event) + "\n"))
       .then(() => process.stdout.write(JSON.stringify({ type: "complete" }) + "\n"))
       .catch(error => { process.stdout.write(JSON.stringify({ type: "failed", code: error.message }) + "\n"); process.exitCode = 1; })

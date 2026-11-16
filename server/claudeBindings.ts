@@ -84,7 +84,33 @@ export class ClaudeBindings {
     }
     return owner;
   }
-  orgIds(userId: string): string[] { return this.owner(userId)?.orgIds ?? []; }
+  canManageOrganizations(userId: string): boolean { return !!this.owner(userId); }
+  private organizationScope(userId: string): string { return this.config.sharedUsers ? "shared" : `user:${userId}`; }
+  private managedOrganizations(): Record<string, string[]> {
+    const file = path.join(this.config.storageDirectory, "organizations.json");
+    try {
+      const value = read(file);
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid registry");
+      for (const ids of Object.values(value)) if (!Array.isArray(ids) || ids.some(id => typeof id !== "string" || !/^[0-9]+$/.test(id))) throw new Error("invalid registry");
+      return value;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+      throw new AppError("runtime_not_connected", "组织绑定记录暂不可读，请检查服务存储后重试。");
+    }
+  }
+  orgIds(userId: string): string[] {
+    const owner = this.owner(userId);
+    return owner ? [...new Set([...owner.orgIds, ...(this.managedOrganizations()[this.organizationScope(userId)] ?? [])])] : [];
+  }
+  /** Called only after the CLI successfully authorizes the organization. The
+   * exclusive lifecycle lease serializes this update across web backends. */
+  addOrganization(userId: string, orgId: string): void {
+    if (!this.owner(userId) || !/^[0-9]+$/.test(orgId)) throw new AppError("runtime_forbidden", "无权绑定此组织。");
+    const all = this.managedOrganizations(), scope = this.organizationScope(userId);
+    all[scope] = [...new Set([...(all[scope] ?? []), orgId])];
+    const file = path.join(this.config.storageDirectory, "organizations.json"), temporary = `${file}.${process.pid}.partial`;
+    fs.writeFileSync(temporary, JSON.stringify(all), { mode: 0o600 }); fs.renameSync(temporary, file);
+  }
   effectiveModel(userId: string, model: string): string {
     const match = model.match(/^(reclaude-[a-z][a-z0-9-]*)@([0-9]+)$/);
     if (!match) return model;
@@ -112,7 +138,7 @@ export class ClaudeBindings {
       try {
         if (!fs.realpathSync(configRoot).startsWith(`${fs.realpathSync(base)}${path.sep}`)) continue;
         const device = read(path.join(base, "device.json"));
-        if (typeof device.sk !== "string" || !device.sk || !owner.orgIds.includes(String(device.org_id))) continue;
+        if (typeof device.sk !== "string" || !device.sk || !this.orgIds(userId).includes(String(device.org_id))) continue;
         const native = read(path.join(configRoot, ".claude.json"));
         const uuid = native.oauthAccount?.accountUuid;
         // ReClaude user_email/org_id/device_id are NOT Claude account identity.
