@@ -1,3 +1,4 @@
+import { terminalCommand, terminalSessionsFor, type TerminalSessions } from "./terminalSessions.js";
 import { assertRuntimeModel, effectiveRuntimeModel, getClaudeService } from "./claudeService.js";
 import { getRuntimeHistoryTransfer } from "./runtimeHistoryTransfer.js";
 import { isReclaudeModel } from "../shared/agentRuntime.js";
@@ -529,8 +530,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   browserService?.on("changed", browserChanged);
   wss.on("close", () => browserService?.off("changed", browserChanged));
   const liveStates = new Map<string, LiveStateStore>();
-  const processOwners = new Map<string, string>();
-  const processSockets = new Map<string, WebSocket>();
+  const terminals = terminalSessionsFor(bridge);
+  const processOwners = terminals.owners;
   const pendingApprovalOwners = new Map<number | string, string>();
   const pendingApprovalTurns = new Map<number | string, { userId: string; accountId: string | null; threadId: string; turnId: string | null }>();
   const turnOwners = new Map<string, string>();
@@ -703,6 +704,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   // only sockets that miss a full ping interval so the client reconnects itself.
   const heartbeat = setInterval(() => {
     const deletedUsers = deletedWebUserIds();
+    terminals.sweep(user => deletedUsers.has(user));
     for (const client of wss.clients) {
       const userClient = client as UserWebSocket;
       if (userClient.codexUserId && deletedUsers.has(userClient.codexUserId)) {
@@ -1248,7 +1250,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         ws.close(1008, "Account access revoked.");
         return;
       }
-      void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission, (requestId) => {
+      void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), terminals, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission, (requestId) => {
         const pending = pendingApprovalTurns.get(requestId);
         if (pending) processBridgeNotification({ method: "serverRequest/resolved", accountId: pending.accountId, params: { threadId: pending.threadId, requestId } } as RpcEnvelope);
       }, browserService, (threadId, itemId) => sendToUser(wss, sessionUserId, {
@@ -1282,14 +1284,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
             : status.type ? "当前未发现待批准操作，已更新运行状态。" : "暂时无法确认运行状态，请稍后重新核对。" };
       });
     });
-    ws.on("close", () => {
-      for (const [processId, socket] of processSockets) {
-        if (socket !== ws) continue;
-        processSockets.delete(processId);
-        processOwners.delete(processId);
-        void bridge.request("command/exec/terminate", { processId }, 10_000).catch(() => undefined);
-      }
-    });
+    ws.on("close", () => terminals.closeSocket(ws));
   });
 
   return wss;
@@ -1301,8 +1296,7 @@ async function handleClientMessage(
   rawCompactFilter: RawCompactFilter,
   store: ProjectStore,
   liveState: LiveStateStore,
-  processOwners: Map<string, string>,
-  processSockets: Map<string, WebSocket>,
+  terminals: TerminalSessions,
   pendingApprovalOwners: Map<number | string, string>,
   pendingApprovalTurns: Map<number | string, { userId: string; accountId: string | null; threadId: string; turnId: string | null }>,
   turnWatchdog: TurnWatchdog,
@@ -1945,13 +1939,9 @@ async function handleClientMessage(
         const processId = pickString(message.processId, `cmd-${randomUUID()}`);
         const tty = pickBoolean(message.tty, true);
         const disableTimeout = pickBoolean(message.disableTimeout, false);
-        processOwners.set(processId, sessionUserId);
-        processSockets.set(processId, ws);
-        let result: unknown;
-        try { result = await bridge.request(
-          "command/exec",
+        const result = await terminals.execute(processId, sessionUserId, ws,
           {
-            command,
+            command: terminalCommand(command),
             processId,
             tty,
             streamStdin: true,
@@ -1964,10 +1954,7 @@ async function handleClientMessage(
             sandboxPolicy: sandboxPolicy(project, pickSandbox(message.sandbox, project.defaultSandbox))
           },
           disableTimeout ? 86_400_000 : 180_000
-        ); } finally {
-          processOwners.delete(processId);
-          processSockets.delete(processId);
-        }
+        );
         send(ws, { type: "ack", requestId, ok: true, data: { processId, result } });
         break;
       }
@@ -1978,17 +1965,14 @@ async function handleClientMessage(
         if (!processId) {
           throw new Error("processId is required.");
         }
-        if (processOwners.get(processId) !== sessionUserId) {
-          throw new Error("Process is not visible for this logged-in user.");
-        }
-        const result = await bridge.request("command/exec/write", { processId, deltaBase64: Buffer.from(data, "utf8").toString("base64") });
+        const result = await terminals.control(processId, sessionUserId, ws, "command/exec/write", { deltaBase64: Buffer.from(data, "utf8").toString("base64") });
         send(ws, { type: "ack", requestId, ok: true, data: result });
         break;
       }
 
       case "command.resize": {
         const processId = pickString(message.processId);
-        if (!processId || processOwners.get(processId) !== sessionUserId) {
+        if (!processId) {
           throw new Error("Process is not visible for this logged-in user.");
         }
         const size = message.size as { cols?: unknown; rows?: unknown } | undefined;
@@ -1997,7 +1981,7 @@ async function handleClientMessage(
         if (!Number.isInteger(cols) || cols < 20 || cols > 400 || !Number.isInteger(rows) || rows < 5 || rows > 200) {
           throw new Error("Invalid terminal size.");
         }
-        const result = await bridge.request("command/exec/resize", { processId, size: { cols, rows } });
+        const result = await terminals.control(processId, sessionUserId, ws, "command/exec/resize", { size: { cols, rows } });
         send(ws, { type: "ack", requestId, ok: true, data: result });
         break;
       }
@@ -2007,12 +1991,7 @@ async function handleClientMessage(
         if (!processId) {
           throw new Error("processId is required.");
         }
-        if (processOwners.get(processId) !== sessionUserId) {
-          throw new Error("Process is not visible for this logged-in user.");
-        }
-        const result = await bridge.request("command/exec/terminate", { processId });
-        processOwners.delete(processId);
-        processSockets.delete(processId);
+        const result = await terminals.terminate(processId, sessionUserId, ws);
         send(ws, { type: "ack", requestId, ok: true, data: result });
         break;
       }

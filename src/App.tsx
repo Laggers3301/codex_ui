@@ -11795,7 +11795,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     setTerminalVisible(false);
     if (terminalCloseTimerRef.current !== null) window.clearTimeout(terminalCloseTimerRef.current);
     terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390);
-  }, content: <TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={false} onClose={() => { setTerminalVisible(false); terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390); }} /> });
+  }, content: <TerminalPanel key={terminalProjectId} closing={!terminalVisible} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={false} onClose={() => { setTerminalVisible(false); terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390); }} /> });
   for (const id of rightUtilityTabs) {
     const title = ({ remote: "远程文件", goal: "持续目标", schedules: "定时任务", outputs: "输出内容", sources: "来源", feishu: "飞书办公", resources: "主机资源", communication: "会话通信" })[id] ?? id;
     rightTabs.push({ id, title, icon: id as "remote" | "goal" | "schedules" | "outputs" | "sources" | "feishu" | "resources" | "communication", attention: id === "feishu" && feishuPendingCount > 0, onClose: () => closeUtilityWindow(id), content:

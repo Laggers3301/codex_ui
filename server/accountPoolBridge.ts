@@ -1136,7 +1136,12 @@ export class AccountPoolBridge extends EventEmitter {
       if (startingProcessId) this.processAccounts.delete(startingProcessId);
       return result;
     } catch (error) {
-      if (startingProcessId) this.processAccounts.delete(startingProcessId);
+      if (startingProcessId) {
+        // A failed/timed-out exec is not proof that the PTY exited. Terminate
+        // on its original runtime before dropping the routing information.
+        await this.invokeAccount(account, "command/exec/terminate", { processId: startingProcessId }, 10_000)
+          .then(() => this.processAccounts.delete(startingProcessId)).catch(() => {});
+      }
       if (error instanceof Error && "code" in error && ['unsupported_model_capability','memory_pressure'].includes(String(error.code))) throw error;
       account.health = "degraded";
       account.lastError = error instanceof Error ? error.message : String(error);
@@ -1313,6 +1318,7 @@ export class AccountPoolBridge extends EventEmitter {
     const processId = processIdFromParams(params);
     const processAccount = processId ? this.accountsById.get(this.processAccounts.get(processId) ?? "") : undefined;
     if (processAccount) return processAccount;
+    if (method.startsWith("command/exec/")) throw new Error("Terminal process routing is no longer available.");
     const requestedModel = typeof asRecord(params).model === "string" ? String(asRecord(params).model) : undefined;
     return this.chooseAccount(requestedModel);
   }
