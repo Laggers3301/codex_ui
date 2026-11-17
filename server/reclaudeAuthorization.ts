@@ -208,8 +208,13 @@ export class ReclaudeAuthorization {
           this.discovered = [];
         }
       }
-    } catch {
-      this.operation.phase = "failed"; this.operation.message = this.operation.action === "use" ? "客户端切换后，目标 Claude 身份尚未确认。请刷新核对当前默认组织后重试；已完成的切换或同步步骤不会回退。" : "客户端登录结束，但新的组织或 Claude 身份尚未确认，请重试。";
+    } catch (error) {
+      this.operation.phase = "failed";
+      // AppError messages are our fixed, public validation errors. Never
+      // expose execFile errors, which include the client's raw output.
+      this.operation.message = error instanceof AppError
+        ? `组织 #${this.operation.orgId} 确认失败：${error.message}`
+        : this.operation.action === "use" ? "客户端切换后，目标 Claude 身份尚未确认。请刷新核对当前默认组织后重试；已完成的切换或同步步骤不会回退。" : `客户端授权已结束，但目标组织 #${this.operation.orgId} 的 Claude 身份尚未确认，请刷新组织列表核对绑定后重试。`;
     } finally {
       delete this.operation.authorizationUrl;
       try { this.save(); } finally {

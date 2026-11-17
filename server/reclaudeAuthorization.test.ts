@@ -58,7 +58,7 @@ describe("shared ReClaude browser authorization",()=>{
     expect(JSON.stringify(f.manager.status("admin"))).not.toContain("secret-fixture");
     expect(fs.readFileSync(path.join(f.config.storageDirectory,"authorization.json"),"utf8")).not.toContain("manager-fixture");
     const calls=fs.readFileSync(path.join(f.home,"calls"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
-    expect(calls).toEqual([["logout","--org","1"],["login","--org","1"]]);
+    expect(calls).toEqual([["logout","--org","1"],["org","bind","1"]]);
     f.lifecycle.acquireRun()();
   });
   it("refuses logout while a cooperating backend has a live Claude operation",()=>{

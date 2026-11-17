@@ -34,10 +34,10 @@ test("accepts only the documented HTTPS device approval page",()=>{
   for(const url of ["javascript:alert(1)","https://reclaude.ai.evil.test/cli/auth?state=x","https://evil@reclaude.ai/cli/auth?state=x","https://reclaude.ai/api/devices?state=x","https://reclaude.ai/cli/auth?state=x&token=private","https://reclaude.ai/cli/auth"]) assert.equal(authorizationUrl(url),null);
   for(const url of ["https://www.recode.cat.evil.test/cli/auth?state=x","https://evil@www.recode.cat/cli/auth?state=x","https://www.recode.cat/api/devices?state=x","https://www.recode.cat/cli/auth?state=x&token=private"]) assert.equal(authorizationUrl(url),null);
 });
-test("runs scoped logout/login and waits for a complete URL line without leaking CLI output",async()=>{
+test("logs out and binds the explicit organization, waiting for a complete URL without leaking CLI output",async()=>{
   const options=await fixture(),events=[];
   await reauthenticate(options,event=>events.push(event));
-  assert.deepEqual((await fs.readFile(path.join(options.home,"calls"),"utf8")).trim().split("\n").map(JSON.parse),[["logout","--org","123"],["login","--org","123"]]);
+  assert.deepEqual((await fs.readFile(path.join(options.home,"calls"),"utf8")).trim().split("\n").map(JSON.parse),[["logout","--org","123"],["org","bind","123"]]);
   assert.deepEqual(events.filter(event=>event.type==="authorization"),[{type:"authorization",url:"https://reclaude.ai/cli/auth?state=fixture-complete-state"}]);
   assert.ok(!JSON.stringify(events).includes("private-fixture-key"));
 });
@@ -61,7 +61,7 @@ test("captures approval before a silent browser opener's login client exits",asy
 test("binds the same organization when logout removed the selected local binding",async()=>{
   const options=await fixture("unbound");await reauthenticate(options,()=>{});
   const calls=(await fs.readFile(path.join(options.home,"calls"),"utf8")).trim().split("\n").map(JSON.parse);
-  assert.deepEqual(calls.at(-1),["org","bind","123"]);assert.equal(calls.length,3);
+  assert.deepEqual(calls.at(-1),["org","bind","123"]);assert.equal(calls.length,2);
 });
 test("cancels and reaps the native login client",async()=>{
   const options=await fixture("hold"),controller=new AbortController();

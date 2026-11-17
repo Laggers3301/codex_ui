@@ -27,7 +27,7 @@ export async function reauthenticate({ client, home, orgId, signal, action = "re
   const captureFile = path.join(temporary, "authorization-url");
   const helper = `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(fileURLToPath(import.meta.url))} --capture-browser-file ${quote(captureFile)} "$@"\n`;
   for (const name of ["xdg-open", "open"]) await fs.writeFile(path.join(temporary, name), helper, { mode: 0o700 });
-  const env = { ...process.env, HOME: home, RECLAUDE_ORG: orgId, CLAUDE_CODE_DISABLE_WORKFLOWS: "1",
+  const env = { ...process.env, HOME: home, RECLAUDE_ORG: orgId, RECLAUDE_LANG: "en", CLAUDE_CODE_DISABLE_WORKFLOWS: "1",
     BROWSER: path.join(temporary, "xdg-open"), PATH: temporary + path.delimiter + (process.env.PATH ?? "") };
   delete env.CLAUDE_CONFIG_DIR;
   const seen = new Set();
@@ -101,11 +101,10 @@ export async function reauthenticate({ client, home, orgId, signal, action = "re
     emit({ type: "phase", phase: "logging_out" });
     const logout = await run(["logout", "--org", orgId], false);
     if (!logout.ok && !logout.missingBinding) throw new Error("logout_failed");
-    emit({ type: "phase", phase: "waiting_authorization" });
-    let login = await run(["login", "--org", orgId], true);
-    // Some CLI releases remove the local organization entry on logout. Bind
-    // that same organization via the documented device flow, never another.
-    if (!login.ok && login.missingBinding) login = await run(["org", "bind", orgId], true);
+    // Generic login can choose the account's default organization. Rebind the
+    // explicit target after logout so device approval remains scoped to it.
+    emit({ type: "phase", phase: "binding" });
+    const login = await run(["org", "bind", orgId], true);
     if (!login.ok) throw new Error("login_failed");
     emit({ type: "phase", phase: "verifying" });
   } finally { await fs.rm(temporary, { recursive: true, force: true }); }
