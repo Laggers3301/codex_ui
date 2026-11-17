@@ -320,12 +320,34 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     throw new Error(`网络请求失败 ${path}: ${detail}`);
   }
 
-  const body = await response.json().catch(() => ({}));
+  const body = await response.json().catch(() => {
+    if (response.ok && response.status !== 204 && response.status !== 205) {
+      throw new Error(`服务器响应无法解析（HTTP ${response.status}，${path.split("?")[0]}），请刷新后重试。`);
+    }
+    return {};
+  });
   if (!response.ok) {
-    const message = body.message ? `${body.error ?? "Request failed"}: ${body.message}` : body.error;
+    const error = body && typeof body === "object" ? body : {};
+    const message = error.message ? `${error.error ?? "Request failed"}: ${error.message}` : error.error;
     throw new Error(message ?? `Request failed: ${response.status}`);
   }
   return body as T;
+}
+
+async function requestThreadPage(path: string, threadId: string, options?: RequestInit): Promise<ThreadReadResponse> {
+  const body = await request<unknown>(path, { ...options, cache: "no-store" });
+  const thread = body && typeof body === "object" && "thread" in body ? body.thread : null;
+  // Check before caching or putting the page into React state. Empty turns are
+  // valid, but a missing page must never masquerade as an empty conversation.
+  if (!thread || typeof thread !== "object" || !("id" in thread)
+    || typeof thread.id !== "string" || !thread.id.trim()
+    || !("turns" in thread) || !Array.isArray(thread.turns)) {
+    throw new Error("会话内容响应不完整，请稍后重新打开会话。");
+  }
+  if (thread.id !== threadId) {
+    throw new Error("返回的会话与请求的会话不一致，请稍后重新打开会话。");
+  }
+  return body as ThreadReadResponse;
 }
 
 export function listUsers(): Promise<{ data: UserProfile[]; defaultUserId: string; lockedToLoginUser?: boolean }> {
@@ -569,7 +591,7 @@ export function readSubagentThread(projectId: string, parentThreadId: string, ag
   const params = new URLSearchParams({ limit: String(options.limit ?? 128) });
   if (options.beforeCursor) params.set("cursor", options.beforeCursor);
   else if (options.before) params.set("before", String(options.before));
-  return request(`${subagentUrl(projectId, parentThreadId)}/${encodeURIComponent(agentId)}?${params}`, { cache: "no-store", signal: options.signal });
+  return requestThreadPage(`${subagentUrl(projectId, parentThreadId)}/${encodeURIComponent(agentId)}?${params}`, agentId, { signal: options.signal });
 }
 
 export function readSubagentItemOutput(projectId: string, parentThreadId: string, agentId: string, itemId: string): Promise<{ data: { output: string } }> {
@@ -744,7 +766,7 @@ export function readThread(threadId: string, projectId?: string, options?: { bef
     params.set("limit", String(Math.min(THREAD_READ_MAX_LIMIT, Math.max(1, Math.floor(options.limit)))));
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  return request(`/api/threads/${threadId}${suffix}`);
+  return requestThreadPage(`/api/threads/${encodeURIComponent(threadId)}${suffix}`, threadId);
 }
 
 export function readThreadItemOutput(threadId: string, itemId: string, projectId?: string): Promise<{ data: { output: string; bytes: number } }> {
