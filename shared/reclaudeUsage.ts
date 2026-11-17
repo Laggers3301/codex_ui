@@ -3,7 +3,7 @@ export interface ReclaudeUsageWindow {
   percent: number;
   resetsAt: number | null;
   observedAt: number;
-  source: "response" | "reclaude-cache";
+  source: "response" | "reclaude-cache" | "native-command";
 }
 export type ReclaudeLimitCode = "claude_five_hour_limit" | "claude_weekly_limit";
 

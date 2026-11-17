@@ -57,3 +57,27 @@ it("exposes only a private local socket and does not start login for health chec
   expect(JSON.parse(reply)).toEqual({ok:true,data:{ready:true}});expect(fs.statSync(file).mode&0o777).toBe(0o600);expect(f.native.request).not.toHaveBeenCalled();
  }finally{close?.();f.cleanup();}
 });
+it("requires an explicit confirmation to retry a mismatched authorization",async()=>{
+ const f=fixture();try{
+  vi.mocked(f.host.installAuthorizedCredentials).mockRejectedValueOnce(new Error("account_mismatch"));
+  const s=await f.manager.start("a");f.native.emit("notification",{method:"account/login/completed",params:{success:true}});
+  await vi.waitFor(()=>expect(f.manager.status(s.id).error).toBe("account_mismatch"));
+  await expect(f.manager.replaceAccount(s.id,{fromAccountHash:"a".repeat(64),toAccountHash:"a".repeat(64)})).rejects.toThrow("replacement_confirmation_failed");
+  expect(f.host.installAuthorizedCredentials).toHaveBeenCalledTimes(1);
+  const confirmation={fromAccountHash:"a".repeat(64),toAccountHash:"b".repeat(64)};
+  expect((await f.manager.replaceAccount(s.id,confirmation)).status).toBe("completed");
+  expect(f.host.installAuthorizedCredentials).toHaveBeenLastCalledWith("a",path.join(f.root,s.id,"home"),{stamp:1,fingerprint:"private-fixture"},confirmation);
+  expect(f.native.request).toHaveBeenCalledTimes(1);
+ }finally{f.cleanup();}
+});
+it("recovers a mismatched staged authorization after restart without logging in again",async()=>{
+ const f=fixture();let resumed:DeviceAuthorization|undefined;
+ try{
+  vi.mocked(f.host.installAuthorizedCredentials).mockRejectedValueOnce(new Error("account_mismatch"));
+  const s=await f.manager.start("a");f.native.emit("notification",{method:"account/login/completed",params:{success:true}});
+  await vi.waitFor(()=>expect(f.manager.status(s.id).status).toBe("failed"));f.manager.close();
+  resumed=new DeviceAuthorization(f.host,f.root);
+  expect((await resumed.replaceAccount(s.id,{fromAccountHash:"a".repeat(64),toAccountHash:"b".repeat(64)})).status).toBe("completed");
+  expect(f.native.request).toHaveBeenCalledTimes(1);
+ }finally{resumed?.close();f.cleanup();}
+});

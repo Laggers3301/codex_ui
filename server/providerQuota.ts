@@ -98,7 +98,7 @@ export class ProviderQuotaCache {
 }
 
 export function registerProviderQuotaRoutes(app: FastifyInstance, authorize: (request: { headers: Record<string, unknown> }) => unknown, cache?: ProviderQuotaCache) {
-  const cli = process.env.CODEX_WEB_ARKCLI_BIN || "arkcli";
+  const cli = process.env.CODEX_WEB_ARKCLI_BIN || path.resolve(process.cwd(), "../../scratch/volc-coding-quota/arkcli");
   const quota = cache ?? new ProviderQuotaCache(async () => {
     const { stdout } = await exec(cli, ["usage", "plan", "--product", "coding-plan", "--format", "json"], { timeout: 30_000, maxBuffer: 1024 * 1024, windowsHide: true });
     return JSON.parse(stdout);

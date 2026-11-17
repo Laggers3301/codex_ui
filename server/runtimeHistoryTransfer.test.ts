@@ -15,6 +15,7 @@ import { createInterface } from "node:readline";
 import {prepareMigratedContext} from './claudeContextPreparation.js';
 import {execFile as runFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {displayTransfer,readMigrationDisplay,displayPath} from './migrationDisplay.js';
 
 const paths=vi.hoisted(()=>new Map<string,string>());
 vi.mock("./threadFallback.js",async(importOriginal)=>({...await importOriginal<typeof import("./threadFallback.js")>(),findThreadJsonlPathById:async(id:string)=>paths.get(id)??null}));
@@ -52,11 +53,136 @@ function fixture(){
     {type:"assistant",uuid:b,parentUuid:a,sessionId:native,cwd,message:{role:"assistant",content:[{type:"text",text:"已记录 TRANSFER-5520"},{type:"tool_use",id:"t1",name:"Bash",input:{command:"echo old"}}]}}].map(row=>JSON.stringify(row)).join("\n")+"\n");
   const binding=service.bindings.resolve("admin","reclaude-sonnet@1");
   service.storage.save({id,nativeSessionId:native,userId:"admin",projectId:project.id,cwd,name:"source",model:"reclaude-sonnet@1",orgId:"1",accountKey:binding.accountKey,configRoot:root,initialized:true,archived:false,createdAt:1,updatedAt:1});
+  service.storage.saveTurn(id,{id:randomUUID(),nativeMessageId:b,nativeSessionId:native,status:'completed',items:[{id:'fixture-user',type:'userMessage',content:[{type:'text',text:'记住 TRANSFER-5520'}]},{id:'fixture-answer',type:'agentMessage',text:'已记录 TRANSFER-5520'},{id:'fixture-tool',type:'dynamicToolCall',tool:'Bash',arguments:{command:'echo old'},status:'completed',output:'done'}]});
   store.registerThreadOwner({threadId:id,userId:"admin",projectId:project.id,rootPath:cwd,model:"reclaude-sonnet@1",reasoningEffort:"medium"});
   return{home,cwd,root,store,project,service,transfers,bridge,request,id,native,file,summaries,
     migrate:(source=id,model="gpt-6.1-sol",operationId=randomUUID())=>transfers.migrate({sourceThreadId:source,userId:"admin",projectId:project.id,targetModel:model,operationId})as Promise<any>};
 }
 describe("bidirectional runtime history transfer",()=>{
+  it('copies a multi-page generated history with byte-bounded batches, buffered writes and exact role/order parity',async()=>{
+    const f=fixture(),first=await f.migrate(),file=paths.get(first.threadId)!;
+    const fd=fs.openSync(file,'a');
+    try{for(let i=0;i<1500;i++){
+      const role=i%2?'assistant':'user';
+      fs.writeSync(fd,JSON.stringify({type:'turn_context',payload:{turn_id:`generated-${Math.floor(i/2)}`}})+'\n'+JSON.stringify({type:'response_item',payload:{type:'message',id:`message-${i}`,role,content:[{type:role==='user'?'input_text':'output_text',text:`${i}:`+'x'.repeat(4096)}]}})+'\n');
+    }}finally{fs.closeSync(fd);}
+    const writes=vi.spyOn(fs,'writeFileSync'),prepare=vi.spyOn(f.service.storage.db,'prepare'),started=performance.now();
+    const phases:Record<string,number>={};
+    for(const name of ['snapshot','captureDisplay','importClaude']){const original=(f.transfers as any)[name].bind(f.transfers);vi.spyOn(f.transfers as any,name).mockImplementation(async(...args:any[])=>{const at=performance.now();try{return await original(...args);}finally{phases[name]=(phases[name]??0)+Math.round(performance.now()-at);}});}
+    const result=await f.migrate(first.threadId,'reclaude-sonnet@1');
+    const milliseconds=Math.round(performance.now()-started);
+    expect(result.messageCount).toBeGreaterThanOrEqual(1500);
+    expect(writes.mock.calls.filter(([target])=>typeof target==='number').length).toBeLessThan(result.messageCount/2);
+    expect(prepare.mock.calls.filter(([sql])=>sql.startsWith('SELECT seq,body FROM runtime_transfer_items')).length).toBe(1);
+    const native=locateClaudeHistory(f.service.storage.get(result.threadId)!.nativeSessionId,[f.root])!;
+    const expected=f.service.storage.db.prepare('SELECT body FROM runtime_transfer_items WHERE transfer_id=? ORDER BY seq').iterate(result.operationId);
+    const lines=createInterface({input:fs.createReadStream(native),crlfDelay:Infinity});let checked=0,parent:string|null=null;
+    try{for await(const line of lines){if(!line.trim())continue;const actual=JSON.parse(line),next=expected.next();expect(next.done).toBe(false);const message=JSON.parse(String(next.value!.body));expect(actual.type).toBe(message.role);expect(actual.message.content[0].text).toBe(message.text);expect(actual.parentUuid).toBe(parent);parent=actual.uuid;checked++;}}finally{lines.close();expected.return?.();}
+    expect(checked).toBe(result.messageCount);expect(f.service.storage.turnCount(result.threadId)).toBe(checked);
+    expect(f.request.mock.calls.some(([method])=>method==='turn/start')).toBe(false);
+    console.log(JSON.stringify({check:'generated-offline-long-branch',messages:checked,ms:milliseconds,phases,modelRequests:0,productionWrites:0}));
+  },30000);
+  it('runs one background operation, exposes owned progress and returns the existing result on retry',async()=>{
+    const f=fixture(),original=f.request.getMockImplementation()!;
+    let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+    f.request.mockImplementation(async(method,p)=>{if(method==='thread/inject_items')await gate;return original(method,p);});
+    const input={operationId:randomUUID(),sourceThreadId:f.id,userId:'admin',projectId:f.project.id,targetModel:'gpt-6.1-sol'};
+    await f.transfers.startBackground(input);
+    await vi.waitFor(()=>expect(f.transfers.status(input.operationId,'admin',f.project.id,f.id)?.phase).toBe('importing'));
+    expect(f.transfers.status(input.operationId,'other',f.project.id,f.id)).toBeNull();
+    expect(f.transfers.status(input.operationId,'admin','wrong-project',f.id)).toBeNull();
+    expect(f.transfers.status(input.operationId,'admin',f.project.id,'wrong-source')).toBeNull();
+    const same=f.transfers.migrate(input);release();const result=await same as {threadId:string;messageCount:number};
+    expect(f.transfers.status(input.operationId,'admin',f.project.id,f.id)).toMatchObject({phase:'completed',targetThreadId:result.threadId,importedMessages:result.messageCount});
+    expect((await f.transfers.migrate(input) as {threadId:string}).threadId).toBe(result.threadId);
+    expect(f.request.mock.calls.filter(([method])=>method==='thread/start')).toHaveLength(1);
+    expect(f.request.mock.calls.some(([method])=>method==='turn/start')).toBe(false);
+  });
+  it('opens an imported history from frozen display metadata without parsing discarded prompt bodies',async()=>{
+    const f=fixture(),first=await f.migrate(),back=await f.migrate(first.threadId,'reclaude-sonnet@1');
+    const transfer=displayTransfer(f.service.storage,back.threadId,'admin')!;
+    expect(transfer.importedBoundaryRowid).toBeGreaterThan(0);
+    const prepare=vi.spyOn(f.service.storage.db,'prepare');
+    const page=await f.service.readHistory(back.threadId,0,5);
+    expect(page.thread.turns.length).toBeGreaterThan(0);
+    expect(prepare.mock.calls.some(([sql])=>sql.includes("json_array_length(body,'$.items')"))).toBe(false);
+    const nativeTurn=randomUUID();f.service.storage.saveTurn(back.threadId,{id:nativeTurn,status:'completed',items:[{id:'new-text',type:'agentMessage',text:'New native continuation'}]});
+    const own=await f.service.readHistory(back.threadId,0,5);
+    expect(own.thread.turns.some((turn:any)=>turn.id===nativeTurn)).toBe(true);
+  });
+  it('migrates an arbitrary owned source into an explicitly shared device without a PP marker',async()=>{
+    const f=fixture(),source=await f.migrate();
+    const root=path.join(f.home,'.rec/claude/accounts/33/config');fs.mkdirSync(root,{recursive:true});
+    fs.writeFileSync(path.join(root,'../device.json'),JSON.stringify({sk:'fixture-only',org_id:3}));
+    fs.writeFileSync(path.join(root,'.claude.json'),JSON.stringify({oauthAccount:{accountUuid:'shared-fixture'}}));
+    f.service.config.users!.admin.orgIds.push('3');
+    f.service.config.sharedAccounts=[{orgId:'3',home:f.home,label:'rec max'}];
+    // The default and explicit location must not point at the same fixture device.
+    f.service.config.home=path.join(f.home,'empty-default-home');
+    const child=await f.migrate(source.threadId,'reclaude-opus@3');
+    expect(f.service.storage.get(child.threadId)?.privateSourceThreadId).toBeUndefined();
+    expect(f.service.storage.get(child.threadId)?.userId).toBe('admin');
+    expect(f.service.storage.get(f.id)?.nativeSessionId).toBe(f.native);
+  });
+  it('restricts a private device to one source and preserves that scope on its continuation',async()=>{
+    const f=fixture(),source=await f.migrate();
+    const root=path.join(f.home,'.rec/claude/accounts/33/config');fs.mkdirSync(root,{recursive:true});
+    fs.writeFileSync(path.join(root,'../device.json'),JSON.stringify({sk:'fixture-only',org_id:3}));
+    fs.writeFileSync(path.join(root,'.claude.json'),JSON.stringify({oauthAccount:{accountUuid:'private-fixture'}}));
+    const account={userId:'admin',orgId:'3',sourceThreadId:'wrong-source',home:f.home,label:'PP only'};
+    f.service.config.privateAccounts=[account];
+    await expect(f.migrate(source.threadId,'reclaude-opus@3')).rejects.toThrow(/指定用户/);
+    account.sourceThreadId=source.threadId;
+    const child=await f.migrate(source.threadId,'reclaude-opus@3');
+    expect(f.service.storage.get(child.threadId)?.privateSourceThreadId).toBe(source.threadId);
+    await expect(f.migrate(source.threadId,'reclaude-opus@3')).rejects.toThrow(/已有/);
+    expect(f.service.storage.get(f.id)?.nativeSessionId).toBe(f.native);
+  });
+  it('keeps typed roles, tool IO, order and pagination across Claude→Codex→Claude, without replaying tools',async()=>{
+    const f=fixture(),turn=f.service.storage.db.prepare('SELECT id FROM turns WHERE thread_id=?').get(f.id)!;
+    f.service.storage.saveTurn(f.id,{id:turn.id,status:'completed',nativeMessageId:JSON.parse(fs.readFileSync(f.file,'utf8').trim().split('\n')[1]).uuid,nativeSessionId:f.native,items:[
+      {id:'real-user',type:'userMessage',content:[{type:'text',text:'用户问题\n第二行'}]},
+      {id:'intro',type:'agentMessage',text:'工具前的正文'},
+      {id:'call',type:'dynamicToolCall',tool:'Read',arguments:{file_path:'/fixture'},status:'completed',output:'结果\n第二行'},
+      {id:'answer',type:'agentMessage',text:'工具后的回答'}]});
+    const child=await f.migrate(),transfer=displayTransfer(f.service.storage,child.threadId,'admin')!;
+    const collect=async()=>{const items:any[]=[];let before=0;for(let i=0;i<12;i++){const p=await readMigrationDisplay(f.service.storage,transfer,{id:child.threadId},before,1,paths.get(child.threadId)!);items.unshift(...p!.thread.turns.flatMap((t:any)=>t.items));if(!p!.history.hasOlder)break;before=p!.history.nextBefore;}return items;};
+    const items=await collect();expect(items.map(i=>i.type)).toEqual(['userMessage','agentMessage','dynamicToolCall','agentMessage']);
+    expect(items[0].content[0].text).toBe('用户问题\n第二行');expect(items[2].arguments).toEqual({file_path:'/fixture'});expect(items[2].output).toBe('结果\n第二行');
+    expect(JSON.stringify(items)).not.toContain('[历史工具调用');
+    // Repair an existing target via a new display sidecar, not a new branch.
+    fs.unlinkSync(displayPath(f.service.storage,transfer.id));const sourceReads=vi.spyOn(f.service,'readHistory');
+    await Promise.all([f.transfers.restoreDisplay(child.threadId,'admin'),f.transfers.restoreDisplay(child.threadId,'admin')]);expect(sourceReads).toHaveBeenCalledTimes(1);
+    expect((await collect()).map(i=>i.id)).toEqual(items.map(i=>i.id));
+    const back=await f.migrate(child.threadId,'reclaude-sonnet@1');
+    const page=await f.service.readHistory(back.threadId,0,100),backItems=page.thread.turns.flatMap((t:any)=>t.items);
+    expect(backItems.map((i:any)=>i.type)).toEqual(items.map(i=>i.type));expect(backItems.map((i:any)=>i.id)).toEqual(items.map(i=>i.id));
+    fs.appendFileSync(paths.get(child.threadId)!,[
+      {type:'turn_context',payload:{turn_id:'fresh-turn'}},
+      {type:'response_item',payload:{id:'fresh-user',type:'message',role:'user',content:[{type:'input_text',text:'分支后的新问题'}]}},
+      {type:'response_item',payload:{id:'fresh-answer',type:'message',role:'assistant',content:[{type:'output_text',text:'新的回答'}]}}
+    ].map(r=>JSON.stringify(r)+'\n').join(''));
+    const latest=await readMigrationDisplay(f.service.storage,transfer,{id:child.threadId},0,100,paths.get(child.threadId)!);
+    expect(latest!.thread.turns.flatMap((t:any)=>t.items).map((i:any)=>i.id)).toEqual(['fresh-user','fresh-answer']);
+    expect(latest!.history.nextBefore).toBe(2);expect(latest!.history.hasOlder).toBe(true);
+    const older=await readMigrationDisplay(f.service.storage,transfer,{id:child.threadId},2,100,paths.get(child.threadId)!);
+    expect(older!.thread.turns.flatMap((t:any)=>t.items).map((i:any)=>i.id)).toEqual(items.map(i=>i.id));
+    expect(f.request.mock.calls.some(([method])=>method==='turn/start')).toBe(false);
+  });
+  it('recovers legacy child checkpoints from owned main-stream identities without future or child messages',async()=>{
+    const f=fixture(),rows=fs.readFileSync(f.file,'utf8').trim().split('\n').map(l=>JSON.parse(l));
+    rows[1].message.id='owned-main-message';
+    rows.push({type:'assistant',uuid:randomUUID(),sessionId:f.native,message:{id:'later-message',role:'assistant',content:[{type:'text',text:'DO-NOT-INCLUDE-FUTURE'}]}});
+    fs.writeFileSync(f.file,rows.map(r=>JSON.stringify(r)).join('\n')+'\n');const original=fs.readFileSync(f.file);
+    const turn={id:'legacy-child-cutoff',status:'interrupted',nativeMessageId:'child-only-uuid',nativeSessionId:f.native,items:[{id:'claude-message::owned-main-message:0',type:'agentMessage',text:'已记录 TRANSFER-5520'},{id:'claude-message:parent-tool:later-message:0',parentToolUseId:'parent-tool',type:'agentMessage',text:'子代理'}]};
+    f.service.storage.saveTurn(f.id,turn);
+    const input={operationId:randomUUID(),sourceThreadId:f.id,userId:'admin',projectId:f.project.id,targetModel:'gpt-6.1-sol',sourceTurnId:turn.id};
+    const child=await f.transfers.migrate(input) as any;
+    expect(child.messageCount).toBe(2);expect(fs.readFileSync(paths.get(child.threadId)!,'utf8')).not.toContain('DO-NOT-INCLUDE-FUTURE');
+    expect(fs.readFileSync(f.file)).toEqual(original);
+    f.service.storage.saveTurn(f.id,{...turn,id:'child-only',items:turn.items.slice(1)});
+    await expect(f.transfers.migrate({...input,operationId:randomUUID(),sourceTurnId:'child-only'})).rejects.toMatchObject({code:'migration_cutoff_missing'});
+  });
   it.skipIf(!process.env.TRANSFER_NATIVE_CODEX)('round-trips through a real isolated Codex app-server and Claude filesystem SDK without model requests',async()=>{
     const f=fixture(),nativeHome=path.join(f.home,'native-codex');fs.mkdirSync(nativeHome);
     const native=new NativeCodexBridge({command:process.env.TRANSFER_NATIVE_CODEX!,args:['app-server','--listen','stdio://'],env:{HOME:f.home,CODEX_HOME:nativeHome,PATH:process.env.PATH}});

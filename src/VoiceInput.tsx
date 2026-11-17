@@ -5,7 +5,7 @@ import { startVoiceAmbient, VOICE_AMBIENT_EVENT } from "./ambient/voiceAmbient";
 import "./voiceInput.css";
 
 /** The parent keys this component by user/thread, preventing cross-thread dictation. */
-export const VoiceInput = memo(function VoiceInput({ onText }: { onText: (text: string) => void }) {
+export const VoiceInput = memo(function VoiceInput({ onText, mobile = false }: { onText: (text: string) => void; mobile?: boolean }) {
   const [phase, setPhase] = useState<"idle" | "permission" | "recording" | "converting">("idle");
   const [error, setError] = useState("");
   const [seconds, setSeconds] = useState(0);
@@ -134,8 +134,8 @@ export const VoiceInput = memo(function VoiceInput({ onText }: { onText: (text: 
       current.current = null; setPhase("idle"); setError(caught instanceof DOMException && caught.name === "NotAllowedError" ? "请在 Safari 的本网站设置中允许麦克风，然后重新录音" : "无法打开麦克风，请检查设备是否被占用");
     }
   }
-  return <div ref={voiceRoot} className="voiceInput">
-    <button type="button" className={`iconButton voiceButton ${phase}`} aria-label={phase === "recording" ? "结束录音并转成文字" : "语音输入"}
+  return <div ref={voiceRoot} className={mobile ? "mobileUiVoiceInput" : "voiceInput"}>
+    <button type="button" className={`${mobile ? "mobileUiVoiceButton" : "iconButton voiceButton"} ${phase}`} aria-label={phase === "recording" ? "结束录音并转成文字" : "语音输入"}
       title="点击开始／结束录音；按住录音，上滑取消（最长 10 分钟）" disabled={phase === "converting" || phase === "permission"}
       onPointerDown={event => {
         if (phase !== "idle") return;
@@ -165,7 +165,7 @@ export const VoiceInput = memo(function VoiceInput({ onText }: { onText: (text: 
       }}
       onPointerCancel={() => { const p = pointer.current; pointer.current = null; suppressClick.current = false; window.clearTimeout(p?.timer); if (p?.held && current.current?.recorder?.state === "recording") stop(true); setCancelHint(false); }}
       onClick={() => { if (suppressClick.current) { suppressClick.current = false; return; } if (phase === "recording") stop(); else if (phase === "idle") void start(); }}>
-      {phase === "converting" || phase === "permission" ? <LoaderCircle size={18} className="voiceSpinner" /> : <Mic size={18} />}
+      {phase === "converting" || phase === "permission" ? <LoaderCircle size={mobile ? 20 : 18} className="voiceSpinner" /> : <Mic size={mobile ? 20 : 18} />}
     </button>
     {noticePresent ? <div className={`voiceNotice${noticeOpen ? "" : " closing"}`} role="status" inert={!noticeOpen}>
       <span>{notice}</span>

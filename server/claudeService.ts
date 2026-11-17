@@ -20,6 +20,7 @@ import type { ReclaudeUsageStatus } from "../shared/reclaudeUsage.js";
 import { ReclaudeLifecycle } from "./reclaudeLifecycle.js";
 import { ReclaudeAuthorization } from "./reclaudeAuthorization.js";
 import { migratedHistoryPresentation,migratedHistoryItem } from "./migratedHistoryPresentation.js";
+import {displayTransfer,displayPath} from './migrationDisplay.js';
 import {prepareMigratedContext} from './claudeContextPreparation.js';
 import { prepareClaudeForkHistory } from "./claudeForkHistory.js";
 import {ClaudeContextUsageStore,claudeContextStatus} from './claudeContextUsage.js';
@@ -29,6 +30,10 @@ import {claudeWebMcp,claudeSkills,claudeInput,claudeOfficeText} from './claudeHa
 import {claudeVisibleItems} from './claudeStreamAdapter.js';
 import {claudeForkCutoff} from './claudeSubagents.js';
 import {overlayJournal} from './timelineJournal.js';
+import {importedTurnBoundary} from './migrationDisplay.js';
+import {readNativeClaudeUsage} from './claudeNativeUsage.js';
+import type {ConversationTasksResponse} from '../shared/conversationTasks.js';
+import { assertHistoryHeapHeadroom } from './historyReadScheduler.js';
 
 type RecordValue = Record<string, any>;
 const object = (v: unknown): RecordValue => v && typeof v === "object" && !Array.isArray(v) ? v as RecordValue : {};
@@ -59,6 +64,7 @@ export class ClaudeService {
   readonly lifecycle: ReclaudeLifecycle;
   readonly authorization: ReclaudeAuthorization;
   private usageTimer?: ReturnType<typeof setInterval>;
+  private nativeUsageChecks=new Map<string,{nextAt:number;pending?:Promise<void>;error?:string}>();
   private busy = new Set<string>();
   private active = new Map<string, ClaudeRuntime>();
   private runtimeLeases = new Map<string, () => void>();
@@ -88,7 +94,7 @@ export class ClaudeService {
     // A backend restart never repeats an uncertain model invocation.
     this.storage.interruptUnfinishedTurns();
   }
-  owns(id: string): boolean { return !!this.storage.get(id); }
+  owns(id: string): boolean { return this.storage.has(id); }
   private refreshUsageCache() {
     if (!this.config.usageCacheFile) return;
     const users = this.config.sharedUsers
@@ -98,9 +104,24 @@ export class ClaudeService {
       users.flatMap(user => this.bindings.list(user)));
   }
   usageStatus(userId: string): ReclaudeUsageStatus {
-    return { thresholdPercent: 99, accounts: this.bindings.list(userId).map(binding => this.usage.status(binding)),
+    const visible=this.bindings.visibleBindings(userId);
+    const error=visible.map(b=>this.nativeUsageChecks.get(b.accountKey)?.error).find(Boolean)??this.usage.cacheError;
+    return { thresholdPercent: 99, accounts: visible.map(binding => this.usage.status(binding)),
       creations: this.storage.quota(), monitoring: this.config.usageCacheFile ? "response-events-and-cache" : "response-events",
-      ...(this.usage.cacheError ? {cacheError:this.usage.cacheError} : {}) };
+      ...(error ? {cacheError:error} : {}) };
+  }
+  async refreshNativeUsage(userId:string):Promise<void>{
+    await Promise.all(this.bindings.visibleBindings(userId).filter(b=>b.privateHome&&b.nativeUsageEnabled).map(async binding=>{
+      const previous=this.nativeUsageChecks.get(binding.accountKey);
+      if(previous?.pending)return previous.pending;
+      if(previous&&Date.now()<previous.nextAt)return;
+      const state={nextAt:Date.now()+5*60_000,pending:undefined as Promise<void>|undefined,error:undefined as string|undefined};
+      this.nativeUsageChecks.set(binding.accountKey,state);
+      state.pending=readNativeClaudeUsage(binding).then(text=>{
+        if(!this.closed)this.usage.observeNativeUsage(binding.accountKey,text);
+      }).catch(()=>{state.nextAt=Date.now()+60_000;state.error='原生 Claude 额度查询暂时失败，保留已有数据；稍后重试，无需重新登录。';}).finally(()=>{state.pending=undefined;});
+      await state.pending;
+    }));
   }
   profiles(userId: string) {
     const bindings=new Map(this.bindings.list(userId).map(b=>[b.orgId,b]));
@@ -155,7 +176,7 @@ export class ClaudeService {
   }
   summary(row: ClaudeConversation): RecordValue {
     return { id: row.id, name: row.name, preview: row.name, cwd: row.cwd, model: row.model, modelProvider: "reclaude",
-      runtime: "claude-code", configuredModel: row.model, configuredReasoningEffort: this.store.getThreadOwner(row.id)?.reasoningEffortOverride??"medium",
+      runtime: "claude-code", configuredModel: this.bindings.effectiveModel(row.userId,row.model), configuredReasoningEffort: this.store.getThreadOwner(row.id)?.reasoningEffortOverride??"medium",
       runtimeCapabilities:row.runtimeCapabilities??null,
       runtimeFeatures:{browser:true,mcp:true,skills:true,attachments:true,historyRecall:true,manualCompact:true,steer:true,goals:false,fast:false},
       collaborationMode: row.collaborationMode ?? "default",
@@ -163,6 +184,17 @@ export class ClaudeService {
       status: { type: this.active.has(row.id) ? "active" : "idle" }, turns: [], archived: row.archived };
   }
   list(userId: string, projectId: string) { return this.storage.list(userId, projectId).map(row => this.summary(row)); }
+  tasks(userId:string,id:string):ConversationTasksResponse {
+    const row=this.row(id);
+    if(row.userId!==userId)throw new AppError('runtime_forbidden','无法读取其他用户的任务。');
+    return {supported:true,data:(row.nativeTasks??[]).filter(task=>task.kind==='agent'||task.background||task.wasBackground).map(task=>({
+      id:task.id,kind:task.kind??'unknown',description:task.description,
+      status:task.status==='running'&&!this.active.has(id)?'unknown':task.status,background:task.background,
+      ...(task.parentTaskId?{parentTaskId:task.parentTaskId}:{}),...(task.subagentType?{subagentType:task.subagentType}:{}),
+      ...(task.summary?{summary:task.summary}:{}),...(task.lastToolName?{lastToolName:task.lastToolName}:{}),
+      ...(task.updatedAt?{updatedAt:task.updatedAt}:{}),...(task.usage?{usage:task.usage}:{})
+    }))};
+  }
   toolArchive(userId: string, threadId: string) {
     const row = this.row(threadId), archive = row.toolOutputArchive;
     if (row.userId !== userId) throw new AppError("runtime_forbidden", "无法读取其他用户的工具结果附件。");
@@ -192,11 +224,23 @@ export class ClaudeService {
   }
   async readHistory(id:string,before=0,limit=50,cursor?:string){
     const row=this.row(id);
+    assertHistoryHeapHeadroom(MAX_FULL_HISTORY_BYTES);
     const activityCursor=cursor?.match(/^claude-activity:([a-f0-9-]{36}):(\d+)$/i);
     const itemCursor=cursor?.match(/^claude-items:([a-f0-9-]{36}):(\d+)$/i),cursorMatch=activityCursor??itemCursor;
     if(cursor&&!cursorMatch)throw new AppError('invalid_cursor','历史分页位置无效，请重新打开会话。');
     const columns="rowid,id,created_at,length(CAST(body AS BLOB)) AS bytes,json_array_length(body,'$.items') AS item_count,json_extract(body,'$.status') AS status,json_extract(body,'$.items[0]') AS user_item";
-    const current=cursorMatch?this.storage.db.prepare(`SELECT ${columns} FROM turns WHERE thread_id=? AND id=?`).get(row.id,cursorMatch[1]):this.storage.db.prepare(`SELECT ${columns} FROM turns WHERE thread_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1 OFFSET ?`).get(row.id,Math.max(0,before));
+    // Locate the turn with small index metadata first. Imported prompt bodies
+    // are not the typed UI history and must not be JSON-decoded just to discard
+    // them, especially during the first open of a long cross-runtime branch.
+    let currentMeta=cursorMatch?this.storage.db.prepare('SELECT rowid,id,created_at FROM turns WHERE thread_id=? AND id=?').get(row.id,cursorMatch[1]):this.storage.db.prepare('SELECT rowid,id,created_at FROM turns WHERE thread_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1 OFFSET ?').get(row.id,Math.max(0,before));
+    const migration=displayTransfer(this.storage,row.id,row.userId);
+    if(currentMeta&&!cursorMatch&&migration?.sourceRuntime==='codex'&&fs.existsSync(displayPath(this.storage,migration.id))){
+      const imported=importedTurnBoundary(this.storage,migration);
+      if(imported!==null&&Number(currentMeta.rowid)<=imported)currentMeta=undefined;
+    }
+    // Without a cursor the current turn was selected by ORDER BY created_at DESC,rowid DESC OFFSET before,
+    // so the number of newer turns is exactly `before`; counting them again scanned tens of thousands of index entries.
+    const current=currentMeta?this.storage.db.prepare(`SELECT ${columns} FROM turns WHERE thread_id=? AND id=?`).get(row.id,currentMeta.id):undefined;
     if(cursorMatch&&!current)throw new AppError('invalid_cursor','历史分页不属于当前会话。');
     if(current&&current.status!=='inProgress'&&!activityCursor&&(itemCursor||Number(current.bytes)>MAX_FULL_HISTORY_BYTES||Number(current.item_count)>Math.max(1,limit))){
       const boundary=itemCursor?Number(itemCursor[2]):Number.MAX_SAFE_INTEGER;
@@ -206,7 +250,7 @@ export class ClaudeService {
       const header=JSON.parse(String(metadata!.header)),userItem=current.user_item?JSON.parse(String(current.user_item)):null;
       const entries=[...(userItem?.type==='userMessage'?[userItem]:[]),...page.items];
       const items=claudeVisibleItems([...new Map(entries.map(item=>[item.id,item])).values()]);
-      const position=Number(this.storage.db.prepare('SELECT COUNT(*) AS n FROM turns WHERE thread_id=? AND (created_at>? OR (created_at=? AND rowid>?))').get(row.id,current.created_at,current.created_at,current.rowid)?.n??0),next=position+1,total=this.count(row);
+      const position=cursorMatch?Number(this.storage.db.prepare('SELECT COUNT(*) AS n FROM turns WHERE thread_id=? AND (created_at>? OR (created_at=? AND rowid>?))').get(row.id,current.created_at,current.created_at,current.rowid)?.n??0):Math.max(0,before),next=position+1,total=this.count(row);
       return {thread:{...this.summary(row),turns:[{...header,items}]},history:{totalItems:total,returnedItems:1,before,nextBefore:next,hasOlder:page.nextIndex!==null||next<total,nextCursor:page.nextIndex!==null?`claude-items:${current.id}:${page.nextIndex}`:null}};
     }
     if(current&&(current.status==='inProgress'||activityCursor)){
@@ -214,7 +258,7 @@ export class ClaudeService {
       if(!Number.isSafeInteger(boundary)||boundary<1)throw new AppError('invalid_cursor','历史分页位置无效。');
       const page=this.store.readTimelinePreviewPage(row.id,String(current.id),boundary,limit);
       const userItem=current.user_item?JSON.parse(String(current.user_item)):null;
-      const position=Number(this.storage.db.prepare('SELECT COUNT(*) AS n FROM turns WHERE thread_id=? AND (created_at>? OR (created_at=? AND rowid>?))').get(row.id,current.created_at,current.created_at,current.rowid)?.n??0);
+      const position=cursorMatch?Number(this.storage.db.prepare('SELECT COUNT(*) AS n FROM turns WHERE thread_id=? AND (created_at>? OR (created_at=? AND rowid>?))').get(row.id,current.created_at,current.created_at,current.rowid)?.n??0):Math.max(0,before);
       const total=this.count(row),next=position+1;
       return {thread:{...this.summary(row),turns:[{id:String(current.id),status:current.status,items:claudeVisibleItems([...(userItem?[userItem]:[]),...page.items])}]},history:{totalItems:total,returnedItems:1,before,nextBefore:next,hasOlder:page.nextRowid!==null||next<total,nextCursor:page.nextRowid!==null?`claude-activity:${current.id}:${page.nextRowid}`:null}};
     }
@@ -248,6 +292,7 @@ export class ClaudeService {
     row.historyArchive = path.join(this.config.storageDirectory, "archive", row.nativeSessionId, hashClaudeHistory(source), `${row.nativeSessionId}.jsonl`);
   }
   private async branchNative(row: ClaudeConversation, binding: ClaudeBinding, cwd: string, title: string, cutoff?: string, accountSwitch = false) {
+    if(binding.restrictedSourceThreadId&&(!accountSwitch||row.privateSourceThreadId!==binding.restrictedSourceThreadId||row.userId!==binding.userId))throw new AppError('runtime_forbidden','PP专用设备不允许创建其他分支或切入其他会话。');
     const source = this.source(row);
     const sourceDigest = hashClaudeHistory(source);
     const key = accountSwitch ? createHash("sha256").update(JSON.stringify([row.id,row.userId,row.nativeSessionId,binding.orgId,binding.accountKey,cwd])).digest("hex") : randomUUID();
@@ -287,6 +332,7 @@ export class ClaudeService {
     this.refreshUsageCache();
     this.usage.assertAvailable(this.bindings.resolve(row.userId, model));
     const binding = await this.bindings.refresh(row.userId, model);
+    if(binding.restrictedSourceThreadId&&row.privateSourceThreadId!==binding.restrictedSourceThreadId)throw new AppError('runtime_forbidden','专用设备仅允许已授权的PP接续分支。');
     this.usage.assertAvailable(binding);
     this.assertCwd(binding, row.cwd);
     if (row.orgId===binding.orgId && row.accountKey===binding.accountKey && (!row.parentSessionId || row.contextHandoff?.rebuildFromNative)) await prepareMigratedContext(this.storage,row,claudeConfigRoots(this.config.home));
@@ -328,6 +374,7 @@ export class ClaudeService {
       const model = this.bindings.effectiveModel(userId, p.model);
       this.refreshUsageCache(); this.usage.assertAvailable(this.bindings.resolve(userId, model));
       const binding = await this.bindings.refresh(userId, model); this.assertCwd(binding, project.rootPath);
+      if(binding.restrictedSourceThreadId)throw new AppError('runtime_forbidden','专用账号仅可由指定PP原会话迁入，不能新建其他会话。');
       this.usage.assertAvailable(binding);
       const row: ClaudeConversation = { id: randomUUID(), nativeSessionId: randomUUID(), userId, projectId: project.id, cwd: project.rootPath,
         name: "新 Claude 会话", model, orgId: binding.orgId, accountKey: binding.accountKey, configRoot: binding.configRoot,
@@ -391,7 +438,7 @@ export class ClaudeService {
       const branchTime=Date.now();
       const fork = await this.branchNative(forkSource, binding, project.rootPath, branchName, cutoff), nativeSessionId = fork.nativeId;
       const child: ClaudeConversation = { ...row, id: randomUUID(), nativeSessionId, parentSessionId: row.nativeSessionId,
-        parentThreadId: row.id, inheritedTurnCount, initialized: true, model, orgId: binding.orgId, accountKey: binding.accountKey,
+        parentThreadId: row.id, inheritedTurnCount, nativeTasks: undefined, initialized: true, model, orgId: binding.orgId, accountKey: binding.accountKey,
         configRoot: binding.configRoot, projectId: project.id, cwd: project.rootPath, name: branchName, createdAt: Date.now(), updatedAt: Date.now(),
         ...(fork.toolOutputArchive ? {toolOutputArchive:fork.toolOutputArchive} : {}) };
       if(forkSource!==row&&row.contextHandoff)child.contextHandoff={...row.contextHandoff,rebuildFromNative:true};
@@ -484,6 +531,7 @@ export class ClaudeService {
         await runtime.runTurn({ userId: row.userId, threadId: row.id, turnId, cwd: row.cwd, model: row.model, prompt,
           sandbox:execution.sandbox,approvalPolicy:execution.approvalPolicy,
           collaborationMode:row.collaborationMode,
+          ...(binding.restrictedSourceThreadId?{privateSourceThreadId:row.privateSourceThreadId}:{}),
           historyReader:createClaudeHistoryReader(this.storage,row),
           mcpServers:claudeWebMcp(browserMcpForThread(row.id)),content:nativeInput.content,
           documentReader:(file,offset)=>claudeOfficeText(file,row.userId,row.cwd,offset),
@@ -497,7 +545,11 @@ export class ClaudeService {
       }));
       return { turn };
     });
-    if (method === "turn/interrupt") { this.active.get(row.id)?.interrupt(row.userId, row.id); return {}; }
+    if (method === "turn/interrupt") {
+      this.active.get(row.id)?.interrupt(row.userId, row.id,
+        new AppError('user_stopped', '已停止本轮回答。', '用户主动停止；已生成的内容保留，未确认的工具结果不会视为成功。', false, 'user'));
+      return {};
+    }
     if(method==='turn/steer'){
       const runtime=this.active.get(row.id);if(!runtime)throw new AppError('turn_changed','当前轮次已结束，未发送引导消息。');
       const parts:RecordValue[]=Array.isArray(p.input)?p.input:[],native=claudeInput(parts,row.userId,row.cwd);

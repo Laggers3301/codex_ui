@@ -94,8 +94,8 @@
 .conversation > .composer.composerLiquidGlass .composerControlRow button:focus-visible { outline:2px solid var(--ui-content-muted); outline-offset:3px; }
 :is(.composerLiquidGlass .groupedModelMenu,.composerLiquidGlass .groupedModelCascade,.composerSlashMenu,#v2PlusMenu,.contextDialog,.composerLiquidGlass .composerFormatToolbar,.composerLiquidGlass .composerFormatTypeMenu,.composerLiquidGlass .voiceNotice) {
   border:0 !important;
-  background:var(--composer-menu-fill,var(--ui-glass-background)) !important;
-  box-shadow:inset 0 .5px 0 rgba(255,255,255,.06),var(--ui-glass-shadow) !important;
+  background:var(--mobile-floating-surface,var(--composer-menu-fill,var(--ui-glass-background))) !important;
+  box-shadow:var(--mobile-floating-shadow,inset 0 .5px 0 rgba(255,255,255,.06),var(--ui-glass-shadow)) !important;
   -webkit-backdrop-filter:blur(20px) saturate(1.12) !important;
   backdrop-filter:blur(20px) saturate(1.12) !important;
 }
@@ -116,8 +116,19 @@
 :root[data-theme="light"] .conversation > .composer.composerLiquidGlass .composerControlRow .v2FastModeButtonActive { background:rgba(121,166,135,.42) !important; color:#254832 !important; }
 :root[data-theme="light"] .conversation > .composer.composerLiquidGlass .composerControlRow .v2ComposerPlus { color:#44584a !important; }
 @media(max-width:720px) {
-  :root[data-theme] .conversation>.composer.composerLiquidGlass {border:0!important;outline:0;box-shadow:0 6px 20px rgba(25,35,27,.08)!important;}
-  .conversation>.composer.composerLiquidGlass .composerOriginalLayer>span {opacity:.04!important;}
+  /* Keep the phone's single optical shell in both capsule and expanded states;
+     controls stay unglazed, and neutral tint does not reintroduce green panels. */
+  :root[data-theme] .conversation>.composer.composerLiquidGlass {
+    --composer-material-fill:rgba(38,38,38,.66);--composer-control-fill:transparent;
+    --composer-control-color:var(--ui-content-muted);
+    --composer-control-row-size:40px;
+    border:0!important;outline:0;box-shadow:0 6px 20px #00000014!important;
+  }
+  :root[data-theme="light"] .conversation>.composer.composerLiquidGlass {--composer-material-fill:rgba(250,250,250,.66);}
+  :root[data-theme] .conversation>.composer.composerLiquidGlass .composerControlRow :is(.voiceButton,.v2ComposerPlus) {background:transparent!important;color:var(--ui-content-muted)!important;box-shadow:none!important;}
+  :root[data-theme] .conversation>.composer.composerLiquidGlass .composerControlRow .sendButton.primary {background:var(--ui-action-primary-bg)!important;color:var(--ui-action-primary-text)!important;box-shadow:none!important;}
+  :root .queuedSubmissionStrip {--queue-material-fill:var(--mobile-field-surface);box-shadow:none;backdrop-filter:none!important;-webkit-backdrop-filter:none!important;}
+  :root[data-theme="light"] .queuedSubmissionStrip {--queue-material-fill:var(--mobile-field-surface);box-shadow:none;}
   /* Routine activity and drafts fold until the user edits/opens a control.
      Safety confirmations stay visible; actual editing remains 16px. */
   .conversation>.composer .v2ComposerPlus {position:relative;}
@@ -128,7 +139,7 @@
   :root .conversation>.composer[data-mobile-idle]:not(:has(.composerRichInput:focus-within,.composerTools :focus-visible,.composerThreadActivity :focus-visible,.queuedSubmissionStrip :focus-visible,.queuedEditInput:focus)):not([data-mobile-control-interaction]):not([data-mobile-detail-open]):not([data-mobile-plus-menu-open]):not(:has(.polishedSelect.open,.groupedModelMenu,.polishedSelectMenu,.v2PlusMenu,.threadStatusPopover,.codexApprovalRequests,.editingPromptNotice)) .v2ComposerPlus {grid-column:1;grid-row:1;}
   :root .conversation>.composer[data-mobile-idle]:not(:has(.composerRichInput:focus-within,.composerTools :focus-visible,.composerThreadActivity :focus-visible,.queuedSubmissionStrip :focus-visible,.queuedEditInput:focus)):not([data-mobile-control-interaction]):not([data-mobile-detail-open]):not([data-mobile-plus-menu-open]):not(:has(.polishedSelect.open,.groupedModelMenu,.polishedSelectMenu,.v2PlusMenu,.threadStatusPopover,.codexApprovalRequests,.editingPromptNotice)) .composerRichEditor {grid-column:2;grid-row:1;order:0;min-height:24px!important;max-height:24px!important;height:24px!important;overflow:hidden!important;overflow:clip!important;scrollbar-gutter:auto;mask-image:linear-gradient(to right,#000 0%,#000 calc(100% - 18px),transparent 100%);-webkit-mask-image:linear-gradient(to right,#000 0%,#000 calc(100% - 18px),transparent 100%);}
   :root .conversation>.composer[data-mobile-idle]:not(:has(.composerRichInput:focus-within,.composerTools :focus-visible,.composerThreadActivity :focus-visible,.queuedSubmissionStrip :focus-visible,.queuedEditInput:focus)):not([data-mobile-control-interaction]):not([data-mobile-detail-open]):not([data-mobile-plus-menu-open]):not(:has(.polishedSelect.open,.groupedModelMenu,.polishedSelectMenu,.v2PlusMenu,.threadStatusPopover,.codexApprovalRequests,.editingPromptNotice)) .composerRichInput {min-height:24px!important;height:24px;padding:0!important;font-size:16px!important;line-height:24px;}
-  :root .conversation>.composer[data-mobile-idle]:not(:has(.composerRichInput:focus-within,.composerTools :focus-visible,.composerThreadActivity :focus-visible,.queuedSubmissionStrip :focus-visible,.queuedEditInput:focus)):not([data-mobile-control-interaction]):not([data-mobile-detail-open]):not([data-mobile-plus-menu-open]):not(:has(.polishedSelect.open,.groupedModelMenu,.polishedSelectMenu,.v2PlusMenu,.threadStatusPopover,.codexApprovalRequests,.editingPromptNotice)) .composerSendActions {grid-column:3;grid-row:1;order:0;align-self:center;}
+  :root .conversation>.composer[data-mobile-idle]:not(:has(.composerRichInput:focus-within,.composerTools :focus-visible,.composerThreadActivity :focus-visible,.queuedSubmissionStrip :focus-visible,.queuedEditInput:focus)):not([data-mobile-control-interaction]):not([data-mobile-detail-open]):not([data-mobile-plus-menu-open]):not(:has(.polishedSelect.open,.groupedModelMenu,.polishedSelectMenu,.v2PlusMenu,.threadStatusPopover,.codexApprovalRequests,.editingPromptNotice)) .composerSendActions {grid-column:3;grid-row:1;order:0;align-self:center;height:34px;}
   :root .conversation>.composer[data-mobile-idle]:not(:has(.composerRichInput:focus-within,.composerTools :focus-visible,.composerThreadActivity :focus-visible,.queuedSubmissionStrip :focus-visible,.queuedEditInput:focus)):not([data-mobile-control-interaction]):not([data-mobile-detail-open]):not([data-mobile-plus-menu-open]):not(:has(.polishedSelect.open,.groupedModelMenu,.polishedSelectMenu,.v2PlusMenu,.threadStatusPopover,.codexApprovalRequests,.editingPromptNotice)) :is(.composerResizeHandle,.composerThreadActivity) {display:none;}
   /* Fold routine activity without unmounting it or losing its state. Approval
      and destructive-history confirmations remain visible above by exception. */
@@ -153,3 +164,12 @@
   .conversation > .composer.composerLiquidGlass .composerControlRow button { transition:none !important; }
   .conversation > .composer.composerLiquidGlass .composerControlRow button:active { transform:none; }
 }
+
+/* Every layer of the composer glass (pane, highlight rings, lens and its warp) must share the
+   shell's corner geometry. The shell uses a continuous (superellipse) corner; layers left on
+   plain round corners produced a ring that no longer followed the visible outline. The topbar
+   glass already did this. Ignored where corner-shape is unsupported. */
+.composerOriginalLayer > *,
+.composerOriginalPane .glass,
+.composerOriginalPane .glass__warp,
+.composerOriginalPane .glass > div { corner-shape: inherit; }

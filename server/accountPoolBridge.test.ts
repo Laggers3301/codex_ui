@@ -63,6 +63,7 @@ function candidate(
     id,
     health: "ready",
     remainingPercent,
+    creditBalance: -1,
     activeRequests: 0,
     assignedThreadCount: 0,
     ...overrides
@@ -584,12 +585,12 @@ describe("account-pool routing policy", () => {
   it("passes an account-local model catalog to that account's app-server", () => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-model-catalog-"));
     try {
-      expect(accountAppServerArgs(temporary)).toEqual(["app-server", "--listen", "stdio://", '-c', 'thread_unload_delay_secs=60']);
+      expect(accountAppServerArgs(temporary)).toEqual(["app-server", "--listen", "stdio://",'-c','thread_unload_delay_secs=60']);
       expect(fs.readFileSync(path.join(temporary, "AGENTS.md"), "utf8")).toContain("默认以简体中文");
 
       const catalogPath = path.join(temporary, "model-catalog-gpt-5.6-sol-long-context.json");
       fs.writeFileSync(catalogPath, '{"models":[]}');
-      expect(accountAppServerArgs(temporary)).toEqual(["app-server", "--listen", "stdio://", '-c', 'thread_unload_delay_secs=60']);
+      expect(accountAppServerArgs(temporary)).toEqual(["app-server", "--listen", "stdio://",'-c','thread_unload_delay_secs=60']);
       expect(accountAppServerArgs(temporary, "api-provider")).toEqual([
         "app-server",
         "--listen",
@@ -905,6 +906,66 @@ describe("account-pool routing policy", () => {
       candidate("many", 80, { assignedThreadCount: 11 }),
       candidate("few", 80, { assignedThreadCount: 3 })
     ]).id).toBe("few");
+  });
+
+  it("uses the largest credits balance when every account has zero remaining quota", () => {
+    expect(selectAccountCandidate([
+      candidate("less-credits", 0, { creditBalance: 100, activeRequests: 0, assignedThreadCount: 0 }),
+      candidate("more-credits", 0, { creditBalance: 20_330.782371, activeRequests: 9, assignedThreadCount: 99 })
+    ]).id).toBe("more-credits");
+  });
+
+  it("routes both a new thread and a branch to the account with the largest credits balance", async () => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "codex-credits-route-"));
+    const accountA = path.join(temporary, "account-a");
+    const accountB = path.join(temporary, "account-b");
+    fs.mkdirSync(accountA);
+    fs.mkdirSync(accountB);
+    const bridges: CreditsRoutingBridge[] = [];
+    class CreditsRoutingBridge extends QuotaCodexBridge {
+      constructor(readonly balance: string) { super(); }
+      override async request(method: string, params?: unknown): Promise<unknown> {
+        if (method === "account/rateLimits/read") {
+          this.requests.push({ method, params });
+          return { rateLimits: { primary: { usedPercent: 100 }, credits: { balance: this.balance, hasCredits: true, unlimited: false } } };
+        }
+        return super.request(method, params);
+      }
+    }
+    let created = 0;
+    const pool = new AccountPoolBridge({
+      accounts: [
+        { id: "less-credits", label: "Less credits", codexHome: accountA },
+        { id: "more-credits", label: "More credits", codexHome: accountB }
+      ],
+      stateFile: "state.json"
+    }, temporary, () => {
+      const bridge = new CreditsRoutingBridge(created++ === 0 ? "100" : "20330.7823710000");
+      bridges.push(bridge);
+      return bridge as unknown as CodexBridge;
+    });
+    try {
+      await pool.refreshAccountData(true);
+      await pool.request("thread/start", {});
+      expect(bridges[0].requests.some(request => request.method === "thread/start")).toBe(false);
+      expect(bridges[1].requests.some(request => request.method === "thread/start")).toBe(true);
+
+      pool.assignThreadsToAccount(["source-thread"], "less-credits");
+      const decision = pool.getBranchRoutingDecision("source-thread");
+      expect(decision.targetAccount.id).toBe("more-credits");
+      await pool.forkThreadOnAccount(decision.targetAccount.id, { threadId: "source-thread" });
+      expect(bridges[1].requests.some(request => request.method === "thread/fork")).toBe(true);
+    } finally {
+      pool.stop();
+      fs.rmSync(temporary, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let credits override an account with remaining quota", () => {
+    expect(selectAccountCandidate([
+      candidate("has-quota", 1, { creditBalance: 0, activeRequests: 9 }),
+      candidate("credits-only", 0, { creditBalance: 99_999, activeRequests: 0 })
+    ]).id).toBe("has-quota");
   });
 
   it("prefers a known zero-percent balance over an unknown balance", () => {

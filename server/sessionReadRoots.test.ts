@@ -4,7 +4,7 @@ import { accountHistoryRoots } from "./sessionReadRoots.js";
 describe("account history read allowlist", () => {
   it("includes disabled configured accounts without changing execution flags", () => {
     const config = { accounts: [{ codexHome: '/configured/active', enabled: true }, { codexHome: '/configured/disabled', enabled: false }] };
-    expect(accountHistoryRoots(config)).toEqual(['/configured/active/sessions','/configured/disabled/sessions']);
+    expect(accountHistoryRoots(config)).toEqual(['/configured/active/sessions','/configured/active/archived_sessions','/configured/disabled/sessions','/configured/disabled/archived_sessions']);
     expect(config.accounts[1].enabled).toBe(false);
   });
   it("rejects malformed and relative homes", () => {

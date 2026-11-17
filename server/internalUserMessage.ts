@@ -9,6 +9,6 @@ export function isInternalUserMessageText(value: string): boolean {
     || text.startsWith("<recommended_plugins>")
     || text.startsWith("<permissions instructions>")
     || text.startsWith("<app-context>")
-    || /^# AGENTS\.md instructions(?:\r?\n|$)/.test(text)
+    || /^# AGENTS\.md instructions(?: for[^\r\n]*)?(?:\r?\n|$)/.test(text)
     || /^<skill>\s*<name>[^<]+<\/name>\s*<path>[^<]+SKILL\.md<\/path>/.test(text);
 }

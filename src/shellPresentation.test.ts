@@ -27,3 +27,22 @@ it("handles open attributes, removed classes, and cleanup of existing body state
   modal.className = "other"; await Promise.resolve(); expect(document.body.hasAttribute("data-shell-search")).toBe(false);
   stop(); expect(document.body.getAttribute("data-shell-search")).toBe("previous"); document.body.removeAttribute("data-shell-search");
 });
+it("announces sidebar motion only for a real toggle after load, and never replays it on a settled page", async () => {
+  vi.useFakeTimers();
+  try {
+    const sidebar = document.createElement("nav"); sidebar.className = "threadList"; document.body.append(sidebar);
+    const stop = observeShellPresentation(document.body), root = document.documentElement;
+    // Load-time toggles and the end of the arming delay are silent.
+    sidebar.classList.add("collapsed"); await Promise.resolve();
+    expect(root.hasAttribute("data-shell-motion")).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(root.hasAttribute("data-shell-motion")).toBe(false);
+    sidebar.classList.remove("collapsed"); await Promise.resolve();
+    expect(root.getAttribute("data-shell-motion")).toBe("expand");
+    await vi.advanceTimersByTimeAsync(500);
+    expect(root.hasAttribute("data-shell-motion")).toBe(false);
+    sidebar.classList.add("collapsed"); await Promise.resolve();
+    expect(root.getAttribute("data-shell-motion")).toBe("collapse");
+    stop(); expect(root.hasAttribute("data-shell-motion")).toBe(false);
+  } finally { vi.useRealTimers(); }
+});

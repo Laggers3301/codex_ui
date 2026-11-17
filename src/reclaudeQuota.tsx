@@ -5,6 +5,15 @@ const percent = (value: number) => new Intl.NumberFormat("zh-CN", { maximumFract
 const remaining = (window: ReclaudeUsageWindow) => percent(Math.max(0, 100 - window.percent));
 const dateTime = (timestamp: number) => new Date(timestamp).toLocaleString("zh-CN", { hour12: false });
 
+export function reclaudeDailyLimit(window: ReclaudeUsageWindow | undefined, now = Date.now()): string {
+  if (!window?.resetsAt || !Number.isFinite(window.resetsAt) || !reclaudeWindowActive(window, now)) return "-";
+  const tonight = new Date(now);
+  tonight.setHours(24, 0, 0, 0);
+  const weeklyDuration = 7 * 24 * 60 * 60 * 1000;
+  const value = Math.max(0, Math.min(100, (window.resetsAt - tonight.getTime()) / weeklyDuration * 100));
+  return `${percent(Number(value.toFixed(1)))}%（截止 今天 24:00）`;
+}
+
 export function reclaudeRemainingLabel(account: ReclaudeAccountUsage, now = Date.now()): string {
   if (account.state === "disabled") return account.limitCode === "claude_five_hour_limit" ? "5h 已满" : "已停用";
   const active = account.windows.filter(window => reclaudeWindowActive(window, now));
@@ -29,6 +38,7 @@ export function ReclaudeQuotaDetails({ account, cacheError, creations, now = Dat
   return <div className="providerQuotaDetails reclaudeQuotaDetails" role="tabpanel" aria-label="ReClaude 额度">
     {account.state === "disabled" ? <p className="providerQuotaRestriction" role="status">{account.limitCode === "claude_five_hour_limit" ? "5 小时额度已达上限 · 账号已暂停" : "周用量达到 99% 停用阈值 · 账号已停用"}</p> : null}
     <div className="quotaPopoverRows">
+      <div data-quota-account={account.orgId}><span>账号</span><strong>{account.label}</strong></div>
       {kinds.map(kind => {
         const window = account.windows.find(window => window.kind === kind);
         const active = window && reclaudeWindowActive(window, now);
@@ -40,6 +50,7 @@ export function ReclaudeQuotaDetails({ account, cacheError, creations, now = Dat
           </>}</strong>
         </div>;
       })}
+      <div><span>每日建议上限</span><strong>{reclaudeDailyLimit(account.windows.find(window => window.kind === "seven_day"), now)}</strong></div>
       {creations ? <div data-quota-window="creations"><span title="全部 Claude 账号共用；仅新建、分支和迁入 Claude 计数，不影响已有会话继续回答。">新建</span><strong>本小时剩余 {creations.remaining}/{creations.limit} 次{creations.remaining === 0 ? <span className="providerQuotaReset">{remainingTime(creations.retryAfterSeconds)}后可重试</span> : null}</strong></div> : null}
       <div className="providerQuotaUpdated"><span>数据时间</span><strong>{observedAt ? dateTime(observedAt) : "待更新"}</strong></div>
     </div>

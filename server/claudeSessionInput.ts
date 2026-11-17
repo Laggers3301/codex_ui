@@ -1,4 +1,5 @@
 import type {SDKUserMessage} from '@anthropic-ai/claude-agent-sdk';
+import type {ConversationTask} from '../shared/conversationTasks.js';
 // The runtime SDK is loaded from integrations/claude-session-tools. Older
 // backend compile-time declarations do not yet describe its priority field.
 export type ClaudeNativeUserMessage=Omit<SDKUserMessage,'uuid'>&{uuid?:string;priority?:'now'|'next'|'later'};
@@ -24,9 +25,10 @@ export class ClaudeSessionInput implements AsyncIterable<ClaudeNativeUserMessage
   }
 }
 
-export interface ClaudeNativeTask {id:string;runId?:string;toolUseId?:string;kind?:'agent'|'shell'|'unknown';description:string;status:'running'|'completed'|'failed'|'stopped'|'interrupted'|'unknown';background:boolean;}
+export interface ClaudeNativeTask extends Omit<ConversationTask,'kind'> {runId?:string;toolUseId?:string;wasBackground?:boolean;kind?:ConversationTask['kind'];}
 export class ClaudeTaskLedger{
   readonly tasks=new Map<string,ClaudeNativeTask>();
+  private ambient=new Set<string>();
   get pending(){return [...this.tasks.values()].filter(t=>t.background&&t.status==='running');}
   update(message:any){
     const before=JSON.stringify(this.snapshot());
@@ -34,17 +36,40 @@ export class ClaudeTaskLedger{
       if(typeof id!=='string'||!id||id.length>256)return;
       const old=this.tasks.get(id);
       if(old?.runId&&patch.runId&&patch.runId<old.runId)return;
+      const newRun=!!old?.runId&&!!patch.runId&&patch.runId>old.runId;
       const defined=Object.fromEntries(Object.entries(patch).filter(([,value])=>value!==undefined));
-      this.tasks.set(id,{id,description:'',status:'running',background:true,...old,...defined});
+      const next:ClaudeNativeTask={id,description:'',status:'running',background:true,...(!newRun?old:{}),...defined};
+      if(next.background)next.wasBackground=true;
+      if(JSON.stringify({...next,updatedAt:undefined})!==JSON.stringify({...old,updatedAt:undefined}))next.updatedAt=Date.now();
+      this.tasks.set(id,next);
     };
+    const text=(value:unknown,limit:number)=>typeof value==='string'?value.slice(0,limit):undefined;
+    const metadata=(value:any):Partial<ClaudeNativeTask>=>{
+      const usage=value.usage;
+      const counter=(n:unknown)=>typeof n==='number'&&Number.isFinite(n)&&n>=0?n:0;
+      return {description:text(value.description,500),parentTaskId:text(value.parent_task_id,256),subagentType:text(value.subagent_type,120),
+        summary:text(value.summary,4096),lastToolName:text(value.last_tool_name,120),
+        ...(usage?{usage:{totalTokens:counter(usage.total_tokens),toolUses:counter(usage.tool_uses),durationMs:counter(usage.duration_ms)}}:{})};
+    };
+    const kind=(value:any):ConversationTask['kind']=>value.task_type==='local_agent'||value.subagent_type?'agent':value.task_type==='local_bash'?'shell':'unknown';
+    if(message.type==='system'&&message.subtype==='task_started'&&typeof message.task_id==='string'){
+      if(message.ambient)this.ambient.add(message.task_id);else this.ambient.delete(message.task_id);
+    }
+    if(message.type==='system'&&this.ambient.has(message.task_id))return false;
     if(message.type==='system'&&!message.ambient){
       const runId=typeof message.run_id==='string'?message.run_id:undefined;
-      if(message.subtype==='task_started')put(message.task_id,{runId,toolUseId:message.tool_use_id,description:String(message.description??'').slice(0,500),kind:message.task_type==='local_agent'||message.subagent_type?'agent':message.task_type==='local_bash'?'shell':'unknown',background:message.is_backgrounded!==false});
+      if(message.subtype==='task_started')put(message.task_id,{...metadata(message),runId,toolUseId:message.tool_use_id,kind:kind(message),background:message.is_backgrounded!==false});
+      const previous=this.tasks.get(message.task_id);
+      if(message.subtype==='task_progress'&&(!previous||previous.status==='running'||!!runId&&!!previous.runId&&runId>previous.runId))put(message.task_id,{...metadata(message),runId,toolUseId:message.tool_use_id,
+        ...(message.subagent_type?{kind:'agent'}:{}),background:previous&&(!runId||!previous.runId||runId===previous.runId)?previous.background:false});
       if(message.subtype==='task_updated'&&message.patch?.is_backgrounded===true)put(message.task_id,{runId,background:true});
-      if(message.subtype==='task_notification'&&['completed','failed','stopped'].includes(message.status))put(message.task_id,{runId,status:message.status});
+      if(message.subtype==='task_notification'&&['completed','failed','stopped'].includes(message.status))put(message.task_id,{...metadata(message),runId,status:message.status});
       if(message.subtype==='background_tasks_changed'&&Array.isArray(message.tasks)){
         const live=new Set<string>();
-        for(const task of message.tasks)if(!task.ambient){live.add(task.task_id);put(task.task_id,{runId:task.run_id,description:String(task.description??'').slice(0,500),kind:task.task_type==='local_agent'?'agent':task.task_type==='local_bash'?'shell':'unknown',background:true});}
+        for(const task of message.tasks){
+          if(task.ambient){this.ambient.add(task.task_id);continue;}
+          this.ambient.delete(task.task_id);live.add(task.task_id);put(task.task_id,{...metadata(task),runId:task.run_id,kind:kind(task),background:true});
+        }
         // Absence means no longer live, not proof of a successful execution.
         for(const task of this.pending)if(!live.has(task.id)){task.background=false;task.status='unknown';}
       }

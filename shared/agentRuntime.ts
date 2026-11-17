@@ -9,6 +9,7 @@ export interface RuntimeModelMetadata {
   availability?: ModelAvailability;
   unavailableReason?: string;
   supportedEffortLevels?: ClaudeEffort[];
+  restrictedToSourceThreadId?:string;
 }
 
 export const CLAUDE_NOT_CONNECTED = "尚未连接 ReClaude 账号，暂时无法使用 Claude。账号连接后需验证可用模型。";

@@ -2,6 +2,38 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect, it, vi } from "vitest";
+it('reuses pagination metadata but invalidates it after append or cutoff changes',async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'history-page-cache-'));
+  vi.stubEnv('CODEX_THREAD_INDEX_DB',path.join(root,'index.sqlite'));vi.stubEnv('CODEX_WEB_CODEX_SESSION_ROOTS',root);vi.resetModules();
+  try{
+    const file=path.join(root,'source.jsonl');
+    const message=(text:string)=>JSON.stringify({type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text}]}})+'\n';
+    await fs.writeFile(file,JSON.stringify({type:'session_meta',payload:{id:'source'}})+'\n'+JSON.stringify({type:'turn_context',payload:{turn_id:'one'}})+'\n'+message('first')+message('second'));
+    const {readIndexedThreadPage}=await import('./threadEventIndex.js');
+    const cache:import('./threadEventIndex.js').ThreadPageReadCache={};
+    const first=await readIndexedThreadPage(file,'source',{limit:1,readCache:cache});
+    expect(first.history.totalItems).toBe(2);const counts=cache.totals,key=cache.key;
+    await readIndexedThreadPage(file,'source',{limit:1,before:1,readCache:cache});expect(cache.totals).toBe(counts);
+    const cutoff=(await fs.stat(file)).size;
+    await fs.appendFile(file,message('third'));
+    const next=await readIndexedThreadPage(file,'source',{limit:1,readCache:cache});expect(next.history.totalItems).toBe(3);expect(cache.key).not.toBe(key);
+    const frozen=await readIndexedThreadPage(file,'source',{limit:1,maxEndOffset:cutoff,readCache:cache});expect(frozen.history.totalItems).toBe(2);
+  }finally{vi.unstubAllEnvs();vi.resetModules();await fs.rm(root,{recursive:true,force:true});}
+});
+
+it('keeps fallback message IDs stable across page sizes and preserves repeated text',async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'stable-history-id-'));
+  vi.stubEnv('CODEX_THREAD_INDEX_DB',path.join(root,'index.sqlite'));vi.stubEnv('CODEX_WEB_CODEX_SESSION_ROOTS',root);vi.resetModules();
+  try{
+    const file=path.join(root,'source.jsonl');
+    await fs.writeFile(file,[{type:'session_meta',payload:{id:'source'}},{type:'turn_context',payload:{turn_id:'same-turn'}},...Array.from({length:6},(_,i)=>({type:'response_item',payload:{type:'message',role:i%2?'assistant':'user',content:[{type:i%2?'output_text':'input_text',text:'重复文字'}]}}))].map(r=>JSON.stringify(r)+'\n').join(''));
+    const {readIndexedThreadPage}=await import('./threadEventIndex.js');
+    const full=await readIndexedThreadPage(file,'source',{limit:20});
+    const expected=(full.thread.turns as any[]).flatMap(t=>t.items).map(i=>i.id),actual:string[]=[];
+    let before=0;for(let n=0;n<3;n++){const page=await readIndexedThreadPage(file,'source',{limit:2,before});actual.unshift(...(page.thread.turns as any[]).flatMap(t=>t.items).map(i=>i.id));before=page.history.nextBefore;}
+    expect(actual).toEqual(expected);expect(new Set(actual).size).toBe(6);
+  }finally{vi.unstubAllEnvs();vi.resetModules();await fs.rm(root,{recursive:true,force:true});}
+});
 
 it('uses the selected completed turn, not the time the branch is created',async()=>{
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'branch-cutoff-'));

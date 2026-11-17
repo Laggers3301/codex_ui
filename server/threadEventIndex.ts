@@ -9,6 +9,10 @@ import {rolloutLogicalStat, rolloutStat,openReadableRollout} from './rolloutStor
 import { HistoryReadScheduler } from './historyReadScheduler.js';
 
 type JsonRecord = Record<string, unknown>;
+export interface ThreadPageReadCache {
+  key?:string;totals?:{value?:number;max_ordinal?:number;min_ordinal?:number};
+  modeResolved?:boolean;mode?:'plan'|'default';
+}
 
 interface FileState {
   threadId: string;
@@ -191,9 +195,13 @@ function toolOutputDescriptor(payload: JsonRecord): { callId: string; searchText
   return callId ? { callId, searchText: boundedText(payload.output ?? payload.result ?? payload.content, 4 * 1024) } : null;
 }
 
-function fileState(threadId: string): FileState | null {
+// metadata_line is the raw session_meta record (~19 KB for typical threads). Only the
+// incremental writer needs it; the warm-up scan and page reads just compare versions, and
+// materialising it for every thread on every pass was a steady stream of garbage.
+function fileState(threadId: string, options: { metadata?: boolean } = {}): FileState | null {
+  const withMetadata = options.metadata !== false;
   const row = db.prepare(`
-    SELECT thread_id, file_path, inode, size, mtime_ms, indexed_offset, current_turn_id, metadata_line, index_generation
+    SELECT thread_id, file_path, inode, size, mtime_ms, indexed_offset, current_turn_id, ${withMetadata ? "metadata_line" : "NULL AS metadata_line"}, index_generation
     FROM thread_files WHERE thread_id = ?
   `).get(threadId) as Record<string, unknown> | undefined;
   if (!row) return null;
@@ -439,7 +447,7 @@ export function warmThreadIndex(filePath: string, threadId: string): Promise<voi
   const update = (async () => {
     // Unchanged files never join the writer queue. A background scan of another
     // large conversation must not delay a cursor jump into an indexed file.
-    const state = fileState(threadId);
+    const state = fileState(threadId, { metadata: false });
     if (state) {
       // Native lossless compression changes physical inode, not logical bytes.
       // Do not inflate the entire cold corpus during background index scans.
@@ -532,10 +540,10 @@ export async function indexedBranchCutoffTime(filePath: string, threadId: string
 export function readIndexedThreadPage(
   filePath: string,
   threadId: string,
-  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number; sessionsRoot?:string }
+  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number; minStartOffset?:number; sessionsRoot?:string;readCache?:ThreadPageReadCache }
 ) {
   return historyReads.run(async () => {
-    const state = fileState(threadId);
+    const state = fileState(threadId, { metadata: false });
     const boundaryMatches = !state || await indexedRecordBoundaryMatches(filePath, threadId);
     if (options.backgroundRefresh && state && boundaryMatches) {
       const existingUpdate = updateLocks.get(threadId);
@@ -550,14 +558,33 @@ export function readIndexedThreadPage(
 async function readIndexedThreadPageUnlocked(
   filePath: string,
   threadId: string,
-  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number; sessionsRoot?:string }
+  options: { cursor?: string; before?: number; limit: number; backgroundRefresh?: boolean; maxEndOffset?: number; minStartOffset?:number; sessionsRoot?:string;readCache?:ThreadPageReadCache }
 ) {
-  const collaborationMode = await indexedCollaborationMode(filePath, threadId);
+  const cache=options.readCache,state=cache?fileState(threadId,{metadata:false}):null;
+  // Caller-owned pagination cache, invalidated by index generation, append,
+  // rewrite, path and cutoff. Live histories therefore cannot reuse stale
+  // counts/mode, while a frozen archive avoids rescanning them on every page.
+  const cacheKey=JSON.stringify([threadId,filePath,state?.generation,state?.indexedOffset,state?.size,state?.mtimeMs,options.maxEndOffset,options.minStartOffset]);
+  if(cache&&cache.key!==cacheKey){cache.key=cacheKey;delete cache.totals;delete cache.mode;cache.modeResolved=false;}
+  const collaborationMode = cache?.modeResolved?cache.mode:await indexedCollaborationMode(filePath, threadId);
+  if(cache){cache.mode=collaborationMode;cache.modeResolved=true;}
   const withMode = (thread: JsonRecord) => collaborationMode ? { ...thread, collaborationMode } : thread;
   const maxEndOffset = options.maxEndOffset ?? Number.MAX_SAFE_INTEGER;
+  const minStartOffset=options.minStartOffset??0;
+  if(!Number.isSafeInteger(minStartOffset)||minStartOffset<0)throw Error('Invalid history start boundary');
   if (!Number.isSafeInteger(maxEndOffset) || maxEndOffset < 0) throw new Error("Invalid inherited history boundary");
-  const totalRow = db.prepare("SELECT COUNT(*) AS value, COALESCE(MAX(ordinal), 0) AS max_ordinal FROM thread_records WHERE thread_id = ? AND end_offset <= ?")
-    .get(threadId, maxEndOffset) as { value?: number; max_ordinal?: number };
+  // Without an inherited-history window the two offset predicates are vacuous (offsets are
+  // never negative nor above MAX_SAFE_INTEGER). Then the totals come straight from the primary
+  // key, a covering index; with the predicates the planner picked the (thread_id, turn_id)
+  // index and fetched every row of a 30k-record thread just to read its offsets - over a second
+  // on a cold page cache, on the event loop.
+  const windowed = maxEndOffset !== Number.MAX_SAFE_INTEGER || minStartOffset !== 0;
+  const totalRow = cache?.totals ?? (windowed
+    ? db.prepare("SELECT COUNT(*) AS value, COALESCE(MAX(ordinal), 0) AS max_ordinal,MIN(ordinal) AS min_ordinal FROM thread_records WHERE thread_id = ? AND end_offset <= ? AND start_offset >= ?")
+      .get(threadId, maxEndOffset, minStartOffset)
+    : db.prepare("SELECT COUNT(*) AS value, COALESCE(MAX(ordinal), 0) AS max_ordinal,MIN(ordinal) AS min_ordinal FROM thread_records WHERE thread_id = ?")
+      .get(threadId)) as { value?: number; max_ordinal?: number;min_ordinal?:number };
+  if(cache)cache.totals=totalRow;
   const totalItems = Number(totalRow.value ?? 0);
   const maxOrdinal = Number(totalRow.max_ordinal ?? 0);
   if (!totalItems) {
@@ -572,8 +599,8 @@ async function readIndexedThreadPageUnlocked(
   const upperExclusive = cursorOrdinal ?? Math.max(1, maxOrdinal - legacyBefore + 1);
   let rows = (db.prepare(`
     SELECT ordinal, record_id, turn_id, start_offset, end_offset, search_text
-    FROM thread_records WHERE thread_id = ? AND ordinal < ? AND end_offset <= ? ORDER BY ordinal DESC LIMIT ?
-  `).all(threadId, upperExclusive, maxEndOffset, Math.max(1, options.limit)) as Array<Record<string, unknown>>)
+    FROM thread_records WHERE thread_id = ? AND ordinal < ? AND end_offset <= ? AND start_offset >= ? ORDER BY ordinal DESC LIMIT ?
+  `).all(threadId, upperExclusive, maxEndOffset,minStartOffset, Math.max(1, options.limit)) as Array<Record<string, unknown>>)
     .map((row): IndexedRecord => ({
       ordinal: Number(row.ordinal), recordId: String(row.record_id), turnId: String(row.turn_id),
       startOffset: Number(row.start_offset), endOffset: Number(row.end_offset), searchText: String(row.search_text ?? "")
@@ -617,14 +644,14 @@ async function readIndexedThreadPageUnlocked(
     endOffset,
     syntheticTurnId: first.turnId
   });
-  const hasOlder = first.ordinal > 1;
+  const hasOlder = first.ordinal > Number(totalRow.min_ordinal??1);
   return {
     thread: withMode(parsed.thread),
     history: {
       totalItems,
       returnedItems: rows.length,
-      before: Math.max(0, totalItems - last.ordinal),
-      nextBefore: Math.max(0, totalItems - first.ordinal + 1),
+      before: Math.max(0, maxOrdinal - last.ordinal),
+      nextBefore: Math.max(0, maxOrdinal - first.ordinal + 1),
       hasOlder,
       nextCursor: hasOlder ? encodeCursor(threadId, first.ordinal) : null,
       indexState: "fresh" as const

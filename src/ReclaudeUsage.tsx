@@ -14,8 +14,8 @@ export function useReclaudeUsage(scope: string) {
   useEffect(()=>{
     let disposed=false,inFlight=false;const controller=new AbortController();
     revision.current++;
-    // This endpoint only reads existing server observations/local cache. It
-    // cannot sync upstream usage. Share one reader across the entire page.
+    // Share one reader across the page. The server deduplicates explicitly
+    // enabled private native /usage queries and caches them for five minutes.
     const read=async()=>{
       if(document.visibilityState==="hidden"||inFlight)return;
       inFlight=true;const startedAtRevision=revision.current;

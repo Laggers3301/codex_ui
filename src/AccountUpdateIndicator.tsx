@@ -5,7 +5,7 @@ import "./AccountUpdateIndicator.css";
 interface AccountUpdateIndicatorProps {
   userId: string;
   menuOpen: boolean;
-  target?: "account" | "plugins" | "feishu" | "questions" | "plan" | "threads" | "runtime" | "leaderboard";
+  target?: "account" | "plugins" | "feishu" | "questions" | "plan" | "threads" | "runtime" | "leaderboard" | "tasks" | "members" | "queue";
   dismissOnRefresh?: boolean;
 }
 

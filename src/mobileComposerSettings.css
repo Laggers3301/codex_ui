@@ -1,0 +1,42 @@
+/* Mobile-only grouped sheet, matching the supplied ChatGPT reference.
+   dialog/select retain browser-native modality and choice UI. */
+@media (max-width:720px) {
+  :root[data-theme] .composerTools .mobileComposerSettingsTrigger {display:flex;align-items:center;justify-content:center;gap:6px;min-width:0;max-width:210px;height:40px;padding:0 6px;border:0;border-radius:0;background:transparent!important;box-shadow:none!important;color:var(--ui-content-muted);font:400 14px/20px var(--pool-ui-font);transition:opacity 160ms ease,color 160ms ease;}
+  :root[data-theme] .composerTools .mobileComposerSettingsTrigger:active {opacity:.6;}
+  .mobileComposerSettingsTrigger:focus-visible {outline:2px solid var(--ui-content-muted);outline-offset:2px;}
+  .mobileComposerSettingsTrigger>span {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .mobileComposerSettingsTrigger>svg {flex:none;color:var(--ui-content-muted);transition:transform 200ms ease;}
+  .mobileComposerSettingsTrigger[aria-expanded="true"]>svg {transform:rotate(180deg);}
+  .mobileComposerSettingsPanel {position:fixed;inset:auto 0 0;box-sizing:border-box;width:100%;max-width:none;max-height:85dvh;margin:0;padding:10px 20px calc(28px + env(safe-area-inset-bottom));overflow:auto;overscroll-behavior:contain;border:0;border-radius:24px 24px 0 0;background:var(--mobile-sheet-surface);color:var(--ui-content);box-shadow:none;}
+  .mobileComposerSettingsPanel:not([open]) {display:none;}
+  .mobileComposerSettingsPanel::backdrop {background:#0006;}
+  .mobileComposerSettingsPanel[open] {animation:mobileSettingsEnter 260ms cubic-bezier(.22,1,.36,1) both;}
+  .mobileComposerSettingsPanel[open]::backdrop {animation:mobileSettingsDimIn 200ms ease both;}
+  .mobileComposerSettingsPanel[data-closing="true"] {animation:mobileSettingsExit 200ms cubic-bezier(.4,0,1,1) both;pointer-events:none;}
+  .mobileComposerSettingsPanel[data-closing="true"]::backdrop {animation:mobileSettingsDimOut 200ms ease both;}
+  .mobileComposerSettingsHandle {width:36px;height:5px;margin:0 auto 6px;border-radius:3px;background:var(--ui-content-muted);opacity:.4;}
+  .mobileComposerSettingsPanel>header {display:grid;grid-template-columns:44px minmax(0,1fr) 44px;align-items:center;min-height:44px;margin-bottom:20px;}
+  .mobileComposerSettingsPanel h2 {grid-column:2;margin:0;text-align:center;font:600 17px/24px var(--pool-ui-font);}
+  .mobileComposerSettingsPanel>header button {grid-column:3;display:grid;place-items:center;width:44px;height:44px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--ui-content-muted);}
+  .mobileComposerSettingsGroups {display:grid;gap:24px;}
+  .mobileComposerSettingsControls {display:grid;gap:0;overflow:hidden;border-radius:14px;background:var(--mobile-group-surface);}
+  .mobileSettingRow,
+  :root[data-theme] .mobileComposerSettingsControls>.v2ContextStatusButton,
+  :root[data-theme] .mobileComposerSettingsControls>.conversationTasksTrigger {display:flex;align-items:center;justify-content:space-between;gap:12px;box-sizing:border-box;width:100%;min-height:52px;height:auto;padding:8px 16px;margin:0;border:0;border-radius:0;background:transparent;color:var(--ui-content);font:400 17px/24px var(--pool-ui-font);text-align:left;}
+  .mobileComposerSettingsControls>*+* {border-top:1px solid var(--ui-divider);}
+  .mobileSettingRow>span {flex:none;}
+  .mobileSettingRow>select {min-width:0;max-width:74%;min-height:36px;padding:0 2px;border:0;border-radius:0;background:transparent;color:inherit;font:inherit;text-align:right;appearance:auto;}
+  .mobileSettingRow>select:disabled {opacity:.5;}
+  .mobileComposerSettingsControls>.v2ContextStatusButton>span:last-child {color:var(--ui-content-muted);}
+  .mobileComposerSettingsControls>.conversationTasksTrigger>svg {display:none;}
+  .mobileComposerSettingsControls>.conversationTasksTrigger::after {content:"›";color:var(--ui-content-muted);font-size:24px;line-height:24px;}
+  .mobileComposerSettingsControls .conversationTasksCount {position:static;min-width:0;padding:0;margin-left:auto;background:none;color:var(--ui-content-muted);font:inherit;opacity:1;}
+}
+@keyframes mobileSettingsEnter {from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
+@keyframes mobileSettingsExit {from{opacity:1;transform:translateY(0)}to{opacity:0;transform:translateY(20px)}}
+@keyframes mobileSettingsDimIn {from{opacity:0}to{opacity:1}}
+@keyframes mobileSettingsDimOut {from{opacity:1}to{opacity:0}}
+@media(prefers-reduced-motion:reduce) {
+  .mobileComposerSettingsPanel[open],.mobileComposerSettingsPanel[open]::backdrop {animation:none;}
+  .mobileComposerSettingsTrigger,.mobileComposerSettingsTrigger>svg {transition:none;}
+}

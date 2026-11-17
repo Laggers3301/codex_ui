@@ -8,6 +8,12 @@ describe("mobile drawer gesture arbitration", () => {
     expect(sidebarSwipeIntent(10, 30, false)).toBe("ignore");
     expect(sidebarSwipeIntent(-10, -30, true)).toBe("ignore");
   });
+  it("tolerates the vertical wobble at the start of a real swipe, and only calls a scroll once it is established", () => {
+    expect(sidebarSwipeIntent(-9, 8, true)).toBe("drag");
+    expect(sidebarSwipeIntent(9, -8, false)).toBe("drag");
+    expect(sidebarSwipeIntent(-9, 11, true)).toBe("wait");
+    expect(sidebarSwipeIntent(-9, 14, true)).toBe("ignore");
+  });
   it("opens rightwards and closes leftwards only", () => {
     expect(sidebarSwipeIntent(20, 2, false)).toBe("drag");
     expect(sidebarSwipeIntent(-20, 2, true)).toBe("drag");

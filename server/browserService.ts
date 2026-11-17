@@ -7,6 +7,22 @@ import path from "node:path";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright-core";
 import { z } from "zod";
 import { createBrowserProxy, validateBrowserUrl } from "./browserNetwork.js";
+import { serverConfig } from "./config.js";
+
+async function privateOriginForUser(userId: string): Promise<string | undefined> {
+  try {
+    const data = JSON.parse(await fs.readFile(path.join(serverConfig.dataDir, "browser-private-access.json"), "utf8"));
+    const origin = data?.users?.[userId];
+    if (typeof origin !== "string") return undefined;
+    const parsed = new URL(origin);
+    // Explicit IPv4 LAN origin and non-default port only; no hostname-based
+    // resolution, credentials, loopback, metadata address, path or wildcard.
+    if (parsed.protocol !== "http:" || !/^192\.168\.\d{1,3}\.\d{1,3}$/.test(parsed.hostname)
+      || parsed.hostname.split(".").some(x => Number(x) > 255) || !parsed.port
+      || Number(parsed.port) < 1024 || parsed.username || parsed.password || parsed.origin !== origin) return undefined;
+    return parsed.origin;
+  } catch { return undefined; }
+}
 
 export function isTopLevelBrowserNavigation(request: { isNavigationRequest(): boolean; frame(): { parentFrame(): unknown } }): boolean {
   if (!request.isNavigationRequest()) return false;
@@ -43,6 +59,7 @@ interface Session {
   frame?: Buffer; capturing?: Promise<void>; viewedAt: number; touchedAt: number; busy: boolean; epoch: number;
   origins: Set<string>; settleApproval?: (approved: boolean) => void;
   approvedRedirectOrigin?: string;
+  privateOrigin?: string; privateNavigationPending?: string;
 }
 export class BrowserError extends Error {
   constructor(public statusCode: number, message: string) { super(message); }
@@ -64,6 +81,7 @@ export class BrowserService extends EventEmitter {
   private browser?: Browser;
   private launching?: Promise<Browser>;
   private proxy?: Awaited<ReturnType<typeof createBrowserProxy>>;
+  private privateProxies = new Map<string, ReturnType<typeof createBrowserProxy>>();
   private child?: ChildProcess;
   private profile?: string;
   private browserUnit?: string;
@@ -235,8 +253,20 @@ export class BrowserService extends EventEmitter {
       this.sessions.set(key, s); this.emitState(s);
       try {
         const browser = await this.launch();
+        s.privateOrigin = await privateOriginForUser(userId);
+        let contextProxy = this.proxy;
+        if (s.privateOrigin) {
+          const proxyKey = `${userId}\0${s.privateOrigin}`;
+          let privateProxy = this.privateProxies.get(proxyKey);
+          if (!privateProxy) {
+            privateProxy = createBrowserProxy({ upstreamProxy: process.env.CODEX_WEB_BROWSER_EGRESS_PROXY ?? process.env.HTTPS_PROXY, privateOrigin: s.privateOrigin });
+            this.privateProxies.set(proxyKey, privateProxy);
+            void privateProxy.catch(() => this.privateProxies.delete(proxyKey));
+          }
+          contextProxy = await privateProxy;
+        }
         const context = await browser.newContext({ viewport: VIEWPORT, deviceScaleFactor: 1, acceptDownloads: false,
-          serviceWorkers: "block", permissions: [], proxy: this.proxy, locale: "zh-CN", ignoreHTTPSErrors: false });
+          serviceWorkers: "block", permissions: [], proxy: contextProxy, locale: "zh-CN", ignoreHTTPSErrors: false });
         // Closing a session while Chromium is starting must cancel this launch too.
         if (this.disposed || this.sessions.get(key) !== s || s.state.status === "closed") { await context.close(); throw new BrowserError(409, "浏览器已停止。"); }
         s.context = context;
@@ -244,7 +274,13 @@ export class BrowserService extends EventEmitter {
           let unapprovedOrigin: string | undefined;
           try {
             const request = route.request();
-            const target = validateBrowserUrl(request.url());
+            const target = validateBrowserUrl(request.url(), s!.privateOrigin);
+            if (target.origin === s!.privateOrigin) {
+              const frameOrigin = (() => { try { return new URL(request.frame().url()).origin; } catch { return ""; } })();
+              if (frameOrigin !== target.origin && !(isTopLevelBrowserNavigation(request) && s!.privateNavigationPending === target.origin)) {
+                throw new Error("内网访问仅允许来自明确打开的目标页面");
+              }
+            }
             if (isTopLevelBrowserNavigation(request) && !s!.origins.has(target.origin)) {
               if (s!.state.mode === "human") s!.origins.add(target.origin);
               else {
@@ -337,9 +373,10 @@ export class BrowserService extends EventEmitter {
     s.busy = true; s.touchedAt = Date.now(); s.state.error = undefined;
     try {
       if (args.action === "navigate" || (args.action === "new_tab" && args.url?.trim())) {
-        const target = validateBrowserUrl(args.url?.trim() || "");
+        const target = validateBrowserUrl(args.url?.trim() || "", s.privateOrigin);
         if (actor === "agent" && !s.origins.has(target.origin)) await this.confirmation(s, "navigate", `允许 AI 打开 ${target.origin}？`, target.href);
         this.assertCurrent(s, epoch, actor); s.origins.add(target.origin);
+        if (target.origin === s.privateOrigin) s.privateNavigationPending = target.origin;
       } else if (actor === "agent" && ["click", "type", "press"].includes(args.action)) {
         // Generic UI actions can submit data or purchase without a reliable DOM
         // annotation. Require exact-action consent instead of guessing by labels.
@@ -376,7 +413,7 @@ export class BrowserService extends EventEmitter {
         args.x = box.x + box.width / 2; args.y = box.y + box.height / 2;
       }
       this.assertCurrent(s, epoch, actor);
-      if (args.action === "navigate" || (args.action === "new_tab" && args.url?.trim())) await page.goto(validateBrowserUrl(args.url!).href, { waitUntil: "domcontentloaded" });
+      if (args.action === "navigate" || (args.action === "new_tab" && args.url?.trim())) await page.goto(validateBrowserUrl(args.url!, s.privateOrigin).href, { waitUntil: "domcontentloaded" });
       if (args.action === "back") await page.goBack({ waitUntil: "domcontentloaded" });
       if (args.action === "forward") await page.goForward({ waitUntil: "domcontentloaded" });
       if (args.action === "reload") await page.reload({ waitUntil: "domcontentloaded" });
@@ -416,6 +453,7 @@ export class BrowserService extends EventEmitter {
       throw new BrowserError(error instanceof BrowserError ? error.statusCode : 400, s.state.error || this.errorText(error));
     } finally {
       clearTimeout(watchdog);
+      s.privateNavigationPending = undefined;
       s.busy = false; s.popupBudget = 0;
       if (s.epoch === epoch && s.state.status !== "closed") s.state.status = s.state.error ? "error" : s.state.mode === "human" ? "paused" : "ready";
       this.emitState(s);
@@ -502,6 +540,8 @@ export class BrowserService extends EventEmitter {
     await Promise.all([...this.sessions.values()].map(s => this.close(s.userId, s.state.threadId)));
     if (this.launching) await this.launching.catch(() => {});
     await this.stopEngine();
+    await Promise.all([...this.privateProxies.values()].map(async proxy => { try { await (await proxy).close(); } catch { /* already closed */ } }));
+    this.privateProxies.clear();
     await this.proxy?.close();
   }
 }

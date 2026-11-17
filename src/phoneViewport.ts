@@ -5,6 +5,21 @@ const consumers = "html,body,#root,.threadList,.v2AccountMenu,.rightWorkspace,.d
 let registered: boolean | undefined;
 
 export function observePhoneViewport(): () => void {
+  if (new URLSearchParams(location.search).get("mobile-ui") === "legacy") return observeLegacyPhoneViewport();
+  // Hand viewport ownership over at the same breakpoint as the React shell.
+  // Wide screens retain the original observer, including tablet keyboard fixes.
+  const phone = matchMedia("(max-width:720px)");
+  let stopLegacy: () => void = () => {};
+  const sync = () => {
+    stopLegacy();
+    stopLegacy = phone.matches ? () => {} : observeLegacyPhoneViewport();
+  };
+  sync();
+  phone.addEventListener("change", sync);
+  return () => { phone.removeEventListener("change", sync); stopLegacy(); };
+}
+
+function observeLegacyPhoneViewport(): () => void {
   const root = document.documentElement, media = matchMedia("(max-width: 900px)");
   if (registered === undefined) {
     try {

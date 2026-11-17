@@ -13,6 +13,7 @@ import {
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { measureCommittedConversationRows } from "./committedConversationMeasurements";
+import { RenderBoundary } from './RenderBoundary';
 
 export interface VirtualConversationHandle {
   scrollToKey(key: string, align?: "start" | "center" | "end" | "auto"): boolean;
@@ -443,7 +444,7 @@ function VirtualConversationInner(
               data-row-key={row.key}
               key={row.key}
             >
-              {row.node}
+              <RenderBoundary scope="turn" resetKey={`${threadKey}:${row.key}`}>{row.node}</RenderBoundary>
             </div>
           ))}
         </div>
@@ -461,7 +462,7 @@ function VirtualConversationInner(
               ref={virtualizer.measureElement}
               style={{ top: `${Math.round(virtualRow.start)}px` }}
             >
-              {row.node}
+              <RenderBoundary scope="turn" resetKey={`${threadKey}:${row.key}`}>{row.node}</RenderBoundary>
             </div>
             );
           })}

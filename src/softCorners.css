@@ -14,7 +14,7 @@
   corner-shape: round;
   display:flex;align-items:center;justify-content:center;text-align:center;
   height:32px!important;min-height:32px!important;box-sizing:border-box;
-  padding-top:0!important;padding-bottom:2px!important;
+  padding-top:0!important;padding-bottom:var(--topbar-label-pad-bottom,2px)!important;
 }
 :root .topbar .controls .topbarPolicySelect .polishedSelectTrigger {padding-inline:10px!important;gap:6px;}
 :root .topbar .controls .topbarPolicySelect .polishedSelectTrigger > span:first-child {text-align:center;}
@@ -49,17 +49,52 @@
 :root .threadList .listHeaderActions button {width:26px;min-width:26px;height:29px;padding:0;display:grid;place-items:center;}
 :root .threadList:not(.collapsed) .v2BrandRow > .v2ThemeToggle {right:41px;translate:none;}
 :root .threadList:not(.collapsed) .v2BrandRow > .v2SidebarToggle {position:absolute;top:50%;right:7px;transform:translateY(-50%);translate:none;}
-/* Native progressive enhancement: no SVG masks, resize JS, layout transforms or extra paints. */
-@supports (corner-shape: superellipse(1.25)) {
-  :root :is(.conversation > .composer, .uiGlassPopover, .polishedSelectMenu, .groupedModelMenu,
+/* Native progressive enhancement for chrome surfaces (same curve as images):
+   no masks, resize JS, layout transforms or extra paints. */
+@supports (corner-shape: superellipse(1.6)) {
+  :root :is(.mobileUiComposerSurface, .mobileUiSheet, .mobileUiHeaderOptions .quotaPopover,
+    .conversation > .composer, .uiGlassPopover, .polishedSelectMenu, .groupedModelMenu,
     .skillPickerPopover, .v2PlusMenu, .accountPoolPopover, .quotaPopover, .modalDialog,
     .renameThreadDialog, .directoryDialog, .settingsDialog, .leaderboardDialog,
     .temporaryCloseDialog, .globalSearchDialog, .rightWorkspaceOverviewCard, .toolQuestionCard,
     .threadContextMenu,.v2AccountMenu,.composerSlashMenu,.petPicker,
     .feishuDialog:not(.feishuDocked),.taskNotificationDialog,.hostResourcesPanel article,.communicationMessage) {
-    corner-shape: superellipse(1.25);
+    corner-shape: var(--ui-corner-shape, superellipse(1.6));
   }
   /* The composer's backdrop is a separate layer; both edges must use the same geometry. */
   :root .conversation > .composer::before { corner-shape: inherit; }
+  :root :is(.mobileUiComposerSurface,.mobileUiQueuedSubmissionStrip)::before { corner-shape: var(--ui-corner-shape, superellipse(1.6)); }
 }
 @media (max-width: 900px) { :root { --ui-radius-composer: 23px; --ui-radius-dialog: 22px; } }
+
+/* Images use one smoother, continuous corner (Gemini/iOS-like) on desktop and
+   phone. Chromium draws it natively; WebKit (iPhone Safari has no corner-shape)
+   gets the same superellipse(1.6) curve from a static 9-slice mask: no JS,
+   no per-resize work. The mask defines the shape, so borders are dropped. */
+:root {
+  --ui-corner-shape: superellipse(1.6);
+  --ui-radius-image-card: 28px;
+  --ui-radius-image: 22px;
+  --ui-radius-thumb: 18px;
+  --ui-squircle-mask: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22232%22 height=%22232%22 viewBox=%220 0 58 58%22%3E%3Cpath d=%22M0 28L0.07 22.4L0.28 19.18L0.63 16.52L1.13 14.2L1.76 12.14L2.54 10.28L3.45 8.6L4.51 7.08L5.72 5.72L7.08 4.51L8.6 3.45L10.28 2.54L12.14 1.76L14.2 1.13L16.52 0.63L19.18 0.28L22.4 0.07L28 0L30 0L35.6 0.07L38.82 0.28L41.48 0.63L43.8 1.13L45.86 1.76L47.72 2.54L49.4 3.45L50.92 4.51L52.28 5.72L53.49 7.08L54.55 8.6L55.46 10.28L56.24 12.14L56.87 14.2L57.37 16.52L57.72 19.18L57.93 22.4L58 28L58 30L57.93 35.6L57.72 38.82L57.37 41.48L56.87 43.8L56.24 45.86L55.46 47.72L54.55 49.4L53.49 50.92L52.28 52.28L50.92 53.49L49.4 54.55L47.72 55.46L45.86 56.24L43.8 56.87L41.48 57.37L38.82 57.72L35.6 57.93L30 58L28 58L22.4 57.93L19.18 57.72L16.52 57.37L14.2 56.87L12.14 56.24L10.28 55.46L8.6 54.55L7.08 53.49L5.72 52.28L4.51 50.92L3.45 49.4L2.54 47.72L1.76 45.86L1.13 43.8L0.63 41.48L0.28 38.82L0.07 35.6L0 30Z%22/%3E%3C/svg%3E");
+}
+:root .inlineImageButton {border-color:transparent!important;border-radius:var(--ui-radius-image-card)!important;}
+:root .inlineImageButton .inlineMessageImage {border-radius:var(--ui-radius-image)!important;}
+:root :is(.messageItem.kind-user .inlineImageButton,.messageItem.kind-user .inlineImageButton .inlineMessageImage,.messageItem.kind-user .pendingUserImagePreview,.toolImagePreviewGrid .inlineImageButton,.uploadedImageThumbnail,.mobileUiComposerExtras .uploadedFileChip) {border-radius:var(--ui-radius-thumb)!important;}
+:root .toolImagePreviewGrid .inlineImageButton .inlineMessageImage {border-radius:calc(var(--ui-radius-thumb) - 5px)!important;}
+@supports (corner-shape: superellipse(1.6)) {
+  :root :is(.inlineImageButton,.inlineMessageImage,.messageItem.kind-user .pendingUserImagePreview,.uploadedImageThumbnail,.mobileUiComposerExtras .uploadedFileChip) {corner-shape:var(--ui-corner-shape);}
+}
+@supports (-webkit-mask-box-image: none) and (not (corner-shape: superellipse(1.6))) {
+  :root .inlineImageButton {border-radius:0!important;-webkit-mask-box-image:var(--ui-squircle-mask) 112 / var(--ui-radius-image-card);}
+  :root .inlineImageButton .inlineMessageImage {border-radius:0!important;-webkit-mask-box-image:var(--ui-squircle-mask) 112 / var(--ui-radius-image);}
+  :root :is(.messageItem.kind-user .inlineImageButton,.messageItem.kind-user .pendingUserImagePreview,.uploadedImageThumbnail,.mobileUiComposerExtras .uploadedFileChip) {border-radius:0!important;-webkit-mask-box-image:var(--ui-squircle-mask) 112 / var(--ui-radius-thumb);}
+  :root :is(.messageItem.kind-user .inlineImageButton .inlineMessageImage,.mobileUiComposerExtras .uploadedImageThumbnail) {-webkit-mask-box-image:none;}
+  :root .toolImagePreviewGrid .inlineImageButton {-webkit-mask-box-image:var(--ui-squircle-mask) 112 / var(--ui-radius-thumb);}
+  :root .toolImagePreviewGrid .inlineImageButton .inlineMessageImage {-webkit-mask-box-image:var(--ui-squircle-mask) 112 / calc(var(--ui-radius-thumb) - 5px);}
+}
+/* Image hover follows the neutral palette in both themes: a faint tint of the
+   theme's own text colour over the card, never the old teal glow/border. */
+:root :is(.inlineImageButton,.pendingUserImagePreview) {transition:box-shadow .18s ease,background-color .18s ease;}
+:root :is(.inlineImageButton,.pendingUserImagePreview):hover {border-color:transparent!important;box-shadow:inset 0 0 0 100vmax color-mix(in srgb,var(--ui-content) 6%,transparent)!important;}
+:root .messageItem.kind-user .pendingUserImagePreview:hover {background:#202120;} /* keep its base fill; only the tint changes */

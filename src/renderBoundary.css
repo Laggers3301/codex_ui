@@ -1,0 +1,13 @@
+.messageRenderFallback {
+  margin: 8px 0;
+  padding: 12px;
+  border: 1px solid var(--border, #5555);
+  border-radius: 12px;
+  color: inherit;
+  font: inherit;
+  overflow-wrap: anywhere;
+}
+.messageRenderFallback p { margin: 0 0 8px; }
+.messageRenderFallback pre { white-space: pre-wrap; font: inherit; max-height: 50vh; overflow: auto; }
+.messageRenderFallback button { font: inherit; color: inherit; background: transparent; border: 1px solid var(--border, #5555); border-radius: 8px; padding: 6px 10px; }
+.messageRenderFallback small, .appRenderFallback small { display: block; margin-top: 8px; opacity: .7; overflow-wrap: anywhere; }

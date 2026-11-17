@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { expect, it } from "vitest";
-import { ReclaudeQuotaDetails, reclaudeRemainingLabel } from "./reclaudeQuota";
+import { ReclaudeQuotaDetails, reclaudeDailyLimit, reclaudeRemainingLabel } from "./reclaudeQuota";
 import type { ReclaudeAccountUsage } from "../shared/reclaudeUsage";
 
 const now=Date.UTC(2026,10,4,10);
@@ -8,6 +8,15 @@ const account:ReclaudeAccountUsage={orgId:"1",label:"组织名",state:"available
   {kind:"five_hour",percent:19,resetsAt:now+3600000,observedAt:now-10000,source:"response"},
   {kind:"seven_day",percent:41,resetsAt:now+604800000,observedAt:now-10000,source:"response"}
 ]};
+it("calculates the daily reserve from the seven-day reset only",()=>{
+  const weekly=account.windows[1];
+  const midnight=new Date(now); midnight.setHours(24,0,0,0);
+  const expected=Math.max(0,Math.min(100,(weekly.resetsAt!-midnight.getTime())/604800000*100));
+  expect(reclaudeDailyLimit(weekly,now)).toBe(`${Number(expected.toFixed(1))}%（截止 今天 24:00）`);
+  expect(reclaudeDailyLimit(undefined,now)).toBe("-");
+  expect(reclaudeDailyLimit({...weekly,resetsAt:now},now)).toBe("-");
+  expect(renderToStaticMarkup(<ReclaudeQuotaDetails account={account} now={now}/>)).toContain("每日建议上限");
+});
 it("keeps creation limits in quota details and distinguishes them from token windows",()=>{
   const creations={limit:5,used:1,remaining:4,windowSeconds:3600,retryAt:null,retryAfterSeconds:0};
   const html=renderToStaticMarkup(<ReclaudeQuotaDetails account={account} creations={creations} now={now}/>);
@@ -17,7 +26,7 @@ it("keeps creation limits in quota details and distinguishes them from token win
 });
 it("shows both account windows and their reset times from the existing observation",()=>{
   const html=renderToStaticMarkup(<ReclaudeQuotaDetails account={account} now={now}/>);
-  expect(html).toContain("ReClaude 额度");expect(html).not.toContain(account.label);expect(html).toContain("5 小时");expect(html).toContain("周限");
+  expect(html).toContain("ReClaude 额度");expect(html).toContain(account.label);expect(html).toContain('data-quota-account="1"');expect(html).toContain("5 小时");expect(html).toContain("周限");
   for(const value of ["剩余 81%","已用 19%","剩余 59%","已用 41%","数据时间","重置"])expect(html).toContain(value);
   expect(reclaudeRemainingLabel(account,now)).toBe("59%");
   expect(html).not.toContain(account.message);

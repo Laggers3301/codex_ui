@@ -1,5 +1,6 @@
 /* Tool activity and reasoning share a compact size on desktop and mobile. */
 :root { --tool-reading-size: 12px; }
+@media(max-width:720px) { :root { --tool-reading-size:14px; } }
 :root[data-theme] .messageItem.kind-tool :is(.messageMeta,.toolBundleTitleLabel,.toolBundleEntryLabel,.toolBundleEntrySummary,.toolRollingCount,.toolCountGlyph),
 :root[data-theme] .messageItem.kind-tool .messageMeta :is(.toolBundleTitleLabel,.toolBundleEntryLabel,.toolBundleEntrySummary,.toolRollingCount,.toolCountGlyph) {
   font-size:var(--tool-reading-size)!important;
@@ -36,4 +37,16 @@
 /* The nested rail is indented like tool entries; standalone thinking stays flush. */
 :root[data-theme] .toolBundleReasoningEntry :is(.reasoningSummaryRow,.reasoningDisclosureTrigger) {
   padding-inline-start:5px!important;
+}
+/* Theme colors and expanded-body inheritance must not paint over the active
+   gradient. Inline markdown inherits this fill from its animated block. */
+:root[data-theme] .toolBundleShimmering .toolBundleReasoningEntry :is(.reasoningLabel,.reasoningSummaryPreview),
+:root[data-theme] .toolBundleShimmering .toolBundleReasoningEntry .reasoningExpandedBody .messageMarkdown > * {
+  -webkit-text-fill-color:transparent!important;
+}
+@media (prefers-reduced-motion:reduce) {
+  :root[data-theme] .toolBundleShimmering .toolBundleReasoningEntry :is(.reasoningLabel,.reasoningSummaryPreview),
+  :root[data-theme] .toolBundleShimmering .toolBundleReasoningEntry .reasoningExpandedBody .messageMarkdown > * {
+    -webkit-text-fill-color:currentColor!important;
+  }
 }

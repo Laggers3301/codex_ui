@@ -3,8 +3,123 @@ import multipart from "@fastify/multipart";
 import { describe, expect, it, vi } from "vitest";
 import { createSessionCookie } from "./auth.js";
 import { registerSpeechRoutes } from "./speech.js";
+import http from 'node:http';
+
+const recognized={text:'你好 Codex',elapsedMs:20,durationSeconds:1,model:'Qwen3-ASR-1.7B'};
+const ownerHeaders={cookie:createSessionCookie('qa-user').split(';')[0]};
+const audioPrefix='--speech\r\nContent-Disposition: form-data; name="audio"; filename="recording"\r\nContent-Type: audio/webm\r\n\r\naudio bytes';
+const audioBody=audioPrefix+'\r\n--speech--\r\n';
+async function lifetimeFixture(uploadTimeoutMs=500,transcriptionTimeoutMs=1000){
+ const app=Fastify();await app.register(multipart);
+ const transcribe=vi.fn().mockResolvedValue(recognized);
+ registerSpeechRoutes(app,{transcribe,ready:async()=>true,uploadTimeoutMs,transcriptionTimeoutMs});
+ const base=await app.listen({host:'127.0.0.1',port:0});
+ const status=async()=>(await app.inject({url:'/api/speech/status',headers:ownerHeaders})).json();
+ const send=(headers=ownerHeaders)=>app.inject({method:'POST',url:'/api/speech/transcribe',headers:{...headers,'content-type':'multipart/form-data; boundary=speech'},payload:audioBody});
+ const open=(route='/api/speech/transcribe')=>{
+  let client!:http.ClientRequest;
+  const response=new Promise<{status:number;body:string}>(resolve=>{
+   client=http.request(base+route,{method:'POST',agent:false,headers:{...ownerHeaders,'content-type':'multipart/form-data; boundary=speech'}},res=>{
+    let body='';res.on('data',part=>{body+=part;});res.on('end',()=>resolve({status:res.statusCode??0,body}));res.on('error',()=>resolve({status:0,body:''}));
+   });client.on('error',()=>resolve({status:0,body:''}));
+  });
+  return {client,response};
+ };
+ return {app,transcribe,status,send,open};
+}
 
 describe("authenticated dictation", () => {
+  it('coalesces slow health checks across users, expires cached failures and recovers',async()=>{
+    const app=Fastify();let release!:(value:boolean)=>void;
+    const ready=vi.fn().mockImplementation(()=>new Promise<boolean>(resolve=>{release=resolve;}));
+    registerSpeechRoutes(app,{ready,healthCacheMs:20});
+    try{
+      const requests=[ownerHeaders,{cookie:createSessionCookie('sample-user').split(';')[0]},ownerHeaders].map(headers=>app.inject({url:'/api/speech/status',headers}));
+      const results=Promise.all(requests);
+      await vi.waitFor(()=>expect(ready).toHaveBeenCalledTimes(1));release(true);
+      expect((await results).every(response=>response.json().ready===true)).toBe(true);
+      expect((await app.inject({url:'/api/speech/status',headers:ownerHeaders})).json().ready).toBe(true);
+      expect(ready).toHaveBeenCalledTimes(1);
+      await new Promise(resolve=>setTimeout(resolve,25));ready.mockRejectedValueOnce(new Error('network timeout'));
+      expect((await app.inject({url:'/api/speech/status',headers:ownerHeaders})).json().ready).toBe(false);
+      expect((await app.inject({url:'/api/speech/status',headers:ownerHeaders})).json().ready).toBe(false);
+      expect(ready).toHaveBeenCalledTimes(2);
+      await new Promise(resolve=>setTimeout(resolve,25));ready.mockResolvedValueOnce(true);
+      expect((await app.inject({url:'/api/speech/status',headers:ownerHeaders})).json().ready).toBe(true);
+      expect(ready).toHaveBeenCalledTimes(3);
+    }finally{await app.close();}
+  });
+  it('times out an unfinished upload before inference and releases the owner lock',async()=>{
+    const f=await lifetimeFixture(),slow=f.open();slow.client.write(audioPrefix);
+    try{
+      await vi.waitFor(async()=>expect((await f.status()).busy).toBe(true),{interval:10});
+      expect((await f.send()).statusCode).toBe(429);
+      const response=await slow.response;expect(response.status).toBe(408);expect(response.body).toContain('上传超时');
+      expect(f.transcribe).not.toHaveBeenCalled();
+      expect((await f.status()).busy).toBe(false);
+      expect((await f.send()).statusCode).toBe(200);expect(f.transcribe).toHaveBeenCalledTimes(1);
+    }finally{slow.client.destroy();await f.app.close();}
+  });
+  it('releases a disconnected upload immediately and leaves other users usable',async()=>{
+    const f=await lifetimeFixture(5000),slow=f.open();slow.client.write(audioPrefix);
+    try{
+      await vi.waitFor(async()=>expect((await f.status()).busy).toBe(true),{interval:10});
+      expect((await f.send({cookie:createSessionCookie('sample-user').split(';')[0]})).statusCode).toBe(200);
+      slow.client.destroy();
+      await vi.waitFor(async()=>expect((await f.status()).busy).toBe(false),{interval:10});
+      expect((await f.send()).statusCode).toBe(200);expect(f.transcribe).toHaveBeenCalledTimes(2);
+    }finally{slow.client.destroy();await f.app.close();}
+  });
+  it('cancels a stalled preupload and frees transfer slots without retaining an owner session',async()=>{
+    const f=await lifetimeFixture(5000);
+    const session=(await f.app.inject({method:'POST',url:'/api/speech/uploads',headers:ownerHeaders,payload:{mime:'audio/webm'}})).json();
+    const slow=f.open(`/api/speech/uploads/${session.id}/0`);slow.client.write(audioPrefix);
+    try{
+      await vi.waitFor(async()=>expect((await f.status()).uploading).toBe(true),{interval:10});
+      expect((await f.app.inject({method:'DELETE',url:`/api/speech/uploads/${session.id}`,headers:ownerHeaders})).statusCode).toBe(200);
+      await slow.response;
+      await vi.waitFor(async()=>expect((await f.status()).uploading).toBe(false),{interval:10});
+      expect((await f.app.inject({method:'POST',url:'/api/speech/uploads',headers:ownerHeaders,payload:{mime:'audio/webm'}})).statusCode).toBe(200);
+      expect(f.transcribe).not.toHaveBeenCalled();
+    }finally{slow.client.destroy();await f.app.close();}
+  });
+  it('times out a partial final fragment and removes its cancelled session',async()=>{
+    const f=await lifetimeFixture();
+    const session=(await f.app.inject({method:'POST',url:'/api/speech/uploads',headers:ownerHeaders,payload:{mime:'audio/webm'}})).json();
+    const slow=f.open(`/api/speech/uploads/${session.id}/complete`);
+    slow.client.write('--speech\r\nContent-Disposition: form-data; name="parts"\r\n\r\n0\r\n'+audioPrefix);
+    try{
+      const response=await slow.response;expect(response.status).toBe(408);
+      expect((await f.app.inject({method:'POST',url:'/api/speech/uploads',headers:ownerHeaders,payload:{mime:'audio/webm'}})).statusCode).toBe(200);
+      expect(f.transcribe).not.toHaveBeenCalled();
+    }finally{slow.client.destroy();await f.app.close();}
+  });
+  it('aborts inference on browser disconnect and ignores a late result without clearing a newer lock',async()=>{
+    const f=await lifetimeFixture(5000,5000),first=f.open();
+    let finishFirst!:(value:typeof recognized)=>void,finishSecond!:(value:typeof recognized)=>void;
+    f.transcribe.mockImplementationOnce(()=>new Promise(resolve=>{finishFirst=resolve;})).mockImplementationOnce(()=>new Promise(resolve=>{finishSecond=resolve;}));
+    first.client.end(audioBody);
+    try{
+      await vi.waitFor(()=>expect(f.transcribe).toHaveBeenCalledTimes(1),{interval:10});
+      const firstSignal=f.transcribe.mock.calls[0][1] as AbortSignal;
+      first.client.destroy();await vi.waitFor(async()=>expect((await f.status()).busy).toBe(false),{interval:10});
+      expect(firstSignal.aborted).toBe(true);
+      const second=f.send().then(result=>result);
+      await vi.waitFor(()=>expect(f.transcribe).toHaveBeenCalledTimes(2),{interval:10});
+      finishFirst(recognized);await new Promise(resolve=>setImmediate(resolve));
+      expect((await f.status()).busy).toBe(true);expect((await f.send()).statusCode).toBe(429);
+      finishSecond(recognized);expect((await second).statusCode).toBe(200);
+      expect((await f.status()).busy).toBe(false);expect(f.transcribe).toHaveBeenCalledTimes(2);
+    }finally{finishFirst?.(recognized);finishSecond?.(recognized);first.client.destroy();await f.app.close();}
+  });
+  it('bounds inference even when the adapter ignores cancellation',async()=>{
+    const f=await lifetimeFixture(1000,40);f.transcribe.mockImplementationOnce(()=>new Promise(()=>{}));
+    try{
+      expect((await f.send()).statusCode).toBe(503);
+      expect((await f.status()).busy).toBe(false);
+      expect((await f.send()).statusCode).toBe(200);expect(f.transcribe).toHaveBeenCalledTimes(2);
+    }finally{await f.app.close();}
+  });
   it("rejects unauthenticated access and exposes the real model", async () => {
     const app = Fastify(); await app.register(multipart);
     registerSpeechRoutes(app, { ready: async () => true });

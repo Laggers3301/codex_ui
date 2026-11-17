@@ -34,6 +34,7 @@ import type {
 } from "./types";
 
 const defaultUserId = "admin";
+
 export function readMemoryProcesses(signal: AbortSignal): Promise<{data: import('../shared/hostResources').MemoryProcesses}> {
   return request('/api/system/memory-processes', {signal: AbortSignal.any([signal, AbortSignal.timeout(8000)])});
 }
@@ -301,6 +302,49 @@ export function testPushNotification(threadId: string): Promise<{ data: { subscr
   return request("/api/push/test", { method: "POST", body: JSON.stringify({ threadId }) });
 }
 
+type Settled = { ok: boolean; status: number; body: any };
+type Flight = { promise: Promise<Settled>; waiters: number; active: number; controller: AbortController };
+const inFlightReads = new Map<string, Flight>();
+
+/** Identical concurrent GETs (startup fires the same list/model/pool reads from several
+ * components) share one network request. Each caller still gets its own copy of the
+ * result and its own abort semantics; the shared request is only cancelled once every
+ * caller that passed a signal has given up and none is waiting without one. */
+function coalescedRead(path: string, options: RequestInit | undefined, run: (signal: AbortSignal) => Promise<Settled>): Promise<Settled> | null {
+  const keys = options ? Object.keys(options) : [];
+  const plain = keys.every(key => key === "signal" || key === "cache" || (key === "method" && (options!.method ?? "GET") === "GET"));
+  if (!plain || typeof structuredClone !== "function") return null;
+  const key = `${currentUserId}\n${options?.cache ?? ""}\n${path}`;
+  let flight = inFlightReads.get(key);
+  if (!flight) {
+    const controller = new AbortController();
+    const created: Flight = { controller, waiters: 0, active: 0, promise: undefined as unknown as Promise<Settled> };
+    created.promise = run(controller.signal).finally(() => { if (inFlightReads.get(key) === created) inFlightReads.delete(key); });
+    inFlightReads.set(key, created); flight = created;
+  }
+  const shared = flight; shared.waiters++; shared.active++;
+  const signal = options?.signal ?? undefined;
+  let release = () => {};
+  const done = new Promise<Settled>((resolve, reject) => {
+    if (signal) {
+      const abort = () => {
+        release();
+        if (--shared.active === 0) shared.controller.abort();
+        reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      };
+      if (signal.aborted) return abort();
+      signal.addEventListener("abort", abort, { once: true });
+      release = () => signal.removeEventListener("abort", abort);
+    }
+    shared.promise.then(value => {
+      release();
+      // A lone caller keeps the original; sharers each get an independent clone.
+      resolve(shared.waiters > 1 ? { ...value, body: structuredClone(value.body) } : value);
+    }, error => { release(); reject(error); });
+  });
+  return done;
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers);
   if (!headers.has("x-codex-web-user-id")) headers.set("x-codex-web-user-id", currentUserId);
@@ -309,21 +353,22 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     headers.set("Content-Type", "application/json");
   }
 
-  let response: Response;
-  try {
-    response = await fetch(path, {
-      ...options,
-      headers
-    });
-  } catch (caught) {
-    const detail = caught instanceof Error ? caught.message : String(caught);
-    throw new Error(`网络请求失败 ${path}: ${detail}`);
-  }
-
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
+  const run = async (signal: AbortSignal | undefined): Promise<Settled> => {
+    let response: Response;
+    try {
+      response = await fetch(path, { ...options, headers, ...(signal ? { signal } : {}) });
+    } catch (caught) {
+      if (signal?.aborted || (caught instanceof DOMException && caught.name === "AbortError")) throw caught;
+      const detail = caught instanceof Error ? caught.message : String(caught);
+      throw new Error(`网络请求失败 ${path}: ${detail}`);
+    }
+    return { ok: response.ok, status: response.status, body: await response.json().catch(() => ({})) };
+  };
+  const settled = await (coalescedRead(path, options, signal => run(signal)) ?? run(options?.signal ?? undefined));
+  const { body } = settled;
+  if (!settled.ok) {
     const message = body.message ? `${body.error ?? "Request failed"}: ${body.message}` : body.error;
-    throw new Error(message ?? `Request failed: ${response.status}`);
+    throw new Error(message ?? `Request failed: ${settled.status}`);
   }
   return body as T;
 }
@@ -549,6 +594,9 @@ export function listArchivedThreads(projectId: string, signal?:AbortSignal): Pro
 function subagentUrl(projectId: string, parentThreadId: string): string {
   return `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(parentThreadId)}/subagents`;
 }
+export function readConversationTasks(projectId:string,threadId:string,signal?:AbortSignal):Promise<import('../shared/conversationTasks').ConversationTasksResponse>{
+  return request(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/tasks`,{cache:'no-store',signal});
+}
 
 export function listSubagentThreads(projectId: string, parentThreadId: string, signal?: AbortSignal, options: { view?: "all" | "active" | "history"; q?: string; cursor?: string; limit?: number } = {}): Promise<import("./types").SubagentDirectoryResponse> {
   const params = new URLSearchParams();
@@ -635,15 +683,38 @@ export function deleteSideChat(side: SideChat): Promise<{ ok: boolean; data: Sid
   return request(`${sideChatUrl(side.projectId, side.parentThreadId)}?id=${encodeURIComponent(side.id)}`, { method: "DELETE" });
 }
 
-export function branchThread(
+export interface BranchProgress {phase:string;stage?:'snapshot'|'display'|'import';totalMessages:number;importedMessages:number;displayItems?:number;updatedAt:number;error?:string}
+export interface BranchResponse { data: { thread: ThreadSummary; turn: { turn?: { id?: string } } | null; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null; branchMode: "native" | "cross-account-native" | "legacy-stream-import" | "legacy-tool-archive" | "cross-runtime" } }
+export async function branchThread(
   projectId: string,
   threadId: string,
-  input: { turnId: string; prompt?: string; targetProjectId?: string; archiveToolOutputs?:boolean;targetAccountId?:string;model?:string;operationId?:string;reasoningEffort?:ReasoningEffort }
-): Promise<{ data: { thread: ThreadSummary; turn: { turn?: { id?: string } } | null; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null; branchMode: "native" | "cross-account-native" | "legacy-stream-import" | "legacy-tool-archive" | "cross-runtime" } }> {
-  return request(`/api/projects/${projectId}/threads/${threadId}/branch`, {
+  input: { turnId: string; prompt?: string; targetProjectId?: string; archiveToolOutputs?:boolean;targetAccountId?:string;model?:string;operationId?:string;reasoningEffort?:ReasoningEffort;onProgress?:(progress:BranchProgress)=>void }
+): Promise<BranchResponse> {
+  const {onProgress,...body}=input;
+  const response=await request<BranchResponse|{data:{branchPending:true;operationId:string}}>(`/api/projects/${projectId}/threads/${threadId}/branch`, {
     method: "POST",
-    body: JSON.stringify(input)
+    body: JSON.stringify({...body,background:!!body.operationId&&!!body.model})
   });
+  if(!('branchPending' in response.data))return response as BranchResponse;
+  const operationId=response.data.operationId;
+  const deadline=Date.now()+15*60_000;let failures=0;
+  while(Date.now()<deadline){
+    let snapshot:{data:BranchProgress&{result?:BranchResponse}};
+    try{
+      snapshot=await request(`/api/projects/${projectId}/threads/${threadId}/branch-status/${operationId}`,{cache:'no-store',signal:AbortSignal.timeout(15000)});
+      failures=0;
+    }catch{
+      // Never repeat the POST after an uncertain network result.
+      if(++failures>=3)throw new Error('分支状态暂时无法读取，后台任务可能仍在继续。请勿重复创建；完成后可从会话列表打开。');
+      await new Promise(resolve=>setTimeout(resolve,1500));continue;
+    }
+    onProgress?.(snapshot.data);
+    if(snapshot.data.error||snapshot.data.phase==='failed')throw new Error(snapshot.data.error??'分支导入失败，原会话保留。');
+    if(snapshot.data.phase==='interrupted')throw new Error('分支导入期间服务重载，结果需要核对。请勿重复创建，原会话保留。');
+    if(snapshot.data.phase==='completed'&&snapshot.data.result)return snapshot.data.result;
+    await new Promise(resolve=>setTimeout(resolve,1000));
+  }
+  throw new Error('长历史分支仍在后台处理，请勿重复创建；完成后可从会话列表打开。');
 }
 
 export function startThreadReview(projectId: string, threadId: string, branch?: string): Promise<{ data: { turn: { id: string }; reviewThreadId: string } }> {

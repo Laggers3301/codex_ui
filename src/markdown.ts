@@ -63,7 +63,16 @@ export function stripInterruptArtifacts(text: string): string {
     .trim();
 }
 
-function normalizeMathInText(text: string): string {
+/** Inverse of one plain-text Markdown serialization, only for legacy math. */
+export function decodeLegacyMathSource(text: string): string {
+  return text.replace(/\\([\\`*{}\[\]()#+\-.!_>])/g, "$1")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+}
+
+function normalizeMathInText(text: string, recoverEscapedMath = false): string {
+  if (recoverEscapedMath) text = text
+    .replace(/(?<!\\)\\{3}\[([\s\S]+?)\\{3}\]/g, (_whole, latex: string) => `\\[${decodeLegacyMathSource(latex)}\\]`)
+    .replace(/(?<!\\)\\{3}\(([^\n]+?)\\{3}\)/g, (_whole, latex: string) => `\\(${decodeLegacyMathSource(latex)}\\)`);
   return text
     .replace(/(?<!\\)\\\[([\s\S]*?)(?<!\\)\\\]/g, (whole, equation: string, offset: number, source: string) => {
       const content = equation.trim();
@@ -91,23 +100,23 @@ function normalizeMathInText(text: string): string {
     });
 }
 
-function normalizeMathInProse(text: string): string {
+function normalizeMathInProse(text: string, recoverEscapedMath = false): string {
   const codeSpanPattern = /(`+)([\s\S]*?)\1/g;
   let result = "";
   let cursor = 0;
 
   for (const match of text.matchAll(codeSpanPattern)) {
     const start = match.index ?? cursor;
-    result += normalizeMathInText(text.slice(cursor, start));
+    result += normalizeMathInText(text.slice(cursor, start), recoverEscapedMath);
     result += match[0];
     cursor = start + match[0].length;
   }
 
-  return result + normalizeMathInText(text.slice(cursor));
+  return result + normalizeMathInText(text.slice(cursor), recoverEscapedMath);
 }
 
 /** Convert LaTeX delimiters that remark-math does not parse, without touching code. */
-export function normalizeMathMarkdown(text: string): string {
+export function normalizeMathMarkdown(text: string, recoverEscapedMath = false): string {
   const lines = text.match(/[^\n]*\n|[^\n]+/g) ?? [];
   const output: string[] = [];
   let prose = "";
@@ -115,7 +124,7 @@ export function normalizeMathMarkdown(text: string): string {
 
   const flushProse = () => {
     if (prose) {
-      output.push(normalizeMathInProse(prose));
+      output.push(normalizeMathInProse(prose, recoverEscapedMath));
       prose = "";
     }
   };

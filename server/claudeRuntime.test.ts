@@ -8,6 +8,7 @@ import { ClaudeStreamAdapter } from "./claudeStreamAdapter.js";
 import { LiveStateStore } from "./liveState.js";
 import type { RpcEnvelope } from "./types.js";
 import { CodexBridge } from "./codexBridge.js";
+import { AppError } from './appErrors.js';
 import { approvalResponse } from "../shared/approvals.js";
 import {claudeBranchName} from '../shared/agentRuntime.js';
 import {responseLanguageInstructions} from '../scripts/agent-response-style.mjs';
@@ -31,6 +32,13 @@ function fixture(factory: ClaudeQueryFactory) {
 }
 
 describe("Claude runtime boundaries", () => {
+  it('keeps native branch checkpoints on the main stream when a child responds later',async()=>{
+    const {runtime,input}=fixture(async()=>query([init,
+      {type:'assistant',uuid:'main-checkpoint',parent_tool_use_id:null,message:{id:'main-msg',content:[{type:'text',text:'主会话'}]}},
+      {type:'assistant',uuid:'child-checkpoint',parent_tool_use_id:'parent-tool',message:{id:'child-msg',content:[{type:'text',text:'子代理'}]}},success]));
+    const checkpoints:unknown[]=[];runtime.on('nativeCheckpoint',event=>checkpoints.push(event));
+    await runtime.runTurn(input);expect(checkpoints).toEqual([{messageId:'main-checkpoint'}]);
+  });
   it('uses the same Chinese language policy in the system prompt and native Agent input without replacing its task',async()=>{
     const factory=vi.fn(async()=>query([init,success])),{runtime,input}=fixture(factory);await runtime.runTurn(input);
     const options=(factory.mock.calls as any)[0][1];expect(options.systemPrompt.append).toContain(responseLanguageInstructions);
@@ -81,6 +89,13 @@ describe("Claude runtime boundaries", () => {
     await runtime.runTurn({...input,resumeSessionId:'old-native'});
     expect(notifications.some(n=>n.method==='runtime/claudeResumePending')).toBe(false);
     expect(notifications.at(-1)?.params).toMatchObject({turn:{status:'failed',error:{code:'claude_empty_response'}}});
+  });
+  it('does not hold a completed turn open merely because a foreground progress frame arrived without its start',async()=>{
+    const {runtime,input,notifications}=fixture(async()=>query([init,{type:'system',subtype:'task_progress',task_id:'foreground',subagent_type:'general-purpose',summary:'检查中'},success]));
+    await runtime.runTurn(input);
+    expect(notifications.some(event=>event.method==='runtime/claudeBackgroundWait')).toBe(false);
+    expect((notifications.find(event=>event.method==='runtime/claudeTasks')?.params as {tasks?:unknown}|undefined)?.tasks).toMatchObject([{id:'foreground',background:false}]);
+    expect(notifications.at(-1)?.params).toMatchObject({turn:{status:'completed'}});
   });
   it('keeps a query alive after the parent result until background results are consumed and summarized',async()=>{
     let release!:()=>void;const gate=new Promise<void>(r=>release=r),closed=vi.fn();
@@ -239,9 +254,9 @@ describe("Claude runtime boundaries", () => {
     runtime.on("serverRequest",pending);
     const run=runtime.runTurn(input);await waiting;
     await expect(runtime.runTurn({...input,turnId:"other"})).rejects.toMatchObject({code:"turn_in_progress"});
-    runtime.interrupt("alice",input.threadId); await run;
+    runtime.interrupt("alice",input.threadId,new AppError('user_stopped','已停止本轮回答。')); await run;
     expect(denied).toMatchObject({behavior:"deny"});
-    expect(notifications.at(-1)?.params).toMatchObject({turn:{status:"interrupted",items:[{text:"已读取文件"}]}});
+    expect(notifications.at(-1)?.params).toMatchObject({turn:{status:"interrupted",items:[{text:"已读取文件"}],error:{code:'user_stopped',source:'user',retryable:false}}});
   });
 
   it("reports truncated and failed streams as failures, never successful answers", async () => {

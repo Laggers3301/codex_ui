@@ -18,6 +18,12 @@ function fixture(){
   return{monitor,stop,db,dir,file,key,binding,get now(){return now},advance:(ms:number)=>{now+=ms;}};
 }
 describe("ReClaude passive usage policy",()=>{
+  it('stores native command observations under the actual account only',()=>{
+    const f=fixture();
+    f.monitor.observeNativeUsage(f.key,'Current session: 8% used\nCurrent week (all models): 69% used');
+    expect(f.monitor.status(f.binding)).toMatchObject({state:'available',windows:expect.arrayContaining([expect.objectContaining({kind:'seven_day',percent:69,source:'native-command'})])});
+    expect(f.monitor.status({...f.binding,accountKey:'unrelated'})).toMatchObject({state:'unknown',windows:[]});
+  });
   it("reads all response header windows, uses fractions, and stops at exactly 99% even when 5h is the top-level limit",()=>{
     const f=fixture();
     f.monitor.observeResponse(f.key,{rate_limit_info:{rateLimitType:"five_hour",utilization:.999,unifiedWindows:{seven_day:{utilization:.9899,resetsAt:(f.now+100_000)/1000}}}});

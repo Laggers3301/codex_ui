@@ -541,6 +541,22 @@ export async function threadJsonlMatchesSearch(filePath: string, query: string, 
 
 /** Read just enough metadata for a search result row; do not construct a full
  * turns/items payload for a large historical conversation. */
+// The conversation list asks for a summary of every visible thread on every refresh (the
+// page even issues it twice at startup). A summary is fully determined by the head of the
+// file, so it is remembered per (thread, source file version). The version is taken from the
+// *source* file - for a compressed .zst rollout that is one cheap stat instead of inflating
+// the whole archive into the shared cache just to read its first lines. Any append or rewrite
+// changes size/mtime/inode and falls through to a fresh read. Bounded LRU; callers get a copy.
+const threadSummaryCache = new Map<string, JsonObject>();
+const threadSummaryCacheLimit = 4096;
+async function threadSourceVersion(filePath: string): Promise<string | null> {
+  for (const candidate of [filePath, `${filePath}.zst`]) {
+    const info = await fs.stat(candidate).catch(() => null);
+    if (info?.isFile()) return `${candidate}:${info.ino}:${info.size}:${info.mtimeMs}`;
+  }
+  return null;
+}
+
 export async function readThreadSummaryFromJsonl(
   filePath: string,
   threadId: string,
@@ -549,6 +565,24 @@ export async function readThreadSummaryFromJsonl(
   if (!isSafeCodexSessionPath(filePath, sessionsRoot)) {
     throw new Error("Refusing to read a thread outside the Codex sessions directory.");
   }
+  const version = await threadSourceVersion(filePath);
+  const key = version ? `${threadId}|${sessionsRoot ?? ""}|${version}` : null;
+  if (key) {
+    const hit = threadSummaryCache.get(key);
+    if (hit) { threadSummaryCache.delete(key); threadSummaryCache.set(key, hit); return structuredClone(hit); }
+  }
+  const summary = await readThreadSummaryFromJsonlUncached(filePath, threadId);
+  if (key) {
+    threadSummaryCache.set(key, structuredClone(summary));
+    while (threadSummaryCache.size > threadSummaryCacheLimit) threadSummaryCache.delete(threadSummaryCache.keys().next().value as string);
+  }
+  return summary;
+}
+
+async function readThreadSummaryFromJsonlUncached(
+  filePath: string,
+  threadId: string
+): Promise<JsonObject> {
   const stat = await rolloutStat(filePath);
   const lines = rolloutLines(filePath);
   let metadata: JsonObject | null = null;
@@ -708,7 +742,18 @@ async function parseThreadFromJsonl(
       const headBuffer = Buffer.allocUnsafe(Math.min(64 * 1024, fileStat.size));
       await handle.read(headBuffer, 0, headBuffer.length, 0);
       const bodyParts:string[]=[];let previewBytes=0;
-      if(endOffset>startOffset)for await(const row of rolloutPreviewRecords(filePath,{start:startOffset,end:endOffset})){previewBytes+=Buffer.byteLength(row.text)+1;if(previewBytes>32*1024*1024)throw new HistoryMemoryLimitError();bodyParts.push(row.text);}
+      if(endOffset>startOffset)for await(const row of rolloutPreviewRecords(filePath,{start:startOffset,end:endOffset})){
+        previewBytes+=Buffer.byteLength(row.text)+1;if(previewBytes>32*1024*1024)throw new HistoryMemoryLimitError();
+        // Match the index's physical record identity. Page-local fallback IDs
+        // collide when several pages contain messages from the same turn.
+        if(row.text.trim()){
+          const value=JSON.parse(row.text);
+          if(value.type==='response_item'&&['message','reasoning'].includes(value.payload?.type)&&typeof value.payload.id!=='string'){
+            value.payload.id=`jsonl-${row.start}`;bodyParts.push(JSON.stringify(value));continue;
+          }
+        }
+        bodyParts.push(row.text);
+      }
       const firstLineEnd = headBuffer.indexOf(10);
       const firstLine = headBuffer.subarray(0, firstLineEnd >= 0 ? firstLineEnd : headBuffer.length).toString("utf8").trimEnd();
       const syntheticTurn = options.syntheticTurnId

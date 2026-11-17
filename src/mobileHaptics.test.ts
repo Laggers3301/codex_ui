@@ -20,3 +20,14 @@ it("never vibrates in reduced-motion mode or lets a rejected API break clicks", 
   vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("pointer: coarse") }));
   expect(mobileHaptic(3200)).toBe(false);
 });
+it("uses the native switch haptic on iOS without moving focus", async () => {
+  const { mobileShapeHaptic } = await import("./mobileHaptics");
+  vi.stubGlobal("navigator", {});
+  vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("pointer: coarse") }));
+  const input = document.createElement("textarea"); document.body.append(input); input.focus();
+  expect(mobileShapeHaptic(10_000)).toBe(true);
+  expect(document.activeElement).toBe(input);
+  expect(document.head.querySelector("input[switch]")).toBeNull();
+  expect(mobileShapeHaptic(10_050)).toBe(false);
+  input.remove();
+});

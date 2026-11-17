@@ -108,3 +108,25 @@ describe("native history migration and offline branching", () => {
     expect(fs.readFileSync(fixture.file)).toEqual(original);
   }, 20000);
 });
+
+describe("hot-path lookups", () => {
+  it("answers ownership without reading the conversation, and counts turns from a cache that can never be stale", () => {
+    const directory = temp();
+    const db = new ClaudeSessionStorage(directory, () => 1000); databases.push(db);
+    expect(db.has("missing")).toBe(false);
+    db.save({ id: "thread-a", userId: "u", projectId: "p", nativeSessionId: "native-a", model: "m" } as unknown as ClaudeConversation);
+    expect(db.has("thread-a")).toBe(true); expect(db.get("thread-a")?.id).toBe("thread-a");
+    // Cached count follows our own writes at once.
+    expect(db.turnCount("t")).toBe(0);
+    db.saveTurn("t", { id: "t-1" }); expect(db.turnCount("t")).toBe(1);
+    db.saveTurn("t", { id: "t-2" }); expect(db.turnCount("t")).toBe(2);
+    expect(db.turnCount("t")).toBe(2); // served from the cache
+    // A commit by ANOTHER connection (same file) is noticed through PRAGMA data_version.
+    const other = new DatabaseSync(path.join(directory, "sessions.sqlite"));
+    other.prepare("INSERT INTO turns VALUES (?,?,?,?)").run("t", "t-3", 1001, "{}");
+    other.close();
+    expect(db.turnCount("t")).toBe(3);
+    // The cursor form is never cached.
+    expect(db.turnCount("t", 1_000_000)).toBe(0);
+  });
+});

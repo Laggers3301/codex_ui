@@ -39,11 +39,14 @@
 :root .exhaustedAccountNoticeActions {gap:8px;}
 :root .exhaustedAccountNoticeActions button {box-sizing:border-box;min-height:36px;padding:8px 12px;font-size:14px;line-height:20px;font-weight:400;border-radius:10px;}
 @media(max-width:720px) {
-  :root {--dialog-text-size:15px;--dialog-text-line:22px;--dialog-title-size:16px;--dialog-title-line:24px;--dialog-control-height:44px;--dialog-control-pad-y:11px;--dialog-control-pad-x:14px;--dialog-control-radius:12px;}
+  :root {--dialog-text-size:16px;--dialog-text-line:24px;--dialog-title-size:16px;--dialog-title-line:24px;--dialog-control-height:44px;--dialog-control-pad-y:10px;--dialog-control-pad-x:14px;--dialog-control-radius:12px;}
   :root .directoryDialog .directoryRow {min-height:44px;padding-block:11px;}
   :root .skillPickerFooter {padding-bottom:max(12px,env(safe-area-inset-bottom));gap:8px;}
-  :root .exhaustedAccountNotice {left:12px;right:12px;width:auto;max-width:none;gap:10px;padding:8px 10px;}
-  :root .exhaustedAccountNoticeActions button {min-height:44px;padding:11px 12px;font-size:15px;line-height:22px;}
+  :root .exhaustedAccountNotice {left:12px;right:12px;width:auto;max-width:none;gap:8px;padding:8px 10px;}
+  :root .exhaustedAccountNoticeCopy {font-size:14px;line-height:20px;}
+  :root .exhaustedAccountNoticeActions {gap:4px;}
+  :root .exhaustedAccountNoticeActions button {min-height:32px;padding:6px 8px;font-size:14px;line-height:20px;border-radius:8px;}
+  :root .exhaustedAccountNoticeActions .exhaustedAccountBranchButton {background:var(--ui-hover);color:var(--ui-content);}
   :root .taskNotificationSwitch {display:flex;align-items:center;width:44px;height:28px;}
   :root .taskNotificationSwitch[aria-checked="true"] span {transform:translateX(19px);}
   :root .taskNotificationSwitch::after {content:"";position:absolute;inset:-8px 0;border-radius:inherit;}

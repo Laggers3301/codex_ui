@@ -3,6 +3,7 @@ import {
   continuationRecoveryPrompt,
   contextRecoveryMessagePrefix,
   contextRecoveryPrompt,
+  nextContextRecoveryAttempt,
   isContextCompactionItem,
   isGenericContextLossReply,
   isPlanOnlyContinuationReply,
@@ -27,8 +28,29 @@ describe("context-window recovery guard", () => {
   it("requires checkpoint hydration before an answer", () => {
     const prompt = contextRecoveryPrompt();
     expect(prompt.startsWith(contextRecoveryMessagePrefix)).toBe(true);
-    expect(prompt).toContain("notes tool");
+    expect(prompt).toContain("only if they are available");
+    expect(prompt).toContain("bounded file reads");
     expect(prompt).toContain("Do not ask what to work on");
+  });
+
+  it("recovers every distinct compaction but deduplicates started/completed and delayed duplicates", () => {
+    const first = nextContextRecoveryAttempt(undefined, "thread", "compact-1")!;
+    expect(nextContextRecoveryAttempt(first, "thread", "compact-1")).toBeNull();
+    const second = nextContextRecoveryAttempt(first, "thread", "compact-2")!;
+    expect(second.compactionIds.size).toBe(2);
+    expect(nextContextRecoveryAttempt(second, "thread", "compact-1")).toBeNull();
+    expect(nextContextRecoveryAttempt(second, "thread", "compact-2")).toBeNull();
+    expect(nextContextRecoveryAttempt(second, "thread", "compact-3")).not.toBeNull();
+  });
+
+  it("recognizes the actual Chinese lost-task and workspace-only replies", () => {
+    expect(isGenericContextLossReply("目前可见上下文只有工作区约定，缺少此前的具体任务。请补一句要继续的目标或任务文件路径。")).toBe(true);
+    expect(isGenericContextLossReply("已采用这些工作区约定：默认用简体中文、结论优先；科研计算仅在 H20 执行。")).toBe(true);
+    expect(isGenericContextLossReply("我当前看不到此前的具体任务，请提供目标。")).toBe(true);
+    expect(isGenericContextLossReply("问题已修复。此前模型回复‘缺少此前的具体任务，请补一句’，这是恢复漏洞。")).toBe(false);
+    expect(isGenericContextLossReply("请提供机器人序列号以确认授权范围。")).toBe(false);
+    expect(isGenericContextLossReply("已读取当前任务文件，正在恢复 MuJoCo4 验收。")).toBe(false);
+    expect(contextRecoveryPrompt("recent concrete task")).toContain("recent concrete task");
   });
 
   it("detects immediate action promises that ended without a tool call", () => {

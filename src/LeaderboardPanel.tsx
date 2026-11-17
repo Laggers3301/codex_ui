@@ -1,16 +1,9 @@
 import { useState } from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
-import { memberRealName } from "../shared/memberDirectory";
-import type { CodexLeaderboard, CodexLeaderboardUserUsage } from "./types";
+import type { CodexLeaderboard } from "./types";
+import { leaderboardPercent, leaderboardPersonName } from "./leaderboardNames";
 
-export function leaderboardPersonName(user: Pick<CodexLeaderboardUserUsage, "userId" | "displayName">): string {
-  return memberRealName(user.userId) ?? user.displayName ?? `待核实（${user.userId}）`;
-}
-
-export function leaderboardPercent(value: number | null | undefined): string {
-  return typeof value === "number" && Number.isFinite(value)
-    ? `${new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value)}%` : "—";
-}
+export { leaderboardPercent, leaderboardPersonName };
 
 type LeaderboardPeriod = "currentCycle" | "lifetime";
 

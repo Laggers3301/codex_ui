@@ -1,7 +1,8 @@
 /** Match browser/Home Screen chrome to the explicit in-app theme, not the OS
  * preference. Also called before React mounts by index.html's bootstrap. */
-export function syncWebAppAppearance(theme: 'dark'|'light', doc:Document=document) {
-  const color=theme==='light'?'#fafaf8':'#151615';
+export function syncWebAppAppearance(theme: 'dark'|'light', doc:Document=document, phoneShell=false) {
+  // The phone shell paints pure white/black canvases; the notch must match them.
+  const color=phoneShell?(theme==='light'?'#fff':'#000'):theme==='light'?'#fafaf8':'#151615';
   doc.documentElement.dataset.theme=theme;
   doc.documentElement.style.colorScheme=theme;
   doc.documentElement.style.backgroundColor=color;

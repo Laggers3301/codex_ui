@@ -9,12 +9,13 @@ export type { TurnRecoveryView } from "../shared/turnRecovery";
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" ? value as Record<string, unknown> : {};
 
 export function historicalRecovery(threadId: string, turn?: { status: unknown; [key: string]: unknown }): TurnRecoveryView | undefined {
+  if(turn?.historicalImport===true)return undefined;
   if (!turn || (turn.status !== "failed" && turn.status !== "interrupted")) return;
   const nativeError = turn.error && typeof turn.error === "object" ? turn.error : undefined;
   const detail = modelErrorDetails(nativeError);
   const code = nativeError ? detail.code : turn.status === "interrupted" ? "turn_interrupted" : "request_failed";
   const message = nativeError ? detail.message : turn.status === "interrupted" ? "本轮已中断，中断来源尚未确认。" : "本轮处理失败，运行时未提供具体错误原因。";
-  const source = errorSource(code), completedAt = turn.completedAt;
+  const source = record(nativeError).source === 'user' ? 'user' : errorSource(code), completedAt = turn.completedAt;
   const at = typeof record(nativeError).at === "string" ? String(record(nativeError).at)
     : typeof completedAt === "number" && Number.isFinite(completedAt) ? new Date(completedAt * (completedAt < 1e12 ? 1000 : 1)).toISOString() : "";
   const unresolvedTools = (Array.isArray(turn.items) ? turn.items : []).filter(item => {
@@ -59,6 +60,17 @@ export function TurnRecoveryNotice({ state, userId, turnId, onSelectModel, onCop
   if (!target) return null;
   const canInspect = Boolean(view.interruption && (!job || job.status === "exhausted"));
   const canContinue = inspection?.status === "ready" || (inspection?.status === "needs_review" && toolsReviewed);
+  if ((view.error?.source ?? view.interruption?.source) === 'user' && !job) {
+    return createPortal(<div className="turnStoppedNotice" role="status" aria-label="本轮已停止">
+      <span>已停止本轮回答。</span>
+      {view.interruption?.unresolvedTools.length ? <>
+        <span>部分工具结果尚未确认。</span>
+        <button type="button" disabled={inspection?.status === 'checking'} onClick={() => onAction('check')}>核对运行状态</button>
+      </> : null}
+      {inspection ? <span>{inspection.message}</span> : null}
+      <button className="iconButton" type="button" aria-label="关闭停止提示" onClick={() => { close(); onAction('dismiss'); }}><X size={16} /></button>
+    </div>, target);
+  }
   const source = recoverySourceLabel(view.error?.source ?? view.interruption?.source);
   const timestamp = view.error?.at && Number.isFinite(Date.parse(view.error.at)) ? new Date(view.error.at).toLocaleString("zh-CN", { hour12: false }) : "发生时间未记录";
   return createPortal(<div className="errorBanner providerErrorBanner turnRecoveryBanner" role="alert" aria-label="本轮模型状态">

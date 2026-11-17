@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // The isolated worker deliberately uses native ESM, without a TS loader.
 // @ts-expect-error Native ESM worker module
 import { ChatSearchStore } from "./chatSearchStore.mjs";
@@ -24,6 +24,21 @@ beforeEach(() => {
 afterEach(() => { search.close(); source.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe('message-only chat search', () => {
+  it('does not re-read the full (large metadata) row of threads whose version is unchanged', async () => {
+    thread('a', ['alpha one']); thread('b', ['beta two']);
+    await search.sync();
+    const prepare = vi.spyOn((search as any).source, 'prepare');
+    await search.sync();
+    expect(prepare.mock.calls.some(([sql]) => /SELECT \* FROM thread_files/.test(String(sql)))).toBe(false);
+    prepare.mockClear();
+    // A real change still takes the full path and is indexed.
+    source.prepare('INSERT INTO thread_records VALUES(?,?,?,?,?,?)').run('a', 2, 'a-1', 'turn-a', 'user', 'alpha later');
+    source.prepare('UPDATE thread_files SET indexed_offset=indexed_offset+1, updated_at=updated_at+1 WHERE thread_id=?').run('a');
+    await search.sync();
+    expect(prepare.mock.calls.filter(([sql]) => /SELECT \* FROM thread_files/.test(String(sql)))).not.toHaveLength(0);
+    expect(search.search([owner('a')], 'later').total).toBe(1);
+    prepare.mockRestore();
+  });
   it('releases source WAL read snapshots between search-index batches', async () => {
     thread('a', Array.from({length: 180}, (_, i) => `first ${i}`));
     thread('b', ['second']);

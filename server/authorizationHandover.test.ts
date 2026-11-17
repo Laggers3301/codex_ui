@@ -1,4 +1,5 @@
 import {EventEmitter} from "node:events";
+import {createHash} from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -76,5 +77,41 @@ it("late old-runtime errors cannot invalidate a newly installed login",async()=>
   f.first.emit("errorEvent","old failed");
   expect(JSON.parse(fs.readFileSync(path.join(f.root,"state.json"),"utf8")).authFailures).toEqual({});
   expect(await f.pool.verifyAuthorizedAccount("a")).toBe(true);
+ }finally{f.cleanup();}
+});
+const hash=(value:string)=>createHash("sha256").update(value).digest("hex");
+it("an explicitly confirmed account replacement backs up the old login and keeps other accounts untouched",async()=>{
+ const f=fixture();try{
+  const baseline=f.pool.authorizationTarget("a").expected;auth(f.stage,"new-login","replacement");
+  const old=fs.readFileSync(path.join(f.root,"a/auth.json"),"utf8");
+  expect(await f.pool.installAuthorizedCredentials("a",f.stage,baseline,{fromAccountHash:hash("same"),toAccountHash:hash("replacement")})).toBe("installed");
+  expect(JSON.parse(fs.readFileSync(path.join(f.stage,"previous-auth.json"),"utf8"))).toEqual(JSON.parse(old));
+  expect(fs.statSync(path.join(f.stage,"previous-auth.json")).mode&0o777).toBe(0o600);
+  expect(JSON.parse(fs.readFileSync(path.join(f.root,"a/auth.json"),"utf8")).tokens.account_id).toBe("replacement");
+  expect(f.instances.get(path.join(f.root,"b"))![0].stops).toBe(0);
+ }finally{f.cleanup();}
+});
+it("refuses a stale or incorrect replacement confirmation before stopping the account",async()=>{
+ const f=fixture();try{
+  const baseline=f.pool.authorizationTarget("a").expected;auth(f.stage,"new-login","replacement");
+  for(const confirmation of [{fromAccountHash:hash("wrong"),toAccountHash:hash("replacement")},{fromAccountHash:hash("same"),toAccountHash:hash("wrong")}]){
+   await expect(f.pool.installAuthorizedCredentials("a",f.stage,baseline,confirmation)).rejects.toThrow("replacement_confirmation_failed");
+  }
+  expect(f.first.stops).toBe(0);expect(fs.existsSync(path.join(f.stage,"previous-auth.json"))).toBe(false);
+ }finally{f.cleanup();}
+});
+it("refuses replacement with an account already present in another slot",async()=>{
+ const f=fixture();try{
+  auth(f.stage,"new-login","b");
+  await expect(f.pool.installAuthorizedCredentials("a",f.stage,f.pool.authorizationTarget("a").expected,{fromAccountHash:hash("same"),toAccountHash:hash("b")})).rejects.toThrow("duplicate_account");
+  expect(f.first.stops).toBe(0);
+ }finally{f.cleanup();}
+});
+it("rechecks duplicate bindings after the old runtime has stopped",async()=>{
+ const f=fixture();try{
+  auth(f.stage,"new-login","replacement");
+  f.first.onStop=()=>auth(path.join(f.root,"b"),"concurrent-login","replacement");
+  await expect(f.pool.installAuthorizedCredentials("a",f.stage,f.pool.authorizationTarget("a").expected,{fromAccountHash:hash("same"),toAccountHash:hash("replacement")})).rejects.toThrow("duplicate_account");
+  expect(JSON.parse(fs.readFileSync(path.join(f.root,"a/auth.json"),"utf8")).tokens.account_id).toBe("same");
  }finally{f.cleanup();}
 });

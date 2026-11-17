@@ -17,7 +17,8 @@
         const theme = localStorage.getItem("codex-web-color-theme") === "light" ? "light" : "dark";
         document.documentElement.dataset.theme = theme;
         document.documentElement.style.colorScheme = theme;
-        const color = theme === "light" ? "#fafaf8" : "#151615";
+        const phoneShell = window.matchMedia?.("(max-width:720px)").matches === true && new URLSearchParams(location.search).get("mobile-ui") !== "legacy";
+        const color = phoneShell ? (theme === "light" ? "#fff" : "#000") : theme === "light" ? "#fafaf8" : "#151615";
         document.documentElement.style.backgroundColor = color;
         document.querySelector('meta[name="theme-color"]').content = color;
         document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]').content = theme === "light" ? "default" : "black-translucent";
@@ -31,6 +32,10 @@
   <body>
     <div id="root"></div>
     <div class="v2PlusMenu" id="v2PlusMenu" hidden>
+      <button type="button" style="display:none" class="v2MobileMenuBack" data-mobile-page="root"><span>‹</span><span>返回</span></button>
+      <button type="button" style="display:none" class="v2MobileMenuGroup" data-mobile-page="session"><span class="v2MenuIcon" data-icon="context"></span><span>会话设置</span></button>
+      <button type="button" style="display:none" class="v2MobileMenuGroup" data-mobile-page="workspace"><span class="v2MenuIcon" data-icon="worktree"></span><span>工作区工具</span></button>
+      <button type="button" style="display:none" class="v2MobileMenuGroup" data-mobile-page="settings"><span class="v2MenuIcon" data-icon="settings"></span><span>设置与用量</span></button>
       <span class="v2MenuSection">添加</span>
       <button type="button" data-action="upload"><span class="v2MenuIcon" data-icon="upload"></span><span><strong>文件和文件夹</strong><small>上传到当前工作区</small></span></button>
       <button type="button" data-action="goal"><span class="v2MenuIcon" data-icon="goal"></span><span><strong>持续目标</strong><small>输入目标后发送</small></span></button>
@@ -60,9 +65,21 @@
         let plusCloseTimer = 0;
         let plusPositionFrame = 0;
         let mobilePlusComposer = null;
+        const mobileMenuGroups = {upload:'root',skills:'root',plan:'root',goal:'session',context:'session','send-markdown':'session','archive-list':'session','archive-current':'session',writing:'workspace',worktree:'workspace',terminal:'workspace',browser:'workspace',hooks:'workspace',settings:'settings',quota:'settings',leaderboard:'settings'};
+        const layoutPlusMenu = (reset = false) => {
+          const mobile = matchMedia('(max-width:720px)').matches;
+          if (reset || !plusMenu.dataset.mobilePage) plusMenu.dataset.mobilePage = 'root';
+          const page = plusMenu.dataset.mobilePage;
+          plusMenu.querySelectorAll('button[data-action]').forEach(button => { button.style.display = mobile && mobileMenuGroups[button.dataset.action] !== page ? 'none' : ''; });
+          plusMenu.querySelectorAll('.v2MenuSection').forEach(section => { section.style.display = mobile ? 'none' : ''; });
+          plusMenu.querySelectorAll('[data-mobile-page]').forEach(button => { button.style.display = mobile && (button.classList.contains('v2MobileMenuBack') ? page !== 'root' : page === 'root') ? 'flex' : 'none'; });
+          // Primary actions precede navigation into secondary settings.
+          if (mobile) plusMenu.querySelectorAll('.v2MobileMenuGroup').forEach(button => plusMenu.append(button));
+        };
         const positionPlusMenu = () => {
           plusPositionFrame = 0;
           if (plusMenu.hidden || plusMenu.classList.contains("uiClosing")) return;
+          layoutPlusMenu();
           const anchor = document.querySelector(".v2ComposerPlus");
           if (!anchor) return;
           const viewport = window.visualViewport;
@@ -78,26 +95,16 @@
           write("boxSizing", "border-box");
           write("width", `${width}px`);
           write("maxHeight", `${Math.min(600, availableHeight)}px`);
-          if (window.matchMedia("(max-width: 720px)").matches) {
-            // Let fixed positioning resolve the menu's own height. Reading it
-            // after maxHeight writes forces a second layout on every frame
-            // while the capsule expands or the keyboard moves its anchor.
-            write("left", `${Math.max(viewportLeft + 12, Math.min(rect.left, viewportLeft + viewportWidth - width - 12))}px`);
-            if (bottom - viewportTop < 52) {
-              write("top", `${viewportTop + 12}px`);
-              write("bottom", "auto");
-            } else {
-              write("top", "auto");
-              write("bottom", `calc(100% - ${bottom}px)`);
-            }
-            return;
-          }
-          // Read the resulting size once, before unrelated position writes.
-          // Unchanged keyboard/anchor events must not force another layout.
-          const menuHeight = plusMenu.offsetHeight;
+          // Anchor the bottom edge directly; reading offsetHeight after changing
+          // maxHeight forces synchronous layout on desktop as well as mobile.
           write("left", `${Math.max(viewportLeft + 12, Math.min(rect.left, viewportLeft + viewportWidth - width - 12))}px`);
-          write("bottom", "auto");
-          write("top", `${Math.max(viewportTop + 12, bottom - menuHeight)}px`);
+          if (bottom - viewportTop < 52) {
+            write("top", `${viewportTop + 12}px`);
+            write("bottom", "auto");
+          } else {
+            write("top", "auto");
+            write("bottom", `calc(100% - ${bottom}px)`);
+          }
         };
         const schedulePlusPosition = () => {
           if (plusPositionFrame) return;
@@ -136,6 +143,9 @@
         }
 
         function installShellBridges() {
+          // The phone shell owns its controls in React. Never inject
+          // legacy buttons or rewrite its layout after a streamed update.
+          if (document.querySelector('[data-mobile-ui="next"]')) return;
           const threadList = document.querySelector(".threadList");
           if (threadList) {
             const applySidebarWidth = (width) => {
@@ -201,6 +211,7 @@
               }
               plusMenu.classList.remove("uiClosing");
               plusMenu.hidden = false;
+              layoutPlusMenu(true);
               plus.setAttribute("aria-expanded", "true");
               const focused = document.activeElement;
               if (mobilePlusComposer?.contains(focused) && focused instanceof HTMLElement && focused.isContentEditable) focused.blur();
@@ -231,6 +242,8 @@
         }
 
         plusMenu.addEventListener("click", (event) => {
+          const page = event.target.closest('button')?.dataset.mobilePage;
+          if (page) { plusMenu.dataset.mobilePage = page; layoutPlusMenu(); schedulePlusPosition(); return; }
           const action = event.target.closest("button")?.dataset.action;
           if (!action) return;
           if (action === "upload") document.querySelector(".hiddenFileInput")?.click();

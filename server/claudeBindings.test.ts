@@ -6,6 +6,75 @@ import {describe,it,expect} from "vitest";
 import {ClaudeBindings,claudeModelEntries} from "./claudeBindings.js";
 
 describe("native Claude model catalogue",()=>{
+  it('shares an existing isolated device across members without source restrictions or workspace leakage',()=>{
+    const home=fs.mkdtempSync(path.join(os.tmpdir(),'shared-external-device-'));
+    try{
+      const users=path.join(home,'users');for(const user of ['alice','bob'])fs.mkdirSync(path.join(users,user),{recursive:true});
+      const deviceHome=path.join(home,'device-home'),root=path.join(deviceHome,'.rec/claude/accounts/77/config');
+      fs.mkdirSync(root,{recursive:true});
+      fs.writeFileSync(path.join(root,'../device.json'),JSON.stringify({sk:'fixture-only',org_id:7}));
+      fs.writeFileSync(path.join(root,'.claude.json'),JSON.stringify({oauthAccount:{accountUuid:'shared-existing-device'}}));
+      const account={orgId:'7',home:deviceHome,label:'rec max',executable:'/shared/launcher',nativeUsageEnabled:true};
+      const b=new ClaudeBindings({home,executable:'/bin/true',storageDirectory:path.join(home,'state'),sharedUsers:{workspaceDirectory:users,orgIds:['7']},
+        sharedAccounts:[account],privateAccounts:[{...account,userId:'alice',replacesPrivateOrgIds:['3']}]});
+      for(const user of ['alice','bob']){
+        expect(b.list(user)).toHaveLength(1);
+        const binding=b.resolve(user,'reclaude-opus@7');
+        expect(binding).toMatchObject({workspaceRoot:path.join(users,user),configRoot:root,privateHome:deviceHome,executable:'/shared/launcher'});
+        expect(binding.restrictedSourceThreadId).toBeUndefined();
+        expect(b.profiles(user).every(p=>!p.restrictedToSourceThreadId)).toBe(true);
+      }
+      expect(b.resolve('alice','reclaude-opus@7').accountKey).toBe(b.resolve('bob','reclaude-opus@7').accountKey);
+      expect(b.effectiveModel('alice','reclaude-opus@3')).toBe('reclaude-opus@7');
+      expect(b.effectiveModel('bob','reclaude-opus@3')).toBe('reclaude-opus@3');
+      expect(b.list('missing')).toEqual([]);expect(b.list('../alice')).toEqual([]);
+    }finally{fs.rmSync(home,{recursive:true,force:true});}
+  });
+  it('redirects a replaced private org only for its owner',()=>{
+    const config={home:'/unused',executable:'/bin/true',storageDirectory:'/unused',users:{alice:{workspaceRoot:'/unused',orgIds:[]},bob:{workspaceRoot:'/unused',orgIds:['3']}},privateAccounts:[{userId:'alice',orgId:'7',sourceThreadId:'pp',home:'/private',label:'Max',replacesPrivateOrgIds:['3']}]};
+    const b=new ClaudeBindings(config);
+    expect(b.effectiveModel('alice','reclaude-opus@3')).toBe('reclaude-opus@7');
+    expect(b.effectiveModel('bob','reclaude-opus@3')).toBe('reclaude-opus@3');
+    expect(b.orgIds('bob')).not.toContain('7');
+    expect(b.effectiveModel('alice','reclaude-sonnet@9')).toBe('reclaude-sonnet@9');
+    config.privateAccounts.push({...config.privateAccounts[0],orgId:'8'});
+    expect(()=>b.effectiveModel('alice','reclaude-opus@3')).toThrow(/不明确/);
+  });
+  it('hides a replaced shared choice only for its private owner without changing old history resolution',()=>{
+    const home=fs.mkdtempSync(path.join(os.tmpdir(),'private-replacement-'));
+    try{
+      const users=path.join(home,'users');for(const user of ['alice','bob'])fs.mkdirSync(path.join(users,user),{recursive:true});
+      const privateHome=path.join(home,'private');
+      for(const [root,id,org] of [[home,'11',1],[privateHome,'77',7]] as const){
+        const dir=path.join(root,`.rec/claude/accounts/${id}/config`);fs.mkdirSync(dir,{recursive:true});
+        fs.writeFileSync(path.join(dir,'../device.json'),JSON.stringify({sk:'fixture',org_id:org}));
+        fs.writeFileSync(path.join(dir,'.claude.json'),JSON.stringify({oauthAccount:{accountUuid:`fixture-${org}`}}));
+      }
+      const b=new ClaudeBindings({home,executable:'/bin/true',storageDirectory:path.join(home,'state'),sharedUsers:{workspaceDirectory:users,orgIds:['1']},privateAccounts:[{userId:'alice',home:privateHome,orgId:'7',sourceThreadId:'pp',label:'new',replacesSharedOrgIds:['1'],nativeUsageEnabled:true}]});
+      expect(b.visibleBindings('alice').map(x=>x.orgId)).toEqual(['7']);
+      expect(b.profiles('alice').every(p=>p.model.endsWith('@7'))).toBe(true);
+      expect(b.visibleBindings('bob').map(x=>x.orgId)).toEqual(['1']);
+      expect(b.resolve('alice','reclaude-opus@1').orgId).toBe('1');
+    }finally{fs.rmSync(home,{recursive:true,force:true});}
+  });
+  it('exposes an isolated local device only to its authorized user and source conversation',()=>{
+    const home=fs.mkdtempSync(path.join(os.tmpdir(),'private-claude-'));
+    try{
+      const users=path.join(home,'users');for(const user of ['alice','bob'])fs.mkdirSync(path.join(users,user),{recursive:true});
+      const privateHome=path.join(home,'private-alice'),configRoot=path.join(privateHome,'.rec/claude/accounts/77/config');fs.mkdirSync(configRoot,{recursive:true});
+      fs.writeFileSync(path.join(configRoot,'../device.json'),JSON.stringify({sk:'fixture-only',org_id:7,org_name:'private'}));
+      fs.writeFileSync(path.join(configRoot,'.claude.json'),JSON.stringify({oauthAccount:{accountUuid:'fixture-private'}}));
+      const bindings=new ClaudeBindings({home,executable:'/bin/true',storageDirectory:path.join(home,'state'),sharedUsers:{workspaceDirectory:users,orgIds:['1']},
+        privateAccounts:[{userId:'alice',orgId:'7',sourceThreadId:'allowed-source',home:privateHome,label:'PP only',executable:'/private/launcher'}]});
+      expect(bindings.list('alice')).toHaveLength(1);expect(bindings.list('bob')).toEqual([]);
+      expect(bindings.orgIds('bob')).not.toContain('7');
+      const bound=bindings.resolve('alice','reclaude-opus@7');
+      expect(bound.privateHome).toBe(privateHome);expect(bound.restrictedSourceThreadId).toBe('allowed-source');
+      expect(bound.executable).toBe('/private/launcher');expect(bindings.config.executable).toBe('/bin/true');
+      expect(bindings.profiles('alice').every(p=>p.restrictedToSourceThreadId==='allowed-source')).toBe(true);
+      expect(()=>bindings.resolve('bob','reclaude-opus@7')).toThrow();
+    }finally{fs.rmSync(home,{recursive:true,force:true});}
+  });
   it("redirects legacy organization model ids for all shared users and rejects invalid mappings",()=>{
     const home=fs.mkdtempSync(path.join(os.tmpdir(),"claude-org-switch-"));
     try{

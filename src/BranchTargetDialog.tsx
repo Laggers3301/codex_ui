@@ -10,11 +10,20 @@ import type {ReasoningEffort} from "./types";
 import "./taskNotificationSettings.css";
 import "./runtimeMigration.css";
 import { remainingTime, type ReclaudeUsageStatus } from "../shared/reclaudeUsage";
+import type {BranchProgress} from './api';
 
-export interface BranchTarget {targetAccountId?:string;model?:string;operationId?:string;reasoningEffort?:ReasoningEffort}
+export interface BranchTarget {targetAccountId?:string;model?:string;operationId?:string;reasoningEffort?:ReasoningEffort;onProgress?:(progress:BranchProgress)=>void}
+export function branchProgressLabel(progress:BranchProgress):string{
+  const count=(value:number)=>value.toLocaleString('zh-CN');
+  if(progress.phase==='completed')return '导入完成，正在打开分支…';
+  if(progress.stage==='import'||progress.phase==='importing')return `导入历史 ${count(progress.importedMessages)} / ${count(progress.totalMessages)} 条`;
+  if(progress.stage==='display')return progress.displayItems?`整理对话与工具记录，已处理 ${count(progress.displayItems)} 条记录`:`整理对话与工具记录，共 ${count(progress.totalMessages)} 条历史`;
+  return progress.totalMessages?`读取源历史，已解析 ${count(progress.totalMessages)} 条`:'正在读取源历史，原会话保持不变…';
+}
 export function BranchTargetDialog(props:{sourceModel:string;sourceEffort?:ReasoningEffort;pool:CodexAccountPool|null;profiles:ModelProfile[];usageStatus?:ReclaudeUsageStatus|null;onClose():void;onConfirm(target:BranchTarget):Promise<boolean>}){
   const [destination,setDestination]=useState("auto"),[model,setModel]=useState(props.sourceModel),[pending,setPending]=useState(false),[error,setError]=useState(""),[closing,setClosing]=useState(false);
   const operation=useRef(crypto.randomUUID());
+  const [progress,setProgress]=useState<BranchProgress|null>(null);
   const [effort,setEffort]=useState(props.sourceEffort??"medium");
   const timer=useRef<ReturnType<typeof setTimeout>|null>(null);
   useEffect(()=>()=>{if(timer.current)clearTimeout(timer.current);},[]);
@@ -26,7 +35,7 @@ export function BranchTargetDialog(props:{sourceModel:string;sourceEffort?:Reaso
   const showEffort=!claude||props.profiles.some(p=>p.model===model&&p.supportedEffortLevels?.length);
   function close(){if(pending||closing)return;setClosing(true);timer.current=setTimeout(props.onClose,220);}
   function choose(value:string){setDestination(value);setError("");operation.current=crypto.randomUUID();const available=props.profiles.filter(p=>modelIsAvailable(p)&&(value==="claude"?isReclaudeModel(p.model):p.model.startsWith("gpt-")));setModel(available.find(p=>p.model===props.sourceModel)?.model??available[0]?.model??"");}
-  async function submit(){if(pending)return;setPending(true);setError("");try{const level=showEffort&&selectedEffort?{reasoningEffort:selectedEffort}:{};const ok=await props.onConfirm(destination==="auto"?level:{...(claude?{}:{targetAccountId:destination}),model,operationId:operation.current,...level});if(ok){setClosing(true);timer.current=setTimeout(props.onClose,220);}else setError("分支未完成，请查看会话中的错误提示后重试。");}catch(caught){setError(caught instanceof Error?caught.message:String(caught));}finally{setPending(false);}}
+  async function submit(){if(pending)return;setPending(true);setProgress(null);setError("");try{const level=showEffort&&selectedEffort?{reasoningEffort:selectedEffort}:{};const ok=await props.onConfirm(destination==="auto"?level:{...(claude?{}:{targetAccountId:destination}),model,operationId:operation.current,onProgress:setProgress,...level});if(ok){setClosing(true);timer.current=setTimeout(props.onClose,220);}else setError("分支未完成，请查看会话中的错误提示后重试。");}catch(caught){setError(caught instanceof Error?caught.message:String(caught));}finally{setPending(false);}}
   const content=<div className={`taskNotificationScrim branchTargetScrim${closing?" uiClosing":""}`} onMouseDown={e=>{if(e.target===e.currentTarget)close();}} onKeyDown={e=>{if(e.key==="Escape"){e.preventDefault();e.stopPropagation();close();}}}>
     <section className="taskNotificationDialog branchTargetDialog" role="dialog" aria-modal="true" aria-label="选择分支目标">
       <header><h2>创建分支</h2><button type="button" className="taskNotificationIcon" aria-label="关闭" disabled={pending} onClick={close}><X size={16}/></button></header>
@@ -39,6 +48,7 @@ export function BranchTargetDialog(props:{sourceModel:string;sourceEffort?:Reaso
         {destination!=="auto"?<BranchChoice label="目标模型" value={model} disabled={pending} onChange={value=>{setModel(value);operation.current=crypto.randomUUID();}} options={models.map(p=>({value:p.model,label:runtimeModelLabel(p).replace(/\s+(?:low|medium|high|xhigh|max|ultra)$/,""),disabled:!modelIsAvailable(p)}))}/>:null}
         {showEffort&&efforts.length?<BranchChoice label="推理级别" value={selectedEffort} disabled={pending} onChange={value=>{setEffort(value as ReasoningEffort);operation.current=crypto.randomUUID();}} options={efforts.map(value=>({value,label:value}))}/>:null}
         <p className="branchTargetNote">{cross?"保留此回答及之前的对话与工具记录，不重放工具。":"保留此回答及之前的历史，原会话不变。"}{claude ? props.usageStatus ? props.usageStatus.creations.remaining ? ` 本小时还可创建 ${props.usageStatus.creations.remaining} 次 Claude 会话。` : ` Claude 新建名额已用完，${remainingTime(props.usageStatus.creations.retryAfterSeconds)}后可重试。` : " 计入 ReClaude 会话创建限额。" : ""}</p>
+        {pending?<p className="branchTargetNote" role="status" aria-live="polite">{progress?branchProgressLabel(progress):'正在准备分支，长历史可能需要一些时间…'}</p>:null}
         {error?<p className="runtimeMigrationError" role="alert">{error}</p>:null}
       </div>
       <footer><button type="button" className="taskNotificationTest" disabled={pending||closing||(destination!=="auto"&&!models.some(p=>p.model===model&&modelIsAvailable(p)))} onClick={()=>void submit()}>{pending?"正在创建…":"创建并打开"}</button></footer>

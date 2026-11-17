@@ -1,0 +1,42 @@
+/* Desktop drawer motion: layout once, move on the compositor.
+ *
+ * Animating grid-template-columns / padding / margin / width re-lays-out the
+ * whole transcript on every frame (~20 full layouts per toggle). Native-feeling
+ * apps snap the layout once and animate only transform/opacity, which run on the
+ * GPU compositor and never block on the main thread. So:
+ *   - the layout properties below switch instantly (theme colour fades stay);
+ *   - the content that just moved is FLIP-animated: it is given a starting
+ *     transform equal to how far its edge moved, and slides to 0 over the same
+ *     duration/easing as the sidebar's own width change.
+ * Applies after first paint only (html[data-shell-motion]), never on page load. */
+@media (min-width: 721px) {
+  .workspace { transition: var(--ui-theme-transition); }
+  .topbar { transition: var(--ui-theme-transition); }
+  :is(.errorBanner, .turnStoppedNotice) { transition: var(--ui-theme-transition); }
+  .branchToolArchive { transition: none; }
+  /* Right panel: the transcript follows the panel's width frame by frame. A single
+     layout per frame is cheap (~1ms); the expensive part of the old sidebar motion
+     was restyling every sidebar row, which is handled separately below. The 4th
+     grid track is `auto`, so animating the panel's own width animates the column. */
+  .diffReviewPanel { transition: width .38s cubic-bezier(.22,1,.36,1), opacity .25s ease, transform .38s cubic-bezier(.22,1,.36,1), visibility 0s linear .38s; }
+  .workspace.diffPanelOpen .diffReviewPanel { transition: width .38s cubic-bezier(.22,1,.36,1), opacity .28s ease, transform .38s cubic-bezier(.22,1,.36,1), visibility 0s; }
+  .workspace.diffPanelResizing .diffReviewPanel { transition: none; }
+
+  :root { --shell-motion-delta: calc(var(--v2-sidebar-width, 280px) - var(--v2-collapsed-sidebar-width, 56px)); }
+  @keyframes shellContentToRail { from { transform: translate3d(var(--shell-motion-delta), 0, 0); } to { transform: none; } }
+  @keyframes shellContentFromRail { from { transform: translate3d(calc(var(--shell-motion-delta) * -1), 0, 0); } to { transform: none; } }
+  html[data-shell-motion="collapse"] :is(.writingCanvas, .topbar > .projectTitle, .threadNoticeStack > *) { animation: shellContentToRail var(--sidebar-motion) backwards; }
+  html[data-shell-motion="expand"] :is(.writingCanvas, .topbar > .projectTitle, .threadNoticeStack > *) { animation: shellContentFromRail var(--sidebar-motion) backwards; }
+  /* The sidebar's own width is the most expensive part: animating it restyles
+     and relays out every row each frame (measured: ~4x the whole rest of the
+     motion). Snap the width and slide the sidebar in on the compositor. */
+  .workspace > .threadList { transition: var(--ui-theme-transition) !important; }
+  .v2AccountDock { transition: var(--ui-theme-transition); }
+  @keyframes shellSidebarIn { from { transform: translate3d(calc(var(--shell-motion-delta) * -1), 0, 0); } to { transform: none; } }
+  html[data-shell-motion="expand"] .workspace > .threadList { animation: shellSidebarIn var(--sidebar-motion) backwards; }
+  body.sidebarResizing .workspace > .threadList { animation: none !important; }
+  body.sidebarResizing :is(.writingCanvas, .topbar > .projectTitle, .threadNoticeStack > *) { animation: none !important; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html[data-shell-motion] body :is(.writingCanvas, .topbar > .projectTitle, .threadNoticeStack > *, .workspace > .threadList) { animation: none !important; }
+}

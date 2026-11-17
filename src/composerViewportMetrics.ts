@@ -1,6 +1,6 @@
 const heightProperty = "--composer-height";
 const viewportProperty = "--messages-viewport-height";
-const consumersSelector = ".messages, .scrollToBottomButton, .conversationTurnRow.topAnchoredTurn, .conversationLiveTail.topAnchoredTurn, .codexApprovalRequests, .threadOpeningLayer";
+const consumersSelector = ".messages, .scrollToBottomButton, .mobileUiScrollToBottom, .conversationTurnRow.topAnchoredTurn, .conversationLiveTail.topAnchoredTurn, .codexApprovalRequests, .threadOpeningLayer";
 let localProperties: boolean | undefined;
 
 /** These changing layout inputs must not invalidate every transcript descendant. */

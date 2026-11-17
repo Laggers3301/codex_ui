@@ -7,8 +7,8 @@ describe('memory process ranking',()=>{
     expect(parseProcessRows(Array.from({length:8},(_,i)=>`${i+1} 1000 ${i+1} node`).join('\n'))).toHaveLength(5);
   });
   it('returns a directory clue, never maps a shared runtime account to a person',()=>{
-    expect(directoryOwnerHint('/home/ls/codex_zerotier_remote/users/gyj/scratch')).toBe('gyj');
-    expect(directoryOwnerHint('/home/ls/codex_zerotier_remote/runtime/account-pool/260707')).toBeNull();
+    expect(directoryOwnerHint('/srv/codex_zerotier_remote/users/qa-user/scratch')).toBe('qa-user');
+    expect(directoryOwnerHint('/srv/codex_zerotier_remote/runtime/account-pool/100004')).toBeNull();
   });
   it('coalesces and caches on-demand sampling',async()=>{
     let calls=0;const monitor=new MemoryProcessMonitor(async()=>{calls++;return {sampledAt:new Date().toISOString(),processes:[]};});

@@ -1,5 +1,8 @@
 import {it,expect} from 'vitest';
 import {hasRecoveryNotice,historicalRecovery,recoverySourceLabel,recoveryViewportBounds,type TurnRecoveryView} from './TurnRecoveryNotice';
+it('does not turn an imported source error into an active target-model failure',()=>{
+ expect(historicalRecovery('target',{historicalImport:true,status:'failed',error:{code:'claude_weekly_limit',message:'源账号周额度已满'}})).toBeUndefined();
+});
 it('renders nested native failures and old object-coercion errors as readable HTTP errors',()=>{
  const state=historicalRecovery('thread',{status:'failed',error:{code:'[object Object]',message:'本轮处理失败',originalMessage:'exceeded retry limit, last status: 429 Too Many Requests'}});
  expect(state?.error?.code).toBe('http_429');
@@ -30,6 +33,12 @@ it('does not label an unexplained interrupted turn as a user stop or invent its 
   expect(recoverySourceLabel('user')).toBe('主动停止');
   expect(recoverySourceLabel('runtime')).toBe('运行进程退出');
   expect(recoverySourceLabel('backend')).toBe('服务重新启动');
+});
+it('keeps an explicit user stop identifiable after history reload',()=>{
+  const state=historicalRecovery('thread',{id:'turn',status:'interrupted',error:{code:'user_stopped',message:'已停止本轮回答。'}});
+  expect(state?.error).toMatchObject({code:'user_stopped',source:'user',retryable:false});
+  expect(historicalRecovery('thread',{id:'turn',status:'interrupted',error:{code:'turn_interrupted',source:'user',message:'stopped'}})?.error?.source).toBe('user');
+  expect(historicalRecovery('thread',{id:'turn',status:'interrupted',error:{code:'backend_restarted',message:'restart'}})?.error?.source).toBe('backend');
 });
 
 it('retains unfinished tool identities and redacts historical credential errors',()=>{

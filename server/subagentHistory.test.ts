@@ -6,7 +6,26 @@ import Fastify from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CodexBridge } from "./codexBridge.js";
 import { ProjectStore } from "./db.js";
-import { configuredSubagentRuntimeHomes, findSubagentDescendant, listSubagentDescendants, readSubagentDirectoryPage, readSubagentTelemetry } from "./subagentHistory.js";
+import { configuredSubagentRuntimeHomes, findSubagentDescendant, listSubagentDescendants, readSubagentDirectoryPage, readSubagentTelemetry, resolveSubagentHistoryFile } from "./subagentHistory.js";
+import { findThreadJsonlPathById } from './threadFallback.js';
+import { readIndexedThreadPage } from './threadEventIndex.js';
+import { zstdCompressSync } from 'node:zlib';
+
+it('opens compressed archived subagents in their owning runtime and keeps inherited cutoffs',async()=>{
+  const home=temporaryDirectory(),id='01a190f2-04cf-72e2-9230-0bc41f7a1f87';
+  const file=path.join(home,'archived_sessions',`rollout-${id}.jsonl`);fs.mkdirSync(path.dirname(file));
+  const prefix=[{type:'session_meta',payload:{id}},{type:'turn_context',payload:{turn_id:'first'}},{type:'response_item',payload:{id:'a',type:'message',role:'assistant',content:[{type:'output_text',text:'ARCHIVED-HISTORY'}]}}].map(r=>JSON.stringify(r)+'\n').join('');
+  const later=JSON.stringify({type:'response_item',payload:{id:'b',type:'message',role:'assistant',content:[{type:'output_text',text:'LATER-HIDDEN'}]}})+'\n';
+  const compressed=zstdCompressSync(Buffer.from(prefix+later));fs.writeFileSync(file+'.zst',compressed);
+  const old=path.join(home,'sessions',`rollout-${id}.jsonl`);fs.mkdirSync(path.dirname(old));fs.writeFileSync(old,prefix);
+  expect((await resolveSubagentHistoryFile({id,runtimeHome:home},findThreadJsonlPathById))?.filePath).toBe(old);
+  fs.unlinkSync(old); // Keep a stale sessions filename-index entry after archiving.
+  expect(await resolveSubagentHistoryFile({id,runtimeHome:home},findThreadJsonlPathById)).toEqual({filePath:file,sessionsRoot:path.dirname(file)});
+  const page=await readIndexedThreadPage(file,id,{sessionsRoot:path.dirname(file),before:0,limit:20,maxEndOffset:Buffer.byteLength(prefix)});
+  expect(JSON.stringify(page.thread)).toContain('ARCHIVED-HISTORY');expect(JSON.stringify(page.thread)).not.toContain('LATER-HIDDEN');
+  expect(fs.readFileSync(file+'.zst')).toEqual(compressed);
+  expect(await resolveSubagentHistoryFile({id,runtimeHome:temporaryDirectory()},findThreadJsonlPathById)).toBeNull();
+});
 
 const tempDirs: string[] = [];
 const previousPoolFile = process.env.CODEX_WEB_ACCOUNT_POOL_FILE;

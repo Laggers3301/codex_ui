@@ -1,0 +1,202 @@
+/* Independent phone shell. All selectors are opt-in; desktop and released
+   mobile retain their existing stylesheet and markup. No new !important layer. */
+:root[data-theme="dark"]:has(.mobileChatShell) {
+  --bg:#000; --panel:#111; --panel-strong:#202020;
+  --ui-surface:#161616; --ui-surface-raised:#202020; --ui-surface-input:#262626;
+  --ui-content:#f2f2f2; --ui-heading:#f2f2f2; --ui-content-muted:#a3a3a3;
+  --ui-hover:#2a2a2a; --ui-divider:#ffffff1a;
+  --mobile-composer-fill:rgba(34,34,34,.86);
+  --mobile-sidebar-surface:#111; --mobile-floating-surface:#161616;
+  --mobile-sheet-surface:#161616; --mobile-group-surface:#242424;
+  --mobile-pill-fill:rgba(38,38,38,.72);
+  background:#000; color-scheme:dark;
+}
+/* The document must never scroll or rubber-band under the fixed shell; only
+   the transcript scrolls, and its overscroll never chains to the page. */
+:root:has(.mobileChatShell),:root:has(.mobileChatShell) body {overflow:hidden;overscroll-behavior:none;}
+.mobileChatShell .messages {overscroll-behavior-y:contain;}
+.mobileChatShell {
+  --mobile-ui-body:16px; --mobile-ui-label:14px; --mobile-ui-meta:12px;
+  --mobile-ui-hit:44px; --mobile-ui-gap:8px; --mobile-ui-radius:24px;
+  --mobile-pill-fill:color-mix(in srgb,var(--ui-surface-raised) 90%,transparent);
+  position:fixed; inset:var(--mobile-ui-top,0px) 0 auto; width:100%; height:var(--mobile-ui-height,100dvh);
+  max-height:var(--mobile-ui-height,100dvh); display:flex; overflow:hidden; min-width:0;
+  background:var(--bg); color:var(--ui-content);
+}
+.mobileChatShell>.sidebar,.mobileChatShell>.panelResizeHandle {display:none;}
+.mobileChatShell>.threadColumn {display:flex;flex:1;flex-direction:column;min-width:0;min-height:0;width:100%;height:100%;overflow:hidden;}
+.mobileChatShell .workspace {display:flex;flex:1;min-width:0;min-height:0;overflow:hidden;}
+.mobileChatShell .writingCanvas {flex:1;min-width:0;min-height:0;}
+.mobileChatShell .conversation {position:relative;display:flex;flex:1;flex-direction:column;min-width:0;min-height:0;height:100%;overflow:hidden;}
+.mobileChatShell .conversationHeader {display:none;}
+.mobileUiConversationContent {position:relative;flex:1;min-height:0;min-width:0;overflow:hidden;}
+.mobileUiConversationContent>.messages {--messages-bottom-clearance:28px;height:100%;min-height:0;padding-bottom:calc(var(--composer-height,64px) + var(--messages-bottom-clearance));}
+.mobileUiScrollToBottom {position:absolute;bottom:calc(var(--composer-height,64px) + 14px);right:16px;z-index:2;display:grid;place-items:center;width:40px;height:40px;padding:0;border:1px solid var(--ui-divider);border-radius:50%;background:var(--ui-surface-raised);color:var(--ui-content);font:500 22px/1 var(--pool-ui-font);box-shadow:0 3px 12px #0002;}
+.mobileUiHeader {position:relative;z-index:20;display:grid;grid-template-columns:40px minmax(0,1fr) 40px;align-items:center;flex:none;gap:12px;padding:calc(6px + env(safe-area-inset-top,0px)) 12px 6px;min-height:52px;box-sizing:border-box;}
+/* A bounded glass strip blends into the transcript, without a hard bottom edge.
+   It stays out of hit-testing and uses no scroll-time JavaScript/filter loops. */
+.mobileUiHeader::before {content:"";position:absolute;inset:0 0 -28px;pointer-events:none;background:linear-gradient(to bottom,var(--bg) 0%,color-mix(in srgb,var(--bg) 88%,transparent) 58%,transparent 100%);-webkit-backdrop-filter:blur(14px) saturate(1.1);backdrop-filter:blur(14px) saturate(1.1);-webkit-mask-image:linear-gradient(to bottom,#000 0%,#000 62%,transparent 100%);mask-image:linear-gradient(to bottom,#000 0%,#000 62%,transparent 100%);transition:bottom .32s cubic-bezier(.22,1,.36,1);}
+.mobileUiHeader[data-options]::before {bottom:-86px;}
+/* Proportion rule for every pill on the phone shell: height ~2.6x the type
+   size, horizontal padding ~1x it, icons ~1.3x it, radius = height/2. */
+.mobileUiHeader>button {position:relative;display:flex;align-items:center;justify-content:center;gap:4px;box-sizing:border-box;min-width:0;height:40px;margin:0;padding:0;border:0;border-radius:20px;background:transparent;color:inherit;font:500 15px/20px var(--pool-ui-font);}
+.mobileUiHeader>button:not(.mobileUiTitle) {width:40px;}
+:root[data-theme="dark"] .mobileUiHeader>button {background:rgba(38,38,38,.72);box-shadow:inset 0 1px 0 #ffffff0d;-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);}
+/* Light theme glass: a frosted white pill with a hairline edge, a bright top
+   highlight and a soft lift, so it reads over white pages too. */
+:root[data-theme="light"] .mobileUiHeader>button {background:linear-gradient(180deg,rgba(255,255,255,.82),rgba(247,247,247,.62));box-shadow:inset 0 0 0 1px rgba(0,0,0,.07),inset 0 1px 0 rgba(255,255,255,.9),0 4px 14px rgba(0,0,0,.07);-webkit-backdrop-filter:blur(18px) saturate(1.5);backdrop-filter:blur(18px) saturate(1.5);}
+.mobileUiHeader>.mobileUiTitle {justify-self:center;max-width:100%;padding:0 12px 0 16px;}
+.mobileUiTitle>span {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mobileUiTitle>svg {flex:none;opacity:.55;transition:transform .3s cubic-bezier(.22,1,.36,1);}
+.mobileUiTitle[aria-expanded="true"]>svg {transform:rotate(180deg);}
+.mobileUiHeader>button:active,.mobileUiPlus:active {background:var(--ui-hover);}
+.mobileUiHeader button:focus-visible,.mobileUiSheet button:focus-visible,.mobileUiComposerSurface button:focus-visible {outline:2px solid var(--ui-content-muted);outline-offset:2px;}
+.mobileUiSheet {position:fixed;inset:auto 0 0;box-sizing:border-box;width:100%;max-width:100%;max-height:85dvh;margin:0;padding:8px 16px calc(20px + env(safe-area-inset-bottom,0px));border:0;border-radius:24px 24px 0 0;background:var(--ui-surface);color:var(--ui-content);overflow:auto;overscroll-behavior:contain;font-family:var(--pool-ui-font);}
+.mobileUiSheet {opacity:1;transform:none;transition:opacity .18s ease,transform .2s cubic-bezier(.22,1,.36,1),display .2s allow-discrete,overlay .2s allow-discrete;}
+.mobileUiSheet:not([open]) {display:none;opacity:0;transform:translateY(20px);}
+.mobileUiSheet::backdrop {background:#0006;opacity:1;transition:opacity .18s ease,display .2s allow-discrete,overlay .2s allow-discrete;}
+.mobileUiSheet:not([open])::backdrop {opacity:0;}
+@starting-style {.mobileUiSheet[open]{opacity:0;transform:translateY(20px)}.mobileUiSheet[open]::backdrop{opacity:0}}
+.mobileUiSheetHandle {width:32px;height:4px;margin:0 auto 8px;border-radius:2px;background:var(--ui-content-muted);opacity:.4;}
+.mobileUiSheet>header {display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px;}
+.mobileUiSheet h2 {margin:0;font:600 17px/24px var(--pool-ui-font);}
+.mobileUiSheet>header>button {display:grid;place-items:center;width:44px;height:44px;padding:0;border:0;background:transparent;color:inherit;border-radius:50%;}
+.mobileUiSheetBody {display:grid;gap:20px;min-width:0;}
+.mobileUiSettingGroup,.mobileUiActionList {overflow:hidden;border-radius:16px;background:var(--ui-surface-raised);}
+.mobileUiActionList>button {display:flex;align-items:center;justify-content:space-between;width:100%;min-height:48px;padding:12px 16px;border:0;background:transparent;color:inherit;font:400 16px/24px var(--pool-ui-font);text-align:left;}
+.mobileUiActionList>button+button {border-top:1px solid var(--ui-divider);}
+.mobileUiActionList>button:disabled {opacity:.45;}
+.mobileUiSettingGroup>.mobileSettingRow,.mobileUiSettingGroup>button {display:flex;align-items:center;justify-content:space-between;gap:12px;box-sizing:border-box;width:100%;min-height:52px;margin:0;padding:10px 14px;border:0;border-radius:0;background:transparent;color:inherit;font:400 16px/24px var(--pool-ui-font);}
+.mobileUiSettingGroup>*+* {border-top:1px solid var(--ui-divider);}
+.mobileUiSettingGroup>button:hover {background:var(--ui-hover);}
+.mobileUiSettingGroup select {max-width:73%;min-width:0;min-height:36px;border:0;background:transparent;color:inherit;font:inherit;text-align:right;}
+.mobileUiHeaderOptions {position:absolute;top:calc(100% + 6px);left:12px;right:12px;opacity:0;transform:translateY(-8px) scale(.98);transform-origin:top center;visibility:hidden;pointer-events:none;transition:opacity .18s ease,transform .3s cubic-bezier(.22,1,.36,1),visibility 0s linear .3s;}
+.mobileUiHeaderOptions[data-open] {opacity:1;transform:none;visibility:visible;pointer-events:auto;transition:opacity .2s ease,transform .32s cubic-bezier(.22,1,.36,1),visibility 0s;}
+.mobileUiHeaderOptions>.controls {position:relative;display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.3fr) minmax(0,1fr) minmax(0,.9fr);gap:6px;margin:0;padding:0;opacity:1;visibility:visible;transform:none;}
+.mobileUiHeaderOptions .controls>:is(.v2SettingsBridge,.rightWorkspaceToggle,.leaderboardButton) {display:none;}
+.mobileUiHeaderOptions :is(.quotaPopoverAnchor,.polishedSelect) {position:static;display:block;min-width:0;width:100%;}
+.mobileUiHeaderOptions :is(.trackedQuotaButton,.v2QuotaTopButton,.mobileNativePolicySelect) {box-sizing:border-box;position:relative;width:100%;height:34px;margin:0;padding:0 6px;overflow:hidden;font-variant-numeric:tabular-nums;text-align:center;white-space:nowrap;text-overflow:ellipsis;-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);}
+/* The released desktop/legacy header pins these controls with !important;
+   override only those declarations, and only inside the phone row. */
+.mobileUiHeader .mobileUiHeaderOptions .controls :is(.trackedQuotaButton,.v2QuotaTopButton,.mobileNativePolicySelect) {display:block!important;min-width:0!important;min-height:0!important;border:0!important;border-radius:17px!important;background-color:var(--mobile-pill-fill)!important;box-shadow:inset 0 0 0 1px var(--ui-divider)!important;color:var(--ui-content)!important;font-family:var(--pool-ui-font)!important;font-size:13px!important;font-weight:400!important;line-height:34px!important;letter-spacing:0!important;}
+.mobileUiHeaderOptions .mobileNativePolicySelect {padding:0 18px 0 8px;text-align-last:center;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 5'%3E%3Cpath d='m1 1 3 3 3-3' fill='none' stroke='%23888' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E")!important;background-repeat:no-repeat!important;background-position:right 9px center!important;background-size:8px 5px!important;}
+.mobileUiHeader .mobileUiHeaderOptions .controls :is(.trackedQuotaButton,.v2QuotaTopButton).warning {color:#e9988f!important;}
+:root[data-theme="light"] .mobileUiHeader .mobileUiHeaderOptions .controls :is(.trackedQuotaButton,.v2QuotaTopButton,.mobileNativePolicySelect) {background-color:rgba(255,255,255,.72)!important;box-shadow:inset 0 0 0 1px rgba(0,0,0,.07),inset 0 1px 0 rgba(255,255,255,.9),0 3px 10px rgba(0,0,0,.06)!important;-webkit-backdrop-filter:blur(18px) saturate(1.5);backdrop-filter:blur(18px) saturate(1.5);}
+.mobileUiHeader .mobileUiHeaderOptions .controls :is(.trackedQuotaButton,.v2QuotaTopButton):is(:active,:hover),.mobileUiHeader .mobileUiHeaderOptions .quotaPopoverAnchor:has(.quotaPopover) .v2QuotaTopButton {background-color:var(--ui-hover)!important;}
+.mobileUiHeaderOptions .topbarGlassControl::before,.mobileUiHeaderOptions .topbarGlassControl::after {display:none;}
+.mobileUiHeaderOptions :is(.composerGlassAnchor,[class$="OriginalLayer"]) {display:none;}
+.mobileUiHeaderOptions .quotaPopover {position:absolute;top:calc(100% + 8px);left:0;right:0;z-index:2;box-sizing:border-box;width:auto;max-width:none;max-height:calc(var(--mobile-ui-height,100dvh) - 150px);overflow:auto;overscroll-behavior:contain;margin:0;padding:12px;border:0!important;border-radius:20px!important;background:color-mix(in srgb,var(--ui-surface) 95%,transparent)!important;color:var(--ui-content);box-shadow:0 18px 48px #0005,inset 0 0 0 1px var(--ui-divider)!important;-webkit-backdrop-filter:blur(24px) saturate(1.2);backdrop-filter:blur(24px) saturate(1.2);}
+.mobileComposerDock {position:absolute;left:0;right:0;bottom:0;z-index:4;box-sizing:border-box;min-width:0;margin:0;padding:6px 10px calc(8px + env(safe-area-inset-bottom,0px));pointer-events:none;}
+.mobileComposerDock>* {pointer-events:auto;}
+/* The transcript scrolls under the dock and fades/blurs into it, mirroring the
+   header strip, instead of ending at a hard solid edge. */
+.mobileComposerDock::before {content:"";position:absolute;inset:-44px 0 0;z-index:-1;pointer-events:none;background:linear-gradient(to top,color-mix(in srgb,var(--bg) 90%,transparent) 0%,color-mix(in srgb,var(--bg) 72%,transparent) 50%,transparent 100%);-webkit-backdrop-filter:blur(10px) saturate(1.1);backdrop-filter:blur(10px) saturate(1.1);-webkit-mask-image:linear-gradient(to top,#000 0%,#000 52%,transparent 100%);mask-image:linear-gradient(to top,#000 0%,#000 52%,transparent 100%);}
+.mobileUiQueuedSubmissionStrip {position:relative;z-index:0;box-sizing:border-box;width:auto;margin:0 12px 6px;padding:0 4px;border-radius:18px;background:transparent;color:var(--ui-content);font:400 14px/20px var(--pool-ui-font);transition:opacity .18s ease,transform .18s ease;}
+/* Same glass as the composer (on a backing layer, so its menu is not clipped);
+   slightly inset, it reads as a card stacked behind the composer. */
+.mobileUiQueuedSubmissionStrip::before,.mobileUiComposerSurface::before {content:"";position:absolute;inset:0;z-index:-1;border-radius:inherit;background:var(--mobile-composer-fill,rgba(110,110,110,.12));box-shadow:inset 0 0 0 1px var(--ui-divider);-webkit-backdrop-filter:blur(20px) saturate(1.15);backdrop-filter:blur(20px) saturate(1.15);pointer-events:none;}
+.mobileUiQueuedSubmissionStrip.closing {opacity:0;transform:translateY(4px);pointer-events:none;}
+.mobileUiQueuedSubmissionList {min-width:0;}
+.mobileUiQueuedSubmission {display:flex;align-items:center;gap:6px;min-width:0;min-height:40px;padding:0 4px 0 8px;font:inherit;}
+.mobileUiQueuedSubmissionLabel {flex:none;color:var(--ui-content-muted);white-space:nowrap;}
+.mobileUiQueuedSubmissionText {flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mobileUiQueuedSubmissionStrip button {display:grid;place-items:center;flex:none;min-height:32px;padding:0 4px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;white-space:nowrap;}
+.mobileUiQueuedSubmissionStrip button:disabled {opacity:.45;}
+.mobileUiQueuedSubmissionStrip button:hover {background:var(--ui-hover);}
+.mobileUiQueuedSubmissionStrip .mobileUiQueuedIconButton {width:28px;padding:0;color:var(--ui-content-muted);font-size:18px;}
+.mobileUiQueuedSubmissionStrip .mobileUiQueuedQueueToggle {display:flex;align-items:center;gap:4px;}
+.mobileUiQueuedQueueHeader {padding:4px 6px 0;}
+.mobileUiQueuedSubmissionStrip.expanded .mobileUiQueuedSubmissionList {max-height:min(32dvh,280px);overflow:auto;overscroll-behavior:contain;}
+.mobileUiQueuedSubmissionStrip.expanded .mobileUiQueuedSubmission {align-items:flex-start;padding-block:4px;}
+.mobileUiQueuedSubmissionStrip.expanded .mobileUiQueuedSubmission+.mobileUiQueuedSubmission {border-top:1px solid var(--ui-divider);}
+.mobileUiQueuedSubmissionStrip.expanded :is(.mobileUiQueuedSubmissionText,.mobileUiQueuedSubmissionLabel) {padding-block:6px;}
+.mobileUiQueuedSubmissionStrip.expanded .mobileUiQueuedSubmissionText {overflow:visible;white-space:pre-wrap;overflow-wrap:anywhere;}
+.mobileUiQueuedEditInput {flex:1;min-width:0;min-height:36px;padding:0;border:0;outline:none;background:transparent;color:inherit;font:400 16px/24px var(--pool-ui-font);}
+.mobileUiQueuedSubmissionMenu {position:absolute;right:0;bottom:calc(100% + 6px);z-index:5;display:grid;min-width:200px;max-width:100%;padding:6px;border-radius:16px;background:var(--ui-surface-raised);box-shadow:0 6px 24px #0003;}
+.mobileUiQueuedSubmissionMenu>button {justify-content:start;min-height:44px;padding:8px 12px;}
+.mobileUiQueuedMenuSelection {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px;padding:8px 12px;color:var(--ui-content-muted);}
+/* Content is bottom-anchored in both shapes, so during the capsule <-> box
+   height morph the +/model/mic/send row stays put and the box grows upward. */
+.mobileUiComposerSurface {position:relative;z-index:0;display:flex;flex-direction:column;justify-content:flex-end;gap:0;min-width:0;padding:4px;border-radius:26px;box-shadow:0 10px 30px #0000002b;}
+.mobileUiComposerSurface[data-morphing] {overflow:hidden;}
+.mobileUiComposerSurface:not([data-expanded]) {display:grid;grid-template-columns:44px minmax(0,1fr) auto;grid-template-rows:44px;align-items:center;align-content:end;}
+.mobileUiComposerEditor {min-width:0;}
+.mobileUiComposerEditor .composerRichEditor {height:auto;min-height:24px;max-height:min(216px,34vh);overflow:auto;margin:0;padding:0;}
+/* Expanded box: ~1.5 lines of room before the toolbar (16/24 type). */
+.mobileUiComposerEditor .composerRichInput {box-sizing:border-box;min-height:45px;padding:10px 12px 8px;font:400 16px/24px var(--pool-ui-font);}
+.mobileUiComposerSurface:not([data-expanded])>.mobileUiComposerEditor {grid-column:2;grid-row:1;overflow:hidden;mask-image:linear-gradient(to right,#000 calc(100% - 16px),transparent);}
+.mobileUiComposerSurface:not([data-expanded]) .composerRichEditor {height:28px;max-height:28px;overflow:clip;}
+.mobileUiComposerSurface:not([data-expanded]) .composerRichInput {min-height:24px;padding:2px 4px;}
+/* Typed line breaks are chat lines, not document paragraphs: keep the pitch at line height + a hair. */
+.mobileUiComposerEditor .composerRichInput>* {margin-block:0;}
+.mobileUiComposerEditor .composerRichInput>*+* {margin-top:4px;}
+.mobileUiComposerSurface:not([data-expanded]) .composerRichInput>* {margin-block:0;}
+.mobileUiComposerToolbar {display:flex;align-items:center;gap:0;min-width:0;min-height:44px;}
+.mobileUiComposerSurface:not([data-expanded])>.mobileUiComposerToolbar {display:contents;}
+.mobileUiPlus,.mobileUiVoiceButton,.mobileUiSendButton {box-sizing:border-box;display:grid;place-items:center;flex:0 0 44px;width:44px;height:44px;min-width:44px;min-height:44px;margin:0;padding:0;border:0;border-radius:50%;background:transparent;color:inherit;cursor:pointer;}
+.mobileUiComposerSurface:not([data-expanded]) .mobileUiPlus {grid-column:1;grid-row:1;}
+.mobileUiComposerModel {min-width:0;flex:1;}
+.mobileUiModelTrigger {display:flex;align-items:center;gap:5px;min-width:0;max-width:100%;min-height:44px;padding:0 4px;border:0;background:transparent;color:var(--ui-content-muted);font:400 14px/20px var(--pool-ui-font);}
+.mobileUiModelTrigger>span {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mobileUiSendActions {display:flex;align-items:center;flex:none;gap:0;height:44px;}
+.mobileUiVoiceInput {position:relative;display:flex;align-items:center;}
+.mobileUiVoiceButton {touch-action:none;color:var(--ui-content-muted);transition:color .18s ease;}
+.mobileUiVoiceButton.recording {color:#e76363;animation:voicePulse 1.3s ease-in-out infinite;}
+.mobileUiSendButton {position:relative;color:var(--ui-action-primary-text);}
+.mobileUiSendButton::before {content:"";position:absolute;inset:6px;border-radius:50%;background:var(--ui-action-primary-bg);pointer-events:none;}
+.mobileUiSendButton>svg {position:relative;}
+.mobileUiSendButton:disabled {opacity:.35;cursor:default;}
+.mobileUiVoiceInput {position:static;}
+.mobileUiVoiceInput .voiceNotice {position:absolute;left:48px;right:92px;top:auto;bottom:4px;z-index:2;box-sizing:border-box;display:flex;align-items:center;gap:6px;width:auto;max-width:none;height:44px;margin:0;padding:0 2px 0 12px;border-radius:22px;background:var(--ui-surface-raised);box-shadow:none;-webkit-backdrop-filter:none;backdrop-filter:none;color:var(--ui-content);font:400 14px/20px var(--pool-ui-font);font-variant-numeric:tabular-nums;animation:mobileUiVoiceEnter .22s cubic-bezier(.22,1,.36,1) both;}
+.mobileUiVoiceInput:has(.mobileUiVoiceButton.recording) .voiceNotice::before {content:"";flex:none;width:8px;height:8px;border-radius:50%;background:#e76363;animation:voicePulse 1.3s ease-in-out infinite;}
+.mobileUiVoiceInput .voiceNotice>span {flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mobileUiVoiceInput .voiceNotice>button {display:grid;place-items:center;flex:none;width:36px;height:36px;padding:0;border-radius:50%;color:var(--ui-content-muted);}
+.mobileUiVoiceInput .voiceNotice.closing {animation:voiceNoticeExit .2s ease both;}
+@keyframes mobileUiVoiceEnter {from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.mobileUiComposerSurface:not([data-expanded]) .mobileUiSendActions {grid-column:3;grid-row:1;}
+.mobileUiComposerSurface:not([data-expanded]) :is(.mobileUiComposerActivity,.mobileUiComposerExtras,.mobileUiComposerModel) {display:none;}
+.mobileUiComposerExtras:empty,.mobileUiComposerActivity:empty {display:none;}
+.mobileUiComposerExtras .dropUploadHint {display:none;}
+.mobileUiComposerExtras {display:flex;flex-direction:column;gap:6px;min-width:0;padding:6px 6px 0;}
+.mobileUiComposerExtras .uploadedFileList {display:flex;gap:8px;min-width:0;margin:0;padding:2px 0;overflow-x:auto;overscroll-behavior-x:contain;scrollbar-width:none;}
+.mobileUiComposerExtras .uploadedFileList::-webkit-scrollbar {display:none;}
+.mobileUiComposerExtras .uploadedFileChip {position:relative;flex:none;display:flex;align-items:stretch;max-width:220px;height:56px;min-height:0;border:0;border-radius:14px;overflow:hidden;background:var(--ui-surface-input);color:var(--ui-content);}
+.mobileUiComposerExtras .uploadedImageChip {width:56px;}
+.mobileUiComposerExtras .uploadedFilePreviewButton {display:grid;grid-template-columns:28px minmax(0,1fr);grid-template-rows:auto auto;align-content:center;column-gap:8px;min-width:0;width:100%;height:100%;padding:0 30px 0 10px;border:0;background:transparent;color:inherit;text-align:left;}
+.mobileUiComposerExtras .uploadedImageChip .uploadedFilePreviewButton {display:block;padding:0;}
+.mobileUiComposerExtras .uploadedImageThumbnail {display:block;width:56px;height:56px;border-radius:0;object-fit:cover;background:var(--ui-surface-raised);}
+.mobileUiComposerExtras .uploadedImageThumbnailFallback {display:grid;place-items:center;color:var(--ui-content-muted);}
+.mobileUiComposerExtras .uploadedFileIcon {grid-row:1/span 2;width:28px;height:28px;padding:6px;box-sizing:border-box;border-radius:8px;background:var(--ui-surface-raised);color:var(--ui-content-muted);}
+.mobileUiComposerExtras .uploadedFilePreviewButton>span {font:500 14px/18px var(--pool-ui-font);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mobileUiComposerExtras .uploadedFilePreviewButton>small {font:400 12px/16px var(--pool-ui-font);color:var(--ui-content-muted);}
+.mobileUiComposerExtras .removeUploadedFileButton {position:absolute;top:4px;right:4px;display:grid;place-items:center;width:20px;height:20px;padding:0;border:0;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;}
+.mobileUiComposerExtras .removeUploadedFileButton::after {content:"";position:absolute;inset:-8px;}
+.mobileUiComposerActivity .composerThreadActivity {display:block;}
+.mobileComposerDock>.composerResizeHandle {display:none;}
+:root[data-theme] .mobileChatShell .v2ThinkingLine {margin:6px 0 14px;font-size:var(--mobile-ui-body)!important;line-height:26px;}
+@keyframes mobileUiSheetEnter {from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce) {.mobileUiSheet,.mobileUiSheet::backdrop,.mobileUiQueuedSubmissionStrip,.mobileUiVoiceButton,.mobileUiHeaderOptions,.mobileUiHeader::before,.mobileUiTitle>svg,.mobileUiVoiceInput .voiceNotice{transition:none;animation:none;}}
+@media (prefers-reduced-transparency:reduce) {:is(.mobileUiHeader,.mobileComposerDock)::before {-webkit-backdrop-filter:none;backdrop-filter:none;}:is(.mobileUiComposerSurface,.mobileUiQueuedSubmissionStrip)::before {background:var(--ui-surface-raised);-webkit-backdrop-filter:none;backdrop-filter:none;}}
+
+/* Left and right drawers use the same glass as the header pills: a translucent
+   tint of the page colour over a blurred copy of the conversation, with a hairline
+   edge. While a finger drags a drawer the blur is dropped (mobileSidebar.css) and
+   the tint is made nearly opaque, so nothing shimmers; full glass returns at rest. */
+.mobileChatShell {--mobile-drawer-glass:color-mix(in srgb,var(--bg) 78%,transparent);--mobile-drawer-glass-drag:color-mix(in srgb,var(--bg) 94%,transparent);}
+:root .mobileChatShell .workspace>.threadList:not(.collapsed),
+:root .mobileChatShell .workspace.diffPanelOpen>.rightWorkspace.diffReviewPanel {background:var(--mobile-drawer-glass-drag)!important;box-shadow:inset 0 0 0 1px var(--ui-divider),0 0 40px #0003!important;}
+:root .mobileChatShell .workspace>.threadList:not(.collapsed):not([data-moving]),
+:root .mobileChatShell .workspace.diffPanelOpen>.rightWorkspace.diffReviewPanel:not([data-moving]) {background:var(--mobile-drawer-glass)!important;-webkit-backdrop-filter:blur(28px) saturate(1.35)!important;backdrop-filter:blur(28px) saturate(1.35)!important;}
+:root .mobileChatShell .workspace>.threadList:not(.collapsed) {border-radius:0 28px 28px 0;}
+:root .mobileChatShell .workspace.diffPanelOpen>.rightWorkspace.diffReviewPanel {border-radius:0;}
+:root .mobileChatShell .workspace>.threadList:not(.collapsed) :is(.v2ProjectDock,.listHeader,.v2AccountDock) {background:transparent!important;}
+/* No hairlines inside the phone drawers: spacing separates the account row. */
+:root .mobileChatShell .workspace>.threadList:not(.collapsed) .v2AccountDock {box-shadow:none!important;border:0!important;}
+:root .mobileChatShell .workspace>.threadList:not(.collapsed) .v2AccountDock .v2AccountTrigger::before {display:none!important;}
+:root .mobileChatShell .rightWorkspace .rightWorkspaceOverviewCard {background:color-mix(in srgb,var(--ui-content) 6%,transparent)!important;box-shadow:inset 0 0 0 1px var(--ui-divider)!important;}
+/* Rows inside the drawers sit on the glass with a soft neutral tint, not an opaque slab. */
+.mobileChatShell .threadList :is(.threadRow.selected,.v2WorkspaceFolderButton.active,.v2WorkspaceGroup.active>.v2WorkspaceFolderButton) {background:color-mix(in srgb,var(--ui-content) 8%,transparent)!important;}
+@media (prefers-reduced-transparency:reduce) {
+  :root .mobileChatShell .workspace>.threadList:not(.collapsed),
+  :root .mobileChatShell .workspace.diffPanelOpen>.rightWorkspace.diffReviewPanel {background:var(--ui-surface)!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important;}
+}

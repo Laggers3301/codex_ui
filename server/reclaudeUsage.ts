@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { AppError } from "./appErrors.js";
+import {parseNativeClaudeUsage} from './claudeNativeUsage.js';
 import type { ClaudeBinding } from "./claudeBindings.js";
 import { isReclaudeWeeklyWindow, reclaudeWindowActive, reclaudeWindowThreshold, remainingTime, type ReclaudeAccountUsage, type ReclaudeLimitCode, type ReclaudeUsageWindow } from "../shared/reclaudeUsage.js";
 
@@ -73,6 +74,9 @@ export class ReclaudeUsageMonitor {
       this.save(accountKey, { kind, percent,
         resetsAt: timestamp(value.resetsAt), observedAt, source: "response" });
     }
+  }
+  observeNativeUsage(accountKey:string,text:string){
+    for(const window of parseNativeClaudeUsage(text,this.now()))this.save(accountKey,window);
   }
   /** Trusted local export: {accounts:[{accountUuid, observedAt, usage_snapshot}]}.
    * Bind by actual Claude UUID; an org id or ReClaude login is insufficient.

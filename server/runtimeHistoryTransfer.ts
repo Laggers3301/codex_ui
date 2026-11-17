@@ -14,6 +14,8 @@ import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import type { ClaudeConversation } from "./claudeSessionStorage.js";
 import { HistoryWriteBatch } from "./historyWriteBatch.js";
 import { setImmediate as yieldToRequests } from "node:timers/promises";
+import {captureMigrationDisplay,displayTransfer,readMigrationDisplay} from './migrationDisplay.js';
+import {readIndexedThreadPage,indexedHistoryEnd,type ThreadPageReadCache} from './threadEventIndex.js';
 
 type Row = Record<string, any>;
 type TransferEffort="low"|"medium"|"high"|"xhigh"|"max"|"ultra";
@@ -25,6 +27,9 @@ interface Transfer {
   sourceRuntime: "codex" | "claude-code"; phase: "preparing" | "prepared" | "creating" | "importing" | "completed" | "uncertain";
   sourceName: string; sourceHash?: string; archive?: string; messageCount: number; importedCount: number;
   warnings: string[]; targetThreadId?: string; nativeSessionId?: string; createdAt: number;
+  updatedAt?:number;stage?:'snapshot'|'display'|'import';error?:string;
+  importedBoundaryRowid?:number;
+  displayItems?:number;
 }
 export interface TransferRequest { operationId: string; sourceThreadId: string; userId: string; projectId: string; targetModel: string; targetAccountId?: string; sourceTurnId?: string;targetReasoningEffort?:TransferEffort; }
 const transferServices=new WeakMap<object,RuntimeHistoryTransfer>();
@@ -54,16 +59,38 @@ export class RuntimeHistoryTransfer {
     return found ? JSON.parse(found.body) : null;
   }
   private save(row: Transfer) {
+    row.updatedAt=Date.now();
     this.claude.storage.db.prepare("INSERT INTO runtime_transfers VALUES (?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body").run(row.id, JSON.stringify(row));
   }
+  status(id:string,userId:string,projectId:string,sourceThreadId:string){
+    const row=this.get(id);
+    if(!row||row.userId!==userId||row.projectId!==projectId||row.sourceThreadId!==sourceThreadId)return null;
+    const interrupted=row.phase!=='completed'&&!row.error&&!this.active.has(id);
+    return {phase:row.error?'failed':interrupted?'interrupted':row.phase,stage:row.stage,totalMessages:row.messageCount,importedMessages:row.importedCount,displayItems:row.displayItems,
+      updatedAt:row.updatedAt??row.createdAt,model:row.targetModel,error:row.error,
+      reasoningEffort:row.targetReasoningEffort,sourceTurnId:row.sourceTurnId,
+      ...(row.phase==='completed'?{targetThreadId:row.targetThreadId}:{} )};
+  }
+  async startBackground(input:TransferRequest):Promise<void>{
+    let failure:unknown;
+    // Register both handlers immediately: disconnected HTTP clients must not
+    // cancel the one durable operation or cause an unhandled rejection.
+    void this.migrate(input).then(()=>{},error=>{failure=error;});
+    await yieldToRequests();
+    if(failure)throw failure;
+  }
+  private checkpoint(row:Transfer){if(Date.now()-(row.updatedAt??0)>=500)this.save(row);}
   private *messages(id: string): Generator<TransferMessage> {
-    // Iterate in bounded pages: no full conversation array in the web process.
+    // Bound by bytes as well as row count; reuse prepared statements rather
+    // than reparsing one query for every message in a six-figure history.
+    const sizes=this.claude.storage.db.prepare('SELECT seq,length(CAST(body AS BLOB)) bytes FROM runtime_transfer_items WHERE transfer_id=? AND seq>? ORDER BY seq LIMIT 128');
+    const read=this.claude.storage.db.prepare('SELECT seq,body FROM runtime_transfer_items WHERE transfer_id=? AND seq>? AND seq<=? ORDER BY seq');
     let seq = -1;
     for (;;) {
-      const rows = this.claude.storage.db.prepare("SELECT seq,body FROM runtime_transfer_items WHERE transfer_id=? AND seq>? ORDER BY seq LIMIT 1")
-        .all(id, seq) as Array<{seq:number;body:string}>;
-      if (!rows.length) return;
-      seq = rows[0].seq; yield JSON.parse(rows[0].body);
+      const metadata=sizes.all(id,seq);if(!metadata.length)return;
+      let bytes=0,end=seq;
+      for(const row of metadata){if(end!==seq&&bytes+Number(row.bytes)>1024*1024)break;bytes+=Number(row.bytes);end=Number(row.seq);}
+      for(const row of read.all(id,seq,end)){seq=Number(row.seq);yield JSON.parse(String(row.body));}
     }
   }
   async migrate(input: TransferRequest): Promise<unknown> {
@@ -73,7 +100,13 @@ export class RuntimeHistoryTransfer {
     }
     const running = this.active.get(input.operationId);
     if (running) return running;
-    const promise = this.run(input);
+    const promise = this.run(input).catch(error=>{
+      const row=this.get(input.operationId);
+      if(row&&row.userId===input.userId&&row.sourceThreadId===input.sourceThreadId){
+        row.error=error instanceof AppError?error.message:'历史导入失败，原对话保留。请检查现有分支后再重试。';this.save(row);
+      }
+      throw error;
+    });
     this.active.set(input.operationId, promise);
     try { return await promise; } finally { this.active.delete(input.operationId); }
   }
@@ -87,18 +120,51 @@ export class RuntimeHistoryTransfer {
     if (!row || row.userId !== userId || row.sourceThreadId !== sourceThreadId || !row.archive) return null;
     return row.archive;
   }
+  async restoreDisplay(target:string,user:string){
+    const row=displayTransfer(this.claude.storage,target,user);if(!row)throw Error('Migration record not found');
+    await this.captureDisplay(row as Transfer,[]);
+  }
+  private async captureDisplay(row:Transfer,ancestry:string[]){
+    if(ancestry.length>=8||ancestry.includes(row.id))throw Error('Migration display ancestry is cyclic');
+    const beforeSource=displayTransfer(this.claude.storage,row.sourceThreadId,row.userId);
+    if(beforeSource)await this.captureDisplay(beforeSource as Transfer,[...ancestry,row.id]);
+    const progress=(count:number)=>{row.displayItems=count;this.checkpoint(row);};
+    if(row.sourceRuntime==='claude-code'){
+      const cutoff=row.sourceTurnId?this.claude.storage.db.prepare('SELECT created_at,rowid FROM turns WHERE thread_id=? AND id=?').get(row.sourceThreadId,row.sourceTurnId):this.claude.storage.db.prepare('SELECT created_at,rowid FROM turns WHERE thread_id=? AND created_at<=? ORDER BY created_at DESC,rowid DESC LIMIT 1').get(row.sourceThreadId,row.createdAt);
+      if(!cutoff)throw Error('Source display cutoff is missing');
+      const skipped=Number(this.claude.storage.db.prepare('SELECT COUNT(*) n FROM turns WHERE thread_id=? AND (created_at>? OR (created_at=? AND rowid>?))').get(row.sourceThreadId,cutoff.created_at,cutoff.created_at,cutoff.rowid)?.n??0);
+      await captureMigrationDisplay(this.claude.storage,row,(before,cursor)=>this.claude.readHistory(row.sourceThreadId,before+skipped,100,cursor),progress);
+    }else{
+      if(!row.archive)throw Error('Source display archive is missing');
+      const id=`migration-capture:${row.id}`,end=await indexedHistoryEnd(row.archive,id,row.sourceTurnId);
+      const readCache:ThreadPageReadCache={};
+      await captureMigrationDisplay(this.claude.storage,row,async(before,cursor)=>{
+        if(beforeSource){const page=await readMigrationDisplay(this.claude.storage,beforeSource,{id:row.sourceThreadId},before,100,row.archive,id,end);if(page)return page;}
+        return readIndexedThreadPage(row.archive!,id,{before,cursor,limit:100,maxEndOffset:end,sessionsRoot:path.dirname(row.archive!),readCache});
+      },progress);
+    }
+  }
   private async run(input: TransferRequest) {
     const project = this.store.getProject(input.projectId, input.userId);
     if (!project || !this.store.userCanAccessThread(input.sourceThreadId, input.userId, input.projectId)) throw new AppError("runtime_forbidden", "无权迁移此会话。");
     let row = this.get(input.operationId);
     if (row?.phase === "completed") return this.result(row);
     if (row && ["creating", "importing", "uncertain"].includes(row.phase)) throw new AppError("migration_uncertain", "此前迁移的提交结果尚未确认，已阻止重复创建或重复导入。原会话完整保留，请查看迁移记录。");
+    if(row?.error){delete row.error;this.save(row);}
     if (isReclaudeModel(input.targetModel)) input={...input,targetModel:this.claude.bindings.effectiveModel(input.userId,input.targetModel)};
     if (row && isReclaudeModel(row.targetModel)) { row.targetModel=this.claude.bindings.effectiveModel(row.userId,row.targetModel);this.save(row); }
     if(isReclaudeModel(input.targetModel))this.claude.storage.assertCapacity(input.operationId);
     const sourceRuntime = this.claude.owns(input.sourceThreadId) ? "claude-code" : "codex";
     if ((sourceRuntime === "claude-code") === isReclaudeModel(input.targetModel)) throw new AppError("migration_target", "请选择另一运行引擎；同引擎请使用原生分支。");
     if (isReclaudeModel(input.targetModel)) this.claude.usage.assertAvailable(this.claude.bindings.resolve(input.userId, input.targetModel));
+    if(isReclaudeModel(input.targetModel)){
+      const binding=this.claude.bindings.resolve(input.userId,input.targetModel);
+      if(binding.restrictedSourceThreadId){
+        if(binding.userId!==input.userId||binding.restrictedSourceThreadId!==input.sourceThreadId)throw new AppError('runtime_forbidden','专用设备仅允许指定用户的PP原会话迁入。');
+        const existing=this.claude.storage.db.prepare("SELECT id FROM runtime_transfers WHERE json_extract(body,'$.sourceThreadId')=? AND json_extract(body,'$.targetModel')=? AND json_extract(body,'$.targetThreadId') IS NOT NULL AND id<>? LIMIT 1").get(input.sourceThreadId,input.targetModel,input.operationId);
+        if(existing)throw new AppError('migration_conflict','此PP会话已有金山接续操作，请继续既有分支，不重复创建。');
+      }
+    }
     if (!row) {
       row = { id: input.operationId, sourceThreadId: input.sourceThreadId, userId: input.userId, projectId: input.projectId,
         targetModel: input.targetModel, sourceTurnId:input.sourceTurnId, targetAccountId:input.targetAccountId,targetReasoningEffort:input.targetReasoningEffort, sourceRuntime, sourceName: "会话", phase: "preparing", messageCount: 0, importedCount: 0,
@@ -125,6 +191,8 @@ export class RuntimeHistoryTransfer {
     }
     // Only a Claude destination creates a native Claude session. Codex targets
     // neither consume a Claude slot nor wait for that budget to reset.
+    row.stage='display';this.save(row);
+    await this.captureDisplay(row,[]);
     if(isReclaudeModel(row.targetModel))this.claude.storage.reserve(row.id);
     try {
       if (isReclaudeModel(row.targetModel)) await this.importClaude(row, project.rootPath);
@@ -143,6 +211,7 @@ export class RuntimeHistoryTransfer {
     }
   }
   private async snapshot(row: Transfer, source: string) {
+    row.stage='snapshot';this.save(row);
     const dir = path.join(this.claude.config.storageDirectory, "transfers", row.id);
     fs.mkdirSync(dir, {recursive:true,mode:0o700});
     const archive = path.join(dir, "source.jsonl"), partial = path.join(dir, `source-${randomUUID()}.partial`);
@@ -171,6 +240,8 @@ export class RuntimeHistoryTransfer {
     const batch=new HistoryWriteBatch<[string,number,string|null,string]>(this.claude.storage.db,values=>insert.run(...values));
     let turnId: string|null=null, skippedInternal=0, rawMessages=0, codexIdentityVerified=false;
     let claudeCutoff:string|undefined, cutoffFound=false;
+    let selectedNativeSession:string|undefined, recoveredCutoff:number|undefined;
+    const mainMessageIds=new Set<string>(),mainToolIds=new Set<string>();
     const nativeIds=new Set([conversation?.nativeSessionId,handoff?.sourceSessionId].filter(Boolean));
     if(row.sourceRuntime==="claude-code"&&row.sourceTurnId){
       // Read only the checkpoint, even when the selected turn is many MiB.
@@ -178,6 +249,17 @@ export class RuntimeHistoryTransfer {
       if(typeof selected?.nativeMessageId!=="string"||!selected.nativeMessageId||!nativeIds.has(String(selected.nativeSessionId)))
         throw new AppError("migration_cutoff_missing","所选轮次没有可确认的原生分支位置，未创建目标会话。");
       claudeCutoff=selected.nativeMessageId;
+      selectedNativeSession=String(selected.nativeSessionId);
+      // Older turns could save a child-agent UUID as their checkpoint. Recover
+      // only through identities belonging to this turn's MAIN-stream items;
+      // never replace a missing checkpoint with the end of the whole session.
+      const items=this.claude.storage.db.prepare("SELECT json_extract(j.value,'$.id') id FROM turns t,json_each(t.body,'$.items') j WHERE t.thread_id=? AND t.id=? AND json_extract(j.value,'$.parentToolUseId') IS NULL").all(row.sourceThreadId,row.sourceTurnId) as Array<{id:string}>;
+      for(const item of items){
+        const message=/^claude-message::([^:]+):\d+$/.exec(item.id);
+        const tool=/^claude-tool::([^:]+)$/.exec(item.id);
+        if(message)mainMessageIds.add(message[1]);
+        if(tool)mainToolIds.add(tool[1]);
+      }
     }
     const seen = new Set<string>();
     let scanned=0;
@@ -213,7 +295,7 @@ export class RuntimeHistoryTransfer {
         if(!message){if(p.type!=="message")skippedInternal++;continue;}
         if(p.id&&seen.has(p.id))continue;if(p.id)seen.add(p.id);
         const body=JSON.stringify(message);
-        if(batch.add([row.id,rawMessages++,turnId,body],Buffer.byteLength(body)))await yieldToRequests();
+        if(batch.add([row.id,rawMessages++,turnId,body],Buffer.byteLength(body))){row.messageCount=rawMessages;this.checkpoint(row);await yieldToRequests();}
       } else {
         if(raw.sessionId && !nativeIds.has(raw.sessionId)) throw new AppError("migration_identity_mismatch","Claude 历史标识不一致。");
         if(raw.isSidechain===true)continue;
@@ -226,7 +308,10 @@ export class RuntimeHistoryTransfer {
         const message=portableClaudeMessage(raw);
         if(!message){skippedInternal++;continue;}
         const body=JSON.stringify(message);
-        if(batch.add([row.id,rawMessages++,null,body],Buffer.byteLength(body)))await yieldToRequests();
+        if(batch.add([row.id,rawMessages++,null,body],Buffer.byteLength(body))){row.messageCount=rawMessages;this.checkpoint(row);await yieldToRequests();}
+        if(raw.type==='assistant'&&raw.sessionId===selectedNativeSession&&(
+          mainMessageIds.has(raw.message?.id)||Array.isArray(raw.message?.content)&&raw.message.content.some((block:Row)=>block.type==='tool_use'&&mainToolIds.has(block.id))
+        ))recoveredCutoff=rawMessages-1;
       }
     }
     batch.flush();
@@ -235,7 +320,11 @@ export class RuntimeHistoryTransfer {
       if(cutoff===null||cutoff===undefined)throw new AppError("migration_cutoff_missing","未找到所选分支轮次，未创建目标会话。");
       this.claude.storage.db.prepare("DELETE FROM runtime_transfer_items WHERE transfer_id=? AND seq>?").run(row.id,cutoff as number);
     }
-    if(claudeCutoff&&!cutoffFound)throw new AppError("migration_cutoff_missing","源记录中没有所选原生分支位置，未创建目标会话。");
+    if(claudeCutoff&&!cutoffFound){
+      if(recoveredCutoff===undefined)throw new AppError("migration_cutoff_missing","源记录中没有所选原生分支位置，未创建目标会话。");
+      this.claude.storage.db.prepare("DELETE FROM runtime_transfer_items WHERE transfer_id=? AND seq>?").run(row.id,recoveredCutoff);
+      row.warnings.push("已按所选轮次的主会话消息标识恢复旧分支位置；未采用子代理消息作为分支点。");
+    }
     row.messageCount=Number((this.claude.storage.db.prepare("SELECT COUNT(*) AS n FROM runtime_transfer_items WHERE transfer_id=?").get(row.id) as {n:number}).n);
     if(!row.messageCount)throw new AppError("migration_empty","没有可迁移的对话内容，未创建目标会话。");
     row.warnings.push("已迁移用户消息、可见回答和工具记录；工具记录作为文字保留，不会执行。原生内部状态与附件原始数据保存在源记录中。");
@@ -248,34 +337,41 @@ export class RuntimeHistoryTransfer {
     this.claude.usage.assertAvailable(binding);
     const relative=path.relative(fs.realpathSync(binding.workspaceRoot),fs.realpathSync(cwd));
     if(relative===".."||relative.startsWith(`..${path.sep}`)||path.isAbsolute(relative))throw new AppError("workspace_forbidden","迁移目标工作目录不属于当前用户。");
-    row.targetThreadId=randomUUID();row.nativeSessionId=randomUUID();row.phase="importing";this.save(row);
+    row.targetThreadId=randomUUID();row.nativeSessionId=randomUUID();row.phase="importing";row.stage='import';this.save(row);
     const folder=path.join(binding.configRoot,"projects",cwd.replace(/[^a-zA-Z0-9]/g,"-"));
     fs.mkdirSync(folder,{recursive:true,mode:0o700});
     if(!fs.realpathSync(folder).startsWith(fs.realpathSync(binding.configRoot)+path.sep))throw new Error("迁移目录越界。");
     const nativeFile=path.join(folder,`${row.nativeSessionId}.jsonl`),fd=fs.openSync(nativeFile,"wx",0o600);
-    let parent:string|null=null;
-    const turns=new HistoryWriteBatch<Record<string,unknown>>(this.claude.storage.db,turn=>this.claude.storage.saveTurn(row.targetThreadId!,turn));
+    let parent:string|null=null,lastImportedTurnId:string|undefined;
+    const turns=new HistoryWriteBatch<{turn:Record<string,unknown>;body:string}>(this.claude.storage.db,value=>this.claude.storage.saveTurn(row.targetThreadId!,value.turn,value.body));
+    let output:string[]=[],outputBytes=0;
+    const flushOutput=()=>{if(output.length){fs.writeFileSync(fd,output.join(''));output=[];outputBytes=0;}};
     try {
       for (const message of this.messages(row.id)) {
         const uuid=randomUUID(),timestamp=new Date(row.createdAt).toISOString();
         const native={type:message.role,uuid,parentUuid:parent,sessionId:row.nativeSessionId,cwd,isSidechain:false,timestamp,
           version:"2.1.316",message:{role:message.role,content:[{type:"text",text:message.text}],
             ...(message.role==="assistant"?{id:randomUUID(),type:"message",model:"historical-import",stop_reason:"end_turn",usage:{input_tokens:0,output_tokens:0}}:{})}};
-        fs.writeSync(fd,JSON.stringify(native)+"\n");parent=uuid;
+        const nativeLine=JSON.stringify(native)+'\n';output.push(nativeLine);outputBytes+=Buffer.byteLength(nativeLine);
+        if(outputBytes>=256*1024)flushOutput();parent=uuid;
         const id=randomUUID();
+        lastImportedTurnId=id;
         const turn={id,status:"completed",nativeMessageId:uuid,nativeSessionId:row.nativeSessionId,items:[message.role==="user"
           ?{id:`import:${id}`,type:"userMessage",content:[{type:"text",text:message.text}]}
           :{id:`import:${id}`,type:"agentMessage",text:message.text}]};
-        const committed=turns.add(turn,Buffer.byteLength(JSON.stringify(turn)));
+        const body=JSON.stringify(turn),committed=turns.add({turn,body},Buffer.byteLength(body));
         row.importedCount+=committed;
-        if(committed)await yieldToRequests();
+        if(committed){this.checkpoint(row);await yieldToRequests();}
       }
       row.importedCount+=turns.flush();
+      flushOutput();
       fs.fsyncSync(fd);
+      if(lastImportedTurnId)row.importedBoundaryRowid=Number(this.claude.storage.db.prepare('SELECT rowid FROM turns WHERE thread_id=? AND id=?').get(row.targetThreadId,lastImportedTurnId)!.rowid);
     } finally {fs.closeSync(fd);}
     const conversation:ClaudeConversation={id:row.targetThreadId,nativeSessionId:row.nativeSessionId,userId:row.userId,projectId:row.projectId,cwd,
       name:claudeBranchName(row.sourceName),model:row.targetModel,orgId:binding.orgId,accountKey:binding.accountKey,configRoot:binding.configRoot,
       initialized:true,archived:false,createdAt:Date.now(),updatedAt:Date.now()};
+    if(binding.restrictedSourceThreadId)conversation.privateSourceThreadId=row.sourceThreadId;
     this.claude.storage.save(conversation);
     this.store.registerThreadOwner({threadId:row.targetThreadId,userId:row.userId,projectId:row.projectId,rootPath:cwd,model:row.targetModel,reasoningEffort:effort??"medium"});
   }

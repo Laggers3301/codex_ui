@@ -23,6 +23,8 @@ export interface ClaudeConversation {
   collaborationMode?: "plan" | "default";
   contextHandoff?: {version:number;sourceSessionId:string;sourceFile:string;archive:string;summaryFound:boolean;bytes:number;records:number;preparedAt:string;rebuildFromNative?:boolean};
   toolOutputArchive?: ClaudeToolArchive;
+  /** Server-minted by the one explicitly authorized private migration. */
+  privateSourceThreadId?:string;
 }
 export interface ClaudeBindingMigration { id: string; before: ClaudeConversation; after: ClaudeConversation; }
 export interface ClaudeNativeFork {
@@ -36,6 +38,7 @@ export interface ClaudeNativeFork {
  * limit or turn an ambiguous attempt into an uncounted new upstream session. */
 export class ClaudeSessionStorage {
   readonly db: DatabaseSync;
+  private turnWriter?:ReturnType<DatabaseSync['prepare']>;
   private transactionSequence = 0;
   constructor(readonly directory: string, private now = Date.now) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -79,9 +82,19 @@ export class ClaudeSessionStorage {
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
   }
+  // Prepared once: these two are on every request/notification path (owns() alone is called
+  // for each thread of each list, event and read), and re-preparing + parsing the whole
+  // conversation body just to answer "is this a Claude thread?" was a steady main-thread cost.
+  private conversationReader?: ReturnType<DatabaseSync["prepare"]>;
+  private conversationPresence?: ReturnType<DatabaseSync["prepare"]>;
   get(id: string): ClaudeConversation | null {
-    const row = this.db.prepare("SELECT body FROM conversations WHERE id=?").get(id) as { body: string } | undefined;
+    this.conversationReader ??= this.db.prepare("SELECT body FROM conversations WHERE id=?");
+    const row = this.conversationReader.get(id) as { body: string } | undefined;
     return row ? JSON.parse(row.body) : null;
+  }
+  has(id: string): boolean {
+    this.conversationPresence ??= this.db.prepare("SELECT 1 FROM conversations WHERE id=?");
+    return this.conversationPresence.get(id) !== undefined;
   }
   private transaction<T>(action: () => T): T {
     const savepoint = `claude_write_${++this.transactionSequence}`;
@@ -136,8 +149,10 @@ export class ClaudeSessionStorage {
     return (this.db.prepare("SELECT body FROM conversations").all() as Array<{ body: string }>).map(row => JSON.parse(row.body) as ClaudeConversation)
       .filter(row => (!userId || row.userId === userId) && (!projectId || row.projectId === projectId));
   }
-  saveTurn(threadId: string, turn: Record<string, unknown>) {
-    this.db.prepare("INSERT INTO turns VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body").run(threadId, String(turn.id), this.now(), JSON.stringify(turn));
+  saveTurn(threadId: string, turn: Record<string, unknown>, serializedBody?:string) {
+    this.turnWriter??=this.db.prepare("INSERT INTO turns VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body");
+    this.turnWriter.run(threadId, String(turn.id), this.now(), serializedBody??JSON.stringify(turn));
+    this.turnCounts.delete(threadId);
   }
   interruptUnfinishedTurns() {
     // Repair restart metadata in SQLite without loading possibly huge bodies into JS.
@@ -160,8 +175,25 @@ export class ClaudeSessionStorage {
     const read = this.db.prepare("SELECT body FROM turns WHERE id=?");
     return selected.reverse().map(id => JSON.parse((read.get(id) as { body: string }).body));
   }
+  // A long conversation has tens of thousands of turn rows; counting them is an index scan
+  // that blocks the event loop on every read. The total for a thread only changes when a turn
+  // is written. Our own writes invalidate it directly; another connection's commit is
+  // detected through PRAGMA data_version, so a stale count can never be served.
+  private turnCounts = new Map<string, { count: number; version: number }>();
+  private dataVersionReader?: ReturnType<DatabaseSync["prepare"]>;
+  private dataVersion(): number {
+    this.dataVersionReader ??= this.db.prepare("PRAGMA data_version");
+    return Number((this.dataVersionReader.get() as { data_version?: number } | undefined)?.data_version ?? 0);
+  }
   turnCount(threadId: string, afterRowid = 0): number {
-    return (this.db.prepare("SELECT COUNT(*) AS n FROM turns WHERE thread_id=? AND rowid>?").get(threadId, afterRowid) as { n: number }).n;
+    const count = () => (this.db.prepare("SELECT COUNT(*) AS n FROM turns WHERE thread_id=? AND rowid>?").get(threadId, afterRowid) as { n: number }).n;
+    if (afterRowid !== 0) return count();
+    const version = this.dataVersion(), hit = this.turnCounts.get(threadId);
+    if (hit && hit.version === version) return hit.count;
+    const value = count();
+    this.turnCounts.set(threadId, { count: value, version });
+    if (this.turnCounts.size > 512) this.turnCounts.delete(this.turnCounts.keys().next().value as string);
+    return value;
   }
   /** Page an immutable completed turn in SQLite, never parsing its full body in JS. */
   turnItemPreviewPage(threadId:string,turnId:string,beforeIndex:number,limit:number){

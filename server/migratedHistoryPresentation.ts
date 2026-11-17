@@ -3,6 +3,7 @@ import path from 'node:path';
 import type {ClaudeSessionStorage,ClaudeConversation} from './claudeSessionStorage.js';
 import {MAX_FULL_HISTORY_BYTES} from './rolloutStorage.js';
 import {readIndexedThreadPage,readIndexedThreadItem,indexedHistoryEnd} from './threadEventIndex.js';
+import {readMigrationDisplay,importedTurnBoundary} from './migrationDisplay.js';
 
 /** Display the frozen Codex archive, not the portable prompt transcript. Native
  * Claude history remains untouched; new Claude turns stay after the snapshot. */
@@ -13,17 +14,18 @@ export async function migratedHistoryPresentation(storage:ClaudeSessionStorage,r
   if(!found)return;
   const transfer=JSON.parse(String(found.body));
   if(transfer.userId!==row.userId||transfer.projectId!==row.projectId||!transfer.archive||!Number.isSafeInteger(transfer.importedCount)||transfer.importedCount<1)throw new Error('迁移历史归属或数量不一致。');
+  const display=await readMigrationDisplay(storage,transfer,summary,before,limit);if(display)return display;
   const archive=fs.realpathSync(transfer.archive),expected=path.join(fs.realpathSync(storage.directory),'transfers',transfer.id,'source.jsonl');
   if(archive!==expected)throw new Error('迁移历史快照路径不一致。');
-  const boundary=db.prepare('SELECT rowid,id FROM turns WHERE thread_id=? ORDER BY created_at,rowid LIMIT 1 OFFSET ?').get(row.id,transfer.importedCount-1);
-  if(!boundary)throw new Error('迁移历史映射不完整。');
-  const ownCount=storage.turnCount(row.id,Number(boundary.rowid));
+  const boundary=importedTurnBoundary(storage,transfer);
+  if(boundary===null)throw new Error('迁移历史映射不完整。');
+  const ownCount=storage.turnCount(row.id,boundary);
   const indexId=`migration-display:${transfer.id}`,end=await indexedHistoryEnd(archive,indexId,transfer.sourceTurnId);
   // Own Claude turns need the frozen source count, not its last tool payload.
   const source=await readIndexedThreadPage(archive,indexId,{before:before<ownCount?Number.MAX_SAFE_INTEGER:Math.max(0,before-ownCount),limit:before<ownCount?1:limit,maxEndOffset:end,sessionsRoot:path.dirname(expected)});
   const total=source.history.totalItems+ownCount;
   if(before<ownCount){
-    const turns=storage.turns(row.id,Math.min(limit,ownCount-before),before,MAX_FULL_HISTORY_BYTES,Number(boundary.rowid));
+    const turns=storage.turns(row.id,Math.min(limit,ownCount-before),before,MAX_FULL_HISTORY_BYTES,boundary);
     const next=before+turns.length;
     return {thread:{...summary,turns},history:{totalItems:total,returnedItems:turns.length,before,nextBefore:next,hasOlder:next<total,nextCursor:null}};
   }

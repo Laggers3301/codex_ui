@@ -1,6 +1,7 @@
 export type ErrorSource = "user" | "runtime" | "backend" | "connection" | "provider" | "resource" | "unknown";
 
 export function errorSource(code: string): ErrorSource {
+  if (code === 'user_stopped') return 'user';
   if (code === "runtime_terminated") return "runtime";
   if (code === "backend_restarted") return "backend";
   if (code === "memory_pressure") return "resource";

@@ -8,6 +8,7 @@ import { AppError } from "./appErrors.js";
 import type { VerifiedClaudeBinding } from "./claudeRuntime.js";
 import type {ClaudeEffort} from "../shared/agentRuntime.js";
 import {ensureClaudeResponseStyle} from '../scripts/agent-response-style.mjs';
+import {probeRemoteClaude,type RemoteClaudeConfig} from './remoteClaudeRelay.js';
 
 const run = promisify(execFile);
 export interface ClaudeIntegrationConfig {
@@ -24,8 +25,15 @@ export interface ClaudeIntegrationConfig {
   /** Optional local cache exported by a trusted ReClaude cache reader. Never
    * a Claude OAuth usage URL, shell command, or browser-provided file path. */
   usageCacheFile?: string;
+  /** Administrative hold; credentials and conversation history are retained. */
+  offlineOrgIds?: string[];
+  /** Private, explicitly authorized user/source-thread bindings, never shared. */
+  remoteAccounts?: RemoteClaudeConfig[];
+  /** Shared devices may live outside the default HOME; users keep private workspaces. */
+  sharedAccounts?: Array<{orgId:string;home:string;label:string;executable?:string;nativeUsageEnabled?:boolean}>;
+  privateAccounts?: Array<{userId:string;orgId:string;sourceThreadId?:string;home:string;label:string;executable?:string;nativeUsageEnabled?:boolean;replacesSharedOrgIds?:string[];replacesPrivateOrgIds?:string[]}>;
 }
-export interface ClaudeBinding extends VerifiedClaudeBinding { deviceId: string; configRoot: string; accountKey: string; label: string; }
+export interface ClaudeBinding extends VerifiedClaudeBinding { deviceId: string; configRoot: string; accountKey: string; label: string; privateHome?:string; nativeUsageEnabled?:boolean; }
 const read = (file: string): Record<string, any> => JSON.parse(fs.readFileSync(file, "utf8"));
 export function claudeModelEntries(value: unknown): Array<{key:string;nativeId:string;label:string;supportedEffortLevels:ClaudeEffort[]}> {
   const seen = new Set<string>();
@@ -52,13 +60,14 @@ export class ClaudeBindings {
   }
   async refreshModels(userId: string): Promise<void> {
     for (const binding of this.list(userId)) {
+      if(binding.remote||this.isOffline(binding.orgId))continue;
       const key=binding.accountKey;
       const pending=this.modelRefreshes.get(key);if(pending){await pending;continue;}
       if(Date.now()-(this.modelCheckedAt.get(key)??0)<15*60_000)continue;
       const promise=(async()=>{
         try {
           const result=await run(process.execPath,[fileURLToPath(new URL("../scripts/claude-model-catalog.mjs",import.meta.url)),binding.executable,binding.workspaceRoot],
-            {env:{...process.env,RECLAUDE_ORG:binding.orgId,CLAUDE_CONFIG_DIR:binding.configRoot},timeout:30_000,maxBuffer:256*1024});
+            {env:{...process.env,...(binding.privateHome?{HOME:binding.privateHome}:{}),RECLAUDE_ORG:binding.orgId,CLAUDE_CONFIG_DIR:binding.configRoot},timeout:30_000,maxBuffer:256*1024});
           const raw=JSON.parse(result.stdout.trim());if(!claudeModelEntries(raw).length)throw new Error("Empty model catalogue");
           const file=this.catalogFile(key);fs.mkdirSync(path.dirname(file),{recursive:true,mode:0o700});
           const partial=`${file}.${process.pid}.partial`;
@@ -84,12 +93,21 @@ export class ClaudeBindings {
     }
     return owner;
   }
-  orgIds(userId: string): string[] { return this.owner(userId)?.orgIds ?? []; }
+  orgIds(userId: string): string[] { return [...new Set([...(this.owner(userId)?.orgIds??[]),...(this.config.remoteAccounts??[]).filter(row=>row.userId===userId).map(row=>row.orgId),...(this.config.privateAccounts??[]).filter(row=>row.userId===userId).map(row=>row.orgId)])]; }
   effectiveModel(userId: string, model: string): string {
     const match = model.match(/^(reclaude-[a-z][a-z0-9-]*)@([0-9]+)$/);
     if (!match) return model;
     const allowed = this.orgIds(userId), seen = new Set<string>();
     let orgId = match[2];
+    // A private replacement is owner-scoped, unlike shared-pool redirects.
+    // ClaudeService still checks the exact authorized source before migration.
+    const replacements=(this.config.privateAccounts??[]).filter(row=>row.userId===userId&&row.replacesPrivateOrgIds?.includes(orgId));
+    if(replacements.length>1)throw new AppError('runtime_forbidden','专用账号替换映射不明确，原会话未修改。');
+    if(replacements.length){
+      const next=replacements[0].orgId;
+      if(!/^\d+$/.test(next)||!allowed.includes(next))throw new AppError('runtime_forbidden','专用账号替换目标无效，原会话未修改。');
+      orgId=next;
+    }
     while (this.config.organizationRedirects?.[orgId] !== undefined) {
       if (seen.has(orgId) || !allowed.includes(orgId)) throw new AppError("runtime_forbidden", "组织切换映射无效，原会话未修改。");
       seen.add(orgId);
@@ -104,23 +122,33 @@ export class ClaudeBindings {
     const owner = this.owner(userId);
     if (!owner) return [];
     const directory = path.join(this.config.home, ".rec", "claude", "accounts");
-    if (!fs.existsSync(directory)) return [];
-    const bindings: ClaudeBinding[] = [];
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const bindings: ClaudeBinding[] = (this.config.remoteAccounts??[]).filter(row=>row.userId===userId).map(remote=>({
+      userId,orgId:remote.orgId,deviceId:remote.deviceId,configRoot:remote.configRoot,accountKey:remote.accountKey,label:remote.label,
+      executable:remote.executable,workspaceRoot:owner.workspaceRoot,remote,restrictedSourceThreadId:remote.sourceThreadId,
+      verifiedModels:Object.fromEntries(remote.models.map(model=>[`reclaude-${model.key}@${remote.orgId}`,model.nativeId]))
+    }));
+    const privateAccounts=(this.config.privateAccounts??[]).filter(row=>row.userId===userId);
+    const sharedAccounts=(this.config.sharedAccounts??[]).filter(row=>owner.orgIds.includes(row.orgId)&&!privateAccounts.some(own=>own.orgId===row.orgId));
+    type LocatedAccount = NonNullable<ClaudeIntegrationConfig['sharedAccounts']>[number] & {sourceThreadId?:string};
+    const locations:Array<{directory:string;account?:LocatedAccount}>=[{directory},
+      ...sharedAccounts.map(account=>({directory:path.join(account.home,'.rec/claude/accounts'),account})),
+      ...privateAccounts.map(account=>({directory:path.join(account.home,'.rec/claude/accounts'),account}))];
+    for(const location of locations)for (const entry of fs.existsSync(location.directory)?fs.readdirSync(location.directory, { withFileTypes: true }):[]) {
       if (!entry.isDirectory() || !/^[0-9]+$/.test(entry.name)) continue;
-      const base = path.join(directory, entry.name), configRoot = path.join(base, "config");
+      const base = path.join(location.directory, entry.name), configRoot = path.join(base, "config");
       try {
         if (!fs.realpathSync(configRoot).startsWith(`${fs.realpathSync(base)}${path.sep}`)) continue;
         const device = read(path.join(base, "device.json"));
-        if (typeof device.sk !== "string" || !device.sk || !owner.orgIds.includes(String(device.org_id))) continue;
+        if (typeof device.sk !== "string" || !device.sk || !(location.account?location.account.orgId===String(device.org_id):owner.orgIds.includes(String(device.org_id)))) continue;
         const native = read(path.join(configRoot, ".claude.json"));
         const uuid = native.oauthAccount?.accountUuid;
         // ReClaude user_email/org_id/device_id are NOT Claude account identity.
         if (typeof uuid !== "string" || !uuid) continue;
         const accountKey=createHash("sha256").update(uuid).digest("hex");
         bindings.push({ userId, orgId: String(device.org_id), deviceId: entry.name, configRoot,
-          accountKey, label: String(device.org_name || device.org_id),
-          executable: this.config.executable, workspaceRoot: owner.workspaceRoot,
+          accountKey, label: location.account?.label??String(device.org_name || device.org_id),
+          ...(location.account?{privateHome:location.account.home,restrictedSourceThreadId:location.account.sourceThreadId,nativeUsageEnabled:location.account.nativeUsageEnabled}:{}),
+          executable: location.account?.executable??this.config.executable, workspaceRoot: owner.workspaceRoot,
           verifiedModels: Object.fromEntries(this.models(accountKey).map(model=>[`reclaude-${model.key}@${device.org_id}`,model.nativeId])) });
       } catch { /* A logged-out/incomplete binding is not usable. */ }
     }
@@ -129,10 +157,11 @@ export class ClaudeBindings {
   resolve(userId: string, model: string): ClaudeBinding {
     model = this.effectiveModel(userId, model);
     const orgId = model.match(/^reclaude-[a-z][a-z0-9-]*@([0-9]+)$/)?.[1];
+    this.assertOnline(orgId??'');
     const matches = this.list(userId).filter(binding => binding.orgId === orgId);
     if (matches.length !== 1) throw new AppError("runtime_not_connected", matches.length ? "此组织有多个本地绑定，需先明确有效绑定。" : "该组织尚未授权，或实际 Claude 账号信息尚未就绪。");
     if(!Object.hasOwn(matches[0].verifiedModels,model))throw new AppError("unsupported_model","客户端尚未确认所选 Claude 模型版本，请刷新模型列表。");
-    ensureClaudeResponseStyle(matches[0].configRoot);
+    if(!matches[0].remote)ensureClaudeResponseStyle(matches[0].configRoot);
     return matches[0];
   }
   async refresh(userId: string, model: string): Promise<ClaudeBinding> {
@@ -142,12 +171,16 @@ export class ClaudeBindings {
   }
   async refreshOrganization(userId: string, orgId: string): Promise<ClaudeBinding> {
     if (!/^[0-9]+$/.test(orgId) || !this.orgIds(userId).includes(orgId)) throw new AppError("runtime_forbidden", "组织不属于当前共享账号池。");
+    this.assertOnline(orgId);
+    const remote=this.list(userId).find(row=>row.orgId===orgId&&row.remote);
+    if(remote?.remote){await probeRemoteClaude(remote.remote);return remote;}
     // auth status refreshes the wrapper's selected account/config without
     // creating a conversation. It also bootstraps a newly created device root
     // before any account UUID or model catalog is assumed to be available.
-    const env: NodeJS.ProcessEnv = { ...process.env, HOME: this.config.home, RECLAUDE_ORG: orgId };
+    const scoped=this.list(userId).find(row=>row.orgId===orgId);
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: scoped?.privateHome??this.config.home, RECLAUDE_ORG: orgId };
     delete env.CLAUDE_CONFIG_DIR;
-    const result = await run(this.config.executable, ["auth", "status"], { env, timeout: 60_000, maxBuffer: 256 * 1024 });
+    const result = await run(scoped?.executable??this.config.executable, ["auth", "status"], { env, timeout: 60_000, maxBuffer: 256 * 1024 });
     let status: Record<string, unknown>;
     try { status = JSON.parse(result.stdout.slice(result.stdout.indexOf("{"))); } catch { throw new AppError("claude_identity_unverified", "Claude 登录状态无法确认，未启动会话。"); }
     if (status.loggedIn !== true) throw new AppError("authentication_failed", "Claude 账号尚未登录，未启动会话。");
@@ -160,13 +193,33 @@ export class ClaudeBindings {
     return refreshed;
   }
   profiles(userId: string) {
-    return this.list(userId).flatMap(binding => this.models(binding.accountKey).flatMap((entry, index) => (entry.supportedEffortLevels.length?entry.supportedEffortLevels:["medium" as const]).map(effort=>({
+    return this.visibleBindings(userId).flatMap(binding => (binding.remote?.models??this.models(binding.accountKey)).flatMap((entry, index) => (entry.supportedEffortLevels.length?entry.supportedEffortLevels:["medium" as const]).map(effort=>({
       id: `reclaude-${entry.key}@${binding.orgId}:${effort}`, model:`reclaude-${entry.key}@${binding.orgId}`, label: `${entry.label} · ${binding.label}`,
       displayName: `${entry.label} · ${binding.label}`,
       nativeModelId:entry.nativeId,
       effort,supportedEffortLevels:entry.supportedEffortLevels, priority: 1000 + index, runtime: "claude-code" as const,
       availability: "ready" as const, workflow: false
+      ,...(binding.restrictedSourceThreadId?{restrictedToSourceThreadId:binding.restrictedSourceThreadId}:{})
     }))));
+  }
+  visibleBindings(userId:string):ClaudeBinding[]{
+    const all=this.list(userId);
+    // Hide replaced shared choices for this owner only. Execution/history
+    // resolution still uses list(), preserving every existing conversation.
+    const hidden=new Set((this.config.privateAccounts??[]).filter(row=>row.userId===userId&&all.some(b=>b.privateHome===row.home&&b.orgId===row.orgId)).flatMap(row=>row.replacesSharedOrgIds??[]));
+    return all.filter(binding=>!this.isOffline(binding.orgId)&&(!!binding.privateHome||!hidden.has(binding.orgId)));
+  }
+  isOffline(orgId:string):boolean{
+    const seen=new Set<string>();
+    while(!seen.has(orgId)){
+      if(this.config.offlineOrgIds?.includes(orgId))return true;
+      seen.add(orgId);
+      const next=this.config.organizationRedirects?.[orgId];if(!next)return false;orgId=next;
+    }
+    return false;
+  }
+  assertOnline(orgId:string):void{
+    if(this.isOffline(orgId))throw new AppError('runtime_not_connected','此 ReClaude 账号已由管理员下线，暂不发送请求；历史对话仍可查看。');
   }
   effort(userId:string,model:string,value:unknown):ClaudeEffort|undefined {
     model=this.effectiveModel(userId,model);

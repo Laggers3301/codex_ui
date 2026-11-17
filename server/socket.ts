@@ -9,7 +9,6 @@ import type { IncomingHttpHeaders } from "node:http";
 import type { Server as HttpServer } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { z } from "zod";
-import { serverConfig } from "./config.js";
 import type { CodexBridge } from "./codexBridge.js";
 import { isAccountPoolBridge } from "./accountPoolBridge.js";
 import { authenticatedUserFromHeaders, deletedWebUserIds, isDeletedWebUser } from "./auth.js";
@@ -33,11 +32,14 @@ import type { BrowserService, BrowserState } from "./browserService.js";
 import {
   continuationRecoveryPrompt,
   contextRecoveryPrompt,
+  nextContextRecoveryAttempt,
+  type ContextRecoveryAttempt,
   isContextCompactionItem,
   isGenericContextLossReply,
   isPlanOnlyContinuationReply,
   isPotentialGenericContextLossReply
 } from "./contextRecovery.js";
+import { readContextRecoverySource } from "./contextRecoverySource.js";
 import { allowedAccountForUser, assertTrackedUserQuotaAvailable, invalidateTrackedQuotaCacheForUser } from "./routes.js";
 import { findThreadJsonlPathById } from "./threadFallback.js";
 import { scopedHookTrustConfig } from "./hookTrust.js";
@@ -73,7 +75,7 @@ const threadStartContextConfigSchema = z.object({
 const contextProbeBytes = 512 * 1024;
 const contextPrecompactThreshold = 0.85;
 const contextFullThreshold = 0.98;
-const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
+const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? "/srv/codex_zerotier_remote/users";
 const DEFAULT_COMPACT_TIMEOUT_MS = 600_000;
 
 function compactTimeoutMs(): number {
@@ -535,7 +537,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   const pendingApprovalTurns = new Map<number | string, { userId: string; accountId: string | null; threadId: string; turnId: string | null }>();
   const turnOwners = new Map<string, string>();
   const rawCompactFilter = new RawCompactFilter();
-  const contextRecoveryByTurn = new Map<string, { threadId: string; steerStatus: "pending" | "accepted" | "failed" }>();
+  const contextRecoveryByTurn = new Map<string, ContextRecoveryAttempt>();
   const contextRecoveryRetries = new Map<string, number>();
   const planContinuationByTurn = new Map<string, { rootTurnId: string; count: number }>();
   const guards: SocketRequestGuards = {
@@ -645,6 +647,15 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
   };
 
+  const recoveryPromptForThread = async (threadId: string) => {
+    try {
+      const source = await findThreadJsonlPathById(threadId);
+      return contextRecoveryPrompt(source ? await readContextRecoverySource(source) : "Original source could not be located automatically; use existing task/checkpoint files with bounded reads.");
+    } catch (error) {
+      console.warn("[context.recovery.source.error]", JSON.stringify({ threadId, error: error instanceof Error ? error.message : String(error) }));
+      return contextRecoveryPrompt("Automatic source extraction failed. Recover from existing task/checkpoint files before answering; do not invent progress.");
+    }
+  };
   const startFallbackContextRecovery = async (
     owner: string,
     threadId: string,
@@ -658,14 +669,19 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     if (!threadOwner || !project) return;
     contextRecoveryRetries.set(threadId, retryCount + 1);
     try {
+      const recoveryPrompt = options?.prompt ?? await recoveryPromptForThread(threadId);
+      const savedExecution = store.getThreadExecutionSettings(threadId, owner);
+      const approvalPolicy = savedExecution?.approvalPolicy ?? project.defaultApprovalPolicy;
+      const sandbox = savedExecution?.sandbox ?? project.defaultSandbox;
       await assertTrackedUserQuotaAvailable(bridge, store, owner, threadId);
       await bridge.request("thread/resume", {
         threadId,
+        excludeTurns: true,
         cwd: threadOwner.rootPath,
         config: browserMcpForThread(threadId),
         model: threadOwner.modelOverride ?? project.defaultModel,
-        approvalPolicy: project.defaultApprovalPolicy,
-        sandbox: project.defaultSandbox
+        approvalPolicy,
+        sandbox
       }, 30_000);
       // A newer user turn may start while resume/quota checks are awaiting RPC.
       // Never race it with a background recovery turn.
@@ -673,10 +689,10 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const requestId = `context-recovery:${priorTurnId}:${retryCount + 1}`;
       const turn = await bridge.request("turn/start", {
         threadId,
-        input: textInput(options?.prompt ?? contextRecoveryPrompt()),
+        input: textInput(recoveryPrompt),
         cwd: threadOwner.rootPath,
-        approvalPolicy: project.defaultApprovalPolicy,
-        sandboxPolicy: sandboxPolicy(project, project.defaultSandbox),
+        approvalPolicy,
+        sandboxPolicy: sandboxPolicy(project, sandbox),
         model: threadOwner.modelOverride ?? project.defaultModel,
         effort: threadOwner.reasoningEffortOverride ?? project.defaultReasoningEffort
       }, 30_000);
@@ -937,28 +953,37 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       && liveUpdate.item.turnId
       && guards.recoverableTurnIds.has(liveUpdate.item.turnId)
       && isContextCompactionItem(liveUpdate.item)
-      && !contextRecoveryByTurn.has(liveUpdate.item.turnId)
     ) {
-      const attempt = { threadId: liveUpdate.item.threadId, steerStatus: "pending" as const };
-      contextRecoveryByTurn.set(liveUpdate.item.turnId, attempt);
-      void bridge.request("turn/steer", {
-        threadId: liveUpdate.item.threadId,
-        expectedTurnId: liveUpdate.item.turnId,
-        input: textInput(contextRecoveryPrompt())
-      }).then(() => {
-        if (contextRecoveryByTurn.get(liveUpdate.item.turnId!) === attempt) {
-          contextRecoveryByTurn.set(liveUpdate.item.turnId!, { ...attempt, steerStatus: "accepted" });
-        }
-      }).catch((error) => {
-        if (contextRecoveryByTurn.get(liveUpdate.item.turnId!) === attempt) {
-          contextRecoveryByTurn.set(liveUpdate.item.turnId!, { ...attempt, steerStatus: "failed" });
-        }
-        console.error("[context.recovery.steer.error]", JSON.stringify({
-          threadId: liveUpdate.item.threadId,
-          turnId: liveUpdate.item.turnId,
-          error: error instanceof Error ? error.message : String(error)
-        }));
-      });
+      const attempt = nextContextRecoveryAttempt(contextRecoveryByTurn.get(liveUpdate.item.turnId), liveUpdate.item.threadId, liveUpdate.item.itemId);
+      if (attempt) {
+        contextRecoveryByTurn.set(liveUpdate.item.turnId, attempt);
+        const recoveryTurnId = liveUpdate.item.turnId;
+        const recoveryThreadId = liveUpdate.item.threadId;
+        void (async () => {
+          const prompt = await recoveryPromptForThread(recoveryThreadId);
+          if (contextRecoveryByTurn.get(recoveryTurnId) !== attempt
+            || !guards.recoverableTurnIds.has(recoveryTurnId)
+            || guards.activeTurnsByThread.get(recoveryThreadId) !== recoveryTurnId) return;
+          await bridge.request("turn/steer", {
+            threadId: recoveryThreadId,
+            expectedTurnId: recoveryTurnId,
+            input: textInput(prompt)
+          });
+        })().then(() => {
+          if (contextRecoveryByTurn.get(recoveryTurnId) === attempt) {
+            contextRecoveryByTurn.set(recoveryTurnId, { ...attempt, steerStatus: "accepted" });
+          }
+        }).catch((error) => {
+          if (contextRecoveryByTurn.get(recoveryTurnId) === attempt) {
+            contextRecoveryByTurn.set(recoveryTurnId, { ...attempt, steerStatus: "failed" });
+          }
+          console.error("[context.recovery.steer.error]", JSON.stringify({
+            threadId: recoveryThreadId,
+            turnId: recoveryTurnId,
+            error: error instanceof Error ? error.message : String(error)
+          }));
+        });
+      }
     }
 
     const maybe = message as { method?: string; params?: { processId?: string; deltaBase64?: string; stream?: string } };
@@ -978,7 +1003,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const completedPlan = turnId ? planContinuationByTurn.get(turnId) : undefined;
       const latestAgent = completingAgentMessages.at(-1);
       const latestAgentText = latestAgent?.text ?? "";
-      const needsFallbackRecovery = Boolean(completedRecovery && isGenericContextLossReply(latestAgentText));
+      const turnStatus = pickString(asRecord(asRecord(message.params).turn).status);
+      const needsFallbackRecovery = turnStatus === "completed" && Boolean(completedRecovery && isGenericContextLossReply(latestAgentText));
       const completedThreadId = notificationThreadId(message);
       if (completedThreadId) guards.completedTurnsByThread.set(completedThreadId, turnId);
       const completedItems = completedThreadId ? store.readTimelineItems(completedThreadId, turnId) : [];
@@ -987,7 +1013,6 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
       const hasToolAfterLatestAgent = Number.isFinite(latestAgentOrder)
         ? completedItems.some((item) => item.type === "toolCall" && Number(item.timelineOrder) > latestAgentOrder)
         : false;
-      const turnStatus = pickString(asRecord(asRecord(message.params).turn).status);
       const nextPlanCount = (completedPlan?.count ?? 0) + 1;
       const needsPlanContinuation = turnStatus === "completed"
         && nextPlanCount <= 2

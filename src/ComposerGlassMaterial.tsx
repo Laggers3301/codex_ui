@@ -7,7 +7,7 @@ const stationaryGlassPointer = { x: 0, y: 0 };
 let scrollObservers = 0;
 let stopScrollObservation: (() => void) | undefined;
 /** Share one passive observer across all five glass surfaces. Never rerender
- * React or measure layout on a scrolling frame. SVG optics resume at rest. */
+ * React or measure layout on a scrolling frame. */
 function observeGlassScrolling() {
   if (++scrollObservers === 1) {
     let timer: ReturnType<typeof setTimeout> | undefined;

@@ -1,11 +1,27 @@
 import { modelIsAvailable, CLAUDE_NOT_CONNECTED, isReclaudeModel, claudePendingProfiles } from "../shared/agentRuntime";
 import { RuntimeMigrationDialog } from "./RuntimeMigrationDialog";
+import { QueuedMessages } from "./QueuedMessages";
+import { confirmQueuedSubmission, restoreQueuedSubmission, type QueuedSubmission } from "./queuedSubmissions";
+import { MobileComposerSettings } from "./MobileComposerSettings";
+import { MobileModelFields } from "./MobileModelFields";
+import { useMobilePreview } from "./mobile/useMobilePreview";
+import { readMobileResume, writeMobileResume } from "./mobile/mobileResume";
+import { useMobileViewport } from "./mobile/useMobileViewport";
+import { MobileLayerProvider } from "./mobile/MobileLayerProvider";
+import { MobileNavigationLayers } from "./mobile/MobileNavigationLayers";
+import { MobileLegacyLayer } from "./mobile/MobileLegacyLayer";
+import { MobileHeader } from "./mobile/MobileHeader";
+import { MobileComposer } from "./mobile/MobileComposer";
+import { MobileSettings } from "./mobile/MobileSettings";
+import "./mobile/mobileUi.css";
 import { useReclaudeUsage } from "./ReclaudeUsage";
 import { ReclaudeAuthorizationDialog } from "./ReclaudeAuthorization";
 import { ReclaudeQuotaDetails, reclaudeRemainingLabel } from "./reclaudeQuota";
 import type { ReclaudeUsageStatus } from "../shared/reclaudeUsage";
 import {claudeFiveHourRemaining} from './claudeTotalQuota';
 import {runtimeModelLabel,runtimeModelTriggerLabel} from "./runtimeModelLabel";
+import {visibleConversationModels} from './modelVisibility';
+import { RenderBoundary } from './RenderBoundary';
 import { accountPoolNeedsQuotaRetry, quotaHasUsableRateLimits } from "./quotaRefreshPolicy";
 import { Children, cloneElement, Fragment, createContext, isValidElement, memo, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type ComponentPropsWithoutRef, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -41,8 +57,8 @@ import type { WritingProject, WritingSelection } from "./writing/types";
 import { withoutDocumentContext, type ComposerDocumentReference } from "./documentReference";
 import "./writingCanvas.css";
 import { Application as IconParkApplication, Command as IconParkCommand } from "@icon-park/svg";
-import { nodeInputRule, type Editor } from "@tiptap/core";
-import { InlineMath, BlockMath } from "@tiptap/extension-mathematics";
+import { type Editor } from "@tiptap/core";
+import { ComposerInlineMath, ComposerBlockMath, hasComposerMath } from "./composerMath";
 import { Markdown } from "@tiptap/markdown";
 import { Placeholder } from "@tiptap/extension-placeholder";
 import { EditorContent, useEditor } from "@tiptap/react";
@@ -127,19 +143,20 @@ import { GoalProgress } from "./GoalProgress";
 import { useThreadGoal } from "./threadGoal";
 import { useThreadSchedules } from "./threadSchedules";
 import { ThreadSchedules, threadScheduleSummary } from "./ThreadSchedules";
-import { SubagentActivity, SubagentToolCard } from "./SubagentActivity";
+import { SubagentToolCard } from "./SubagentActivity";
+import { ConversationTasks } from "./ConversationTasks";
+import { conversationTasksEvent } from "./conversationTasks";
 import { observeComposerViewportMetrics } from "./composerViewportMetrics";
 import { observeShellPresentation } from "./shellPresentation";
-import { SubagentPanel } from "./SubagentPanel";
 import { SubagentAvatar } from "./SubagentAvatar";
 import { SelectionAskAction, type SelectionAskActionHandle } from "./SelectionAskAction";
 import { PetBuddy } from "./PetBuddy";
 import { AccountUpdateIndicator } from "./AccountUpdateIndicator";
-import { LeaderboardPanel, leaderboardPercent } from "./LeaderboardPanel";
+import { leaderboardPercent, leaderboardPersonName } from "./leaderboardNames";
 import { memberRealName } from "../shared/memberDirectory";
 import { useConversationPlanMode } from "./useConversationPlanMode";
 import { TurnRecoveryNotice, historicalRecovery, hasRecoveryNotice, type TurnRecoveryView } from "./TurnRecoveryNotice";
-import { FeishuOffice } from "./FeishuOffice";
+import "./FeishuOffice.css";
 import { useFeishuAttention, needsFeishuAuthorization } from "./useFeishuAttention";
 import { FeatureUpdateNotice } from "./FeatureUpdateNotice";
 import { collectAgents, parseAgentOperation, reconcileSubagents } from "./subagentPresentation";
@@ -214,11 +231,14 @@ import {
 } from "./api";
 import { codexSocket } from "./codexSocket";
 import { accountQuotaStatus } from "./accountQuotaStatus";
-import { TerminalPanel } from "./TerminalPanel";
-import { BrowserPanel } from "./BrowserPanel";
+import "@xterm/xterm/css/xterm.css";
+import "./TerminalPanel.css";
+import "./BrowserPanel.css";
+import { LazyPane } from "./lazyPanel";
+import { BrowserPanel, FeishuOffice, HostResourcePanel, LeaderboardPanel, SessionCommunication, SubagentPanel, TerminalPanel, installWorkspacePanelWarmup, warmWorkspacePanels } from "./workspacePanels";
 import { RightWorkspace, WorkspaceOverview, WorkspaceIcon, type WorkspaceTab, type WorkspaceSection } from "./RightWorkspace";
-import { HostResourcePanel, HostResourceProvider, HostResourceSummary } from "./HostResources";
-import { SessionCommunication } from "./SessionCommunication";
+import { HostResourceProvider, HostResourceSummary } from "./HostResources";
+import "./sessionCommunication.css";
 import { normalizeGfmTableBoundaries, normalizeMathMarkdown, stripInterruptArtifacts } from "./markdown";
 import { createRevealPass, emptyRevealSnapshot, StreamRevealSpan } from "./streamReveal";
 import { rehypeLatinApostrophes } from "./proseTypography";
@@ -435,6 +455,7 @@ function PolishedSelect<T extends string>({
   disabled = false,
   className = "",
   glass = false,
+  native = false,
   title
 }: {
   value: T;
@@ -443,6 +464,7 @@ function PolishedSelect<T extends string>({
   disabled?: boolean;
   className?: string;
   glass?: boolean;
+  native?: boolean;
   title?: string;
 }) {
   const [open, setOpen] = useState(false);
@@ -492,6 +514,11 @@ function PolishedSelect<T extends string>({
     setOpen(false);
     triggerRef.current?.focus();
   });
+  if (native) return <div className={`polishedSelect ${className}`}>
+    <select className="mobileNativePolicySelect" value={value} disabled={disabled} aria-label={title} onChange={event => onChange(event.target.value as T)}>
+      {options.map(option => <option key={option.value} value={option.value} title={option.detail}>{option.label}</option>)}
+    </select>
+  </div>;
   return (
     <div
       ref={rootRef}
@@ -816,12 +843,6 @@ interface PromptRequestContext {
   sentPromptText: string;
   visibleText: string;
   remoteDraftId?: string;
-}
-
-interface QueuedSubmission {
-  id: string;
-  input: Array<{ type: string; text?: string; name?: string }>;
-  clientUserMessageId: string;
 }
 
 interface TurnInterruptContext {
@@ -2173,7 +2194,12 @@ function imageTargetsFromText(text: string, assetBasePath?: string): string[] {
     .map(candidate => fileTargetFromHref(candidate))
     .filter((target): target is string => Boolean(target && isInlineImageTarget(target)));
 }
-const MarkdownMessage = memo(function MarkdownMessage({
+const MarkdownMessage = memo(function MarkdownMessage(props: ComponentPropsWithoutRef<typeof MarkdownMessageContent>) {
+  return <RenderBoundary scope="message" resetKey={props.projectId} rawText={props.text}>
+    <MarkdownMessageContent {...props} />
+  </RenderBoundary>;
+});
+const MarkdownMessageContent = memo(function MarkdownMessageContent({
   text,
   projectId,
   assetBasePath,
@@ -2411,26 +2437,6 @@ function MarkdownImage({ src, alt, originalTarget }: { src: string; alt: string;
   }
   return <img className="inlineMessageImage" src={src} alt={alt} loading="lazy" decoding="async" onError={() => setFailed(true)} />;
 }
-
-const ComposerInlineMath = InlineMath.extend({
-  addInputRules() {
-    return [nodeInputRule({
-      find: /((?<!\$)\$([^$\n]+)\$(?!\$))$/,
-      type: this.type,
-      getAttributes: (match) => ({ latex: match[2] }),
-    })];
-  },
-});
-
-const ComposerBlockMath = BlockMath.extend({
-  addInputRules() {
-    return [nodeInputRule({
-      find: /^(\$\$([^$\n]+)\$\$)$/,
-      type: this.type,
-      getAttributes: (match) => ({ latex: match[2] }),
-    })];
-  },
-});
 
 const composerExtensions = [
   StarterKit.configure({ link: { markdownLinks: true } }),
@@ -2787,6 +2793,15 @@ export const MarkdownComposerEditor = memo(function MarkdownComposerEditor({
         if (table) {
           event.preventDefault();
           editor.commands.insertContent(table);
+          return;
+        }
+        const text = event.clipboardData.getData("text/plain");
+        if (!editor.isActive("code") && !Array.from(event.clipboardData.items).some(item => item.kind === "file")
+          && text.length <= 500_000 && hasComposerMath(text)) {
+          // Native text paste bypasses Markdown tokenization and re-escapes
+          // LaTeX on serialization. Parse the original source once instead.
+          event.preventDefault();
+          editor.commands.insertContent(text, { contentType: "markdown" });
           return;
         }
       }
@@ -3959,10 +3974,10 @@ function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, c
               </button>
             ))}
             {claudeAccounts.map(account => <button type="button" role="tab" key={`reclaude:${account.orgId}`} data-account-id={`reclaude:${account.orgId}`}
-              aria-selected={account === selectedClaude} title={`ReClaude · ${account.message}`}
+              aria-selected={account === selectedClaude} title={`ReClaude · ${account.label} · ${account.message}`}
               className={`accountPoolTab ${account === selectedClaude ? "active" : ""} ${account.orgId === currentClaudeOrgId ? "current" : ""} ${account.state === "disabled" ? "lowQuota" : ""}`}
               onClick={() => setSelectedAccountId(`reclaude:${account.orgId}`)}>
-              <span className="reclaudeAccountName">ReClaude</span><strong>{reclaudeRemainingLabel(account)}</strong>
+              <span className="reclaudeAccountName">{account.label}</span><strong>{reclaudeRemainingLabel(account)}</strong>
             </button>)}
             {providerQuotas.map(item => <button type="button" role="tab" key={`provider:${item.id}`} data-account-id={`provider:${item.id}`}
               aria-selected={item === selectedProvider} title={`${item.name} · ${item.stale ? "缓存用量" : "套餐用量"}`}
@@ -4017,12 +4032,12 @@ function leaderboardMarkdown(leaderboard: CodexLeaderboard, users: UserProfile[]
     "总 GPT 号池合计容量为 100%，以下为估算占用。",
     "**当前周期**",
     ...leaderboard.currentCycle.users.map(user =>
-      `- ${userDisplayName(user.userId, users)}：${leaderboardPercent(user.poolQuotaPercent)}`),
+      `- ${leaderboardPersonName(user)}：${leaderboardPercent(user.poolQuotaPercent)}`),
     "",
     "**总榜**",
     "历史 Token 按当前周期比例折算为累计估算额度，可超过 100%；缺少校准依据显示 —。",
     ...leaderboard.lifetime.users.map(user =>
-      `- ${userDisplayName(user.userId, users)}：${leaderboardPercent(user.poolQuotaPercent)}`)
+      `- ${leaderboardPersonName(user)}：${leaderboardPercent(user.poolQuotaPercent)}`)
   ];
   if (leaderboard.errors.length) {
     lines.push("", `读取警告：${leaderboard.errors.join("；")}`);
@@ -4119,7 +4134,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
               <span>{account.independentTokens?'独立用量':`账号剩余 ${account.accountRemainingPercent === null ? "--" : `${percentText(account.accountRemainingPercent)}%`}`}</span>
             </header>
             <div className="trackedQuotaMetrics">
-              <div><span>lzc 今日</span><strong>{account.independentTokens?formatNumber(account.todayTokens):`${percentText(account.todayQuotaPercent)}%`}</strong><small>{account.independentTokens?'token':`${formatNumber(account.todayTokens)} token`}</small></div>
+              <div><span>个人今日</span><strong>{account.independentTokens?formatNumber(account.todayTokens):`${percentText(account.todayQuotaPercent)}%`}</strong><small>{account.independentTokens?'token':`${formatNumber(account.todayTokens)} token`}</small></div>
               <div><span>{account.independentTokens?'累计':'本周期累计'}</span><strong>{account.independentTokens?formatNumber(account.userCycleTokens):`${percentText(account.userCycleQuotaPercent)}%`}</strong><small>{account.independentTokens?'token':`${formatNumber(account.userCycleTokens)} token`}</small></div>
             </div>
             <p>{account.cycleStartAt && account.resetAt
@@ -4137,7 +4152,7 @@ function TrackedQuotaDetails({ usage }: { usage: TrackedQuotaUsage }) {
             <em>{percentText(day.quotaPercent)}%</em>
             <small>{day.accounts.map((account) => account.accountId==='reclaude'?`ReClaude ${formatNumber(account.userTokens)} token`:`${account.accountLabel} ${percentText(account.quotaPercent)}%`).join(" · ")}</small>
           </article>
-        )) : <div className="emptyState">当前额度周期暂无 lzc token 记录。</div>}
+        )) : <div className="emptyState">当前额度周期暂无个人 token 记录。</div>}
       </section>
 
       <p className="trackedQuotaFootnote">个人百分比为估算值，并非 OpenAI 提供的个人扣额；多人共用账号时无法精确拆分。{usage.dailyLimitEnforced
@@ -4505,19 +4520,23 @@ function beginVerticalResize(
 }
 
 export function App() {
+  const mobileNext = useMobilePreview();
+  const [mobileShellElement, setMobileShellElement] = useState<HTMLElement | null>(null);
+  const [mobileOptionsRequest, setMobileOptionsRequest] = useState(0);
+  useMobileViewport(mobileShellElement, mobileNext);
   useLayoutEffect(() => observeShellPresentation(document.body), []);
   const [colorTheme, setColorTheme] = useState<"dark" | "light">(() => window.localStorage.getItem("codex-web-color-theme") === "light" ? "light" : "dark");
   useLayoutEffect(() => {
-    syncWebAppAppearance(colorTheme);
+    syncWebAppAppearance(colorTheme, document, mobileNext);
     window.localStorage.setItem("codex-web-color-theme", colorTheme);
-  }, [colorTheme]);
+  }, [colorTheme, mobileNext]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
   const [messagesElement,setMessagesElement]=useState<HTMLDivElement|null>(null);
   const [composerElement,setComposerElement]=useState<HTMLDivElement|null>(null);
-  useMobileComposerMotion(composerElement);
-  useMobileComposerControls(composerElement);
+  useMobileComposerMotion(mobileNext ? null : composerElement);
+  useMobileComposerControls(mobileNext ? null : composerElement);
   const bindMessagesElement=useCallback((element:HTMLDivElement|null)=>{
     messagesRef.current=element;setMessagesElement(element);
   },[]);
@@ -4554,7 +4573,7 @@ export function App() {
   const promptRequestContextsRef = useRef(new Map<string, PromptRequestContext>());
   const pendingQueuedPromptsRef = useRef(new Map<string, { threadId: string; text: string; uploads: ComposerUpload[] }>());
   const failedComposerDraftsRef = useRef(new Map<string, Array<{text:string;uploads:ComposerUpload[];skills:string[];reference:ComposerDocumentReference|null}>>());
-  const pendingQueueSteersRef = useRef(new Map<string, { threadId: string; entry: QueuedSubmission }>());
+  const pendingQueueSteersRef = useRef(new Map<string, { threadId: string; entry: QueuedSubmission; originalOrder: string[] }>());
   const interruptRequestContextsRef = useRef(new Map<string, TurnInterruptContext>());
   const threadRenameRequestContextsRef = useRef(new Map<string, ThreadRenameRequestContext>());
   const interruptRequestedTurnIdsRef = useRef(new Set<string>());
@@ -4783,6 +4802,14 @@ export function App() {
     if (rightWorkspaceOpen && window.matchMedia("(max-width: 720px)").matches) mobileSidebarController.current(false);
   }, [rightWorkspaceOpen]);
   const setMobileRightWorkspaceOpen = useMobileSidebar(!rightWorkspaceOpen, collapsed => setRightWorkspaceOpen(!collapsed), "right");
+  useEffect(() => installWorkspacePanelWarmup(), []);
+  useEffect(() => {
+    if (!rightWorkspaceOpen) return;
+    // Opening the right panel is the strongest "about to use a window" signal; fetch the light chunks when idle.
+    const idle = window.requestIdleCallback?.(warmWorkspacePanels, { timeout: 1500 });
+    const timer = idle === undefined ? window.setTimeout(warmWorkspacePanels, 300) : undefined;
+    return () => { if (idle !== undefined) window.cancelIdleCallback?.(idle); if (timer !== undefined) window.clearTimeout(timer); };
+  }, [rightWorkspaceOpen]);
   const [rightWorkspaceTab, setRightWorkspaceTab] = useState("overview");
   const rightWorkspaceOpenRef = useRef(rightWorkspaceOpen);
   rightWorkspaceOpenRef.current = rightWorkspaceOpen;
@@ -5025,9 +5052,6 @@ export function App() {
   const [queuedInterruptPrompts, setQueuedInterruptPrompts] = useState<Record<string, true>>({});
   const [queuedSubmissions, setQueuedSubmissions] = useState<QueuedSubmission[]>([]);
   const lastQueuedSubmissionRef = useRef<{ threadId: string; entry: QueuedSubmission } | null>(null);
-  const [queuedMenuOpen, setQueuedMenuOpen] = useState(false);
-  const [editingQueuedId, setEditingQueuedId] = useState<string | null>(null);
-  const [queuedEditText, setQueuedEditText] = useState("");
   const [liveTurnDiffs, setLiveTurnDiffs] = useState<Record<string, string>>({});
   const [diffReview, setDiffReview] = useState<{ title: string; changes: unknown[]; focusPath?: string; reviewTurnId?: string } | null>(null);
   const [diffPanelVisible, setDiffPanelVisible] = useState(false);
@@ -5186,13 +5210,14 @@ export function App() {
     [newThreadModelProfileId, modelProfiles]
   );
   const selectableModelProfiles = useMemo(() => {
+    const visibleProfiles=visibleConversationModels(modelProfiles,selectedThread);
     if (!selectedThread) {
-      return modelProfiles;
+      return visibleProfiles;
     }
     const profile = modelProfileForExistingThread(selectedThread, selectedProject, modelProfiles);
-    return modelProfiles.some((item) => item.id === profile.id)
-      ? modelProfiles
-      : [profile, ...modelProfiles];
+    return visibleProfiles.some((item) => item.id === profile.id)
+      ? visibleProfiles
+      : [profile, ...visibleProfiles];
   }, [modelProfiles, selectedProject, selectedThread]);
   const activeModelProfileId = useMemo(() => {
     if (!selectedThread) {
@@ -5204,7 +5229,7 @@ export function App() {
     () => modelProfileById(activeModelProfileId, selectableModelProfiles),
     [activeModelProfileId, selectableModelProfiles]
   );
-  const resolveServiceTier=(enabled:boolean)=>resolveNativeServiceTier(enabled&&!isReclaudeModel(selectedModelProfile.model));
+  const resolveServiceTier=(enabled:boolean,model=selectedModelProfile.model)=>resolveNativeServiceTier(enabled&&!isReclaudeModel(model));
   const temporaryModelProfile = useMemo(
     () => modelProfileById(temporaryModelProfileId, modelProfiles),
     [temporaryModelProfileId, modelProfiles]
@@ -5346,7 +5371,7 @@ export function App() {
         prompt: text,
         model: temporaryModelProfile.model,
         reasoningEffort: temporaryModelProfile.effort,
-        serviceTier: resolveServiceTier(codexFastModeEnabled),
+        serviceTier: resolveServiceTier(codexFastModeEnabled, temporaryModelProfile.model),
         sandbox,
         approvalPolicy,
       } : {
@@ -5359,7 +5384,7 @@ export function App() {
         prompt: text,
         model: temporaryModelProfile.model,
         reasoningEffort: temporaryModelProfile.effort,
-        serviceTier: resolveServiceTier(codexFastModeEnabled),
+        serviceTier: resolveServiceTier(codexFastModeEnabled, temporaryModelProfile.model),
         sandbox,
         approvalPolicy,
       });
@@ -5539,12 +5564,22 @@ export function App() {
   useLayoutEffect(() => {
     const composer = composerElement;
     if (!composer) return;
+    if (mobileNext) {
+      // The phone dock floats over the transcript's faded tail, like the
+      // desktop overlay: same live clearance, plus keyboard-resize following.
+      if (!messagesElement) return;
+      const follow = () => { if (autoFollowMessagesRef.current && !manualMessageScrollLockRef.current) conversationVirtualRef.current?.scrollToEnd("auto"); };
+      const observer = new ResizeObserver(follow);
+      observer.observe(messagesElement);
+      const stopMetrics = observeComposerViewportMetrics(composer, messagesElement, follow);
+      return () => { observer.disconnect(); stopMetrics(); };
+    }
     return observeComposerViewportMetrics(composer, messagesElement, () => {
       if (autoFollowMessagesRef.current && !manualMessageScrollLockRef.current) {
         conversationVirtualRef.current?.scrollToEnd("auto");
       }
     });
-  }, [messagesElement,composerElement]);
+  }, [messagesElement,composerElement,mobileNext]);
 
   useLayoutEffect(() => {
     const content = messagesRef.current?.querySelector<HTMLElement>(".virtualConversationFlow, .virtualConversationSizer");
@@ -5780,6 +5815,7 @@ export function App() {
   }
 
   function resetToNewThread(clearPrompt = false) {
+    if (mobileNext) writeMobileResume(window.sessionStorage, selectedUserId, null);
     window.sessionStorage.removeItem(remoteDraftStorageKey);
     setRemoteDraftVersion((version) => version + 1);
     try { window.sessionStorage.removeItem(`codex-web-active-diff:${selectedUserId}`); } catch { /* Storage can be disabled. */ }
@@ -5838,6 +5874,7 @@ export function App() {
 
   function activateWorkspaceProject(projectId: string) {
     if (selectedProjectIdRef.current === projectId) return;
+    if (mobileNext) writeMobileResume(window.sessionStorage, selectedUserId, null);
     selectedProjectIdRef.current = projectId;
     setSelectedProjectId(projectId);
   }
@@ -5978,8 +6015,9 @@ export function App() {
   useEffect(() => {
     if (notificationLinkHandledRef.current || !projects.length) return;
     const params = new URLSearchParams(window.location.search);
-    const threadId = params.get("thread");
-    const projectId = params.get("project");
+    const resume = mobileNext && !params.has("thread") ? readMobileResume(window.sessionStorage, selectedUserId) : null;
+    const threadId = params.get("thread") ?? resume?.threadId;
+    const projectId = params.get("project") ?? resume?.projectId;
     if (!threadId || !projectId) return;
     // A cached project list may precede the authoritative list. Keep the link
     // pending until its owned workspace arrives instead of silently losing it.
@@ -5989,7 +6027,15 @@ export function App() {
     params.delete("project");
     window.history.replaceState(null, "", `${window.location.pathname}${params.size ? `?${params}` : ""}${window.location.hash}`);
     selectThread(threadId, projectId);
-  }, [projects]);
+  }, [projects, mobileNext]);
+
+  useEffect(() => {
+    if (!mobileNext || !selectedThread?.id) return;
+    const projectId = threadProjectIdsRef.current.get(selectedThread.id);
+    if (projectId === selectedProjectId) {
+      writeMobileResume(window.sessionStorage, selectedUserId, { projectId, threadId: selectedThread.id });
+    }
+  }, [mobileNext, selectedUserId, selectedProjectId, selectedThread?.id]);
 
   useEffect(() => {
     if (!("serviceWorker" in navigator)) return;
@@ -8396,10 +8442,17 @@ export function App() {
     if (!imageGallery) return;
     const stage = imageViewerStageRef.current;
     if (!stage) return;
-    const sync = () => setImageViewerStageSize({ width: stage.clientWidth, height: stage.clientHeight });
+    const sync = () => {
+      // Fit against the fixed stage box, not the scrollbar-dependent viewport.
+      // Otherwise zoom near an overflow threshold toggles a scrollbar, which
+      // changes clientHeight/Width and fits the image back across the threshold.
+      const width = stage.offsetWidth, height = stage.offsetHeight;
+      if (width <= 0 || height <= 0) return;
+      setImageViewerStageSize(previous => previous.width === width && previous.height === height ? previous : { width, height });
+    };
     sync();
     const observer = new ResizeObserver(sync);
-    observer.observe(stage);
+    observer.observe(stage, { box: "border-box" });
     return () => observer.disconnect();
   }, [Boolean(imageGallery)]);
 
@@ -8920,6 +8973,11 @@ export function App() {
       return true;
     }
     if (command === "fast") {
+      if (isReclaudeModel(selectedModelProfile.model)) {
+        addLocalMessage("Claude 模型不支持 Fast 模式。");
+        setPrompt("");
+        return true;
+      }
       const next = !codexFastModeEnabled;
       setCodexFastModeEnabled(next);
       window.localStorage.setItem(codexFastModeStorageKey(selectedUserId), String(next));
@@ -9133,10 +9191,9 @@ export function App() {
         expectedTurnId: selectedActiveTurnId,
         queuedSubmissionId: entry.id
       });
-      pendingQueueSteersRef.current.set(requestId, { threadId, entry });
+      pendingQueueSteersRef.current.set(requestId, { threadId, entry, originalOrder: queuedSubmissions.map(item => item.id) });
       setTopAnchoredPrompt(null);
       setQueuedSubmissions((current) => current.filter((queued) => queued.id !== entry.id));
-      setQueuedMenuOpen(false);
       autoFollowMessagesRef.current = true;
       setShowScrollToBottom(false);
       setPendingUserMessages((current) => [...current, {
@@ -9155,13 +9212,13 @@ export function App() {
     }
   }
 
-  function updateQueuedSubmission(entry: QueuedSubmission) {
-    if (!selectedThread?.id || !queuedEditText.trim()) return;
+  function updateQueuedSubmission(entry: QueuedSubmission, text: string): boolean {
+    if (!selectedThread?.id || !text.trim()) return false;
     try {
       const skillNames = entry.input.flatMap((part) => part.type === "skill" && part.name ? [part.name] : []);
       // The running backend still recognizes skill prefixes on queued edits;
       // the updated backend uses skillNames and removes this compatibility text.
-      const queuePrompt = [skillNames.map((name) => `$${name}`).join(" "), queuedEditText.trim()].filter(Boolean).join(" ");
+      const queuePrompt = [skillNames.map((name) => `$${name}`).join(" "), text.trim()].filter(Boolean).join(" ");
       codexSocket.send({
         type: "turn.queue.update",
         requestId: `queue-update-${requestToken()}`,
@@ -9170,9 +9227,10 @@ export function App() {
         prompt: queuePrompt,
         skillNames
       });
-      setEditingQueuedId(null);
+      return true;
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
+      return false;
     }
   }
 
@@ -10159,14 +10217,15 @@ export function App() {
             }, 1200);
           } else {
             if (pending && pending.threadId === selectedThreadRef.current?.id) {
-              setQueuedSubmissions((current) => [pending.entry, ...current]);
+              setQueuedSubmissions((current) => restoreQueuedSubmission(current, pending.entry, pending.originalOrder));
+              requestQueuedSubmissions(pending.threadId);
             }
             setPendingUserMessages((current) => current.filter((entry) => entry.requestId !== message.requestId));
             setError(`调整方向失败：${message.error ?? "未收到确认，请检查当前回答是否仍在运行。"}`);
           }
           return;
         }
-        const data = message.data as { threadId?: string; data?: QueuedSubmission[] } | undefined;
+        const data = message.data as { threadId?: string; data?: QueuedSubmission[]; queuedSubmission?: unknown } | undefined;
         const requestThreadId = data?.threadId ?? (message.requestId.startsWith("queue-add-") ? pendingQueuedPromptsRef.current.get(message.requestId)?.threadId : selectedThreadRef.current?.id);
         if (message.requestId.startsWith("queue-list-") && message.ok && requestThreadId === selectedThreadRef.current?.id) {
           setQueuedSubmissions((current) => {
@@ -10184,6 +10243,11 @@ export function App() {
             setQueuedSubmissions((current) => current.filter((entry) => entry.id !== `pending:${message.requestId}`));
             setError(`排队发送失败：${message.error ?? "Codex 未接受排队请求。"}`);
           } else if (message.ok && requestThreadId) {
+            if (requestThreadId === selectedThreadRef.current?.id) {
+              setQueuedSubmissions(current => confirmQueuedSubmission(current, message.requestId!, data?.queuedSubmission));
+            }
+            // Reconcile authoritatively in the background (including a queue
+            // that started immediately); don't hold controls behind this read.
             requestQueuedSubmissions(requestThreadId);
           }
         }
@@ -10495,6 +10559,10 @@ export function App() {
         return;
       }
       const params = notification.params ?? {};
+      if (notification.method === "runtime/claudeTasks") {
+        window.dispatchEvent(new CustomEvent(conversationTasksEvent, { detail: { userId: selectedUserId, threadId: params.threadId } }));
+        return;
+      }
       if(notification.method==='runtime/initialized'&&params.runtime==='claude-code'&&typeof params.threadId==='string'&&Array.isArray(params.tools)&&Array.isArray(params.mcpServers)){
         const runtimeCapabilities={model:String(params.model??''),tools:params.tools as string[],skills:Array.isArray(params.skills)?params.skills as string[]:[],mcpServers:params.mcpServers as Array<{name:string;status:string}>};
         setSelectedThread(previous=>previous&&previous.id===params.threadId?{...previous,runtimeCapabilities}:previous);
@@ -11782,28 +11850,28 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       return reviewText ? <div className="nativeReviewResult"><div className="nativeReviewResultLabel">审查结果 · 原始意见</div><MarkdownMessage text={reviewText.replace(/^Full review comments:/m, "审查意见：")} projectId={selectedProject?.id} onOpenFileLink={openFilePreview} /></div>
         : <div className="nativeReviewPending" role="status"><span className="nativeReviewActivity" aria-hidden="true" />{reviewTurn?.completedAt ? "本次审查没有文字结果，请查看会话记录。" : progress ? `正在审查 · ${progress}` : "正在审查；原生审查通常在完成后一次性返回意见。"}</div>;
     })() : diffReview.changes.length ? <FileChangeReview changes={diffReview.focusPath ? diffReview.changes.filter(change => fileChangePath(change) === diffReview.focusPath) : diffReview.changes} onComment={addInlineReviewComment} /> : <p className="subagentPanelEmpty">当前已加载的消息中没有文件变更。</p>}</div></section> });
-  if (subagentReview) rightTabs.push({ id: "agents", title: "子代理", icon: "agents", closing: !subagentPanelVisible, onClose: closeSubagentReview, content: <SubagentPanel key={`${selectedUserId}:${subagentReview.requestId}`} projectId={subagentReview.projectId} parentThreadId={subagentReview.threadId} initialAgent={subagentReview.initialAgent} initialView={subagentReview.initialView} visible={subagentPanelVisible && rightWorkspaceOpen && rightWorkspaceTab === "agents"} parentRunning={subagentReview.threadId === selectedThread?.id && Boolean(selectedActiveTurnId)} knownAgents={knownSubagentStates} onClose={closeSubagentReview} renderItem={renderSubagentThreadItem} renderBundle={renderSubagentToolBundle} /> });
+  if (subagentReview) rightTabs.push({ id: "agents", title: "子代理", icon: "agents", closing: !subagentPanelVisible, onClose: closeSubagentReview, content: <LazyPane label="子代理"><SubagentPanel key={`${selectedUserId}:${subagentReview.requestId}`} projectId={subagentReview.projectId} parentThreadId={subagentReview.threadId} initialAgent={subagentReview.initialAgent} initialView={subagentReview.initialView} visible={subagentPanelVisible && rightWorkspaceOpen && rightWorkspaceTab === "agents"} parentRunning={subagentReview.threadId === selectedThread?.id && Boolean(selectedActiveTurnId)} knownAgents={knownSubagentStates} onClose={closeSubagentReview} renderItem={renderSubagentThreadItem} renderBundle={renderSubagentToolBundle} /></LazyPane> });
   if (browserReview) rightTabs.push({ id: "browser", title: "浏览器", icon: "browser", attention: browserNeedsApproval, closing: !browserVisible, onClose: () => {
     setBrowserVisible(false);
     if (browserCloseTimerRef.current !== null) window.clearTimeout(browserCloseTimerRef.current);
     browserCloseTimerRef.current = window.setTimeout(() => { setBrowserReview(null); browserCloseTimerRef.current = null; }, 390);
-  }, content: <BrowserPanel key={`${selectedUserId}:${browserReview.threadId ?? "new"}`} projectId={browserReview.projectId} threadId={browserReview.threadId} navigation={browserReview.navigation} visible={browserVisible && rightWorkspaceOpen && rightWorkspaceTab === "browser"} onClose={() => setRightWorkspaceOpen(false)} /> });
+  }, content: <LazyPane label="浏览器"><BrowserPanel key={`${selectedUserId}:${browserReview.threadId ?? "new"}`} projectId={browserReview.projectId} threadId={browserReview.threadId} navigation={browserReview.navigation} visible={browserVisible && rightWorkspaceOpen && rightWorkspaceTab === "browser"} onClose={() => setRightWorkspaceOpen(false)} /></LazyPane> });
   if (terminalProjectId) rightTabs.push({ id: "terminal", title: "终端", icon: "terminal", closing: !terminalVisible, onClose: () => {
     setTerminalVisible(false);
     if (terminalCloseTimerRef.current !== null) window.clearTimeout(terminalCloseTimerRef.current);
     terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390);
-  }, content: <TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={false} onClose={() => { setTerminalVisible(false); terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390); }} /> });
+  }, content: <LazyPane label="终端"><TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={false} onClose={() => { setTerminalVisible(false); terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390); }} /></LazyPane> });
   for (const id of rightUtilityTabs) {
     const title = ({ remote: "远程文件", goal: "持续目标", schedules: "定时任务", outputs: "输出内容", sources: "来源", feishu: "飞书办公", resources: "主机资源", communication: "会话通信" })[id] ?? id;
     rightTabs.push({ id, title, icon: id as "remote" | "goal" | "schedules" | "outputs" | "sources" | "feishu" | "resources" | "communication", attention: id === "feishu" && feishuPendingCount > 0, onClose: () => closeUtilityWindow(id), content:
-      id === "resources" ? <HostResourcePanel /> :
-      id === "communication" ? <SessionCommunication key={`${selectedUserId}:${selectedThread?.id}`}
+      id === "resources" ? <LazyPane label="主机资源"><HostResourcePanel /></LazyPane> :
+      id === "communication" ? <LazyPane label="会话通信"><SessionCommunication key={`${selectedUserId}:${selectedThread?.id}`}
         userId={selectedUserId} projectId={selectedProject?.id} threadId={selectedThread?.id}
         threadName={selectedThread?.name ?? selectedThread?.preview}
         sideChat={temporaryAsk && temporaryAsk.parentThreadId === selectedThread?.id
           ? { threadId: temporaryAsk.threadId ?? undefined, name: `${selectedThread?.name || "当前主会话"}的侧边会话` } : undefined}
-        visible={rightWorkspaceOpen && rightWorkspaceTab === "communication"} /> :
-      id === "feishu" ? <FeishuOffice userId={selectedUserId} threadId={selectedThread?.id} inline visible={rightWorkspaceOpen && rightWorkspaceTab === "feishu"} onClose={() => setRightWorkspaceOpen(false)} /> :
+        visible={rightWorkspaceOpen && rightWorkspaceTab === "communication"} /></LazyPane> :
+      id === "feishu" ? <LazyPane label="飞书办公"><FeishuOffice userId={selectedUserId} threadId={selectedThread?.id} inline visible={rightWorkspaceOpen && rightWorkspaceTab === "feishu"} onClose={() => setRightWorkspaceOpen(false)} /></LazyPane> :
       id === "remote" ? <RemoteFolderSidebar key={`remote-folders-${selectedUserId}-${selectedThread?.id ?? openingThreadId ?? remoteDraftId}`} userId={selectedUserId} threadId={selectedThread?.id ?? openingThreadId ?? remoteDraftId} isDraft={!selectedThread && !openingThreadId} visible={rightWorkspaceOpen && rightWorkspaceTab === "remote"} onClose={() => setRightWorkspaceOpen(false)}
         onBusyChange={busy => { const scope = selectedThread?.id ?? openingThreadId ?? remoteDraftId; if (busy) remoteConnectionsInProgress.current.add(scope); else remoteConnectionsInProgress.current.delete(scope); }}
         onReference={filePath => { setPrompt(current => `${current.trimEnd()}${current.trim() ? "\n\n" : ""}${fileReferenceText(filePath)} `); requestAnimationFrame(() => composerRef.current?.querySelector<HTMLElement>("[contenteditable=true]")?.focus()); }}
@@ -11816,13 +11884,365 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
   if (filePreview || filePreviewLoading || filePreviewError || runnablePreview) rightTabs.push({ id: "preview", title: runnablePreview?.title || filePreview?.name || "文件预览", icon: "preview", closing: filePreviewClosing, onClose: closeFilePreview, content: <div className="rightWorkspacePreviewMount" ref={setPreviewMount}>{!previewDocked ? <button type="button" className="rightWorkspaceEntry" onClick={() => setPreviewDocked(true)}>预览已全屏打开 · 返回右栏</button> : null}</div> });
   const placeFilePreview = (content: ReactNode) => previewDocked ? previewMount ? createPortal(content, previewMount) : null : content;
 
+  // Shared business callbacks; each platform owns its presentation.
+  const ComposerSettings = mobileNext ? MobileSettings : MobileComposerSettings;
+  const composerSettings = (<ComposerSettings mobile={mobileHeader.mobile} label={modelPickerLabel(selectedModelProfile)} scope={`${selectedUserId}:${selectedThread?.id ?? "new"}`}
+                  context={selectedProject && (selectedThread || threadContextFeatureEnabled) ? (
+                    <button
+                      className={`iconTextButton v2FastModeButton v2ContextStatusButton ${contextWarningVisible ? "v2ContextStatusButtonWarning" : ""} ${threadContextStatus?.pin.text ? "v2ContextStatusButtonPinned" : ""}`}
+                      type="button"
+                      onClick={threadContextFeatureEnabled ? openContextPinDialog : () => void showThreadStatus()}
+                      title={threadContextFeatureEnabled ? "查看上下文比例、compact 时间并固定关键信息" : "查看当前会话状态"}
+                    >
+                      {mobileHeader.mobile ? <><span>上下文</span><span>{threadContextStatus?.usedPercent == null ? "查看状态" : `${Math.round(threadContextStatus.usedPercent)}%`}</span></> : <span>{selectedThread && threadContextLoading && !threadContextStatus
+                        ? "上下文…"
+                        : selectedThread
+                          ? `上下文 ${threadContextStatus?.usedPercent === null || threadContextStatus?.usedPercent === undefined ? "--" : `${Math.round(threadContextStatus.usedPercent)}%`}`
+                          : threadContextFeatureEnabled ? `新会话上下文 ${contextConfigShortLabel(newThreadContextConfig)}` : "会话状态"}</span>}
+                    </button>
+                  ) : null}
+                  speed={!isReclaudeModel(selectedModelProfile.model) ? mobileHeader.mobile ? <label className="mobileSettingRow"><span>速度</span><select aria-label="速度" value={codexFastModeEnabled ? "fast" : "standard"} onChange={event => {
+                    const next = event.target.value === "fast"; setCodexFastModeEnabled(next);
+                    window.localStorage.setItem(codexFastModeStorageKey(selectedUserId), String(next));
+                  }}><option value="standard">标准</option><option value="fast">快速</option></select></label> : <button
+                    className={`iconTextButton v2FastModeButton ${codexFastModeEnabled ? "v2FastModeButtonActive" : ""}`}
+                    type="button"
+                    onClick={() => {
+                      const next = !codexFastModeEnabled;
+                      setCodexFastModeEnabled(next);
+                      if (typeof window !== "undefined") {
+                        window.localStorage.setItem(codexFastModeStorageKey(selectedUserId), String(next));
+                      }
+                    }}
+                    title={codexFastModeEnabled ? "已开启 Fast 模式（下次请求会带 service_tier: fast）" : "开启 Fast 模式"}
+                  >
+                    <span>{codexFastModeEnabled ? "Fast On" : "Fast Off"}</span>
+                  </button> : null}
+                  tasks={selectedProject && selectedThread ? <ConversationTasks key={`tasks:${selectedUserId}:${selectedThread.id}`} userId={selectedUserId} projectId={selectedProject.id} threadId={selectedThread.id}
+                    plainTrigger={mobileNext}
+                    triggerLabel={mobileHeader.mobile ? "会话任务" : undefined}
+                    native={isReclaudeModel(selectedThread.configuredModel ?? selectedModelProfile.model)} agents={composerAgents} directoryPage={subagentDirectory.page} parentRunning={Boolean(selectedActiveTurnId)}
+                    onOpenAgent={openSubagentReview} onOpenHistory={() => openSubagentReview(undefined, "history")} /> : null}
+                  model={mobileHeader.mobile ? <MobileModelFields value={activeModelProfileId}
+                    profiles={selectableModelProfiles.filter(profile => profile.id === activeModelProfileId || (!isUltraModelProfile(profile) && !hiddenArkCodingModels.has(profile.model)))}
+                    disabled={savingThreadModel || conversationRunState === "running" || Boolean(selectedThread && turnRecoveries[`${selectedUserId}:${selectedThread.id}`]?.job?.status === "running")}
+                    onOpen={() => void refreshModels()} onChange={profileId => void changeConversationModelProfile(profileId)} /> : <ModelGroupedSelect
+                    value={activeModelProfileId}
+                    onChange={(profileId) => void changeConversationModelProfile(profileId)}
+                    onOpen={()=>void refreshModels()}
+                    disabled={savingThreadModel || conversationRunState === "running" || Boolean(selectedThread && turnRecoveries[`${selectedUserId}:${selectedThread.id}`]?.job?.status === "running")}
+                    title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
+                    profiles={selectableModelProfiles}
+                  />}
+                  />);
+  const composerActivity = (<div className="composerThreadActivity">
+                  <TurnRecoveryNotice key={`recovery:${selectedUserId}:${selectedThread?.id}`} state={selectedThread ? turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1)) : undefined} userId={selectedUserId} turnId={selectedThread?.turns.at(-1)?.id} onSelectModel={()=>document.querySelector<HTMLButtonElement>(mobileNext ? '.mobileUiModelTrigger' : '.composerTools .groupedModelPicker .polishedSelectTrigger')?.click()} onCopy={copyTextToClipboard} onAction={(action, toolsReviewed) => {
+                    if (!selectedThread) return;
+                    const recovery = turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1));
+                    const types = { dismiss: "turn.error.dismiss", now: "turn.retry.now", cancel: "turn.retry.cancel", check: "turn.recovery.check", continue: "turn.recovery.continue" };
+                    codexSocket.send({ type: types[action], threadId: selectedThread.id, turnId: recovery?.interruption?.turnId ?? selectedThread.turns.at(-1)?.id,
+                      errorAt: recovery?.error?.at, historicalError: turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ? undefined : recovery?.error,
+                      toolsReviewed, requestId: `recovery-${requestToken()}` });
+                  }} />
+                  <ToolReveal key={`progress:${selectedUserId}:${selectedThread?.id ?? "new"}`} open={Boolean(selectedThread?.id && turnProgress[`${selectedUserId}:${selectedThread.id}`]?.turnId === selectedActiveTurnId)}><div className="composerRunNotice" role="status">{turnProgressText(selectedThread?.id ? turnProgress[`${selectedUserId}:${selectedThread.id}`] : undefined)}</div></ToolReveal>
+                  <GoalProgress key={`goal:${selectedUserId}:${selectedThread?.id ?? "new"}`} controller={threadGoal} running={conversationRunState === "running"} />
+                  <ToolReveal open={Boolean(documentReference && documentReference.projectId === selectedProject?.id)}><div className="composerDocumentReference"><FileText size={14} /><span title={documentReference?.text}><strong>{documentReference?.path}</strong> · {documentReference?.text.slice(0, 120)}</span><button type="button" aria-label="移除文档引用" onClick={() => setDocumentReference(null)}><X size={14} /></button></div></ToolReveal>
+                </div>);
+  const composerChips = <>{planMode ? <button className="v2PlanActiveChip" type="button" onClick={() => setPlanMode(false)} title="关闭计划模式，下次发送可执行改动"><Lightbulb size={14} />计划<AccountUpdateIndicator key={`plan:${selectedUserId}`} userId={selectedUserId} menuOpen={false} target="plan" dismissOnRefresh /></button> : null}
+                  {selectedSkills.map((skill) => (
+                    <button className="selectedSkillChip" type="button" key={skill.name} onClick={() => toggleSelectedSkill(skill.name)} title={`移除 $${skill.name}`}>
+                      <span>{localizedSkill(skill).name}</span>
+                      <X size={12} />
+                    </button>
+                  ))}</>;
+  const composerTools = (<div className="composerTools">
+                  {planMode ? <button className="v2PlanActiveChip" type="button" onClick={() => setPlanMode(false)} title="关闭计划模式，下次发送可执行改动"><Lightbulb size={14} />计划<AccountUpdateIndicator key={`plan:${selectedUserId}`} userId={selectedUserId} menuOpen={false} target="plan" dismissOnRefresh /></button> : null}
+                  {selectedSkills.map((skill) => (
+                    <button className="selectedSkillChip" type="button" key={skill.name} onClick={() => toggleSelectedSkill(skill.name)} title={`移除 $${skill.name}`}>
+                      <span>{localizedSkill(skill).name}</span>
+                      <X size={12} />
+                    </button>
+                  ))}
+                  {composerSettings}
+                  <button
+                    className="v2SendMarkdownLocalAction"
+                    type="button"
+                    onClick={() => void exportCurrentThread(true, "markdown")}
+                    disabled={exportingThread}
+                    aria-hidden="true"
+                    tabIndex={-1}
+                  >
+                    {exportingThread ? "发送中" : "Markdown 发到本机"}
+                  </button>
+                  <input
+                    ref={fileInputRef}
+                    className="hiddenFileInput"
+                    multiple
+                    type="file"
+                    onChange={(event) => void handleFileUpload(event.target.files)}
+                  />
+                  <button
+                    className="iconTextButton"
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={!selectedProject || uploadingFiles}
+                  >
+                    <Upload size={15} />
+                    {uploadingFiles ? "传输中" : "上传/粘贴/拖拽文件"}
+                  </button>
+                  <button className="iconTextButton" type="button" onClick={() => void refreshQuota(true, { force: true })} disabled={quotaLoading}>
+                    {quotaLoading ? "额度..." : "额度"}
+                  </button>
+                  <button className="iconTextButton skillsButton" type="button" onClick={() => void openSkillsPicker(true)} disabled={!selectedProject || skillsLoading}>
+                    {skillsLoading ? "加载技能..." : `技能 ${skills.length || ""}`}
+                  </button>
+                  <button className="v2PlanModeBridge v2MovedIntoPlus" type="button" aria-pressed={planMode} aria-hidden="true" tabIndex={-1} onClick={() => setPlanMode((current) => !current)} title={planMode ? "关闭计划模式，下次发送可执行改动" : "开启原生计划模式：先给出方案，不执行改动"}>{planMode ? "计划模式已开启" : "计划模式"}</button>
+                  <select
+                    className="skillSelect"
+                    value=""
+                    onChange={(event) => {
+                      const skill = skills.find((entry) => entry.name === event.target.value);
+                      if (skill) {
+                        setSelectedSkillNames((current) => current.includes(skill.name) ? current : [...current, skill.name]);
+                      }
+                    }}
+                    disabled={!selectedProject || !skills.length}
+                    title="插入 Codex skill"
+                  >
+                    <option value="">插入 skill</option>
+                    {skills.map((skill) => (
+                      <option key={skill.name} value={skill.name}>
+                        {"$"}{skill.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="exportFormatSelect"
+                    value={exportFormat}
+                    onChange={(event) => setExportFormat(event.target.value as ThreadExportFormat)}
+                    title="导出对话记录格式"
+                  >
+                    <option value="markdown">MD</option>
+                    <option value="json">JSON</option>
+                  </select>
+                  <label className="inlineCheckbox compactCheckbox" title="导出后通过 SSH 发送到访问设备保存目录">
+                    <input type="checkbox" checked={exportSendLocal} onChange={(event) => setExportSendLocal(event.target.checked)} />
+                    <span>发当前设备</span>
+                  </label>
+                  <button className="iconTextButton composerExportButton" type="button" onClick={() => void exportCurrentThread()} disabled={!selectedThread || exportingThread}>
+                    {exportingThread ? "导出中" : "导出记录"}
+                  </button>
+                  {uploadedFiles.length ? (
+                    <span className="uploadCount">
+                      {uploadedFiles.some((file) => file.uploading)
+                        ? `正在上传 ${uploadedFiles.filter((file) => file.uploading).length} 个文件`
+                        : `${uploadedFiles.length} 个文件已上传`}
+                    </span>
+                  ) : null}
+                </div>);
+  const composerActions = (<div className={mobileNext ? "mobileUiSendActions" : "composerSendActions"}>
+                  <VoiceInput mobile={mobileNext} key={`${selectedUserId}:${selectedThread?.id ?? selectedProject?.id ?? "new"}`} onText={text => setPrompt(current => `${current}${current && !/\s$/.test(current) ? "\n" : ""}${text}`)} />
+                  <button className={mobileNext ? "mobileUiSendButton" : `iconButton sendButton ${composerShowsStop ? "stopMode" : "primary"}`} type="button"
+                    onClick={() => {
+                      if (composerShowsStop && requestInterruptSelectedConversation()) return;
+                      if (window.matchMedia("(max-width: 720px)").matches) (document.activeElement as HTMLElement | null)?.blur();
+                      void sendPrompt("queue",undefined,mobilePredictedPrompt??undefined);
+                    }}
+                    disabled={composerShowsStop ? composerStopBusy : uploadingFiles || editingLastPrompt || !selectedProject || (!composerHasDraft&&!mobilePredictedPrompt)}
+                    aria-label={composerShowsStop ? "终止当前对话" : "发送"}
+                    title={composerShowsStop ? (composerStopBusy ? "正在终止当前对话" : "终止当前对话（Esc）") : "发送"}>
+                    {composerShowsStop ? <Square size={16} fill="currentColor" /> : <Send size={18} />}
+                  </button>
+                </div>);
+  const composerExtras = <>{uploadedFiles.length || exitingUploads.length ? (
+                  <div className="uploadedFileList">
+                    {[...uploadedFiles, ...exitingUploads].map((file) => {
+                      const leaving = exitingUploads.some((entry) => entry.relativePath === file.relativePath);
+                      return <div className={`uploadedFileChip${file.isImage ? " uploadedImageChip" : ""}${/\.pdf$/i.test(file.name) ? " uploadedPdfChip" : ""}${leaving ? " attachmentLeaving" : ""}`} key={file.relativePath} title={file.relativePath} aria-hidden={leaving}>
+                      <button
+                          className={`uploadedFilePreviewButton${file.isImage ? " uploadedImageFilePreviewButton" : ""}`}
+                          type="button"
+                          onClick={() => void openFilePreview(file.relativePath, file.isImage ? uploadedFiles.filter((entry) => entry.isImage && !entry.uploading).map((entry) => entry.relativePath) : undefined)}
+                          disabled={file.uploading || leaving}
+                          title={file.isImage ? "查看图片预览" : "查看文件预览"}
+                        >
+                          {file.isImage ? <ComposerImageThumbnail upload={file} /> : <FileText className="uploadedFileIcon" size={14} />}
+                          {file.isImage ? null : (
+                            <>
+                              <span>{file.name}</span>
+                              <small>{file.uploading ? "正在上传" : (file.name.split(".").pop()?.toUpperCase() || "文件")}</small>
+                            </>
+                          )}
+                        </button>
+                        <button
+                          className="removeUploadedFileButton"
+                          type="button"
+                          onClick={() => removeUploadedFile(file.relativePath)}
+                          disabled={leaving}
+                          aria-label={`取消 ${file.name} 作为本轮输入`}
+                          title="取消作为本轮会话输入"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>;
+                    })}
+                  </div>
+                ) : null}
+                <div className="dropUploadHint">
+                  {draggingUpload ? "松开鼠标上传到 4090-left 的 /tmp/codex_remote_uploads/用户名/时间/" : "支持 Ctrl/Cmd+V 粘贴图片或文件，也可拖拽上传；仅已知 /命令 会由网页处理，/路径 会原样发送给 Codex。"}
+                </div>
+                {continuationPrompt ? (
+                  <div className="continuationPrompt" role="status">
+                    <span>当前会话上下文已满，原输入已保留，尚未发送。</span>
+                    <div>
+                      <button type="button" onClick={continueInNewThread}>新建续接会话并发送</button>
+                      <button type="button" className="secondary" onClick={() => setContinuationPrompt(null)}>取消</button>
+                    </div>
+                  </div>
+                ) : null}</>;
+  const composerEditor = (<MarkdownComposerEditor
+                  value={prompt}
+                  height={mobileNext ? undefined : composerHeight}
+                  prediction={visibleComposerPrediction}
+                  onPredictionDismiss={setDismissedComposerPrediction}
+                  onChange={setPrompt}
+                  onPaste={handleComposerPaste}
+                  onSubmit={() => void sendPrompt()}
+                  skills={skills}
+                  onChooseSkill={(name) => setSelectedSkillNames((current) => current.includes(name) ? current : [...current, name])}
+                  placeholder={planMode ? "描述你的任务，先生成可审阅的方案…" : "随心输入"}
+                />);
+  const scrollToBottomControl = showScrollToBottom ? <button
+    className={mobileNext ? "mobileUiScrollToBottom" : "scrollToBottomButton"}
+    type="button" onClick={() => scrollMessagesToBottom("smooth")}
+    aria-label="回到底部" title="回到底部">↓</button> : null;
+  const headerControls = (          <div id="conversation-header-controls" ref={mobileHeader.controls} className="controls trackedQuotaVisible" aria-hidden={mobileHeader.mobile && !mobileHeader.revealed && !mobileNext} inert={mobileHeader.mobile && !mobileHeader.revealed && !mobileNext} onPointerDownCapture={mobileHeader.arm} onFocusCapture={mobileHeader.arm}>
+            <button className="iconTextButton v2SettingsBridge v2MovedIntoPlus" type="button" onClick={() => void openSettingsDialog()} title="设置当前访问设备 SSH 发送路径" aria-hidden="true" tabIndex={-1}>
+              <Settings2 size={17} />
+              设置
+            </button>
+            <button className={`trackedQuotaButton topbarGlassControl${trackedQuotaUsage && trackedQuotaUsage.todayQuotaPercent > 50 ? " warning" : ""}`}
+              type="button" onClick={() => void refreshTrackedQuota(true)} title="查看个人今日估算用量和历史统计（仅显示，不限制使用）" aria-label="个人额度占用">
+              个人 {trackedQuotaUsage ? `${percentText(trackedQuotaUsage.todayQuotaPercent)}%` : "--"}
+              <ComposerGlassMaterial variant="topbar" />
+            </button>
+            <div
+              className="quotaPopoverAnchor"
+              // Only the trigger may open the panel. Exit animations/inert can
+              // change descendant hit testing and generate a parent re-entry.
+              onMouseEnter={cancelQuotaHoverClose}
+              onMouseLeave={() => {
+                cancelQuotaHoverClose();
+                if (quotaPopoverPinned) return;
+                quotaHoverCloseTimer.current = window.setTimeout(() => {
+                  quotaHoverCloseTimer.current = null;
+                  setQuotaPopoverOpen(false);
+                }, 140);
+              }}
+            >
+              <button
+                className="quotaButton v2QuotaTopButton topbarGlassControl"
+                type="button"
+                onMouseEnter={() => {
+                  cancelQuotaHoverClose();
+                  setQuotaPopoverOpen(true);
+                  void refreshQuota(false, { background: true });
+                }}
+                onClick={() => {
+                  cancelQuotaHoverClose();
+                  setQuotaPopoverPinned((current) => {
+                    const next = !current;
+                    setQuotaPopoverOpen(next);
+                    return next;
+                  });
+                  void refreshQuota(false, { force: true, background: true });
+                }}
+                disabled={quotaLoading}
+                title="悬停查看；点击可固定或收起额度详情"
+              >
+                {quotaLoading ? "额度..." : quotaSummaryLabel(quota, accountPool, reclaudeUsage)}
+                <ComposerGlassMaterial variant="topbar" />
+              </button>
+              {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} reclaudeStatus={reclaudeUsage} currentClaudeOrgId={isReclaudeModel(selectedModelProfile.model)?selectedModelProfile.model.split("@")[1]:undefined}
+                onReauthenticate={orgId=>{setReclaudeAuthTarget({orgId});setQuotaPopoverPinned(false);setQuotaPopoverOpen(false);}} /> : null}
+            </div>
+            <button
+              className="leaderboardButton"
+              type="button"
+              onClick={() => {
+                setLeaderboardOpen(true);
+                void refreshLeaderboard(false, false);
+              }}
+              title="查看实名额度排行和模型使用明细"
+            >
+              <Trophy size={14} />
+              排行榜
+              <AccountUpdateIndicator key={`leaderboard:${selectedUserId}`} userId={selectedUserId} menuOpen={leaderboardOpen} target="leaderboard" />
+            </button>
+            <PolishedSelect<SandboxMode>
+              className="topbarPolicySelect"
+              native={mobileHeader.mobile}
+              title="文件访问权限"
+              glass
+              value={sandbox}
+              onChange={value => updateExecutionSettings(value, approvalPolicy)}
+              options={[
+                { value: "danger-full-access", label: "完全访问", detail: "可读取和修改所有文件" },
+                { value: "workspace-write", label: "项目可写", detail: "仅可修改当前工作区" },
+                { value: "read-only", label: "只读", detail: "不允许写入文件" }
+              ]}
+            />
+            <PolishedSelect<ApprovalPolicy>
+              className="topbarPolicySelect approvalSelect"
+              native={mobileHeader.mobile}
+              title="执行确认方式"
+              glass
+              value={approvalPolicy}
+              onChange={value => updateExecutionSettings(sandbox, value)}
+              options={[
+                { value: "never", label: "不询问", detail: "自动执行允许的操作" },
+                { value: "on-request", label: "需要时询问", detail: "由 Codex 请求确认" },
+                { value: "untrusted", label: "不可信命令询问", detail: "仅危险操作需要确认" }
+              ]}
+            />
+            <button className="rightWorkspaceToggle topbarGlassControl" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} title={rightWorkspaceOpen ? "隐藏右栏（Ctrl+Shift+B）" : "显示右栏（Ctrl+Shift+B）"} aria-expanded={rightWorkspaceOpen} onClick={() => setMobileRightWorkspaceOpen(!rightWorkspaceOpen)}><WorkspaceIcon name="panel" /><ComposerGlassMaterial variant="topbar" /></button>
+          </div>);
+  const mobileMenu = [
+    {id:"upload",label:uploadingFiles?"正在上传…":"文件与图片",disabled:!selectedProject||uploadingFiles,action:()=>fileInputRef.current?.click()},
+    {id:"skills",label:"技能与插件",disabled:!selectedProject||skillsLoading,action:()=>void openSkillsPicker(true)},
+    {id:"plan",label:"计划模式",active:planMode,action:()=>setPlanMode(value=>!value)},
+    {id:"goal",label:"持续目标",action:()=>window.dispatchEvent(new CustomEvent("codex:compose-goal"))},
+    ...(["writing","worktree","archive-list","archive-current","terminal","browser","hooks"] as const).map((id,index)=>({id,label:["LaTeX / Word 写作","独立工作树","归档会话","归档当前会话","交互终端","浏览器","Hooks 状态"][index],action:()=>window.dispatchEvent(new CustomEvent("codex:workspace-action",{detail:id}))})),
+    {id:"export",label:"导出对话",disabled:!selectedThread||exportingThread,action:()=>void exportCurrentThread()},
+    {id:"send-markdown",label:"发送对话记录到本机",disabled:!selectedThread||exportingThread,action:()=>void exportCurrentThread(true,"markdown")},
+    {id:"settings",label:"设备与导出设置",action:()=>void openSettingsDialog()},
+    {id:"quota",label:"用量与重置时间",action:()=>{setMobileOptionsRequest(value=>value+1);setQuotaPopoverPinned(true);setQuotaPopoverOpen(true);void refreshQuota(false,{force:true,background:true});}},
+    {id:"leaderboard",label:"用量排行",action:()=>{setLeaderboardOpen(true);void refreshLeaderboard(false,false);}}
+  ];
+
+
   return (
     <RunnablePreviewContext.Provider value={preview => { setRunnablePreview(preview); setPreviewDocked(true); showRightWindow("preview"); }}>
+    <MobileLayerProvider enabled={mobileNext}>
+    {mobileNext ? <MobileNavigationLayers sidebar={!threadListCollapsed} workspace={rightWorkspaceOpen} image={Boolean(imageGallery) && !imageViewerClosing}
+      onSidebarClose={()=>setMobileSidebarOpen(false)} onWorkspaceClose={()=>setMobileRightWorkspaceOpen(false)} onImageClose={closeImageViewer} /> : null}
+    {mobileNext ? <>
+      <MobileLegacyLayer open={settingsOpen} onClose={()=>setSettingsOpen(false)} />
+      <MobileLegacyLayer open={skillsPickerOpen} onClose={()=>setSkillsPickerOpen(false)} />
+      <MobileLegacyLayer open={contextPinDialogOpen && !contextPinSaving} onClose={closeContextPinDialog} />
+      <MobileLegacyLayer open={leaderboardOpen} onClose={()=>setLeaderboardOpen(false)} />
+      <MobileLegacyLayer open={trackedQuotaOpen} onClose={()=>setTrackedQuotaOpen(false)} />
+      <MobileLegacyLayer open={notificationSettingsOpen} onClose={()=>setNotificationSettingsOpen(false)} />
+      <MobileLegacyLayer open={globalSearchOpen} onClose={()=>setGlobalSearchOpen(false)} />
+      <MobileLegacyLayer open={Boolean(filePreview) && !filePreviewClosing} onClose={closeFilePreview} />
+    </> : null}
     <HostResourceProvider userId={selectedUserId}>
     <FeatureUpdateNotice key={`notice:${selectedUserId}`} userId={selectedUserId} />
     <main
-      className="appShell"
-      style={{
+      ref={setMobileShellElement}
+      className={mobileNext ? "mobileChatShell" : "appShell"}
+      data-mobile-ui={mobileNext ? "next" : undefined}
+      style={mobileNext ? undefined : {
         gridTemplateColumns: sidebarCollapsed
           ? `0px 0px minmax(${temporaryAsk ? "0px" : "620px"}, 1fr)`
           : `${sidebarWidth}px 8px minmax(${temporaryAsk ? "0px" : "620px"}, 1fr)`,
@@ -12316,7 +12736,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 <div className="emptyState">读取排行榜中...</div>
               ) : leaderboard ? (
                 <>
-                  <LeaderboardPanel leaderboard={leaderboard} />
+                  <LazyPane label="排行榜" fallback={<div className="emptyState" role="status">读取排行榜中...</div>}><LeaderboardPanel leaderboard={leaderboard} /></LazyPane>
                   <LeaderboardWarnings errors={leaderboard.errors} />
                   <p className="leaderboardUpdated">{leaderboardLoading ? "正在更新 · " : ""}更新于 {new Date(leaderboard.updatedAt).toLocaleString()}</p>
                 </>
@@ -12340,10 +12760,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         <div className={`modalBackdrop uiExitLayer${trackedQuotaPresence.closing ? " uiClosing" : ""}`} role="presentation" aria-hidden={trackedQuotaPresence.closing} inert={trackedQuotaPresence.closing} onMouseDown={(event) => {
           if (event.target === event.currentTarget) setTrackedQuotaOpen(false);
         }}>
-          <section className="settingsDialog trackedQuotaDialog" role="dialog" aria-modal="true" aria-label="lzc 额度占用">
+          <section className="settingsDialog trackedQuotaDialog" role="dialog" aria-modal="true" aria-label="个人额度占用">
             <div className="dialogHeader">
               <div>
-                <h2>lzc 额度占用</h2>
+                <h2>个人额度占用</h2>
                 <p>各账号分别统计，并按自然日合计。</p>
               </div>
               <button className="iconButton" type="button" onClick={() => setTrackedQuotaOpen(false)} title="关闭">
@@ -12354,7 +12774,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               ? <div className="emptyState">正在核对各账号的会话记录…</div>
               : trackedQuotaUsage
                 ? <TrackedQuotaDetails usage={trackedQuotaUsage} />
-                : <div className="emptyState">暂未读取到 lzc 用量。</div>}
+                : <div className="emptyState">暂未读取到个人用量。</div>}
             <div className="dialogActions">
               <span className="trackedQuotaUpdated">{trackedQuotaUsage ? `更新于 ${new Date(trackedQuotaUsage.updatedAt).toLocaleString()}` : ""}</span>
               <button className="iconTextButton" type="button" onClick={() => setTrackedQuotaOpen(false)}>关闭</button>
@@ -12648,6 +13068,10 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       ) : null}
 
       <section className="threadColumn">
+        {mobileNext ? <MobileHeader title={selectedThread?.name || selectedThread?.preview || "新对话"} scope={`${selectedUserId}:${selectedThread?.id ?? "new"}`}
+          sidebarOpen={!threadListCollapsed} workspaceOpen={rightWorkspaceOpen} onSidebar={()=>setMobileSidebarOpen(threadListCollapsed)}
+          onWorkspace={()=>setMobileRightWorkspaceOpen(!rightWorkspaceOpen)} controls={headerControls} openRequest={mobileOptionsRequest}
+          onOptionsClose={()=>{cancelQuotaHoverClose();setQuotaPopoverPinned(false);setQuotaPopoverOpen(false);}} /> : (
         <header className="topbar" data-mobile-controls={mobileHeader.revealed ? "visible" : "hidden"}>
           <button className="mobileSidebarToggle" type="button" aria-label={threadListCollapsed ? "展开侧边栏" : "收起侧边栏"} aria-expanded={!threadListCollapsed} aria-controls="conversation-sidebar" onClick={() => setMobileSidebarOpen(threadListCollapsed)}><IconParkSmallArrow direction="left" /></button>
           <div className="projectTitle">
@@ -12656,94 +13080,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             {selectedProject ? <span className="recordMapping">记录来源：cwd 匹配该目录的 Codex threads</span> : null}
           </div>
           <button className="mobileRightWorkspaceToggle rightWorkspaceToggle" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} aria-expanded={rightWorkspaceOpen} onClick={() => setMobileRightWorkspaceOpen(!rightWorkspaceOpen)}><WorkspaceIcon name="panel" /></button>
-          <div id="conversation-header-controls" ref={mobileHeader.controls} className="controls trackedQuotaVisible" aria-hidden={mobileHeader.mobile && !mobileHeader.revealed} inert={mobileHeader.mobile && !mobileHeader.revealed} onPointerDownCapture={mobileHeader.arm} onFocusCapture={mobileHeader.arm}>
-            <button className="iconTextButton v2SettingsBridge v2MovedIntoPlus" type="button" onClick={() => void openSettingsDialog()} title="设置当前访问设备 SSH 发送路径" aria-hidden="true" tabIndex={-1}>
-              <Settings2 size={17} />
-              设置
-            </button>
-            <button className={`trackedQuotaButton topbarGlassControl${trackedQuotaUsage && trackedQuotaUsage.todayQuotaPercent > 50 ? " warning" : ""}`}
-              type="button" onClick={() => void refreshTrackedQuota(true)} title="查看 lzc 今日估算用量和历史统计（仅显示，不限制使用）" aria-label="lzc 额度占用">
-              lzc {trackedQuotaUsage ? `${percentText(trackedQuotaUsage.todayQuotaPercent)}%` : "--"}
-              <ComposerGlassMaterial variant="topbar" />
-            </button>
-            <div
-              className="quotaPopoverAnchor"
-              // Only the trigger may open the panel. Exit animations/inert can
-              // change descendant hit testing and generate a parent re-entry.
-              onMouseEnter={cancelQuotaHoverClose}
-              onMouseLeave={() => {
-                cancelQuotaHoverClose();
-                if (quotaPopoverPinned) return;
-                quotaHoverCloseTimer.current = window.setTimeout(() => {
-                  quotaHoverCloseTimer.current = null;
-                  setQuotaPopoverOpen(false);
-                }, 140);
-              }}
-            >
-              <button
-                className="quotaButton v2QuotaTopButton topbarGlassControl"
-                type="button"
-                onMouseEnter={() => {
-                  cancelQuotaHoverClose();
-                  setQuotaPopoverOpen(true);
-                  void refreshQuota(false, { background: true });
-                }}
-                onClick={() => {
-                  cancelQuotaHoverClose();
-                  setQuotaPopoverPinned((current) => {
-                    const next = !current;
-                    setQuotaPopoverOpen(next);
-                    return next;
-                  });
-                  void refreshQuota(false, { force: true, background: true });
-                }}
-                disabled={quotaLoading}
-                title="悬停查看；点击可固定或收起额度详情"
-              >
-                {quotaLoading ? "额度..." : quotaSummaryLabel(quota, accountPool, reclaudeUsage)}
-                <ComposerGlassMaterial variant="topbar" />
-              </button>
-              {quotaPopoverPresence.present ? <QuotaPopover userId={selectedUserId} quota={quota} pool={accountPool} loading={quotaLoading} closing={quotaPopoverPresence.closing} reclaudeStatus={reclaudeUsage} currentClaudeOrgId={isReclaudeModel(selectedModelProfile.model)?selectedModelProfile.model.split("@")[1]:undefined}
-                onReauthenticate={orgId=>{setReclaudeAuthTarget({orgId});setQuotaPopoverPinned(false);setQuotaPopoverOpen(false);}} /> : null}
-            </div>
-            <button
-              className="leaderboardButton"
-              type="button"
-              onClick={() => {
-                setLeaderboardOpen(true);
-                void refreshLeaderboard(false, false);
-              }}
-              title="查看实名额度排行和模型使用明细"
-            >
-              <Trophy size={14} />
-              排行榜
-              <AccountUpdateIndicator key={`leaderboard:${selectedUserId}`} userId={selectedUserId} menuOpen={leaderboardOpen} target="leaderboard" />
-            </button>
-            <PolishedSelect<SandboxMode>
-              className="topbarPolicySelect"
-              glass
-              value={sandbox}
-              onChange={value => updateExecutionSettings(value, approvalPolicy)}
-              options={[
-                { value: "danger-full-access", label: "完全访问", detail: "可读取和修改所有文件" },
-                { value: "workspace-write", label: "项目可写", detail: "仅可修改当前工作区" },
-                { value: "read-only", label: "只读", detail: "不允许写入文件" }
-              ]}
-            />
-            <PolishedSelect<ApprovalPolicy>
-              className="topbarPolicySelect approvalSelect"
-              glass
-              value={approvalPolicy}
-              onChange={value => updateExecutionSettings(sandbox, value)}
-              options={[
-                { value: "never", label: "不询问", detail: "自动执行允许的操作" },
-                { value: "on-request", label: "需要时询问", detail: "由 Codex 请求确认" },
-                { value: "untrusted", label: "不可信命令询问", detail: "仅危险操作需要确认" }
-              ]}
-            />
-            <button className="rightWorkspaceToggle topbarGlassControl" type="button" aria-label={rightWorkspaceOpen ? "隐藏右栏" : "显示右栏"} title={rightWorkspaceOpen ? "隐藏右栏（Ctrl+Shift+B）" : "显示右栏（Ctrl+Shift+B）"} aria-expanded={rightWorkspaceOpen} onClick={() => setMobileRightWorkspaceOpen(!rightWorkspaceOpen)}><WorkspaceIcon name="panel" /><ComposerGlassMaterial variant="topbar" /></button>
-          </div>
+          {headerControls}
         </header>
+        )}
 
         <div className="threadNoticeStack">
         {error ? (
@@ -12763,7 +13102,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             </div>
               <button className="providerErrorModel" type="button" onClick={() => {
                 setProviderFailureOpen(false);
-                window.setTimeout(() => document.querySelector<HTMLButtonElement>(".composerTools .groupedModelPicker .polishedSelectTrigger")?.click(), 100);
+                window.setTimeout(() => document.querySelector<HTMLButtonElement>(mobileNext ? '.mobileUiModelTrigger' : '.composerTools .groupedModelPicker .polishedSelectTrigger')?.click(), 100);
               }}>切换模型</button>
               <button className="iconButton errorBannerDismiss" type="button" aria-label="关闭模型错误提示" onClick={() => setProviderFailureOpen(false)}><X size={16} /></button>
           </div>
@@ -12773,7 +13112,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
 
 
         <div className={`workspace${rightWorkspaceOpen ? " diffPanelOpen" : ""}${diffPanelResizing ? " diffPanelResizing" : ""}`} style={{ gridTemplateColumns: `${threadListCollapsed ? 56 : threadListWidth}px 0px minmax(0, 1fr) auto` }}>
-          {!threadListCollapsed ? <button className="mobileSidebarBackdrop" type="button" aria-label="收起侧边栏" onClick={() => setMobileSidebarOpen(false)} /> : null}
+          <button className={`mobileSidebarBackdrop${threadListCollapsed ? " inactive" : ""}`} type="button" aria-label="收起侧边栏" tabIndex={threadListCollapsed ? -1 : 0} aria-hidden={threadListCollapsed} onClick={() => setMobileSidebarOpen(false)} />
           <nav id="conversation-sidebar" className={`threadList ${threadListCollapsed ? "collapsed" : ""}`} onClickCapture={event => {
             if (!window.matchMedia("(max-width: 720px)").matches || !(event.target instanceof Element)) return;
             if (shouldDismissMobileSidebar(event.target, event.currentTarget)) setMobileSidebarOpen(false);
@@ -13198,9 +13537,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 inert={exhaustedAccountNoticePresence.closing}
               >
                 <p className="exhaustedAccountNoticeCopy">
-                  {exhaustedAccountNotice.sourceLabel} 剩余额度不足 10%。
+                  {exhaustedAccountNotice.sourceLabel} {mobileHeader.mobile ? "额度不足 10%。" : "剩余额度不足 10%。"}
                   {exhaustedAccountNotice.hasAvailableAlternative
-                    ? "可分支到额度最高的可用账号继续。"
+                    ? mobileHeader.mobile ? "可分支继续。" : "可分支到额度最高的可用账号继续。"
                     : "其它账号暂无可用额度。"}
                 </p>
                 <div className="exhaustedAccountNoticeActions">
@@ -13215,7 +13554,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   >
                     <GitBranch size={14} /> {branchingThread ? "分支中…" : "分支"}
                   </button>
-                  <button type="button" onClick={() => setDismissedExhaustedThreadId(selectedThread?.id ?? null)}>关闭</button>
+                  <button type="button" aria-label="关闭额度提示" onClick={() => setDismissedExhaustedThreadId(selectedThread?.id ?? null)}>{mobileHeader.mobile ? <X size={16} /> : "关闭"}</button>
                 </div>
               </aside>
             ) : null}
@@ -13240,7 +13579,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 </div>
               </aside>
             ) : null}
-            <div className="conversationContent hasComposerAmbientGlow">
+            <div className={mobileNext ? "mobileUiConversationContent" : "conversationContent hasComposerAmbientGlow"}>
               <ComposerAmbientGlow key={`ambient:${selectedUserId}`} theme={colorTheme} hasDraft={composerHasDraft || Boolean(temporaryPrompt.trim())} welcome={Boolean(selectedProject && !selectedThread && !openingThreadId && !openingThreadPresence.present && visiblePendingUserMessages.length === 0 && liveTimelineEntries.length === 0 && localMessages.length === 0)} />
               {showPromptNavigator ? (
                 <nav
@@ -13742,21 +14081,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                   </div>
                 </div>
               ) : null}
+              {mobileNext ? scrollToBottomControl : null}
             </div>
-            {showScrollToBottom ? (
-              <button
-                className="scrollToBottomButton"
-                type="button"
-                onClick={() => scrollMessagesToBottom("smooth")}
-                aria-label="回到底部"
-                title="回到底部"
-              >
-                ↓
-              </button>
-            ) : null}
+            {!mobileNext ? scrollToBottomControl : null}
             <div
               ref={bindComposerElement}
-              className={`composer composerLiquidGlass ${draggingUpload ? "draggingUpload" : ""}`}
+              className={mobileNext ? "mobileComposerDock" : `composer composerLiquidGlass ${draggingUpload ? "draggingUpload" : ""}`}
               data-mobile-idle={!composerHasDraft && !editingPromptDraft && !documentReference && !selectedSkills.length && !planMode}
               data-has-thread={Boolean(selectedThread)}
               data-plan-mode={planMode}
@@ -13765,7 +14095,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
               onDragLeave={handleUploadDragLeave}
               onDrop={handleUploadDrop}
             >
-              <ComposerGlassMaterial />
+              {!mobileNext ? <ComposerGlassMaterial /> : null}
               {selectedThread && statusPopoverThreadId === selectedThread.id ? (
                 <aside className={`threadStatusPopover uiGlassSurface uiGlassPopover${statusPopoverVisible ? " open" : ""}`} style={{ left: statusPopoverLeft }} role="dialog" aria-label="当前会话状态" aria-hidden={!statusPopoverVisible}>
                   <header><strong>会话状态</strong><button type="button" aria-label="关闭会话状态" tabIndex={statusPopoverVisible ? 0 : -1} onClick={closeStatusPopover}><X size={15} /></button></header>
@@ -13790,36 +14120,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 </aside>
               ) : null}
               {selectedThread && displayedConversationTurns.length > 0 && queuedSubmissionPresence.present && visibleQueuedSubmission ? (
-                <div className={`queuedSubmissionStrip${queuedSubmissionPresence.closing ? " closing" : ""}`} role="status" aria-label="排队发送的消息" aria-hidden={queuedSubmissionPresence.closing} inert={queuedSubmissionPresence.closing}>
-                  {(() => {
-                    const entry = visibleQueuedSubmission;
-                    return <div className="queuedSubmission" key={entry.id}>
-                      {editingQueuedId === entry.id ? (
-                        <>
-                          <input className="queuedEditInput" value={queuedEditText} onChange={(event) => setQueuedEditText(event.target.value)} onKeyDown={(event) => {
-                            if (event.key === "Escape") setEditingQueuedId(null);
-                            if (event.key === "Enter") updateQueuedSubmission(entry);
-                          }} autoFocus aria-label="编辑排队消息" />
-                          <button type="button" onClick={() => updateQueuedSubmission(entry)}>保存</button>
-                        </>
-                      ) : (
-                        <>
-                          <span className="queuedSubmissionLabel">{entry.id.startsWith("pending:") ? "排队中" : "已排队"}{queuedSubmissions.length > 1 ? ` · ${queuedSubmissions.length} 条` : ""}</span>
-                          <span className="queuedSubmissionText" title={queuedSubmissionText(entry)}>{queuedSubmissionText(entry)}</span>
-                          {selectedActiveTurnId&&(!isReclaudeModel(selectedModelProfile.model)||selectedThread?.runtimeFeatures?.steer===true) ? <button className="queuedSteerButton" type="button" disabled={entry.id.startsWith("pending:")} onClick={() => steerQueuedSubmission(entry)}>调整方向</button> : null}
-                          {!entry.id.startsWith("pending:") ? <button className="queuedIconButton" type="button" aria-label="移除排队消息" title="移除排队消息" onClick={() => codexSocket.send({ type: "turn.queue.delete", requestId: `queue-delete-${requestToken()}`, threadId: selectedThread.id, queuedSubmissionId: entry.id })}><X size={13} /></button> : null}
-                          {!entry.id.startsWith("pending:") ? <button className="queuedIconButton" type="button" aria-label="更多排队操作" aria-expanded={queuedMenuOpen} onClick={() => setQueuedMenuOpen((open) => !open)}>⋯</button> : null}
-                        </>
-                      )}
-                    </div>;
-                  })()}
-                  <ComposerGlassMaterial variant="topbar" />
-                  {queuedMenuOpen && queuedSubmissions.length ? <div className="queuedSubmissionMenu">
-                    <button type="button" onClick={() => { setQueuedEditText(queuedSubmissionText(queuedSubmissions[0])); setEditingQueuedId(queuedSubmissions[0].id); setQueuedMenuOpen(false); }}>编辑消息</button>
-                    <button type="button" onClick={() => { openTemporaryAsk(queuedSubmissionText(queuedSubmissions[0]), window.innerWidth / 2, window.innerHeight / 2); setQueuedMenuOpen(false); }}>在侧边聊天中打开</button>
-                    <button type="button" onClick={() => { codexSocket.send({ type: "turn.queue.delete", requestId: `queue-delete-${requestToken()}`, threadId: selectedThread.id, queuedSubmissionId: queuedSubmissions[0].id }); setQueuedMenuOpen(false); }}>关闭排队</button>
-                  </div> : null}
-                </div>
+                <QueuedMessages mobile={mobileNext} key={`queue:${selectedUserId}:${selectedThread.id}`} entries={queuedSubmissions} fallbackEntry={visibleQueuedSubmission}
+                  closing={queuedSubmissionPresence.closing}
+                  canSteer={Boolean(selectedActiveTurnId && (!isReclaudeModel(selectedModelProfile.model) || selectedThread.runtimeFeatures?.steer === true))}
+                  textFor={queuedSubmissionText} onSteer={steerQueuedSubmission} onSave={updateQueuedSubmission}
+                  onRemove={entry => codexSocket.send({ type: "turn.queue.delete", requestId: `queue-delete-${requestToken()}`, threadId: selectedThread.id, queuedSubmissionId: entry.id })}
+                  onOpenSideChat={entry => openTemporaryAsk(queuedSubmissionText(entry), window.innerWidth / 2, window.innerHeight / 2)} />
               ) : null}
               {renderApprovalRequests(selectedThread?.id)}
               {skillsPickerPresence.present ? createPortal(
@@ -13879,217 +14185,18 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                 onMouseDown={(event) => beginVerticalResize(event, composerHeight, setComposerHeight, composerHeightStorageKey, 38, Math.min(320, window.innerHeight - 260))}
               />
               <EditingPromptNotice draft={editingPromptDraft} busy={editingLastPrompt} confirmed={editingHistoryConfirmed} onConfirm={setEditingHistoryConfirmed} onCancel={cancelEditingPrompt}/>
-              <div className="composerBody">
-                <div className="composerThreadActivity">
-                  <TurnRecoveryNotice key={`recovery:${selectedUserId}:${selectedThread?.id}`} state={selectedThread ? turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1)) : undefined} userId={selectedUserId} turnId={selectedThread?.turns.at(-1)?.id} onSelectModel={()=>document.querySelector<HTMLButtonElement>('.composerTools .groupedModelPicker .polishedSelectTrigger')?.click()} onCopy={copyTextToClipboard} onAction={(action, toolsReviewed) => {
-                    if (!selectedThread) return;
-                    const recovery = turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ?? historicalRecovery(selectedThread.id, selectedThread.turns.at(-1));
-                    const types = { dismiss: "turn.error.dismiss", now: "turn.retry.now", cancel: "turn.retry.cancel", check: "turn.recovery.check", continue: "turn.recovery.continue" };
-                    codexSocket.send({ type: types[action], threadId: selectedThread.id, turnId: recovery?.interruption?.turnId ?? selectedThread.turns.at(-1)?.id,
-                      errorAt: recovery?.error?.at, historicalError: turnRecoveries[`${selectedUserId}:${selectedThread.id}`] ? undefined : recovery?.error,
-                      toolsReviewed, requestId: `recovery-${requestToken()}` });
-                  }} />
-                  <ToolReveal key={`progress:${selectedUserId}:${selectedThread?.id ?? "new"}`} open={Boolean(selectedThread?.id && turnProgress[`${selectedUserId}:${selectedThread.id}`]?.turnId === selectedActiveTurnId)}><div className="composerRunNotice" role="status">{turnProgressText(selectedThread?.id ? turnProgress[`${selectedUserId}:${selectedThread.id}`] : undefined)}</div></ToolReveal>
-                  <GoalProgress key={`goal:${selectedUserId}:${selectedThread?.id ?? "new"}`} controller={threadGoal} running={conversationRunState === "running"} />
-                  <SubagentActivity key={`agents:${selectedUserId}:${selectedThread?.id ?? "new"}`} agents={composerAgents} directoryPage={subagentDirectory.page} parentRunning={Boolean(selectedActiveTurnId)} taskKey={selectedActiveTurnId ?? "idle"} onOpen={openSubagentReview} onOpenHistory={() => openSubagentReview(undefined, "history")} />
-                  <ToolReveal open={Boolean(documentReference && documentReference.projectId === selectedProject?.id)}><div className="composerDocumentReference"><FileText size={14} /><span title={documentReference?.text}><strong>{documentReference?.path}</strong> · {documentReference?.text.slice(0, 120)}</span><button type="button" aria-label="移除文档引用" onClick={() => setDocumentReference(null)}><X size={14} /></button></div></ToolReveal>
+              {mobileNext ? <MobileComposer scope={`${selectedUserId}:${selectedThread?.id ?? "new"}`} userId={selectedUserId}
+                value={prompt} onChange={setPrompt} editor={composerEditor} activity={composerActivity} extras={composerExtras}
+                chips={composerChips} model={composerSettings} actions={composerActions} menu={mobileMenu}
+                active={composerHasDraft || uploadedFiles.length > 0 || exitingUploads.length > 0 || Boolean(editingPromptDraft || documentReference || selectedSkills.length || planMode)}
+                fileInput={<input ref={fileInputRef} hidden multiple type="file" onChange={event=>void handleFileUpload(event.target.files)} />} /> : (
+                <div className="composerBody">
+                  {composerActivity}
+                  <div className="composerControlRow">{composerTools}{composerActions}</div>
+                  {composerExtras}
+                  {composerEditor}
                 </div>
-                <div className="composerControlRow">
-                <div className="composerTools">
-                  {planMode ? <button className="v2PlanActiveChip" type="button" onClick={() => setPlanMode(false)} title="关闭计划模式，下次发送可执行改动"><Lightbulb size={14} />计划<AccountUpdateIndicator key={`plan:${selectedUserId}`} userId={selectedUserId} menuOpen={false} target="plan" dismissOnRefresh /></button> : null}
-                  {selectedSkills.map((skill) => (
-                    <button className="selectedSkillChip" type="button" key={skill.name} onClick={() => toggleSelectedSkill(skill.name)} title={`移除 $${skill.name}`}>
-                      <span>{localizedSkill(skill).name}</span>
-                      <X size={12} />
-                    </button>
-                  ))}
-                  {selectedProject && (selectedThread || threadContextFeatureEnabled) ? (
-                    <button
-                      className={`iconTextButton v2FastModeButton v2ContextStatusButton ${contextWarningVisible ? "v2ContextStatusButtonWarning" : ""} ${threadContextStatus?.pin.text ? "v2ContextStatusButtonPinned" : ""}`}
-                      type="button"
-                      onClick={threadContextFeatureEnabled ? openContextPinDialog : () => void showThreadStatus()}
-                      title={threadContextFeatureEnabled ? "查看上下文比例、compact 时间并固定关键信息" : "查看当前会话状态"}
-                    >
-                      <span>{selectedThread && threadContextLoading && !threadContextStatus
-                        ? "上下文…"
-                        : selectedThread
-                          ? `上下文 ${threadContextStatus?.usedPercent === null || threadContextStatus?.usedPercent === undefined ? "--" : `${Math.round(threadContextStatus.usedPercent)}%`}`
-                          : threadContextFeatureEnabled ? `新会话上下文 ${contextConfigShortLabel(newThreadContextConfig)}` : "会话状态"}</span>
-                    </button>
-                  ) : null}
-                  <button
-                    className={`iconTextButton v2FastModeButton ${codexFastModeEnabled ? "v2FastModeButtonActive" : ""}`}
-                    type="button"
-                    disabled={isReclaudeModel(selectedModelProfile.model)}
-                    onClick={() => {
-                      const next = !codexFastModeEnabled;
-                      setCodexFastModeEnabled(next);
-                      if (typeof window !== "undefined") {
-                        window.localStorage.setItem(codexFastModeStorageKey(selectedUserId), String(next));
-                      }
-                    }}
-                    title={isReclaudeModel(selectedModelProfile.model)?'尚未验证此账号的 Claude Fast 资格与计费，暂不启用':codexFastModeEnabled ? "已开启 Fast 模式（下次请求会带 service_tier: fast）" : "开启 Fast 模式"}
-                  >
-                    <span>{isReclaudeModel(selectedModelProfile.model)?'Fast —':codexFastModeEnabled ? "Fast On" : "Fast Off"}</span>
-                  </button>
-                  <ModelGroupedSelect
-                    value={activeModelProfileId}
-                    onChange={(profileId) => void changeConversationModelProfile(profileId)}
-                    onOpen={()=>void refreshModels()}
-                    disabled={savingThreadModel || conversationRunState === "running" || Boolean(selectedThread && turnRecoveries[`${selectedUserId}:${selectedThread.id}`]?.job?.status === "running")}
-                    title={conversationRunState === "running" ? "当前会话运行中，完成后可切换模型" : "选择当前会话后续轮次使用的真实模型"}
-                    profiles={selectableModelProfiles}
-                  />
-                  <button
-                    className="v2SendMarkdownLocalAction"
-                    type="button"
-                    onClick={() => void exportCurrentThread(true, "markdown")}
-                    disabled={exportingThread}
-                    aria-hidden="true"
-                    tabIndex={-1}
-                  >
-                    {exportingThread ? "发送中" : "Markdown 发到本机"}
-                  </button>
-                  <input
-                    ref={fileInputRef}
-                    className="hiddenFileInput"
-                    multiple
-                    type="file"
-                    onChange={(event) => void handleFileUpload(event.target.files)}
-                  />
-                  <button
-                    className="iconTextButton"
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={!selectedProject || uploadingFiles}
-                  >
-                    <Upload size={15} />
-                    {uploadingFiles ? "传输中" : "上传/粘贴/拖拽文件"}
-                  </button>
-                  <button className="iconTextButton" type="button" onClick={() => void refreshQuota(true, { force: true })} disabled={quotaLoading}>
-                    {quotaLoading ? "额度..." : "额度"}
-                  </button>
-                  <button className="iconTextButton skillsButton" type="button" onClick={() => void openSkillsPicker(true)} disabled={!selectedProject || skillsLoading}>
-                    {skillsLoading ? "加载技能..." : `技能 ${skills.length || ""}`}
-                  </button>
-                  <button className="v2PlanModeBridge v2MovedIntoPlus" type="button" aria-pressed={planMode} aria-hidden="true" tabIndex={-1} onClick={() => setPlanMode((current) => !current)} title={planMode ? "关闭计划模式，下次发送可执行改动" : "开启原生计划模式：先给出方案，不执行改动"}>{planMode ? "计划模式已开启" : "计划模式"}</button>
-                  <select
-                    className="skillSelect"
-                    value=""
-                    onChange={(event) => {
-                      const skill = skills.find((entry) => entry.name === event.target.value);
-                      if (skill) {
-                        setSelectedSkillNames((current) => current.includes(skill.name) ? current : [...current, skill.name]);
-                      }
-                    }}
-                    disabled={!selectedProject || !skills.length}
-                    title="插入 Codex skill"
-                  >
-                    <option value="">插入 skill</option>
-                    {skills.map((skill) => (
-                      <option key={skill.name} value={skill.name}>
-                        {"$"}{skill.name}
-                      </option>
-                    ))}
-                  </select>
-                  <select
-                    className="exportFormatSelect"
-                    value={exportFormat}
-                    onChange={(event) => setExportFormat(event.target.value as ThreadExportFormat)}
-                    title="导出对话记录格式"
-                  >
-                    <option value="markdown">MD</option>
-                    <option value="json">JSON</option>
-                  </select>
-                  <label className="inlineCheckbox compactCheckbox" title="导出后通过 SSH 发送到访问设备保存目录">
-                    <input type="checkbox" checked={exportSendLocal} onChange={(event) => setExportSendLocal(event.target.checked)} />
-                    <span>发当前设备</span>
-                  </label>
-                  <button className="iconTextButton composerExportButton" type="button" onClick={() => void exportCurrentThread()} disabled={!selectedThread || exportingThread}>
-                    {exportingThread ? "导出中" : "导出记录"}
-                  </button>
-                  {uploadedFiles.length ? (
-                    <span className="uploadCount">
-                      {uploadedFiles.some((file) => file.uploading)
-                        ? `正在上传 ${uploadedFiles.filter((file) => file.uploading).length} 个文件`
-                        : `${uploadedFiles.length} 个文件已上传`}
-                    </span>
-                  ) : null}
-                </div>
-                <div className="composerSendActions">
-                  <VoiceInput key={`${selectedUserId}:${selectedThread?.id ?? selectedProject?.id ?? "new"}`} onText={text => setPrompt(current => `${current}${current && !/\s$/.test(current) ? "\n" : ""}${text}`)} />
-                  <button className={`iconButton sendButton ${composerShowsStop ? "stopMode" : "primary"}`} type="button"
-                    onClick={() => {
-                      if (composerShowsStop && requestInterruptSelectedConversation()) return;
-                      if (window.matchMedia("(max-width: 720px)").matches) (document.activeElement as HTMLElement | null)?.blur();
-                      void sendPrompt("queue",undefined,mobilePredictedPrompt??undefined);
-                    }}
-                    disabled={composerShowsStop ? composerStopBusy : uploadingFiles || editingLastPrompt || !selectedProject || (!composerHasDraft&&!mobilePredictedPrompt)}
-                    aria-label={composerShowsStop ? "终止当前对话" : "发送"}
-                    title={composerShowsStop ? (composerStopBusy ? "正在终止当前对话" : "终止当前对话（Esc）") : "发送"}>
-                    {composerShowsStop ? <Square size={16} fill="currentColor" /> : <Send size={18} />}
-                  </button>
-                </div>
-                </div>
-                {uploadedFiles.length || exitingUploads.length ? (
-                  <div className="uploadedFileList">
-                    {[...uploadedFiles, ...exitingUploads].map((file) => {
-                      const leaving = exitingUploads.some((entry) => entry.relativePath === file.relativePath);
-                      return <div className={`uploadedFileChip${file.isImage ? " uploadedImageChip" : ""}${/\.pdf$/i.test(file.name) ? " uploadedPdfChip" : ""}${leaving ? " attachmentLeaving" : ""}`} key={file.relativePath} title={file.relativePath} aria-hidden={leaving}>
-                      <button
-                          className={`uploadedFilePreviewButton${file.isImage ? " uploadedImageFilePreviewButton" : ""}`}
-                          type="button"
-                          onClick={() => void openFilePreview(file.relativePath, file.isImage ? uploadedFiles.filter((entry) => entry.isImage && !entry.uploading).map((entry) => entry.relativePath) : undefined)}
-                          disabled={file.uploading || leaving}
-                          title={file.isImage ? "查看图片预览" : "查看文件预览"}
-                        >
-                          {file.isImage ? <ComposerImageThumbnail upload={file} /> : <FileText className="uploadedFileIcon" size={14} />}
-                          {file.isImage ? null : (
-                            <>
-                              <span>{file.name}</span>
-                              <small>{file.uploading ? "正在上传" : (file.name.split(".").pop()?.toUpperCase() || "文件")}</small>
-                            </>
-                          )}
-                        </button>
-                        <button
-                          className="removeUploadedFileButton"
-                          type="button"
-                          onClick={() => removeUploadedFile(file.relativePath)}
-                          disabled={leaving}
-                          aria-label={`取消 ${file.name} 作为本轮输入`}
-                          title="取消作为本轮会话输入"
-                        >
-                          <X size={14} />
-                        </button>
-                      </div>;
-                    })}
-                  </div>
-                ) : null}
-                <div className="dropUploadHint">
-                  {draggingUpload ? "松开鼠标上传到 4090-left 的 /tmp/codex_remote_uploads/用户名/时间/" : "支持 Ctrl/Cmd+V 粘贴图片或文件，也可拖拽上传；仅已知 /命令 会由网页处理，/路径 会原样发送给 Codex。"}
-                </div>
-                {continuationPrompt ? (
-                  <div className="continuationPrompt" role="status">
-                    <span>当前会话上下文已满，原输入已保留，尚未发送。</span>
-                    <div>
-                      <button type="button" onClick={continueInNewThread}>新建续接会话并发送</button>
-                      <button type="button" className="secondary" onClick={() => setContinuationPrompt(null)}>取消</button>
-                    </div>
-                  </div>
-                ) : null}
-                <MarkdownComposerEditor
-                  value={prompt}
-                  height={composerHeight}
-                  prediction={visibleComposerPrediction}
-                  onPredictionDismiss={setDismissedComposerPrediction}
-                  onChange={setPrompt}
-                  onPaste={handleComposerPaste}
-                  onSubmit={() => void sendPrompt()}
-                  skills={skills}
-                  onChooseSkill={(name) => setSelectedSkillNames((current) => current.includes(name) ? current : [...current, name])}
-                  placeholder={planMode ? "描述你的任务，先生成可审阅的方案…" : "随心输入"}
-                />
-              </div>
+              )}
             </div>
           </section>
           </div>
@@ -14247,6 +14354,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
       <PetBuddy key={selectedUserId} status={Object.values(pendingApprovals).some((request) => request.params.threadId === selectedThread?.id) ? "needsInput" : selectedActiveTurnId ? "running" : selectedThread?.turns?.at(-1)?.status && /fail|error/i.test(statusText(selectedThread.turns.at(-1)?.status)) ? "failed" : selectedThread?.turns?.at(-1)?.status && /complete|success|review/i.test(statusText(selectedThread.turns.at(-1)?.status)) ? "complete" : "idle"} />
     </main>
     </HostResourceProvider>
+    </MobileLayerProvider>
     </RunnablePreviewContext.Provider>
   );
 }

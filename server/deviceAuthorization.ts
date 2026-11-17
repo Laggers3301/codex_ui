@@ -6,16 +6,17 @@ import type {CodexBridge} from "./codexBridge.js";
 import {authDiagnostic, type AuthDiagnostic} from "./authDiagnostics.js";
 
 interface Target {home:string;expected:{stamp:number;fingerprint:string|null};version:string}
+export interface AccountReplacementConfirmation { fromAccountHash:string; toAccountHash:string }
 export interface AuthorizationHost {
   authorizationTarget(accountId:string):Target;
   createDeviceAuthorizationBridge(accountId:string,stageHome:string):CodexBridge;
-  installAuthorizedCredentials(accountId:string,stageHome:string,expected:Target["expected"]):Promise<"busy"|"installed">;
+  installAuthorizedCredentials(accountId:string,stageHome:string,expected:Target["expected"],replacement?:AccountReplacementConfirmation):Promise<"busy"|"installed">;
   verifyAuthorizedAccount(accountId:string):Promise<boolean>;
 }
 type Phase="starting"|"awaiting_authorization"|"authorized_waiting_idle"|"verifying"|"completed"|"failed";
-interface Session {id:string;accountId:string;status:Phase;createdAt:string;updatedAt:string;expected:Target["expected"];code?:string;verificationUrl?:string;error?:string;native?:CodexBridge;working?:boolean;nextTryAt?:number}
+interface Session {id:string;accountId:string;status:Phase;createdAt:string;updatedAt:string;expected:Target["expected"];replacement?:AccountReplacementConfirmation;code?:string;verificationUrl?:string;error?:string;native?:CodexBridge;working?:boolean;nextTryAt?:number}
 const value=(x:unknown):Record<string,unknown>=>x&&typeof x==="object"?x as Record<string,unknown>:{};
-const safeError=(error:unknown)=>error instanceof Error&&["account_mismatch","authorization_conflict","invalid_credentials"].includes(error.message)?error.message:"authorization_failed";
+const safeError=(error:unknown)=>error instanceof Error&&["account_mismatch","authorization_conflict","invalid_credentials","replacement_confirmation_failed","duplicate_account"].includes(error.message)?error.message:"authorization_failed";
 
 export class DeviceAuthorization {
   private sessions=new Map<string,Session>();
@@ -27,7 +28,7 @@ export class DeviceAuthorization {
     for(const id of fs.readdirSync(root).filter(v=>/^[a-f0-9-]{36}$/.test(v)).slice(-50)) {
       try {
         const row=JSON.parse(fs.readFileSync(path.join(root,id,"session.json"),"utf8")) as Session;
-        if(row.id!==id || !["authorized_waiting_idle","verifying"].includes(row.status))continue;
+        if(row.id!==id || !(["authorized_waiting_idle","verifying"].includes(row.status) || row.status==="failed"&&row.error==="account_mismatch"))continue;
         this.host.authorizationTarget(row.accountId);this.sessions.set(id,row);
       }catch{/* A damaged private manifest must not modify any live account. */}
     }
@@ -37,13 +38,22 @@ export class DeviceAuthorization {
   private save(s:Session){
     s.updatedAt=new Date().toISOString();
     // Device codes and raw native responses stay in memory, not on disk.
-    const {id,accountId,status,createdAt,updatedAt,expected,error}=s;
+    const {id,accountId,status,createdAt,updatedAt,expected,error,replacement}=s;
     const file=path.join(this.root,id,"session.json"),tmp=file+".tmp";
-    fs.writeFileSync(tmp,JSON.stringify({id,accountId,status,createdAt,updatedAt,expected,error}),{mode:0o600});fs.renameSync(tmp,file);
+    fs.writeFileSync(tmp,JSON.stringify({id,accountId,status,createdAt,updatedAt,expected,error,replacement}),{mode:0o600});fs.renameSync(tmp,file);
   }
   private view(s:Session){return {id:s.id,accountId:s.accountId,status:s.status,createdAt:s.createdAt,updatedAt:s.updatedAt,error:s.error,
     ...(s.status==="awaiting_authorization"?{userCode:s.code,verificationUrl:s.verificationUrl}: {})};}
   status(id:string){const s=this.sessions.get(id);if(!s)throw new Error("Unknown authorization session");return this.view(s);}
+  /** Explicit local-admin confirmation only; ordinary device login still rejects a different account. */
+  async replaceAccount(id:string,replacement:AccountReplacementConfirmation){
+    const s=this.sessions.get(id);
+    if(this.stopped || !s || s.working || s.status!=="failed" || s.error!=="account_mismatch")throw new Error("authorization_conflict");
+    if(!/^[a-f0-9]{64}$/.test(replacement.fromAccountHash) || !/^[a-f0-9]{64}$/.test(replacement.toAccountHash) || replacement.fromAccountHash===replacement.toAccountHash)throw new Error("replacement_confirmation_failed");
+    if([...this.sessions.values()].some(other=>other!==s&&other.accountId===s.accountId&&!["completed","failed"].includes(other.status)))throw new Error("authorization_conflict");
+    s.replacement={...replacement};s.status="authorized_waiting_idle";delete s.error;this.save(s);
+    await this.advance(s);return this.view(s);
+  }
   async start(accountId:string){
     if(this.stopped)throw new Error("Authorization manager stopped");
     const existing=[...this.sessions.values()].find(s=>s.accountId===accountId&&!["completed","failed"].includes(s.status));
@@ -79,7 +89,7 @@ export class DeviceAuthorization {
         await s.native?.stopAndWait();s.native=undefined;
         if(this.stopped)return;
         this.diagnostic(authDiagnostic(s.accountId,"device_authorization","success"));
-        if(await this.host.installAuthorizedCredentials(s.accountId,this.home(s),s.expected)==="busy")return;
+        if(await this.host.installAuthorizedCredentials(s.accountId,this.home(s),s.expected,s.replacement)==="busy")return;
         s.status="verifying";this.save(s);
       }
       if(s.status==="verifying" && !this.stopped) {
@@ -121,6 +131,7 @@ export async function startAuthorizationControl(manager:DeviceAuthorization,sock
           if(input.action==="health")result={ready:true};
           else if(input.action==="start"&&typeof input.accountId==="string")result=await manager.start(input.accountId);
           else if(input.action==="status"&&typeof input.sessionId==="string")result=manager.status(input.sessionId);
+          else if(input.action==="replace"&&typeof input.sessionId==="string"&&typeof input.fromAccountHash==="string"&&typeof input.toAccountHash==="string")result=await manager.replaceAccount(input.sessionId,{fromAccountHash:input.fromAccountHash,toAccountHash:input.toAccountHash});
           else throw new Error();
           socket.end(JSON.stringify({ok:true,data:result})+"\n");
         }catch{socket.end(JSON.stringify({ok:false,error:"authorization_control_failed"})+"\n");}

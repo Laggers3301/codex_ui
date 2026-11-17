@@ -3,10 +3,10 @@ import path from 'node:path';
 import type {ClaudeConversation,ClaudeSessionStorage} from './claudeSessionStorage.js';
 import {locateClaudeHistory} from './claudeSessionStorage.js';
 import {ClaudeStreamAdapter,claudeVisibleItems} from './claudeStreamAdapter.js';
-async function boundedRows(file:string,before=0,cutoff=Infinity,limit=100){
+async function boundedRows(file:string,before=0,cutoff=Infinity,limit=100,maxEndOffset=Infinity){
   const handle=await fs.open(file,'r');try{
-    const stat=await handle.stat(),end=before||stat.size;
-    if(!Number.isSafeInteger(end)||end<0||end>stat.size)throw Error('Invalid Claude history cursor');
+    const stat=await handle.stat(),maxEnd=Math.min(stat.size,maxEndOffset),end=before||maxEnd;
+    if(!Number.isSafeInteger(end)||end<0||end>maxEnd)throw Error('Invalid Claude history cursor');
     const start=Math.max(0,end-512*1024),buffer=Buffer.alloc(end-start);await handle.read(buffer,0,buffer.length,start);
     let text=buffer.toString('utf8'),offset=start;if(start){const split=text.indexOf('\n');if(split<0)throw Error('单条子代理记录过大，原文保留，请使用文件工具分段读取。');offset+=Buffer.byteLength(text.slice(0,split+1));text=text.slice(split+1);}
     const entries:Array<{row:any;offset:number}>=[];let cursor=offset;
@@ -15,7 +15,7 @@ async function boundedRows(file:string,before=0,cutoff=Infinity,limit=100){
     return {rows:selected.map(r=>r.row),before:next,hasOlder:next>0};
   }finally{await handle.close();}
 }
-type FileRecord={id:string;file:string;cutoff:number;inherited:boolean;updatedAt:string};
+export type FileRecord={id:string;file:string;cutoff:number;inherited:boolean;updatedAt:string};
 export async function claudeForkCutoff(file:string):Promise<number|null>{
   try{const page=await boundedRows(file);let latest:number|null=null;
     for(const row of page.rows)if(['user','assistant'].includes(row.type)&&Number.isFinite(Date.parse(row.timestamp)))latest=Math.max(latest??0,Date.parse(row.timestamp));return latest;
@@ -53,7 +53,10 @@ export async function claudeSubagentDirectory(storage:ClaudeSessionStorage,row:C
 }
 export async function claudeSubagentPage(storage:ClaudeSessionStorage,row:ClaudeConversation,id:string,before=0,limit=100){
   const found=(await claudeSubagentFiles(storage,row)).find(r=>r.id===id);if(!found)throw Error('当前会话没有此 Claude 子代理。');
-  const page=await boundedRows(found.file,before,found.cutoff,limit),adapter=new ClaudeStreamAdapter(id,`claude-agent-page:${page.before}`,()=>{});
+  return claudeSubagentReferencePage(found,id,before,limit);
+}
+export async function claudeSubagentReferencePage(found:{file:string;cutoff:number;maxEndOffset?:number},id:string,before=0,limit=100){
+  const page=await boundedRows(found.file,before,found.cutoff,limit,found.maxEndOffset),adapter=new ClaudeStreamAdapter(id,`claude-agent-page:${page.before}`,()=>{});
   for(const record of page.rows)adapter.accept(record);
   return {thread:{id,name:`Claude · ${id}`,turns:[{id:`claude-agent-page:${page.before}`,status:'unknown',items:claudeVisibleItems([...adapter.items.values()],{includeSubagents:true})}]},history:{totalItems:null,returnedItems:page.rows.length,before,nextBefore:page.before,hasOlder:page.hasOlder,nextCursor:page.hasOlder?String(page.before):null}};
 }

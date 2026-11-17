@@ -20,6 +20,16 @@ export interface SubagentThreadRecord {
   runtimeHome: string;
 }
 
+/** Stay within the already-authorized agent's owning runtime, including archives. */
+export async function resolveSubagentHistoryFile(record: Pick<SubagentThreadRecord,'id'|'runtimeHome'>, resolve: (id:string,root:string)=>Promise<string|null>): Promise<{filePath:string;sessionsRoot:string}|null> {
+  for(const folder of ['sessions','archived_sessions']){
+    const sessionsRoot=path.join(record.runtimeHome,folder),filePath=await resolve(record.id,sessionsRoot);
+    // The filename index can retain the pre-archive path for its cache TTL.
+    if(filePath&&(fs.existsSync(filePath)||fs.existsSync(filePath+'.zst')))return {filePath,sessionsRoot};
+  }
+  return null;
+}
+
 export async function readSubagentTelemetry(filePath: string): Promise<{ state: "running" | "completed" | "failed" | "interrupted" | "unknown"; model?: string; reasoningEffort?: string }> {
   const result: Awaited<ReturnType<typeof readSubagentTelemetry>> = { state: "unknown" };
   const handle = await fs.promises.open(filePath, "r");

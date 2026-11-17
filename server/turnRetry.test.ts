@@ -128,10 +128,20 @@ describe("persistent overload retries", () => {
   it('distinguishes a recorded stop request, an unexplained interruption, and a runtime exit',()=>{
     const {queue}=fixture();queue.started('thread','stop');queue.requestStop('admin','thread','stop');queue.interrupted('admin','thread','stop');
     expect(queue.snapshot('admin')[0].error?.source).toBe('user');
+    expect(queue.snapshot('admin')[0].error?.code).toBe('user_stopped');
+    expect(queue.snapshot('admin')[0].job).toBeNull();
     queue.watch('admin','thread',{});queue.started('thread','unknown');queue.interrupted('admin','thread','unknown');
     expect(queue.snapshot('admin')[0].error?.source).toBe('unknown');
     queue.watch('admin','thread',{});queue.started('thread','exit');queue.interrupted('admin','thread','exit',{code:'runtime_terminated',message:'Codex app-server exited (SIGABRT)'});
     expect(queue.snapshot('admin')[0].error).toMatchObject({source:'runtime',code:'runtime_terminated'});
+  });
+  it('preserves a pending user stop across a backend restart without making it retryable', async()=>{
+    const {queue,store,start}=fixture();queue.started('thread','stop');queue.requestStop('admin','thread','stop');queue.close();
+    const restarted=new TurnRetryQueue(store,{start,busy:()=>false,changed:()=>{},tickMs:1_000_000});
+    try {
+      expect(store.getTurnRecoveryState('thread')).toMatchObject({stopRequestedTurnId:'stop',cancelled:true,error:{code:'backend_restarted',source:'backend'},job:null});
+      await restarted.drain();expect(start).not.toHaveBeenCalled();
+    } finally {restarted.close();}
   });
   it('persists explicit dismissal and clears it when a new user turn starts',()=>{
     const {queue,store}=fixture();queue.started('thread','turn');queue.interrupted('admin','thread','turn');

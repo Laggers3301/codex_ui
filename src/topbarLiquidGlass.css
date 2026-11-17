@@ -48,6 +48,10 @@
   --topbar-control-fill:linear-gradient(145deg,rgba(238,240,236,.94),rgba(238,240,236,.82));
 }
 :root[data-theme="light"] .topbar .controls button.topbarGlassControl:is(.warning,.blocked) { --topbar-control-fill:transparent; }
+@media(max-width:720px) {
+  :root[data-theme] .topbar .controls button.topbarGlassControl {--topbar-control-fill:var(--ui-surface-raised);--topbar-backdrop-optics:none;}
+  .topbarOriginalLayer {display:none;}
+}
 @media(prefers-reduced-motion:reduce) {
   .topbar .controls button.topbarGlassControl,.topbar .controls button.topbarGlassControl::after,.topbarOriginalLayer > * { transition:none!important; }
 }

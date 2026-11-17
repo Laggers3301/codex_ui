@@ -1,9 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { HistoryReadScheduler } from './historyReadScheduler.js';
+import { HistoryReadScheduler, assertHistoryHeapHeadroom } from './historyReadScheduler.js';
+import { getHeapStatistics } from 'node:v8';
 
 function gate() { let open!: () => void; const wait = new Promise<void>(resolve => { open = resolve; }); return { wait, open }; }
 
 describe('bounded history reads', () => {
+  it('rejects memory pressure before allocating a history page and admits reads with reserved headroom', () => {
+    const mib = 1024 * 1024, base = getHeapStatistics();
+    expect(() => assertHistoryHeapHeadroom(8 * mib, { ...base, heap_size_limit: 384 * mib, used_heap_size: 330 * mib })).toThrowError(expect.objectContaining({ code: 'memory_pressure', retryable: false }));
+    expect(() => assertHistoryHeapHeadroom(32 * mib, { ...base, heap_size_limit: 768 * mib, used_heap_size: 330 * mib })).not.toThrow();
+  });
   it('does not block a ready page behind another thread waiting for its index', async () => {
     const scheduler = new HistoryReadScheduler(), slow = gate(), order: string[] = [];
     const a = scheduler.run(async () => { await slow.wait; }, async () => { order.push('A'); return 'A'; });

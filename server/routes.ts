@@ -25,7 +25,7 @@ import { LegacyRollbackConflictError } from "./legacyRollback.js";
 import {readableRolloutPath, rolloutLogicalStat, rolloutReadStream, MAX_FULL_HISTORY_BYTES, HistoryMemoryLimitError} from './rolloutStorage.js';
 import { inheritedBillingTurnIds } from "./leaderboardForkUsage.js";
 import { billingLines } from "./billingLines.js";
-import { authenticatedUserFromHeaders, deletedWebUserIds, isDeletedWebUser } from "./auth.js";
+import { authenticatedUserFromHeaders, deletedWebUserIds, isDeletedWebUser, webUserDisplayNames } from "./auth.js";
 import { AppError } from "./appErrors.js";
 import { memberRealName } from "../shared/memberDirectory.js";
 import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
@@ -48,6 +48,7 @@ import {readArchivedThreadIndex} from "./archivedThreadIndex.js";
 import { isProjectLocalHook, listHooksForProject } from "./hookTrust.js";
 import { assertRepositoryWithinProject, createManagedWorktree, discoverGitRepositories, removeManagedWorktree } from "./worktree.js";
 import { locateIndexedThreadItem, readIndexedThreadItem, readIndexedThreadPage, warmThreadIndex } from "./threadEventIndex.js";
+import {displayTransfer,readMigrationDisplay,migrationDisplayItem} from './migrationDisplay.js';
 import { readBranchHistoryItem, readBranchHistoryPage } from "./branchHistory.js";
 import { searchChatThreadHits, searchChatThreads, startChatSearch } from "./chatSearch.js";
 import { listAllCodexThreads, THREAD_LIST_PAGE_SIZE } from "./threadList.js";
@@ -66,7 +67,7 @@ import { importStagedUserHandoff, type ImportedUserHandoff } from "./userHandoff
 import { pushPublicKey, sendUserPush } from "./webPush.js";
 import { pushSubscriptionSchema, validatePushEndpoint } from "./pushProtocol.js";
 import { advanceTrackedQuotaLedger, type TrackedQuotaLedgerAccount } from "./trackedQuotaLedger.js";
-import { configuredSubagentRuntimeHomes, findSubagentDescendant, readSubagentDirectoryPage, subagentsForInheritance } from "./subagentHistory.js";
+import { configuredSubagentRuntimeHomes, findSubagentDescendant, readSubagentDirectoryPage, subagentsForInheritance, resolveSubagentHistoryFile } from "./subagentHistory.js";
 import {freezeInheritedSubagents} from './subagentInheritance.js';
 import {indexedBranchCutoffTime} from './threadEventIndex.js';
 import { executionSettingsOverrides, queueScheduledPrompt, resumeThreadIfUnloaded, ScheduleConflictError, ScheduledTaskStore, type ScheduleRule } from "./scheduledTasks.js";
@@ -74,7 +75,7 @@ import { executionSettingsOverrides, queueScheduledPrompt, resumeThreadIfUnloade
 const execFileAsync = promisify(execFile);
 const uploadRoot = process.env.CODEX_WEB_UPLOAD_TMP_DIR ?? "/tmp/codex_remote_uploads";
 // Default Codex cwd per logged-in user. This prevents generated artifacts from
-// accumulating in the shared home while retaining historical projects.
+// accumulating in /home/example-user while retaining historical shared-home projects.
 const userWorkspaceRoot = process.env.CODEX_WEB_USER_WORKSPACE_ROOT ?? path.join(serverConfig.dataDir, "users");
 const maxPreviewBytes = 2 * 1024 * 1024;
 const defaultThreadHistoryPageSize = 120;
@@ -236,6 +237,7 @@ const threadBranchSchema = z.object({
   targetAccountId: z.string().trim().min(1).max(128).optional(),
   reasoningEffort: effortSchema.optional(),
   operationId: z.string().uuid().optional(),
+  background: z.boolean().optional().default(false),
   archiveToolOutputs: z.boolean().optional().default(false),
   compactToolOutputs: z.boolean().optional().default(false)
 });
@@ -800,6 +802,7 @@ export function filterDeletedLeaderboardUsers(
 
 export function presentLeaderboard(board: PublicCodexLeaderboard): PublicCodexLeaderboard {
   const filtered = filterDeletedLeaderboardUsers(board);
+  const displayNames = webUserDisplayNames();
   const count = board.quotaAccountCount ?? 0;
   const poolPercent = (quota: number | null | undefined): number | null =>
     count > 0 && typeof quota === "number" && Number.isFinite(quota) ? round2(quota / count) : null;
@@ -807,7 +810,7 @@ export function presentLeaderboard(board: PublicCodexLeaderboard): PublicCodexLe
     ...value,
     users: value.users.map(user => ({
       ...user,
-      displayName: memberRealName(user.userId),
+      displayName: displayNames.get(user.userId) ?? memberRealName(user.userId),
       poolQuotaPercent: poolPercent(user.quotaPercent),
       models: user.models.map(model => ({ ...model, poolQuotaPercent: poolPercent(model.quotaPercent) }))
     })).sort((a, b) => (b.poolQuotaPercent ?? -1) - (a.poolQuotaPercent ?? -1)
@@ -1043,6 +1046,30 @@ function loadLeaderboardFileCache(): void {
   }
 }
 
+// The cache is ~50 MB of JSON; stringifying and rewriting it synchronously on every scan that
+// touched any file blocked the event loop for 250+ ms each time. Persist at most once per
+// interval (leading edge immediately, later changes coalesced into one trailing write, plus a
+// final write at process exit). Losing the last few seconds only means those few changed
+// files are summarised again after a restart - the cache is keyed by size+mtime.
+const leaderboardPersistIntervalMs = 30_000;
+let leaderboardPersistTimer: NodeJS.Timeout | null = null, leaderboardLastPersistAt = 0, leaderboardPersistDirty = false;
+function flushLeaderboardFileCache(): void {
+  if (leaderboardPersistTimer) { clearTimeout(leaderboardPersistTimer); leaderboardPersistTimer = null; }
+  if (!leaderboardPersistDirty) return;
+  leaderboardPersistDirty = false; leaderboardLastPersistAt = Date.now();
+  try { persistLeaderboardFileCache(); }
+  catch (error) { leaderboardPersistDirty = true; console.warn(`Unable to persist leaderboard cache: ${error instanceof Error ? error.message : String(error)}`); }
+}
+process.once("exit", flushLeaderboardFileCache);
+function schedulePersistLeaderboardFileCache(): void {
+  leaderboardPersistDirty = true;
+  if (leaderboardPersistTimer) return;
+  const wait = leaderboardLastPersistAt + leaderboardPersistIntervalMs - Date.now();
+  if (wait <= 0) { flushLeaderboardFileCache(); return; }
+  leaderboardPersistTimer = setTimeout(flushLeaderboardFileCache, wait);
+  leaderboardPersistTimer.unref?.();
+}
+
 function persistLeaderboardFileCache(): void {
   fs.mkdirSync(path.dirname(leaderboardFileCachePath), { recursive: true, mode: 0o700 });
   const temporary = `${leaderboardFileCachePath}.${process.pid}.tmp`;
@@ -1060,6 +1087,7 @@ function walkJsonlFiles(root: string): string[] {
   }
   const pending = [root];
   const result: string[] = [];
+  const seen = new Set<string>(); // a .jsonl and its .jsonl.zst twin count once; O(1), not O(n) per file
   while (pending.length) {
     const current = pending.pop()!;
     const entries = fs.readdirSync(current, { withFileTypes: true });
@@ -1069,7 +1097,7 @@ function walkJsonlFiles(root: string): string[] {
         pending.push(nextPath);
       } else if (entry.isFile() && /\.jsonl(?:\.zst)?$/.test(entry.name)) {
         const canonical=nextPath.replace(/\.zst$/,'');
-        if(!result.includes(canonical)) result.push(canonical);
+        if(!seen.has(canonical)){seen.add(canonical);result.push(canonical);}
       }
     }
   }
@@ -1086,7 +1114,7 @@ export function userIdFromSessionCwd(cwd: string | null, isKnownUser?: (userId: 
     const [firstSegment] = path.relative(normalizedRoot, normalizedCwd).split(path.sep);
     return firstSegment?.trim() || null;
   }
-  // Some existing users run Codex directly in a shared home/<login> rather than
+  // Some existing users run Codex directly in /home/example-user/<login> rather than
   // the managed users root. Only trust this layout for a registered login.
   const homeRoot = path.dirname(path.dirname(normalizedRoot));
   if (isKnownUser && normalizedCwd.startsWith(`${homeRoot}${path.sep}`)) {
@@ -1460,7 +1488,9 @@ export async function summarizeLeaderboardFile(
     if (!knownUsers.has(id)) knownUsers.set(id, store.getUser(id) !== null);
     return knownUsers.get(id)!;
   };
-  const lines = billingLines(filePath);
+  // Only these four record kinds are read below; the byte-level pre-filter keeps every other line
+  // (tool results can be megabytes each) from being decoded into a string first.
+  const lines = billingLines(filePath, ['"session_meta"', '"turn_context"', '"token_count"', '"task_started"']);
 
   for await (const line of lines) {
     if (!line.trim()) continue;
@@ -1636,7 +1666,7 @@ async function readCodexLeaderboard(
       cacheChanged = true;
     }
   }
-  if (cacheChanged) persistLeaderboardFileCache();
+  if (cacheChanged) schedulePersistLeaderboardFileCache();
 
   return {
     currentCycle: finalizeLeaderboardScope(currentCycle, {
@@ -2497,6 +2527,7 @@ function renderThreadExport(thread: Record<string, unknown>, project: { name: st
 }
 
 function errorStatus(error: unknown): number {
+  if (error instanceof Error && 'code' in error && error.code === 'memory_pressure') return 503;
   if (error instanceof Error && "code" in error && error.code === "claude_session_rate_limit") return 429;
   if (error instanceof Error && "code" in error && ["claude_weekly_limit", "claude_five_hour_limit"].includes(String(error.code))) return 429;
   if (error instanceof Error && "code" in error && String(error.code).startsWith("migration_")) return 409;
@@ -2809,8 +2840,9 @@ async function readThreadPreferJsonlFallback(threadId: string, bridgeResult: unk
 
 async function readOwnedThreadForList(bridge: CodexBridge, threadId: string): Promise<unknown | null> {
   // The persisted session is both faster and more complete than app-server's
-  // global list recovery for an old thread.
-  const fallbackPath = await findThreadJsonlPathById(threadId);
+  // global list recovery for an old thread. A Claude thread has no Codex rollout; searching
+  // the sessions tree for one only ever came back empty (and cost a full walk per thread).
+  const fallbackPath = getClaudeService(bridge)?.owns(threadId) ? null : await findThreadJsonlPathById(threadId);
   if (fallbackPath) {
     return await readThreadSummaryFromJsonl(fallbackPath, threadId);
   }
@@ -2874,8 +2906,12 @@ async function readOwnedThreadSummariesFromJsonl(ownedThreadIds: Set<string>): P
 const pendingIndexWarm = new Set<string>();
 const lastIndexWarm = new Map<string, number>();
 let backgroundIndexWarmPromise: Promise<void> | null = null;
-function warmOwnedThreadIndexes(ownedThreadIds: Set<string>): void {
+// Claude (ReClaude) threads never have a Codex rollout. Looking one up walks the whole
+// sessions tree (thousands of readdir calls) and always comes back empty, so callers pass a
+// predicate that lets those ids skip the search entirely.
+function warmOwnedThreadIndexes(ownedThreadIds: Set<string>, skip?: (threadId: string) => boolean): void {
   for (const id of ownedThreadIds) {
+    if (skip?.(id)) continue;
     if (Date.now() - (lastIndexWarm.get(id) ?? 0) > 10_000) pendingIndexWarm.add(id);
   }
   if (backgroundIndexWarmPromise) return;
@@ -2915,7 +2951,7 @@ async function filterOwnedThreadList(
       continue;
     }
     const fullThread = await readOwnedThreadForList(bridge, threadId);
-    // Ownership is the access boundary. A legacy session may retain a shared home as
+    // Ownership is the access boundary. A legacy session may retain /home/example-user as
     // its historical cwd after the user's default workspace is moved.
     if (fullThread) {
       byId.set(threadId, listItemSummaryFromThread(fullThread));
@@ -2991,7 +3027,7 @@ function ensureProjectsForUser(store: ProjectStore, userId: string) {
   const rootPath = ensureUserWorkspaceDirectory(userId);
 
   // List the personal workspace first: a newly opened page selects it by
-  // default. Existing projects (including historical shared-home conversations)
+  // default. Existing projects (including historical /home/example-user conversations)
   // are deliberately retained below it.
   const workspace = store.getProjectByRootPath(rootPath, userId) ?? store.createProject({
     name: "我的工作区",
@@ -3197,7 +3233,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     startChatSearch();
     const refresh = () => {
       const ids = new Set(store.listUsers().flatMap(user => store.listVisibleThreadOwnersForUser(user.id).map(owner => owner.threadId)));
-      warmOwnedThreadIndexes(ids);
+      const claude = getClaudeService(bridge);
+      warmOwnedThreadIndexes(ids, claude ? id => claude.owns(id) : undefined);
     };
     refresh();
     searchRefreshTimer = setInterval(refresh, 15_000);
@@ -3316,6 +3353,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     reply.header("Cache-Control", "no-store");
     const service = getClaudeService(bridge);
     if (!service) return reply.code(404).send({ error: "ReClaude 尚未配置。" });
+    await service.refreshNativeUsage(userIdFromRequest(request, store));
     return { data: service.usageStatus(userIdFromRequest(request, store)) };
   });
 
@@ -3403,7 +3441,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const currentThreadAccount = bridge.getKnownThreadAccount(request.query.threadId?.trim());
       return {
         data: {
-          strategy: "highest-remaining-sticky-thread",
+          strategy: "highest-remaining-then-credits-sticky-thread",
           currentThreadAccountId: currentThreadAccount?.id ?? null,
           currentThreadAccountLabel: currentThreadAccount?.label ?? null,
           accounts: snapshots.map((entry) => ({
@@ -4062,9 +4100,16 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         }
         const fast = request.query.fast !== "false" && !archived;
         const visibleOwnedThreadIds=new Set([...ownedThreadIds].filter(id=>!locallyArchivedIds.has(id)));
-        warmOwnedThreadIndexes(visibleOwnedThreadIds);
+        const claudeThreads = getClaudeService(bridge);
+        const isClaudeThread = claudeThreads ? (id: string) => claudeThreads.owns(id) : undefined;
+        warmOwnedThreadIndexes(visibleOwnedThreadIds, isClaudeThread);
         if (fast) {
-          const summaries = await readOwnedThreadSummariesFromJsonl(visibleOwnedThreadIds);
+          // With any Claude thread present this fast path can never complete (it has no Codex
+          // file to summarise) and the list falls through to the app-server path below; do not
+          // spend a full sessions-tree walk per request discovering that again.
+          const summaries = isClaudeThread && [...visibleOwnedThreadIds].some(isClaudeThread)
+            ? null
+            : await readOwnedThreadSummariesFromJsonl(visibleOwnedThreadIds);
           if (summaries) {
             return {
               data: sortThreadsForUser(store, userId, [...summaries, ...(getClaudeService(bridge)?.list(userId, project.id) ?? []).filter(row => visibleOwnedThreadIds.has(row.id))]),
@@ -4199,6 +4244,16 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     }
   });
 
+  app.get<{Params:{id:string;threadId:string}}>("/api/projects/:id/threads/:threadId/tasks",async(request,reply)=>{
+    try{
+      reply.header('Cache-Control','private, no-store');
+      const userId=userIdFromRequest(request,store),project=store.getProject(request.params.id,userId);
+      if(!project)return reply.code(404).send({error:'Project not found.'});
+      if(!store.userCanAccessThread(request.params.threadId,userId,project.id))return reply.code(403).send({error:'Thread is not visible for this logged-in user.'});
+      return claudeService?.owns(request.params.threadId)?claudeService.tasks(userId,request.params.threadId):{data:[],supported:false};
+    }catch(error){return reply.code(errorStatus(error)).send({error:error instanceof Error?error.message:String(error)});}
+  });
+
   app.get<{ Params: { id: string; threadId: string }; Querystring: { view?: string; q?: string; cursor?: string; limit?: string } }>("/api/projects/:id/threads/:threadId/subagents", async (request, reply) => {
     try {
       reply.header("Cache-Control", "no-store");
@@ -4245,10 +4300,11 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId))
         ?? store.getInheritedSubagents(request.params.threadId,userId).find(row=>row.id===request.params.agentThreadId);
       if (!record) return reply.code(404).send({ error: "Subagent thread not found." });
-      const sessionsRoot = path.join(record.runtimeHome, "sessions");
-      const filePath = await findThreadJsonlPathById(record.id, sessionsRoot);
-      if (!filePath) return reply.code(404).send({ error: "Subagent history file not found." });
+      const source = await resolveSubagentHistoryFile(record,findThreadJsonlPathById);
+      if (!source) return reply.code(404).send({ error: "Subagent history file not found." });
+      const {filePath,sessionsRoot}=source;
       const indexedPage = await readIndexedThreadPage(filePath, record.id, {
+        sessionsRoot,
         before: input.before,
         cursor: input.cursor,
         limit: input.limit,
@@ -4276,9 +4332,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const record = findSubagentDescendant(request.params.threadId, request.params.agentThreadId, configuredSubagentRuntimeHomes(request.params.threadId))
         ?? store.getInheritedSubagents(request.params.threadId,userId).find(row=>row.id===request.params.agentThreadId);
       if (!record) return reply.code(404).send({ error: "Subagent thread not found." });
-      const sessionsRoot = path.join(record.runtimeHome, "sessions");
-      const filePath = await findThreadJsonlPathById(record.id, sessionsRoot);
-      const indexedItem = filePath ? await readIndexedThreadItem(filePath, record.id, request.params.itemId,{maxEndOffset:record.maxEndOffset}) : null;
+      const source = await resolveSubagentHistoryFile(record,findThreadJsonlPathById);
+      const indexedItem = source ? await readIndexedThreadItem(source.filePath, record.id, request.params.itemId,{maxEndOffset:record.maxEndOffset}) : null;
       if (!indexedItem) return reply.code(404).send({ error: "Tool output was not found in the thread index." });
       const output = typeof indexedItem.aggregatedOutput === "string"
         ? indexedItem.aggregatedOutput
@@ -4456,6 +4511,22 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       .header("Content-Disposition",'attachment; filename="migration-source.jsonl"').type("application/x-ndjson").send(fs.createReadStream(file));
   });
 
+  app.get<{Params:{id:string;threadId:string;operationId:string}}>("/api/projects/:id/threads/:threadId/branch-status/:operationId",async(request,reply)=>{
+    const userId=userIdFromRequest(request,store),{id,threadId,operationId}=request.params;
+    reply.header('Cache-Control','private, no-store');
+    if(!store.userCanAccessThread(threadId,userId,id))return reply.code(403).send({error:'无权查看此分支任务。'});
+    if(!/^[a-f0-9-]{36}$/i.test(operationId))return reply.code(400).send({error:'分支任务标识无效。'});
+    const progress=historyTransfers?.status(operationId,userId,id,threadId);
+    if(!progress)return reply.code(404).send({error:'分支任务不存在。'});
+    let result:unknown;
+    if(progress.phase==='completed'&&progress.targetThreadId){
+      const response=asRecord(await bridge.request('thread/read',{threadId:progress.targetThreadId,includeTurns:false}));
+      result={data:{thread:{...asRecord(response.thread),configuredModel:progress.model,configuredReasoningEffort:progress.reasoningEffort??'medium'},
+        turn:null,sourceThreadId:threadId,sourceTurnId:progress.sourceTurnId,branchMode:'cross-runtime'}};
+    }
+    return {data:{...progress,...(result?{result}:{})}};
+  });
+
   app.post<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/branch", async (request, reply) => {
     let releaseBranch: (() => void) | undefined;
     try {
@@ -4481,8 +4552,13 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         const targetAccountId = restriction ?? input.targetAccountId;
         if (isReclaudeModel(input.model) && input.targetAccountId) throw new Error("ReClaude 账号由目标模型绑定确定。");
         if (targetAccountId && (!input.model.startsWith("gpt-") || !isAccountPoolBridge(bridge) || !bridge.hasAccount(targetAccountId))) throw new Error("所选 GPT 账号不存在或不支持该模型。");
-        const transfer = asRecord(await historyTransfers.migrate({operationId:input.operationId,sourceThreadId:request.params.threadId,userId,
-          projectId:project.id,targetModel:input.model,targetAccountId,sourceTurnId:input.turnId,targetReasoningEffort:input.reasoningEffort}));
+        const transferInput={operationId:input.operationId,sourceThreadId:request.params.threadId,userId,
+          projectId:project.id,targetModel:input.model,targetAccountId,sourceTurnId:input.turnId,targetReasoningEffort:input.reasoningEffort};
+        if(input.background){
+          await historyTransfers.startBackground(transferInput);
+          return reply.code(202).send({data:{branchPending:true,operationId:input.operationId}});
+        }
+        const transfer = asRecord(await historyTransfers.migrate(transferInput));
         const result=asRecord(await bridge.request("thread/read",{threadId:transfer.threadId,includeTurns:false}));
         return {data:{thread:{...asRecord(result.thread),configuredModel:input.model,configuredReasoningEffort:input.reasoningEffort??"medium"},turn:null,sourceThreadId:request.params.threadId,sourceTurnId:input.turnId,
           branchMode:"cross-runtime",warnings:transfer.warnings,historySourceUrl:transfer.historySourceUrl}};
@@ -4997,7 +5073,9 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       // app-server queue. Prefer it for every existing session, not only huge ones.
       const fallbackPath = await findThreadJsonlPathById(request.params.threadId);
       if (fallbackPath) {
-        const indexedPage = await readBranchHistoryPage(fallbackPath, request.params.threadId, {
+        const transfer=claude?displayTransfer(claude.storage,request.params.threadId,userId):null;
+        const display=transfer?await readMigrationDisplay(claude!.storage,transfer,await readThreadSummaryFromJsonl(fallbackPath,request.params.threadId),input.before,input.limit,fallbackPath):null;
+        const indexedPage = display??await readBranchHistoryPage(fallbackPath, request.params.threadId, {
           before: input.before,
           cursor: input.cursor,
           limit: input.limit,
@@ -5063,7 +5141,9 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const claude=getClaudeService(bridge);
       const timelineItem=store.readTimelineItem(request.params.threadId, request.params.itemId);
       const filePath=claude?.owns(request.params.threadId)?null:await findThreadJsonlPathById(request.params.threadId);
-      const indexedItem=filePath?await readBranchHistoryItem(filePath,request.params.threadId,request.params.itemId,parentId=>store.getThreadOwner(parentId)?.userId===userId):null;
+      const transfer=claude?displayTransfer(claude.storage,request.params.threadId,userId):null;
+      const displayed=transfer?migrationDisplayItem(claude!.storage,transfer,request.params.itemId):null;
+      const indexedItem=displayed??(filePath?await readBranchHistoryItem(filePath,request.params.threadId,request.params.itemId,parentId=>store.getThreadOwner(parentId)?.userId===userId):null);
       const item=indexedItem??timelineItem??(claude?.owns(request.params.threadId)?await claude.historyItem(request.params.threadId,request.params.itemId):null);
       if (!item) return reply.code(404).send({ error: "Tool output was not found in the thread index." });
       const output = typeof item.aggregatedOutput === "string"

@@ -85,7 +85,7 @@ export function ReclaudeAuthorizationDialog({ orgId, onClose, onAuthenticated }:
       <header><h2>重新认证</h2><button type="button" className="taskNotificationIcon" aria-label="关闭重新认证" onClick={close}><X size={16}/></button></header>
       <p>将退出所选共享账号并重新登录，可能暂时中断使用该账号的会话。原历史保留。</p>
       <BranchChoice label="账号" value={selected} onChange={setSelected} disabled={!!active || submitting}
-        options={status?.organizations.map((row, index) => ({value:row.orgId,label:status.organizations.length === 1 ? "ReClaude" : `ReClaude ${index + 1}`})) ?? []}/>
+        options={status?.organizations.map(row => ({value:row.orgId,label:`ReClaude · ${row.label}`})) ?? []}/>
       {!status ? <p role="status">正在读取账号状态…</p> : !status.enabled ? <p role="status">当前服务尚未启用重新认证。</p> : null}
       {operation ? <div className="reclaudeAuthStatus" role="status">
         <strong>{phases[operation.phase]}</strong>

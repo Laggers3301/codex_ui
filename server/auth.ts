@@ -17,6 +17,7 @@ type HeaderValue = string | string[] | undefined;
 type HeadersLike = { cookie?: HeaderValue; authorization?: HeaderValue };
 
 type StoredUser = {
+  displayName?: string;
   salt: string;
   hash: string;
   createdAt: string;
@@ -61,12 +62,32 @@ function ensureAuthDir(): void {
   fs.mkdirSync(authDir(), { recursive: true, mode: 0o700 });
 }
 
+// Auth runs on every request (several times per request). Re-reading the same two small
+// files from disk each time was pure synchronous I/O on the event loop. The raw text is cached
+// per file keyed by mtime+size+inode, so any rewrite - including the local deletion/
+// provisioning commands and atomic rename-replace - is picked up on the very next call.
+// Only the text is cached; callers still parse their own copy and can never share an object.
+const fileTextCache = new Map<string, { key: string; text: string }>();
+function readTextCached(filePath: string): string | null {
+  let info: fs.Stats;
+  try { info = fs.statSync(filePath); } catch { fileTextCache.delete(filePath); return null; }
+  const key = `${info.mtimeMs}:${info.size}:${info.ino}`;
+  const hit = fileTextCache.get(filePath);
+  if (hit?.key === key) return hit.text;
+  let text: string;
+  try { text = fs.readFileSync(filePath, "utf8"); } catch { fileTextCache.delete(filePath); return null; }
+  fileTextCache.set(filePath, { key, text });
+  return text;
+}
+
 function sessionSecret(): string {
   if (process.env.CODEX_WEB_SESSION_SECRET) {
     return process.env.CODEX_WEB_SESSION_SECRET;
   }
-  ensureAuthDir();
   const filePath = path.join(authDir(), "session-secret");
+  const cached = readTextCached(filePath);
+  if (cached !== null) return cached.trim();
+  ensureAuthDir();
   if (!fs.existsSync(filePath)) {
     fs.writeFileSync(filePath, `${randomBytes(32).toString("hex")}\n`, { mode: 0o600 });
   }
@@ -74,12 +95,12 @@ function sessionSecret(): string {
 }
 
 function loadUsers(): UserDb {
-  const filePath = usersFilePath();
-  if (!fs.existsSync(filePath)) {
+  const text = readTextCached(usersFilePath());
+  if (text === null) {
     return { users: {} };
   }
   try {
-    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as UserDb;
+    const parsed = JSON.parse(text) as UserDb;
     return { ...parsed, users: parsed.users && typeof parsed.users === "object" ? parsed.users : {} };
   } catch {
     return { users: {} };
@@ -93,6 +114,15 @@ export function deletedWebUserIds(): ReadonlySet<string> {
 
 export function isDeletedWebUser(userId: string): boolean {
   return deletedWebUserIds().has(userId);
+}
+
+/** Local provisioning names are read on use, including for cached leaderboards. */
+export function webUserDisplayNames(): ReadonlyMap<string, string> {
+  const db = loadUsers();
+  return new Map(Object.entries(db.users).flatMap(([id, user]) => {
+    const name = typeof user?.displayName === "string" ? user.displayName.trim() : "";
+    return name && !Object.hasOwn(db.deletedUsers ?? {}, id) ? [[id, name] as const] : [];
+  }));
 }
 
 function saveUsers(db: UserDb): void {
@@ -236,6 +266,7 @@ export function changeUserPassword(username: string, currentPassword: string, ne
   const now = new Date().toISOString();
   const salt = randomBytes(16).toString("hex");
   db.users[cleanUsername] = {
+    ...db.users[cleanUsername],
     salt,
     hash: passwordHash(nextPassword, salt),
     createdAt: db.users[cleanUsername]?.createdAt ?? now,

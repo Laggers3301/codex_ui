@@ -9,6 +9,6 @@ export function accountHistoryRoots(config: unknown): string[] {
   return accounts.flatMap(account => {
     if (!account || typeof account !== "object") return [];
     const home = (account as { codexHome?: unknown }).codexHome;
-    return typeof home === "string" && path.isAbsolute(home) ? [path.join(home, "sessions")] : [];
+    return typeof home === "string" && path.isAbsolute(home) ? [path.join(home, "sessions"), path.join(home, "archived_sessions")] : [];
   });
 }

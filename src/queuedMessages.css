@@ -1,0 +1,12 @@
+.queuedSubmissionList { position: relative; min-width: 0; }
+.queuedSubmissionStrip.expanded .queuedSubmissionList { max-height: min(36dvh, 320px); overflow-y: auto; overscroll-behavior: contain; }
+.queuedSubmissionStrip.expanded .queuedSubmission { align-items: flex-start; padding-block: 7px; }
+.queuedSubmissionStrip.expanded .queuedSubmission + .queuedSubmission { border-top: 1px solid var(--line); }
+.queuedSubmissionStrip.expanded .queuedSubmissionText { white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; padding-block: 3px; }
+.queuedSubmissionStrip.expanded .queuedSubmissionLabel { padding-top: 4px; }
+.queuedQueueHeader { position: relative; padding: 2px 5px 5px; }
+.queuedSubmissionStrip .queuedQueueToggle { display: inline-flex; flex: none; align-items: center; gap: 3px; width: auto; min-height: 22px; height: auto; padding: 0 3px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: inherit; cursor: pointer; white-space: nowrap; }
+.queuedSubmissionStrip.expanded .queuedQueueToggle > svg { transform: rotate(180deg); }
+.queuedMenuSelection { max-width: min(260px, calc(100vw - 40px)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 5px 9px; color: var(--ui-content-muted); font-size: inherit; }
+.queuedSubmissionStrip.expanded .queuedSubmission :is(.queuedSteerButton,.queuedIconButton) { flex-shrink: 0; }
+@media (max-width: 720px) { .queuedSubmissionStrip.expanded .queuedSubmissionList { max-height: min(32dvh, 280px); } }

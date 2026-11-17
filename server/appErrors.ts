@@ -16,6 +16,7 @@ export class AppError extends Error {
   static from(value: unknown): AppError {
     if (value instanceof AppError) return value;
     const { message: original, code: nativeCode, signature, status } = modelErrorDetails(value);
+    if (nativeCode === 'user_stopped') return new AppError('user_stopped', '已停止本轮回答。', '用户主动停止；已生成的内容保留，未确认的工具结果不会视为成功。', false, 'user');
     if (nativeCode === "claude_five_hour_limit" || nativeCode === "claude_weekly_limit") {
       return new AppError(nativeCode, original, original);
     }

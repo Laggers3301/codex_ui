@@ -21,6 +21,7 @@ import { ProviderTurnProtocol } from "./providerProtocol.js";
 import { validateModelRequest } from "./modelRequestValidation.js";
 import { nativeModelDiscoveryEnabled } from "./nativeModelDiscovery.js";
 import { BranchConflictError } from "./largeThreadFork.js";
+import type {AccountReplacementConfirmation} from "./deviceAuthorization.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -198,26 +199,45 @@ function remainingPercent(limits: unknown): number {
     : -1;
 }
 
+function creditBalance(limits: unknown): number {
+  const root = asRecord(limits);
+  const rateLimits = asRecord(root.rateLimits);
+  const credits = asRecord(Object.keys(rateLimits).length ? rateLimits.credits : root.credits);
+  if (credits.unlimited === true) return Number.POSITIVE_INFINITY;
+  const balance = typeof credits.balance === "number"
+    ? credits.balance
+    : typeof credits.balance === "string" && credits.balance.trim()
+      ? Number(credits.balance)
+      : Number.NaN;
+  return Number.isFinite(balance) && balance >= 0 ? balance : -1;
+}
+
 export interface AccountRoutingCandidate {
   id: string;
   health: "ready" | "degraded" | "starting";
   remainingPercent: number;
+  creditBalance: number;
   activeRequests: number;
   assignedThreadCount: number;
 }
 
 /**
  * Deterministic, side-effect-free account selection used by the live bridge and
- * by policy regression tests. Quota balance is the primary goal; concurrency
- * and existing assignment count only break equal-quota ties.
+ * by policy regression tests. Quota balance is the primary goal. When every
+ * candidate is at zero, credits balance becomes the fallback; concurrency and
+ * existing assignment count only break the remaining ties.
  */
 export function selectAccountCandidate<T extends AccountRoutingCandidate>(accounts: readonly T[]): T {
   if (!accounts.length) throw new Error("The Codex account pool has no routing candidates.");
   const healthy = accounts.filter((account) => account.health !== "degraded");
   const candidates = healthy.length ? healthy : accounts;
+  const allQuotaExhausted = candidates.every((account) => account.remainingPercent === 0);
   return [...candidates].sort((left, right) => {
     const remainingDifference = right.remainingPercent - left.remainingPercent;
     if (remainingDifference) return remainingDifference;
+    if (allQuotaExhausted && left.creditBalance !== right.creditBalance) {
+      return right.creditBalance > left.creditBalance ? 1 : -1;
+    }
     if (left.activeRequests !== right.activeRequests) return left.activeRequests - right.activeRequests;
     return left.assignedThreadCount - right.assignedThreadCount;
   })[0];
@@ -391,7 +411,7 @@ export class AccountPoolBridge extends EventEmitter {
 
   /** Single installation entry. The staging runtime MUST be stopped first.
    * No logout, no overwrite on conflict, and no restart of a busy account. */
-  async installAuthorizedCredentials(accountId: string, stageHome: string, expected: {stamp:number;fingerprint:string|null}): Promise<"busy"|"installed"> {
+  async installAuthorizedCredentials(accountId: string, stageHome: string, expected: {stamp:number;fingerprint:string|null}, confirmation?:AccountReplacementConfirmation): Promise<"busy"|"installed"> {
     // Finish the current read batch before replacing its runtime or cache.
     if(this.accountRefreshInFlight)await this.accountRefreshInFlight;
     const account=this.accountsById.get(accountId);
@@ -411,13 +431,32 @@ export class AccountPoolBridge extends EventEmitter {
       const staged=readAuth(stageHome),tokens=asRecord(staged.tokens);
       if(staged.auth_mode!=="chatgpt" || !tokens.access_token || !tokens.refresh_token || !tokens.account_id || !credentialTiming(stageHome)?.expiresAt || credentialTiming(stageHome)!.expiresAt!<=Date.now())throw new Error("invalid_credentials");
       const old=fs.existsSync(path.join(account.codexHome,"auth.json"))?asRecord(readAuth(account.codexHome).tokens):{};
-      if(old.account_id && old.account_id!==tokens.account_id)throw new Error("account_mismatch");
+      const changesAccount=Boolean(old.account_id && old.account_id!==tokens.account_id);
+      if(changesAccount && !confirmation)throw new Error("account_mismatch");
+      const validateReplacement=()=>{if(confirmation){
+        const hash=(id:unknown)=>createHash("sha256").update(String(id??"")).digest("hex");
+        if(!changesAccount || hash(old.account_id)!==confirmation.fromAccountHash || hash(tokens.account_id)!==confirmation.toAccountHash)throw new Error("replacement_confirmation_failed");
+        for(const other of this.accounts){
+          if(other.id===accountId || other.kind!=="codex-account")continue;
+          let otherId:unknown;
+          try{otherId=asRecord(readAuth(other.codexHome).tokens).account_id;}catch{continue;}
+          if(otherId===tokens.account_id)throw new Error("duplicate_account");
+        }
+      }};
+      validateReplacement();
       const before=this.currentCredentialVersion(account);
       if(before.fingerprint!==expected.fingerprint || before.stamp!==expected.stamp)throw new Error("authorization_conflict");
       await account.bridge.stopAndWait();stopped=true;
       if(this.authRenewalStopped)throw new Error("authorization_conflict");
       const final=this.currentCredentialVersion(account);
       if(final.fingerprint!==expected.fingerprint || final.stamp!==expected.stamp)throw new Error("authorization_conflict");
+      validateReplacement();
+      if(changesAccount){
+        // Retain the previous login privately; never erase history or silently
+        // restore an old refresh-token chain after installing the new account.
+        const backup=path.join(stageHome,"previous-auth.json");
+        fs.writeFileSync(backup,JSON.stringify(readAuth(account.codexHome)),{mode:0o600,flag:"wx"});
+      }
       const file=path.join(stageHome,"auth.json");fs.chmodSync(file,0o600);fs.renameSync(file,path.join(account.codexHome,"auth.json"));
       installedOnDisk=true;
       const installed=this.currentCredentialVersion(account);
@@ -1353,6 +1392,7 @@ export class AccountPoolBridge extends EventEmitter {
       id: account.id,
       health: account.health,
       remainingPercent: remainingPercent(account.cache?.limits),
+      creditBalance: creditBalance(account.cache?.limits),
       activeRequests: account.activeRequests,
       assignedThreadCount: this.assignedThreadCount(account.id)
     })));
@@ -1528,9 +1568,11 @@ export class AccountPoolBridge extends EventEmitter {
     if (requiredMemoryBytes !== undefined) {
       if (!Number.isFinite(requiredMemoryBytes) || requiredMemoryBytes < 0) throw new Error("Invalid branch memory budget.");
       const eligible = (account: AccountRuntime) => {
+        const remaining = remainingPercent(account.cache?.limits);
+        const credits = creditBalance(account.cache?.limits);
         if (account.kind !== "codex-account" || account.health !== "ready" || account.authFailureCode
           || model && account.supportedModels && !account.supportedModels.has(model)
-          || remainingPercent(account.cache?.limits) === 0) return false;
+          || remaining === 0 && credits <= 0) return false;
         const available = account.bridge.getMemoryHeadroom();
         return available !== null && Number.isFinite(available) && available >= requiredMemoryBytes;
       };
@@ -1540,7 +1582,7 @@ export class AccountPoolBridge extends EventEmitter {
         const alternatives = forcedTargetAccountId ? [] : this.accounts.filter(eligible);
         if (!alternatives.length) throw new BranchConflictError("当前没有支持同一模型且内存余量足够的 GPT 账号，已安全停止分支；原会话未修改。");
         const selected = selectAccountCandidate(alternatives.map(account => ({ id: account.id, health: account.health,
-          remainingPercent: remainingPercent(account.cache?.limits), activeRequests: account.activeRequests,
+          remainingPercent: remainingPercent(account.cache?.limits), creditBalance: creditBalance(account.cache?.limits), activeRequests: account.activeRequests,
           assignedThreadCount: this.assignedThreadCount(account.id) })));
         target = this.accountsById.get(selected.id)!;
       }

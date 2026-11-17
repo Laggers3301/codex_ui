@@ -56,10 +56,13 @@ export function isPublicAddress(address: string): boolean {
   return isPublicV6(s);
 }
 
-export function validateBrowserUrl(value: string): URL {
+export function validateBrowserUrl(value: string, privateOrigin?: string): URL {
   let url: URL;
   try { url = new URL(value); } catch { throw new BrowserNetworkError('Invalid URL'); }
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new BrowserNetworkError('Only public HTTP(S) URLs are allowed');
+  // Private exceptions are exact origins only and are supplied by a trusted
+  // per-user server policy, never by a web page or browser client.
+  if (privateOrigin && url.origin === privateOrigin) return url;
   const port = url.port ? Number(url.port) : (url.protocol === 'https:' ? 443 : 80);
   if ((url.protocol === 'http:' && port !== 80) || (url.protocol === 'https:' && port !== 443)) throw new BrowserNetworkError('Target port is not allowed');
   const hostname = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
@@ -73,6 +76,7 @@ type ProxyDependencies = {
   /** Test seam: receives only the selected, already-validated address. */
   connect?: (options: { host: string; port: number; family: number }) => Socket;
   upstreamProxy?: string;
+  privateOrigin?: string;
 };
 
 export async function createBrowserProxy(options: ProxyDependencies = {}): Promise<{ server: string; username: string; password: string; close: () => Promise<void> }> {
@@ -188,13 +192,14 @@ export async function createBrowserProxy(options: ProxyDependencies = {}): Promi
     res.once('close', () => { active = Math.max(0, active - 1); abortUpstream?.(); });
     try {
       if (req.headers.upgrade) return denied(res, 501, 'Upgrade not supported');
-      const u = validateBrowserUrl(req.url || '');
-      const addresses = await resolvePublic(u.hostname.replace(/^\[|\]$/g, ''));
+      const u = validateBrowserUrl(req.url || '', options.privateOrigin);
+      const isPrivateTarget = !!options.privateOrigin && u.origin === options.privateOrigin;
+      const addresses = isPrivateTarget ? [{ address: u.hostname, family: 4 }] : await resolvePublic(u.hostname.replace(/^\[|\]$/g, ''));
       const chosen = addresses[0];
       const headers: import('node:http').OutgoingHttpHeaders = { ...req.headers, host: u.host };
       delete headers['proxy-authorization']; delete headers['proxy-connection'];
       const agent = new Agent({ keepAlive: false });
-      if (egressProxy) {
+      if (egressProxy && !isPrivateTarget) {
         agent.createConnection = (_agentOptions, callback) => {
           void connectPinned(chosen.address, Number(u.port || 80), chosen.family).then(socket => callback!(null, socket), error => callback!(error as Error, null as unknown as Socket));
           return undefined;

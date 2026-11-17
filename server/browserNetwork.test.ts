@@ -32,9 +32,32 @@ describe('browser network URL and address guards', () => {
       expect(() => validateBrowserUrl(url), url).toThrow(BrowserNetworkError);
     }
   });
+  it('permits only the exact explicitly trusted origin', () => {
+    const allowed = 'http://192.168.1.10:5180';
+    expect(validateBrowserUrl(`${allowed}/path?q=1`, allowed).origin).toBe(allowed);
+    for (const url of ['http://192.168.1.10:5181/', 'http://192.168.1.11:5180/', 'http://192.168.1.10/', 'https://192.168.1.10:5180/', 'http://x:pass@192.168.1.10:5180/', 'http://localhost:5180/']) {
+      expect(() => validateBrowserUrl(url, allowed), url).toThrow(BrowserNetworkError);
+      expect(() => validateBrowserUrl(url), url).toThrow(BrowserNetworkError);
+    }
+    expect(() => validateBrowserUrl(`${allowed}/`)).toThrow(BrowserNetworkError);
+  });
 });
 
 describe('authenticated browser proxy', () => {
+  it('uses direct pinned LAN access only on the authorized proxy and never its public egress', async () => {
+    const upstream = createHttpServer((_req, res) => res.end('private-ok'));
+    const upstreamPort = await listen(upstream);
+    const dialed: Array<{host:string;port:number;family:number}> = [];
+    const origin = 'http://192.168.1.10:5180';
+    const proxy = await createBrowserProxy({ privateOrigin: origin, upstreamProxy: 'http://127.0.0.1:1', connect: options => { dialed.push(options); return tcpConnect({host:'127.0.0.1',port:upstreamPort}); } });
+    const ordinary = await createBrowserProxy({ connect: () => { throw new Error('must not dial'); } });
+    try {
+      expect(await proxyRequest(proxy, `${origin}/page`)).toMatchObject({status:200,body:'private-ok'});
+      expect(dialed).toEqual([{host:'192.168.1.10',port:5180,family:4}]);
+      expect((await proxyRequest(proxy, 'http://192.168.1.11:5180/')).status).toBe(400);
+      expect((await proxyRequest(ordinary, `${origin}/`)).status).toBe(400);
+    } finally { await proxy.close(); await ordinary.close(); await closeServer(upstream); }
+  });
   it('authenticates, challenges unsupported clients, forwards via the resolved pinned IP, and strips proxy credentials', async () => {
     let requestHost = '';
     const upstream = createHttpServer((req, res) => { requestHost = req.headers.host || ''; res.end(`ok:${req.url}:${req.headers['proxy-authorization'] || 'clean'}`); });

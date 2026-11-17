@@ -42,7 +42,11 @@ export class TurnRetryQueue {
       if (!turnId) continue;
       state.error = new AppError("backend_restarted", "服务已重新启动，上一轮的执行结果需要核对。", "检测到重启前尚未收尾的请求或轮次。重启原因未记录，不能据此判断工具是否完成。", false, "backend").toPublic();
       state.interruption = { turnId, source: "backend", unresolvedTools: state.activeTurn?.unresolvedTools ?? [], previousTurnId: state.activeTurn?.previousTurnId };
-      state.activeTurn = undefined; state.stopRequestedTurnId = undefined; state.job = null; state.dismissedTurnId = undefined;
+      // A restart does not revoke a stop request. Deployment recovery must not
+      // resume a turn the user stopped immediately before the process exited.
+      state.stopRequestedTurnId = state.stopRequestedTurnId === turnId ? turnId : undefined;
+      if (state.stopRequestedTurnId) state.cancelled = true;
+      state.activeTurn = undefined; state.job = null; state.dismissedTurnId = undefined;
       this.save(state);
     }
     this.timer = setInterval(() => void this.drain(), options.tickMs ?? 2500); this.timer.unref?.();
@@ -106,7 +110,7 @@ export class TurnRetryQueue {
   }
   interrupted(userId: string, threadId: string, turnId: string, error?: unknown) {
     const source = this.store.getTurnRecoveryState(threadId)?.stopRequestedTurnId === turnId ? "user" : "unknown";
-    this.failed(userId, threadId, turnId, error ?? new AppError("turn_interrupted",
+    this.failed(userId, threadId, turnId, error ?? new AppError(source === 'user' ? 'user_stopped' : 'turn_interrupted',
       source === "user" ? "本轮已按你的停止请求中断，可核对结果后继续。" : "本轮已中断，中断来源尚未确认。",
       source === "user" ? "已记录当前轮次的停止请求。部分工具可能已经执行，请先核对结果。" : "运行时报告 interrupted，但未提供可确认的中断来源。", false, source), false);
   }

@@ -68,13 +68,28 @@ export class ChatSearchStore {
       // the WAL read snapshot for the entire potentially long search sync and
       // prevents the history writer from checkpointing. Snapshot only IDs, and
       // fetch each file's current metadata with a completed short read.
-      const ids = this.source.prepare('SELECT thread_id FROM thread_files ORDER BY updated_at DESC').all().map(row => row.thread_id);
+      // Version columns only: thread_files rows also carry a ~19 KB metadata_line, and
+      // materialising it for every thread on every pass (thousands of threads, every
+      // couple of seconds) cost tens of MB of short-lived strings per sync. A thread whose
+      // version matches what is already indexed is skipped from this light snapshot; only
+      // changed threads take the full read below, which re-checks everything as before.
+      // Older source databases predate index_generation; the full read below already treats it as 0.
+      const hasGeneration = this.source.prepare('PRAGMA table_info(thread_files)').all().some(column => column.name === 'index_generation');
+      const versions = this.source.prepare(`SELECT thread_id, updated_at, indexed_offset${hasGeneration ? ', index_generation' : ''} FROM thread_files ORDER BY updated_at DESC`).all();
+      const ids = versions.map(row => row.thread_id);
       const present = new Set(ids);
-      const readFile = this.source.prepare('SELECT * FROM thread_files WHERE thread_id=?');
-      for (const row of this.db.prepare('SELECT thread_id FROM threads').all()) {
+      const indexed = new Map();
+      for (const row of this.db.prepare('SELECT thread_id, source_updated, source_size, source_generation FROM threads').all()) {
+        indexed.set(row.thread_id, row);
         if (!present.has(row.thread_id)) this.clearThread(row.thread_id);
       }
-      for (const id of ids) {
+      let readFile = null; // prepared on first use: an all-unchanged pass never needs it
+      for (const version of versions) {
+        const known = indexed.get(version.thread_id);
+        if (known && known.source_updated === version.updated_at && known.source_size === version.indexed_offset
+          && known.source_generation === (version.index_generation ?? 0)) continue;
+        const id = version.thread_id;
+        readFile ??= this.source.prepare('SELECT * FROM thread_files WHERE thread_id=?');
         const file = readFile.get(id);
         if (!file) continue;
         let previous = this.db.prepare('SELECT * FROM threads WHERE thread_id=?').get(file.thread_id);

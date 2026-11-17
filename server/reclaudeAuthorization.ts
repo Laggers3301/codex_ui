@@ -48,7 +48,7 @@ export class ReclaudeAuthorization {
     const owned = operation?.userId === userId;
     return {
       enabled: !!this.config.reclaudeExecutable,
-      organizations: [...new Set(ids)].filter(id => /^[0-9]+$/.test(id)).map(orgId => {
+      organizations: [...new Set(ids)].filter(id => /^[0-9]+$/.test(id)&&!this.bindings.isOffline(id)).map(orgId => {
         const binding = bindings.find(binding => binding.orgId === orgId);
         return { orgId, label: binding?.label ?? `组织 ${orgId}`, connected: !!binding };
       }),
@@ -59,6 +59,9 @@ export class ReclaudeAuthorization {
   }
   start(userId: string, orgId: string, requestId: string): ReclaudeAuthorizationStatus {
     if (this.closed) throw new AppError("runtime_not_connected", "ReClaude 正在关闭，请稍后重试。");
+    this.bindings.assertOnline(orgId);
+    if(this.config.remoteAccounts?.some(row=>row.userId===userId&&row.orgId===orgId))throw new AppError('runtime_forbidden','金山专用账号只使用已有远端设备，不允许在小主机重新登录、注销或替换设备。');
+    if(this.config.privateAccounts?.some(row=>row.userId===userId&&row.orgId===orgId))throw new AppError('runtime_forbidden','PP专用账号使用隔离认证入口，不通过共享客户端重新登录或注销。');
     if (!/^[0-9]+$/.test(orgId) || !this.bindings.orgIds(userId).includes(orgId)) throw new AppError("runtime_forbidden", "无法重新认证此组织。");
     if (!/^[0-9a-f-]{36}$/i.test(requestId)) throw new AppError("invalid_request", "重新认证请求缺少有效标识。");
     if (this.operation?.id === requestId) {

@@ -90,3 +90,36 @@ describe("forked JSONL recovery", () => {
     expect((recovered.thread.turns as Array<{ items: Array<{ id: string }> }>).flatMap((turn) => turn.items).map((item) => item.id)).toEqual(["prompt"]);
   });
 });
+
+describe("thread summary cache", () => {
+  it("serves an unchanged file from memory, hands out independent copies, and notices every change", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "thread-summary-cache-"));
+    temporaryRoots.push(root);
+    const filePath = path.join(root, "rollout-cache.jsonl");
+    const write = (extra = "") => fs.writeFile(filePath, [
+      { type: "session_meta", payload: { id: "cached", timestamp: "2026-09-16T01:00:00Z", cwd: "/work" } },
+      { type: "event_msg", payload: { type: "user_message", message: `第一条问题${extra}` } }
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+    await write();
+    // Whole-second timestamps survive a utimes round-trip exactly (nanosecond ones would not).
+    await fs.utimes(filePath, 1_700_000_000, 1_700_000_000);
+    const first = await readThreadSummaryFromJsonl(filePath, "cached", root);
+    expect(first.preview).toBe("第一条问题");
+    // Prove the second read never touches the file: overwrite it with same-length different
+    // text and restore the old mtime. Same inode/size/mtime means "unchanged" to the cache.
+    const before = await fs.stat(filePath);
+    await write("").then(() => fs.readFile(filePath, "utf8")).then((text) => fs.writeFile(filePath, text.replace("第一条问题", "第二条问题")));
+    await fs.utimes(filePath, 1_700_000_000, 1_700_000_000);
+    expect((await fs.stat(filePath)).size).toBe(before.size);
+    const second = await readThreadSummaryFromJsonl(filePath, "cached", root);
+    expect(second.preview).toBe("第一条问题");
+    expect(second).toEqual(first);
+    // Mutating one caller's copy never leaks into the next caller.
+    (second as Record<string, unknown>).name = "mutated"; (second.status as Record<string, unknown>).type = "mutated";
+    const third = await readThreadSummaryFromJsonl(filePath, "cached", root);
+    expect(third.name).toBe(first.name); expect((third.status as { type: string }).type).toBe("recoveredFromJsonl");
+    // A rewrite (new size/mtime) is a miss, and the new content is read.
+    await write("（已改）");
+    expect((await readThreadSummaryFromJsonl(filePath, "cached", root)).preview).toBe("第一条问题（已改）");
+  });
+});

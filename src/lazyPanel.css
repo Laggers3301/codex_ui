@@ -1,0 +1,6 @@
+/* Placeholder for lazily loaded panels: occupies the pane at once (no layout jump) and only shows
+   its label if loading is slow, so a warm cache never flashes text. */
+.lazyPaneFallback { flex: 1 1 auto; width: 100%; height: 100%; min-height: 0; display: grid; place-content: center; color: var(--ui-content-muted); font-size: 13px; }
+.lazyPaneFallback > span { opacity: 0; animation: lazyPaneFallbackIn .2s ease .45s forwards; }
+@keyframes lazyPaneFallbackIn { to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .lazyPaneFallback > span { animation-duration: .01ms; } }

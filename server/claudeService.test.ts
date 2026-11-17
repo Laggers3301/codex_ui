@@ -13,11 +13,62 @@ import type { ClaudeIntegrationConfig } from "./claudeBindings.js";
 import { registerRoutes } from "./routes.js";
 import { locateClaudeHistory } from "./claudeSessionStorage.js";
 import * as claudeStorage from "./claudeSessionStorage.js";
+import * as nativeUsage from './claudeNativeUsage.js';
+import {getRuntimeHistoryTransfer} from './runtimeHistoryTransfer.js';
 import { gzipSync } from "node:zlib";
 import * as authentication from "./auth.js";
 import {resumeThreadIfUnloaded} from './scheduledTasks.js';
 
 const cleanup: Array<() => void> = [];
+it('returns a background branch acknowledgement and bounded owned status without holding the POST',async()=>{
+ const f=fixture(),source=await f.start();
+ const base=Object.assign(new EventEmitter(),{request:vi.fn(async()=>({data:[]})),getPendingServerRequests:()=>[]}) as unknown as CodexBridge;
+ const bridge=withClaudeService(base,f.store,f.config),service=getClaudeService(bridge)!;cleanup.push(()=>service.close());
+ const transfers=getRuntimeHistoryTransfer(bridge,f.store)!,operation=randomUUID();
+ const begin=vi.spyOn(transfers,'startBackground').mockResolvedValue();
+ const status=vi.spyOn(transfers,'status').mockReturnValue({phase:'importing',stage:'import',totalMessages:90000,importedMessages:128,displayItems:90000,updatedAt:1,model:'gpt-6-astra',reasoningEffort:undefined,sourceTurnId:'cutoff',error:undefined});
+ const app=Fastify();registerRoutes(app,bridge,f.store,{backgroundIndexing:false});
+ try{
+  const post=await app.inject({method:'POST',url:`/api/projects/${f.project.id}/threads/${source}/branch`,payload:{turnId:'cutoff',model:'gpt-6-astra',operationId:operation,background:true}});
+  expect(post.statusCode).toBe(202);expect(post.json().data).toMatchObject({branchPending:true,operationId:operation});expect(begin).toHaveBeenCalledTimes(1);
+  const url=`/api/projects/${f.project.id}/threads/${source}/branch-status/${operation}`;
+  const pending=await app.inject({method:'GET',url});expect(pending.statusCode).toBe(200);expect(pending.json().data.importedMessages).toBe(128);
+  status.mockReturnValue({phase:'completed',totalMessages:90000,importedMessages:90000,displayItems:90000,updatedAt:2,model:'gpt-6-astra',targetThreadId:source,reasoningEffort:undefined,sourceTurnId:'cutoff',error:undefined,stage:'import'});
+  const completed=await app.inject({method:'GET',url});expect(completed.json().data.result.data.thread.id).toBe(source);
+  expect(completed.json().data.result.data.thread.turns).toEqual([]);
+  const unauthorized=await app.inject({method:'GET',url:`/api/projects/${f.project.id}/threads/not-owned/branch-status/${operation}`});expect(unauthorized.statusCode).toBe(403);
+ }finally{await app.close();}
+});
+it('keeps an administratively offline account history readable but blocks new work and reauthentication',async()=>{
+ const f=fixture();const id=await f.start();await f.turn(id);
+ const before=f.calls.length;
+ f.config.offlineOrgIds=['1'];
+ expect(await f.service.request('thread/read',{threadId:id})).toMatchObject({thread:{id}});
+ expect(await f.service.request('thread/resume',{threadId:id,model:'reclaude-sonnet@1'})).toMatchObject({thread:{id}});
+ await expect(f.turn(id)).rejects.toThrow('管理员下线');
+ expect(f.calls).toHaveLength(before);
+ expect(f.service.profiles('admin').every(p=>!p.model.endsWith('@1'))).toBe(true);
+ expect(f.service.usageStatus('admin').accounts.every(p=>p.orgId!=='1')).toBe(true);
+ expect(()=>f.service.authorization.start('admin','1',randomUUID())).toThrow('管理员下线');
+ f.config.organizationRedirects={'2':'1'};
+ expect(()=>f.service.bindings.resolve('admin','reclaude-opus@2')).toThrow('管理员下线');
+ expect(f.service.bindings.list('admin')).toHaveLength(2);
+});
+it('deduplicates private native usage, caches it and keeps other users untouched',async()=>{
+ const f=fixture();
+ f.config.users!.admin.orgIds=['1'];
+ f.config.privateAccounts=[{userId:'admin',orgId:'2',sourceThreadId:'pp',home:f.home,label:'private',nativeUsageEnabled:true,replacesSharedOrgIds:['1']}];
+ let release!:(text:string)=>void;
+ const query=vi.spyOn(nativeUsage,'readNativeClaudeUsage').mockImplementation(()=>new Promise(resolve=>{release=resolve;}));
+ const first=f.service.refreshNativeUsage('admin'),second=f.service.refreshNativeUsage('admin');
+ expect(query).toHaveBeenCalledTimes(1);
+ release('Current session: 8% used\nCurrent week (all models): 69% used');
+ await Promise.all([first,second]);
+ await f.service.refreshNativeUsage('admin');await f.service.refreshNativeUsage('missing-user');
+ expect(query).toHaveBeenCalledTimes(1);
+ expect(f.service.usageStatus('admin').accounts).toEqual([expect.objectContaining({orgId:'2',state:'available',windows:expect.arrayContaining([expect.objectContaining({percent:69,kind:'seven_day'})])})]);
+ expect(f.service.usageStatus('missing-user').accounts).toEqual([]);
+});
 afterEach(() => { cleanup.splice(0).reverse().forEach(fn => fn()); vi.restoreAllMocks(); });
 function fixture(rateLimitInfo?: Record<string,unknown>, options: {shared?:boolean;weeklyCachePercent?:number} = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "claude-service-"));
@@ -65,6 +116,51 @@ function fixture(rateLimitInfo?: Record<string,unknown>, options: {shared?:boole
   return {home,cwd,project,store,service,config,rootA,rootB,binding,events,calls,start,turn,runtimeFactory};
 }
 describe("Claude conversation switching",()=>{
+  it('lazily switches only the authorized PP to its replacement without creating a new web conversation',async()=>{
+    const f=fixture(),id=await f.start();await f.turn(id);
+    const before={...f.service.storage.get(id)!};
+    f.service.storage.save({...before,privateSourceThreadId:'pp'});
+    const source=locateClaudeHistory(before.nativeSessionId,[f.rootA])!,bytes=fs.readFileSync(source);
+    f.config.users!.admin.orgIds=[];
+    f.config.privateAccounts=[{userId:'admin',orgId:'2',sourceThreadId:'pp',home:f.home,label:'Max',replacesPrivateOrgIds:['1']}];
+    const opened=await f.service.request('thread/resume',{threadId:id,excludeTurns:true}) as any;
+    expect(opened.thread.configuredModel).toBe('reclaude-sonnet@2');
+    expect(f.service.storage.get(id)?.nativeSessionId).toBe(before.nativeSessionId);expect(f.calls).toHaveLength(1);
+    await expect(f.service.request('thread/fork',{threadId:id,model:'reclaude-sonnet@2'})).rejects.toThrow(/PP专用设备/);
+    await f.turn(id);
+    const next=f.service.storage.get(id)!;
+    expect(next).toMatchObject({id,userId:'admin',orgId:'2',model:'reclaude-sonnet@2',privateSourceThreadId:'pp',parentSessionId:before.nativeSessionId});
+    expect(next.nativeSessionId).not.toBe(before.nativeSessionId);expect(fs.readFileSync(source)).toEqual(bytes);
+    expect(f.service.storage.list('admin',f.project.id)).toHaveLength(1);expect(f.service.history(id).thread.turns).toHaveLength(2);
+    expect(f.calls[1].options.resume).toBe(next.nativeSessionId);
+    await f.turn(id);expect(f.service.storage.get(id)?.nativeSessionId).toBe(next.nativeSessionId);
+  });
+  it('does not migrate an unrelated conversation through a private org replacement',async()=>{
+    const f=fixture(),id=await f.start();await f.turn(id);const before={...f.service.storage.get(id)!};
+    f.config.users!.admin.orgIds=[];
+    f.config.privateAccounts=[{userId:'admin',orgId:'2',sourceThreadId:'pp',home:f.home,label:'Max',replacesPrivateOrgIds:['1']}];
+    await expect(f.turn(id)).rejects.toThrow(/专用设备仅允许/);
+    expect(f.service.storage.get(id)).toEqual(before);expect(f.calls).toHaveLength(1);
+  });
+  it('persists an immediate user stop without starting the deferred native query', async () => {
+    const f = fixture(), id = await f.start();
+    const result = await f.service.request('turn/start', { threadId: id, input: [{ type: 'text', text: 'stop fixture' }] }) as any;
+    await f.service.request('turn/interrupt', { threadId: id, turnId: result.turn.id });
+    await vi.waitFor(() => expect(f.service.storage.turn(result.turn.id)?.status).toBe('interrupted'));
+    expect(f.service.storage.turn(result.turn.id)).toMatchObject({ error: { code: 'user_stopped', source: 'user', retryable: false } });
+    expect(f.calls).toHaveLength(0);
+    await f.turn(id);expect(f.calls).toHaveLength(1);
+    expect(f.service.storage.turn(result.turn.id)).toMatchObject({ error: { code: 'user_stopped', source: 'user' } });
+  });
+  it('rejects standalone creation and shared reauthorization of a thread-scoped private account',async()=>{
+    const f=fixture();
+    f.config.privateAccounts=[{userId:'admin',orgId:'3',sourceThreadId:'only-source',home:f.home,label:'PP only'}];
+    f.binding('33',3,'private-account');
+    await expect(f.service.request('thread/start',{userId:'admin',projectId:f.project.id,cwd:f.cwd,model:'reclaude-opus@3'})).rejects.toThrow(/不能新建/);
+    expect(f.service.storage.quota().used).toBe(0);
+    expect(()=>f.service.authorization.start('admin','3',randomUUID())).toThrow(/隔离认证/);
+    expect(f.service.profiles('other').some(p=>p.model.endsWith('@3'))).toBe(false);
+  });
   it('pages a completed oversized turn from durable items without full-turn reads or a live journal',async()=>{
     const f=fixture(),id=await f.start(),older=randomUUID(),turnId=randomUUID();
     f.service.storage.saveTurn(id,{id:older,status:'completed',items:[{id:'old-reply',type:'agentMessage',text:'上一轮回答'}]});
@@ -419,10 +515,13 @@ describe("Claude conversation switching",()=>{
   it("branches to a different organization entirely offline, inherits full UI history and resumes only the new native id",async()=>{
     const f=fixture(), id=await f.start(), first=await f.turn(id);
     const parent=f.service.storage.get(id)!;
+    parent.nativeTasks=[{id:'parent-task',kind:'agent',description:'父会话的后台任务',background:true,status:'running'}];f.service.storage.save(parent);
     const refreshCalls=vi.mocked(f.service.bindings.refresh).mock.calls.length;
     const result=await f.service.request("thread/fork",{threadId:id,model:"reclaude-sonnet@2",lastTurnId:first}) as any;
     expect(vi.mocked(f.service.bindings.refresh).mock.calls).toHaveLength(refreshCalls);
     const child=f.service.storage.get(result.thread.id)!;
+    expect(child.nativeTasks).toBeUndefined();expect(f.service.tasks('admin',child.id).data).toEqual([]);
+    expect(f.service.storage.get(id)?.nativeTasks?.[0].id).toBe('parent-task');
     expect(child.nativeSessionId).not.toBe(parent.nativeSessionId); expect(child.orgId).toBe("2");
     expect(f.calls).toHaveLength(1);
     expect(f.service.history(child.id).thread.turns[0].id).toBe(first);
@@ -488,6 +587,17 @@ describe("Claude conversation switching",()=>{
       expect((await app.inject({method:"POST",url:"/api/reclaude/authorization/start",payload:{orgId:"999",requestId:randomUUID()}})).statusCode).toBe(403);
       expect((await app.inject({method:"POST",url:"/api/reclaude/authorization/start",headers:{"sec-fetch-site":"cross-site"},payload:{orgId:"1",requestId:randomUUID()}})).statusCode).toBe(403);
       expect((await app.inject({method:"POST",url:"/api/reclaude/authorization/cancel",payload:{id:randomUUID()}})).statusCode).toBe(403);
+      const taskConversation=service.storage.get(id)!;
+      taskConversation.nativeTasks=[{id:'owned-task',kind:'shell',description:'后台测试',status:'running',background:true,runId:'private-run',toolUseId:'private-call',summary:'任务摘要'},
+        {id:'foreground-task',kind:'shell',description:'前台命令',status:'running',background:false}];
+      service.storage.save(taskConversation);
+      const tasks=await app.inject({method:'GET',url:`/api/projects/${f.project.id}/threads/${id}/tasks`});
+      expect(tasks.statusCode).toBe(200);expect(tasks.headers['cache-control']).toContain('no-store');
+      expect(tasks.json()).toMatchObject({supported:true,data:[{id:'owned-task',description:'后台测试',status:'unknown',summary:'任务摘要'}]});
+      expect(tasks.json().data).toHaveLength(1);expect(tasks.body).not.toContain('private-run');expect(tasks.body).not.toContain('private-call');
+      expect(()=>service.tasks('outsider',id)).toThrow('其他用户');
+      f.store.ensureUser('tasks-outsider');const taskUser=vi.spyOn(authentication,'authenticatedUserFromHeaders').mockReturnValue('tasks-outsider');
+      try{const denied=await app.inject({method:'GET',url:`/api/projects/${f.project.id}/threads/${id}/tasks`});expect([403,404]).toContain(denied.statusCode);expect(denied.body).not.toContain('任务摘要');}finally{taskUser.mockRestore();}
       const archiveFile=path.join(service.config.storageDirectory,"fixture-tools.gz"),archiveBody=gzipSync('full-native-tool-record\n');fs.writeFileSync(archiveFile,archiveBody,{mode:0o600});
       const conversation=service.storage.get(id)!;conversation.toolOutputArchive={path:archiveFile,summary:{version:1,threadId:id,sourceThreadId:id,keptRecentTurnIds:[],archivedRecords:1,archivedBytes:24,originalBranchBytes:200000000,branchBytes:1000,archiveBytes:archiveBody.length,createdAt:new Date().toISOString()}};service.storage.save(conversation);
       const attachment=await app.inject({method:"GET",url:`/api/projects/${f.project.id}/threads/${id}/tool-output-archive`});expect(attachment.statusCode).toBe(200);expect(attachment.json().data).toMatchObject({threadId:id,archivedRecords:1});expect(JSON.stringify(attachment.json())).not.toContain(archiveFile);

@@ -3,7 +3,7 @@
 .composerAmbientGlow {
   position: absolute;
   inset: auto 0 0;
-  height: 40%;
+  height: var(--composer-glow-height,40%);
   z-index: 0;
   overflow: hidden;
   pointer-events: none;
@@ -16,7 +16,7 @@
   opacity: 0;
   transition: opacity 1100ms cubic-bezier(.4, 0, .2, 1);
 }
-.composerAmbientGlow[data-active="true"] { opacity: 1; transition-duration: 680ms; }
+.composerAmbientGlow[data-active="true"] { opacity: var(--composer-glow-opacity,1); transition-duration: 680ms; }
 .composerAmbientGlowField {
   position: absolute;
   inset-inline: 0;
@@ -45,6 +45,9 @@
 .composerAmbientGlow[data-mode="welcome"] .composerAmbientGlowField {
   -webkit-mask-image: radial-gradient(ellipse 110% 92% at 50% 100%, #000 12%, #000000a6 43%, transparent 88%);
   mask-image: radial-gradient(ellipse 110% 92% at 50% 100%, #000 12%, #000000a6 43%, transparent 88%);
+}
+@media(max-width:720px) {
+  .composerAmbientGlow {display:none;}
 }
 @media (prefers-reduced-motion: reduce) {
   .composerAmbientGlow, .composerAmbientGlowCanvas, .composerAmbientGlowField { transition-duration: 160ms !important; }

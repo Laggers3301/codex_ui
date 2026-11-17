@@ -14,6 +14,7 @@ import {claudeMessageUsage,type ClaudeContextSnapshot} from './claudeContextUsag
 import {CLAUDE_HISTORY_INSTRUCTIONS,type ClaudeHistoryReader} from './claudeHistoryRecall.js';
 import { claudeQuestions, claudeQuestionAnswer } from "./claudeUserInput.js";
 import { assertClaudeExecutionAllowed, claudeToolPolicyDenial, enforceClaudeToolPolicy, CLAUDE_EXECUTION_INSTRUCTIONS, type ClaudeExecutionOrigin } from "./claudeExecutionPolicy.js";
+import {startRemoteClaudeRelay,type RemoteClaudeConfig} from './remoteClaudeRelay.js';
 
 /** Supplied by a trusted, server-side binding registry after live verification.
  * This stage deliberately has no HTTP endpoint or environment switch that can
@@ -25,6 +26,9 @@ export interface VerifiedClaudeBinding {
   workspaceRoot: string;
   verifiedModels: Readonly<Record<string, string>>;
   configRoot?: string;
+  remote?:RemoteClaudeConfig;
+  privateHome?:string;
+  restrictedSourceThreadId?:string;
 }
 export interface ClaudeTurnInput {
   documentReader?:(file:string,offset?:number)=>Promise<unknown>;
@@ -46,6 +50,7 @@ export interface ClaudeTurnInput {
   forkSession?: boolean;
   collaborationMode?: "plan" | "default";
   historyReader?:ClaudeHistoryReader;
+  privateSourceThreadId?:string;
 }
 export type ClaudeQuery = AsyncIterable<SDKMessage> & { close(): void;send?(content:any[],id:string):Promise<void>;mcpServerStatus?():Promise<Array<{name:string;status:string}>> };
 export type ClaudeQueryFactory = (prompt: string, options: Options, historyReader?:ClaudeHistoryReader,content?:any[],documentReader?:ClaudeTurnInput['documentReader'],initialMessageId?:string) => Promise<ClaudeQuery>;
@@ -115,6 +120,7 @@ export class ClaudeRuntime extends EventEmitter {
   private active = new Map<string, { controller: AbortController; query?: ClaudeQuery;ready?:Promise<ClaudeQuery>;stopReason?: string | AppError;turnId:string;adapter:ClaudeStreamAdapter;pendingSteers:Set<string>;steers:Map<string,{fingerprint:string;promise:Promise<unknown>}> }>();
   private sessions = new Map<string, string>();
   private pending = new Map<string, PendingApproval>();
+  private pendingInterrupts = new Map<string, string | AppError | undefined>();
 
   constructor(private binding: VerifiedClaudeBinding | null = null, private factory: ClaudeQueryFactory = nativeQuery) { super(); }
 
@@ -133,6 +139,7 @@ export class ClaudeRuntime extends EventEmitter {
   async runTurn(input: ClaudeTurnInput): Promise<void> {
     assertClaudeExecutionAllowed(input);
     const binding = this.ownedBinding(input.userId);
+    if(binding.restrictedSourceThreadId&&input.privateSourceThreadId!==binding.restrictedSourceThreadId)throw new AppError('runtime_forbidden','专用设备仅允许已授权的PP接续分支。');
     const nativeModel = Object.hasOwn(binding.verifiedModels, input.model) ? binding.verifiedModels[input.model] : undefined;
     if (!isReclaudeModel(input.model) || !nativeModel) throw new AppError("unsupported_model", "此账号尚未验证所选 Claude 模型。");
     if (!input.prompt.trim()) throw new Error("Prompt is required.");
@@ -149,6 +156,11 @@ export class ClaudeRuntime extends EventEmitter {
     const adapter = new ClaudeStreamAdapter(input.threadId, input.turnId, event => this.emit("notification", event));
     const state:NonNullable<ReturnType<typeof this.active.get>>={controller,turnId:input.turnId,adapter,pendingSteers:new Set(),steers:new Map()};
     this.active.set(input.threadId, state);
+    if (this.pendingInterrupts.has(input.threadId)) {
+      state.stopReason = this.pendingInterrupts.get(input.threadId);
+      this.pendingInterrupts.delete(input.threadId);
+      controller.abort();
+    }
     const tasks=new ClaudeTaskLedger();
     const usageTotals:Record<string,number>={},seenResults=new Set<string>();let nativeResults=0,thinkingTokens=0,thinkingObserved=false;
     const fullAccessNoAsk=input.sandbox==='danger-full-access'&&input.approvalPolicy==='never'&&input.collaborationMode!=='plan';
@@ -195,11 +207,18 @@ export class ClaudeRuntime extends EventEmitter {
     };
     adapter.start();
     let contextSnapshot:ClaudeContextSnapshot|null=null,mcpObserved=false;
+    let remoteRelay:Awaited<ReturnType<typeof startRemoteClaudeRelay>>|undefined;
     try {
+      if (controller.signal.aborted) { adapter.finish('interrupted', state.stopReason); return; }
       const env = { ...process.env };
       // The bound wrapper supplies Claude auth. Do not forward another provider's
       // backend credentials (or an unrelated inherited Anthropic login) to tools.
       for (const key of Object.keys(env)) if (/^(?:CODEX_WEB_|OPENAI_|ARK_|MIMO_|ANTHROPIC_(?:API_KEY|AUTH_TOKEN|BASE_URL)$)/.test(key)) delete env[key];
+      if(binding.privateHome)env.HOME=binding.privateHome;
+      if(binding.remote){
+        remoteRelay=await startRemoteClaudeRelay(binding.remote,{userId:input.userId,sourceThreadId:input.privateSourceThreadId!,turnId:input.turnId});
+        Object.assign(env,{ANTHROPIC_BASE_URL:remoteRelay.url,ANTHROPIC_API_KEY:remoteRelay.secret,CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:'1'});
+      }
       state.ready = this.factory(input.prompt, {
         cwd, model: nativeModel,
         ...(input.effort?{effort:input.effort}:{}),
@@ -232,7 +251,7 @@ export class ClaudeRuntime extends EventEmitter {
         // Preserve Claude Code's native tools, skills, CLAUDE.md and MCP config.
         systemPrompt: { type: "preset", preset: "claude_code", append: responseLanguageInstructions+'\n\n'+CLAUDE_EXECUTION_INSTRUCTIONS+(input.historyReader?'\n'+CLAUDE_HISTORY_INSTRUCTIONS:'')+'\n联网优先使用可用的 WebSearch/WebFetch；抓取失败时可使用 codex_browser 浏览器工具。网页 TLS、站点拒绝或工具失败，不代表所有联网能力都不可用。不得关闭 TLS 校验。DOCX优先使用codex_documents.read_docx分页读取正文，无需pandoc；提取正文不等于已读取图片或版式。' },
         tools: { type: "preset", preset: "claude_code" },
-        settingSources: ["user", "project", "local"],
+        settingSources: binding.remote?[]:["user", "project", "local"],
         ...(input.resumeSessionId ? { resume: input.resumeSessionId, forkSession: input.forkSession ?? false }
           : this.sessions.has(input.threadId) ? { resume: this.sessions.get(input.threadId) } : {}),
         extraArgs: {
@@ -265,7 +284,7 @@ export class ClaudeRuntime extends EventEmitter {
           this.emit("rateLimit", message);
           if (controller.signal.aborted) break;
         }
-        if (message.type === "assistant") this.emit("nativeCheckpoint", { messageId: message.uuid });
+        if (message.type === "assistant" && !envelope.parent_tool_use_id) this.emit("nativeCheckpoint", { messageId: message.uuid });
         if(envelope.type==='result'&&envelope.terminal_reason==='aborted_streaming'&&state.pendingSteers.size){
           this.emit('notification',{method:'runtime/claudeSteerPending',params:{threadId:input.threadId,turnId:input.turnId}});
           continue;
@@ -293,6 +312,7 @@ export class ClaudeRuntime extends EventEmitter {
     } finally {
       // Termination must release callbacks waiting for UI approval.
       controller.abort();
+      remoteRelay?.close();
       state.query?.close();
       if(tasks.pending.length){tasks.stop();this.emit('notification',{method:'runtime/claudeTasks',params:{threadId:input.threadId,turnId:input.turnId,tasks:tasks.snapshot()}});}
       this.active.delete(input.threadId);
@@ -342,6 +362,7 @@ export class ClaudeRuntime extends EventEmitter {
   interrupt(userId: string, threadId: string, reason?: string | AppError): void {
     this.ownedBinding(userId);
     const state = this.active.get(threadId);
+    if (!state) { this.pendingInterrupts.set(threadId, reason); return; }
     if (state && reason) state.stopReason = reason;
     state?.controller.abort();
     state?.query?.close();

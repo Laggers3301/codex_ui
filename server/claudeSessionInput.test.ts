@@ -25,3 +25,27 @@ it('accepts a completed structured Agent result and does not report an absent ta
   ledger.update({type:'system',subtype:'background_tasks_changed',tasks:[]});expect(ledger.pending).toHaveLength(0);expect(ledger.snapshot()[0].status).toBe('unknown');
   ledger.update({type:'user',tool_use_result:{agentId:'a',status:'completed'}});expect(ledger.snapshot()[0].status).toBe('completed');
 });
+it('retains bounded progress and a final summary without stale frames reviving a task',()=>{
+  const ledger=new ClaudeTaskLedger();
+  ledger.update({type:'system',subtype:'task_started',task_id:'shell',run_id:'002',task_type:'local_bash',description:'运行测试',parent_task_id:'agent',is_backgrounded:true});
+  ledger.update({type:'system',subtype:'task_progress',task_id:'shell',run_id:'002',description:'运行测试',last_tool_name:'Bash',summary:'正在测试',usage:{total_tokens:120,tool_uses:2,duration_ms:2000}});
+  expect(ledger.snapshot()[0]).toMatchObject({kind:'shell',parentTaskId:'agent',summary:'正在测试',lastToolName:'Bash',usage:{totalTokens:120,toolUses:2,durationMs:2000}});
+  ledger.update({type:'system',subtype:'task_notification',task_id:'shell',run_id:'002',status:'completed',summary:'全部通过'});
+  ledger.update({type:'system',subtype:'task_progress',task_id:'shell',run_id:'002',summary:'晚到的进度'});
+  ledger.update({type:'system',subtype:'task_notification',task_id:'shell',run_id:'001',status:'failed',summary:'旧运行失败'});
+  expect(ledger.snapshot()[0]).toMatchObject({status:'completed',summary:'全部通过'});
+  ledger.update({type:'system',subtype:'task_started',task_id:'shell',run_id:'003',task_type:'local_bash',description:'重新测试',is_backgrounded:true});
+  expect(ledger.snapshot()[0]).toMatchObject({status:'running',runId:'003',description:'重新测试'});
+  expect(ledger.snapshot()[0].summary).toBeUndefined();
+});
+it('does not turn ambient progress into a user task and retains the identity of ended background work',()=>{
+  const ledger=new ClaudeTaskLedger();
+  ledger.update({type:'system',subtype:'task_started',task_id:'watcher',ambient:true});
+  ledger.update({type:'system',subtype:'task_progress',task_id:'watcher',summary:'不可展示'});
+  expect(ledger.snapshot()).toEqual([]);
+  ledger.update({type:'system',subtype:'task_started',task_id:'shell',task_type:'local_bash',is_backgrounded:true});
+  ledger.update({type:'system',subtype:'background_tasks_changed',tasks:[]});
+  expect(ledger.snapshot()[0]).toMatchObject({background:false,wasBackground:true,status:'unknown'});
+  ledger.update({type:'system',subtype:'task_notification',task_id:'shell',status:'completed',summary:'x'.repeat(5000)});
+  expect(ledger.snapshot()[0].summary).toHaveLength(4096);
+});

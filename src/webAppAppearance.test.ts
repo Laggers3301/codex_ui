@@ -11,6 +11,11 @@ it('updates document and browser chrome together when toggling explicit themes',
  expect(doc.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')?.getAttribute('content')).toBe('default');
  syncWebAppAppearance('dark',doc);
  expect(doc.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')?.getAttribute('content')).toBe('black-translucent');
+ syncWebAppAppearance('dark',doc,true);
+ expect(doc.querySelector('meta[name="theme-color"]')?.getAttribute('content')).toBe('#000');
+ expect(doc.documentElement.style.backgroundColor).toBe('rgb(0, 0, 0)');
+ syncWebAppAppearance('light',doc,true);
+ expect(doc.querySelector('meta[name="theme-color"]')?.getAttribute('content')).toBe('#fff');
  syncWebAppAppearance('light',doc);
  expect(doc.querySelectorAll('meta[name="theme-color"]')).toHaveLength(1);
  expect(doc.querySelectorAll('meta[name="apple-mobile-web-app-status-bar-style"]')).toHaveLength(1);
