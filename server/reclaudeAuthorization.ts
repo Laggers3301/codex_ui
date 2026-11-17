@@ -21,6 +21,30 @@ const messages: Record<string, string> = {
   invalid_configuration: "ReClaude 登录程序尚未正确配置。"
 };
 
+function organizationReadError(error: unknown): string {
+  const failure = error && typeof error === "object"
+    ? error as { code?: unknown; message?: unknown; stdout?: unknown; stderr?: unknown; killed?: boolean }
+    : {};
+  // Classify locally; command output can contain private device information.
+  // Only fixed messages are returned to the browser.
+  const detail = [failure.message, failure.stdout, failure.stderr]
+    .filter((value): value is string => typeof value === "string").join("\n");
+  if (/device_revoked|此设备已被解绑/i.test(detail)) {
+    return "ReClaude 设备授权已失效，请选择“重新认证已有组织”，完成认证后再刷新列表。";
+  }
+  if (/\b401\b|unauthorized|not logged in|no device|未登录|尚未登录/i.test(detail)) {
+    return "ReClaude 尚未登录或登录已失效，请先完成组织认证，再刷新列表。";
+  }
+  if (["ENOENT", "EACCES", "EPERM"].includes(String(failure.code))
+    || /permission denied|operation not permitted|read-only file system/i.test(detail)) {
+    return "ReClaude 客户端未能启动，请检查服务配置、命令路径和目录权限。";
+  }
+  if (failure.code === "ETIMEDOUT" || failure.killed && failure.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+    return "读取 ReClaude 组织列表超时，请检查网络和客户端状态后重试。";
+  }
+  return "读取 ReClaude 组织列表失败，请检查客户端登录和网络后重试；也可输入组织编号进行绑定。";
+}
+
 export class ReclaudeAuthorization {
   private discovered: Array<{ orgId: string; label: string; bound: boolean; current: boolean }> = [];
   private organizationError?: string;
@@ -55,19 +79,24 @@ export class ReclaudeAuthorization {
     this.discovery ??= (async () => {
       const release = this.lifecycle.acquireRun();
       try {
-        const env: NodeJS.ProcessEnv = { ...process.env, HOME: this.config.home };
+        const env: NodeJS.ProcessEnv = { ...process.env, HOME: this.config.home, RECLAUDE_LANG: "en" };
         delete env.RECLAUDE_ORG; delete env.CLAUDE_CONFIG_DIR;
         const result = await promisify(execFile)(this.config.reclaudeExecutable!, ["org"], { env, timeout: 30_000, maxBuffer: 256 * 1024 });
         // rec org returns tab-separated rows. Never pass its raw output or
         // device files to the browser; only organization metadata is retained.
         const rows = result.stdout.replace(/\x1b\[[0-9;]*m/g, "").split(/\r?\n/).flatMap(line => {
-          const match = line.match(/^\s*(\*)?\s*(\d+)\t([^\t]+)\t[^\t]+\t[^\t]+\t(bound|not bound)\s*$/);
-          return match ? [{ orgId: match[2], label: match[3].trim().slice(0, 100), current: !!match[1], bound: match[4] === "bound" }] : [];
+          const match = line.match(/^\s*(\*)?\s*(\d+)\t([^\t]*)\t[^\t]*\t[^\t]*\t(bound|not bound|已绑定|未绑定)\s*$/i);
+          return match ? [{ orgId: match[2], label: match[3].trim().slice(0, 100) || `组织 ${match[2]}`, current: !!match[1], bound: /^(bound|已绑定)$/i.test(match[4]) }] : [];
         });
-        if (!rows.length) throw new Error("No recognized organizations");
+        if (!rows.length) {
+          this.organizationError = /No organizations available\.|没有可用组织。/i.test(result.stdout)
+            ? "当前账号没有可列出的组织，可输入组织编号进行绑定。"
+            : "ReClaude 已返回结果，但未识别组织列表格式，请检查客户端版本；也可输入组织编号进行绑定。";
+          return;
+        }
         this.discovered = rows; this.organizationError = undefined;
-      } catch {
-        this.organizationError = "暂未取得最新组织列表，可重试刷新，或输入组织编号进行绑定。";
+      } catch (error) {
+        this.organizationError = organizationReadError(error);
       } finally { release(); this.discovery = undefined; }
     })();
     try { await this.discovery; } finally { this.discovery = undefined; }
