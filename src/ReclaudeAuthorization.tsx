@@ -32,7 +32,7 @@ export function ReclaudeAuthorizationDialog({ orgId, onClose, onAuthenticated }:
   const [syncHistory, setSyncHistory] = useState(false);
   const targetOrgId = selected === "manual" ? manualOrgId.trim() : selected;
   const [submitting, setSubmitting] = useState(false), [error, setError] = useState("");
-  const popup = useRef<Window | null>(null), openedUrl = useRef(""), completed = useRef("");
+  const completed = useRef("");
   const revision = useRef(0);
   const active = status?.operation && reclaudeAuthorizationPending(status.operation.phase);
   const operation = status?.operation;
@@ -62,24 +62,17 @@ export function ReclaudeAuthorizationDialog({ orgId, onClose, onAuthenticated }:
   }, [status, selected]);
   useEffect(() => {
     if (!operation?.owned) return;
-    const url = operation.authorizationUrl && reclaudeAuthorizationUrl(operation.authorizationUrl);
-    if (url && openedUrl.current !== url && popup.current && !popup.current.closed) {
-      popup.current.location.replace(url); openedUrl.current = url;
-    }
     if (operation.phase === "completed" && completed.current !== operation.id) { completed.current = operation.id; onAuthenticated(); }
   }, [operation, onAuthenticated]);
   const begin = async () => {
     if (submitting || active || !/^[0-9]{1,20}$/.test(targetOrgId)) return;
     revision.current++;
-    // The user gesture opens the window now; asynchronous device-flow polling
-    // may only navigate this window, avoiding popup blockers on the real URL.
-    const windowRef = action === "use" ? null : window.open("about:blank", "_blank");
-    popup.current = windowRef; openedUrl.current = "";
-    if (windowRef) { windowRef.opener = null; windowRef.document.title = "ReClaude 认证"; windowRef.document.body.textContent = "正在准备 ReClaude 认证页面…"; }
+    // Wait in this dialog for the real device approval URL. Opening its link
+    // is a separate user gesture, so no placeholder window is needed.
     setSubmitting(true); setError("");
     try { const result = await startReclaudeAuthorization(targetOrgId, newReclaudeAuthorizationRequestId(), action, action === "use" && syncHistory && !!status?.canSyncHistory); revision.current++; setStatus(result.data); }
     catch (error) {
-      windowRef?.close(); setError(error instanceof Error ? error.message : "认证暂未启动。");
+      setError(error instanceof Error ? error.message : "认证暂未启动。");
       // A lost HTTP acknowledgement is reconciled by status polling, never by
       // automatically submitting another logout/login operation.
     } finally { setSubmitting(false); }
@@ -88,11 +81,11 @@ export function ReclaudeAuthorizationDialog({ orgId, onClose, onAuthenticated }:
     if (!operation?.owned) return;
     revision.current++;
     setSubmitting(true); setError("");
-    try { const result = await cancelReclaudeAuthorization(operation.id); revision.current++; setStatus(result.data); popup.current?.close(); }
+    try { const result = await cancelReclaudeAuthorization(operation.id); revision.current++; setStatus(result.data); }
     catch (error) { setError(error instanceof Error ? error.message : "暂未能取消认证。"); }
     finally { setSubmitting(false); }
   };
-  const link = operation?.owned && operation.authorizationUrl ? reclaudeAuthorizationUrl(operation.authorizationUrl) : null;
+  const link = operation?.owned && operation.phase === "waiting_authorization" && operation.authorizationUrl ? reclaudeAuthorizationUrl(operation.authorizationUrl) : null;
   const content = <div className={`taskNotificationScrim reclaudeAuthScrim${closing ? " uiClosing" : ""}`} aria-hidden={closing} inert={closing} onMouseDown={event => { if (event.target === event.currentTarget) close(); }}>
     <section className="taskNotificationDialog reclaudeAuthDialog" role="dialog" aria-modal="true" aria-label="ReClaude 组织管理">
       <header><h2>ReClaude 组织管理</h2><button type="button" className="taskNotificationIcon" aria-label="关闭组织管理" onClick={close}><X size={16}/></button></header>
@@ -100,6 +93,7 @@ export function ReclaudeAuthorizationDialog({ orgId, onClose, onAuthenticated }:
         <BranchChoice label="操作" value={action} onChange={value => { setAction(value as ReclaudeAuthorizationAction); if (selected === "manual" && value !== "bind") setSelected(status?.organizations[0]?.orgId ?? ""); }} disabled={!!active || submitting}
           options={[{value:"bind",label:"绑定新组织"},{value:"use",label:"切换默认组织"},{value:"reauthenticate",label:"重新认证已有组织"}]}/>
         <p>{action === "bind" ? "新增组织绑定，保留当前默认组织。完成后可在模型菜单中选择新组织。" : action === "use" ? "切换之后新启动的客户端使用的默认组织。已有网页会话沿用原组织；需要更换当前会话时，可选择目标模型或创建分支。" : "将退出所选共享账号并重新登录，可能暂时中断使用该账号的会话。原历史保留。"}</p>
+        {action !== "use" ? <p>开始后，请在此等待认证链接，再点击“打开认证页面”完成授权。</p> : null}
         <BranchChoice label="组织" value={selected} onChange={setSelected} disabled={!!active || submitting}
           options={[...(status?.organizations ?? []).map(row => ({value:row.orgId,label:`${row.label} · #${row.orgId}${row.current ? " · 当前默认" : ""}${row.bound ? "" : " · 未绑定"}`,disabled:action === "use" && !row.connected})), ...(action === "bind" ? [{value:"manual",label:"输入其他组织编号"}] : [])]}/>
         {action === "bind" && selected === "manual" ? <label>组织编号<input inputMode="numeric" pattern="[0-9]*" autoComplete="off" maxLength={20} value={manualOrgId} onChange={event => setManualOrgId(event.target.value)} disabled={!!active || submitting}/></label> : null}
