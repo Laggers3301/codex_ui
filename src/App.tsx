@@ -10645,6 +10645,10 @@ export function App() {
         return;
       }
       const params = notification.params ?? {};
+      // A command starting or finishing changes the background task list.
+      if (["item/started", "item/completed"].includes(notification.method ?? "") && (params.item as { type?: unknown } | undefined)?.type === "commandExecution") {
+        window.dispatchEvent(new CustomEvent(conversationTasksEvent, { detail: { userId: selectedUserId, threadId: params.threadId } }));
+      }
       if (notification.method === "runtime/claudeTasks") {
         window.dispatchEvent(new CustomEvent(conversationTasksEvent, { detail: { userId: selectedUserId, threadId: params.threadId } }));
         return;

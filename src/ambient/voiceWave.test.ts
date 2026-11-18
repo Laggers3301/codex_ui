@@ -24,3 +24,12 @@ it("draws silence as dots and speech as bars that attack fast and release slowly
   expect(value).toBeGreaterThan(loud * .5);
   expect(waveStep(Number.NaN, 2, 2)).toBeLessThanOrEqual(1);
 });
+
+it("keeps everyday sounds low so only projected speech reaches the top", () => {
+  const block = (gain: number) => new Float32Array(1024).fill(gain);
+  expect(voiceInstant(block(.005))).toBe(0);                    // room hum
+  expect(voiceInstant(block(.02))).toBeLessThan(.35);           // a tap, a cough in the next room
+  expect(voiceInstant(block(.1))).toBeGreaterThan(.55);         // normal speech sits mid-height
+  expect(voiceInstant(block(.1))).toBeLessThan(.8);
+  expect(voiceInstant(block(.3))).toBeGreaterThan(.9);          // loud speech reaches the top
+});

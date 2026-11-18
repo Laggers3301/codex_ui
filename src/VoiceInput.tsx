@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { createSpeechPreupload, reportSpeechTiming } from "./api";
 import { Mic, LoaderCircle, X } from "./PanelIcons";
 import { startVoiceAmbient, VOICE_AMBIENT_EVENT, type VoiceAmbientDetail } from "./ambient/voiceAmbient";
+import { holdScreenAwake } from "./screenWakeLock";
 import { VoiceWave } from "./mobile/VoiceWave";
 import "./voiceInput.css";
 
@@ -75,6 +76,8 @@ export const VoiceInput = memo(function VoiceInput({ onText, mobile = false }: {
     session.recorder.stop();
     // Keep tracks alive until the final dataavailable/onstop has flushed MP4.
   };
+  // The screen stays on while recording and while the text is being converted.
+  useEffect(() => (phase === "recording" || phase === "converting" ? holdScreenAwake() : undefined), [phase]);
   useEffect(() => {
     mounted.current = true;
     const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") stop(true); };

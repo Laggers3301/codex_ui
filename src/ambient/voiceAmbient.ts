@@ -3,12 +3,13 @@ export const VOICE_AMBIENT_EVENT = "codex-voice-ambient";
 /** `level` is the smoothed envelope; `instant` is the unsmoothed loudness of the latest block (for waveforms). */
 export type VoiceAmbientDetail = { recording: boolean; level: number; instant?: number };
 
-/** Loudness of one block of samples, 0..1. Quiet room noise maps to 0; speech dynamics are compressed. */
+/** Loudness of one block of samples, 0..1: -46 dBFS and below is silence, -8 dBFS is full scale. Ordinary room sounds and soft
+ *  speech stay low; only clearly projected speech approaches the top. */
 export function voiceInstant(samples: Float32Array) {
   let power = 0;
   for (const sample of samples) power += Number.isFinite(sample) ? sample * sample : 0;
   const rms = samples.length ? Math.sqrt(power / samples.length) : 0;
-  return Math.max(0, Math.min(1, (20 * Math.log10(Math.max(rms, 1e-6)) + 52) / 34));
+  return Math.max(0, Math.min(1, (20 * Math.log10(Math.max(rms, 1e-6)) + 46) / 38));
 }
 
 export function voiceEnvelope(samples: Float32Array, previous: number, elapsedMs: number) {
