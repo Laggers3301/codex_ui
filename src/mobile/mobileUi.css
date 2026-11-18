@@ -1,6 +1,6 @@
 /* Independent phone shell. All selectors are opt-in; desktop and released
    mobile retain their existing stylesheet and markup. No new !important layer. */
-:root[data-theme="dark"]:has(.mobileChatShell) {
+:root[data-theme="dark"][data-mobile-shell] {
   --bg:#000; --panel:#111; --panel-strong:#202020;
   --ui-surface:#161616; --ui-surface-raised:#202020; --ui-surface-input:#262626;
   --ui-content:#f2f2f2; --ui-heading:#f2f2f2; --ui-content-muted:#a3a3a3;
@@ -13,7 +13,7 @@
 }
 /* The document must never scroll or rubber-band under the fixed shell; only
    the transcript scrolls, and its overscroll never chains to the page. */
-:root:has(.mobileChatShell),:root:has(.mobileChatShell) body {overflow:hidden;overscroll-behavior:none;}
+:root[data-mobile-shell],:root[data-mobile-shell] body {overflow:hidden;overscroll-behavior:none;}
 .mobileChatShell .messages {overscroll-behavior-y:contain;}
 .mobileChatShell {
   --mobile-ui-body:16px; --mobile-ui-label:14px; --mobile-ui-meta:12px;
@@ -147,11 +147,27 @@
 .mobileUiSendButton>svg {position:relative;}
 .mobileUiSendButton:disabled {opacity:.35;cursor:default;}
 .mobileUiVoiceInput {position:static;}
-.mobileUiVoiceInput .voiceNotice {position:absolute;left:48px;right:92px;top:auto;bottom:4px;z-index:2;box-sizing:border-box;display:flex;align-items:center;gap:6px;width:auto;max-width:none;height:44px;margin:0;padding:0 2px 0 12px;border-radius:22px;background:var(--ui-surface-raised);box-shadow:none;-webkit-backdrop-filter:none;backdrop-filter:none;color:var(--ui-content);font:400 14px/20px var(--pool-ui-font);font-variant-numeric:tabular-nums;animation:mobileUiVoiceEnter .22s cubic-bezier(.22,1,.36,1) both;}
+.mobileUiVoiceInput .voiceNotice {position:absolute;left:50%;right:auto;top:auto;bottom:calc(100% + 8px);z-index:3;box-sizing:border-box;display:flex;align-items:center;gap:6px;width:max-content;max-width:calc(100% - 8px);min-height:32px;margin:0;padding:5px 12px;border-radius:16px;background:var(--ui-surface-raised);box-shadow:0 4px 16px #0000002e,inset 0 0 0 1px var(--ui-divider);-webkit-backdrop-filter:none;backdrop-filter:none;color:var(--ui-content);font:400 13px/20px var(--pool-ui-font);font-variant-numeric:tabular-nums;transform:translateX(-50%);animation:mobileUiVoiceStatusEnter .22s cubic-bezier(.22,1,.36,1) both;}
 .mobileUiVoiceInput:has(.mobileUiVoiceButton.recording) .voiceNotice::before {content:"";flex:none;width:8px;height:8px;border-radius:50%;background:#e76363;animation:voicePulse 1.3s ease-in-out infinite;}
-.mobileUiVoiceInput .voiceNotice>span {flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.mobileUiVoiceInput .voiceNotice>button {display:grid;place-items:center;flex:none;width:36px;height:36px;padding:0;border-radius:50%;color:var(--ui-content-muted);}
-.mobileUiVoiceInput .voiceNotice.closing {animation:voiceNoticeExit .2s ease both;}
+.mobileUiVoiceInput .voiceNotice>span {min-width:0;overflow-wrap:anywhere;text-align:center;}
+.mobileUiVoiceInput .voiceNotice>button {display:grid;place-items:center;flex:none;width:28px;height:28px;margin-right:-6px;padding:0;border-radius:50%;color:var(--ui-content-muted);}
+.mobileUiVoiceInput .voiceNotice.closing {animation:mobileUiVoiceStatusExit .2s ease both;pointer-events:none;}
+/* Recording: the capsule shows a scrolling bar waveform (dots at silence, bars up/down with speech) between a cancel button and the stop/send buttons; the status text sits above the capsule. */
+.mobileUiVoiceWave {position:absolute;left:4px;right:92px;bottom:4px;z-index:2;box-sizing:border-box;display:flex;align-items:center;gap:6px;height:44px;animation:mobileUiVoiceWaveEnter .22s ease both;}
+.mobileUiVoiceWave.closing {animation:mobileUiVoiceWaveExit .2s ease both;pointer-events:none;}
+.mobileUiVoiceCancel {display:grid;place-items:center;flex:none;width:36px;height:36px;margin-left:4px;padding:0;border:0;border-radius:50%;background:var(--ui-hover);color:var(--ui-content);cursor:pointer;}
+.mobileUiVoiceCanvas {flex:1;min-width:0;height:100%;color:var(--ui-content);-webkit-mask-image:linear-gradient(to right,transparent,#000 24%);mask-image:linear-gradient(to right,transparent,#000 24%);}
+.mobileUiComposerSurface:has(.mobileUiVoiceWave:not(.closing)) :is(.mobileUiPlus,.mobileUiComposerModel) {opacity:0;pointer-events:none;}
+.mobileUiComposerSurface:not([data-expanded]):has(.mobileUiVoiceWave:not(.closing))>.mobileUiComposerEditor {opacity:0;pointer-events:none;}
+.mobileUiPlus,.mobileUiComposerModel,.mobileUiComposerSurface:not([data-expanded])>.mobileUiComposerEditor {transition:opacity .18s ease;}
+.mobileUiVoiceButton {position:relative;}
+.mobileUiVoiceButton.recording {color:var(--ui-content);animation:none;}
+.mobileUiVoiceButton.recording::before {content:"";position:absolute;inset:6px;border-radius:50%;background:var(--ui-hover);}
+.mobileUiStopGlyph {position:relative;width:13px;height:13px;border-radius:3px;background:currentColor;}
+@keyframes mobileUiVoiceStatusEnter {from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}
+@keyframes mobileUiVoiceStatusExit {from{opacity:1;transform:translate(-50%,0)}to{opacity:0;transform:translate(-50%,6px)}}
+@keyframes mobileUiVoiceWaveEnter {from{opacity:0}to{opacity:1}}
+@keyframes mobileUiVoiceWaveExit {from{opacity:1}to{opacity:0}}
 @keyframes mobileUiVoiceEnter {from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 .mobileUiComposerSurface:not([data-expanded]) .mobileUiSendActions {grid-column:3;grid-row:1;}
 .mobileUiComposerSurface:not([data-expanded]) :is(.mobileUiComposerActivity,.mobileUiComposerExtras,.mobileUiComposerModel) {display:none;}
@@ -175,7 +191,7 @@
 .mobileComposerDock>.composerResizeHandle {display:none;}
 :root[data-theme] .mobileChatShell .v2ThinkingLine {margin:6px 0 14px;font-size:var(--mobile-ui-body)!important;line-height:26px;}
 @keyframes mobileUiSheetEnter {from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:none}}
-@media (prefers-reduced-motion:reduce) {.mobileUiSheet,.mobileUiSheet::backdrop,.mobileUiQueuedSubmissionStrip,.mobileUiVoiceButton,.mobileUiHeaderOptions,.mobileUiHeader::before,.mobileUiTitle>svg,.mobileUiVoiceInput .voiceNotice{transition:none;animation:none;}}
+@media (prefers-reduced-motion:reduce) {.mobileUiSheet,.mobileUiSheet::backdrop,.mobileUiQueuedSubmissionStrip,.mobileUiVoiceButton,.mobileUiHeaderOptions,.mobileUiHeader::before,.mobileUiTitle>svg,.mobileUiVoiceInput .voiceNotice,.mobileUiVoiceWave{transition:none;animation:none;}}
 @media (prefers-reduced-transparency:reduce) {:is(.mobileUiHeader,.mobileComposerDock)::before {-webkit-backdrop-filter:none;backdrop-filter:none;}:is(.mobileUiComposerSurface,.mobileUiQueuedSubmissionStrip)::before {background:var(--ui-surface-raised);-webkit-backdrop-filter:none;backdrop-filter:none;}}
 
 /* Left and right drawers use the same glass as the header pills: a translucent

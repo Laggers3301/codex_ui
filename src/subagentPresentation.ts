@@ -12,6 +12,7 @@ const labels: Record<string, string> = {
   interrupt_agent: "停止子代理", interruptagent: "停止子代理", closeagent: "结束子代理",
 };
 const MAX_AGENT_PAYLOAD = 128_000;
+const parsedPayloads = new Map<string, Record<string, unknown>>();
 function object(value: unknown, depth = 0): Record<string, unknown> {
   if (depth > 4) return {};
   if (typeof value === "string") {
@@ -20,7 +21,18 @@ function object(value: unknown, depth = 0): Record<string, unknown> {
     // them through exceptions on every render is very costly on mobile.
     const first = value.trimStart()[0];
     if (first !== "{" && first !== '"') return {};
-    try { return object(JSON.parse(value), depth + 1); } catch { return {}; }
+    // The same large payloads are re-read on every render of a thread view; parse each one once. The parsed
+    // objects are only read, never mutated, by this module.
+    const known = depth === 0 && value.length >= 512 ? parsedPayloads.get(value) : undefined;
+    if (known) return known;
+    try {
+      const parsed = object(JSON.parse(value), depth + 1);
+      if (depth === 0 && value.length >= 512) {
+        parsedPayloads.set(value, parsed);
+        if (parsedPayloads.size > 24) parsedPayloads.delete(parsedPayloads.keys().next().value as string);
+      }
+      return parsed;
+    } catch { return {}; }
   }
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const record = value as Record<string, unknown>;

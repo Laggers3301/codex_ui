@@ -1,4 +1,5 @@
 import type { CodexAccountPool } from "./types";
+import { codexHasAllowance, codexHasCredits, codexRemainingPercent } from "../shared/codexAllowance";
 
 export interface ExhaustedAccountSuggestion {
   threadId: string;
@@ -12,16 +13,15 @@ export function exhaustedAccountSuggestion(
 ): ExhaustedAccountSuggestion | null {
   const source = pool.accounts.find((account) => account.id === pool.currentThreadAccountId);
   if (!threadId || !source) return null;
-  const used = source.quota.rateLimits?.primary?.usedPercent;
-  if (typeof used !== "number" || !Number.isFinite(used) || used <= 90) return null;
+  const remaining = codexRemainingPercent(source.quota.rateLimits);
+  if (remaining < 0 || remaining >= 10 || codexHasCredits(source.quota.rateLimits)) return null;
   return {
     threadId,
     sourceLabel: source.label,
     hasAvailableAlternative: pool.accounts.some((account) => (
       account.id !== source.id
       && account.health !== "degraded"
-      && typeof account.quota.rateLimits?.primary?.usedPercent === "number"
-      && account.quota.rateLimits.primary.usedPercent < 100
+      && codexHasAllowance(account.quota.rateLimits)
     ))
   };
 }

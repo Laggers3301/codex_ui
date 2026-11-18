@@ -13,3 +13,8 @@
 .reclaudeAuthStatus {margin-top:18px;overflow-wrap:anywhere;}
 .reclaudeAuthError {color:var(--red,#f88);}
 .reclaudeAuthEntry {margin-top:10px;font-size:12px;}
+.reclaudeOrganizationFields {display:grid;gap:12px;margin-top:16px;}
+.reclaudeOrganizationFields p {margin:0;}
+.reclaudeOrganizationFields input {width:100%;box-sizing:border-box;padding:9px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:inherit;font:inherit;}
+.reclaudeAuthDialog label.reclaudeSyncOption {display:flex;align-items:center;gap:8px;}
+.reclaudeOrganizationFields input[type="checkbox"] {width:auto;margin:0;}

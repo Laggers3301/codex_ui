@@ -44,6 +44,11 @@
 :root[data-theme] .toolBundleShimmering .toolBundleReasoningEntry .reasoningExpandedBody .messageMarkdown > * {
   -webkit-text-fill-color:transparent!important;
 }
+/* Inline code keeps its own chip and text colour while the block around it shimmers: a transparent fill would
+   leave an empty box (the block's gradient cannot show through the chip's own background) until the answer starts. */
+:root[data-theme] .toolBundleShimmering .toolBundleReasoningEntry .reasoningExpandedBody .messageMarkdown :not(pre) > code {
+  -webkit-text-fill-color:currentColor!important;
+}
 @media (prefers-reduced-motion:reduce) {
   :root[data-theme] .toolBundleShimmering .toolBundleReasoningEntry :is(.reasoningLabel,.reasoningSummaryPreview),
   :root[data-theme] .toolBundleShimmering .toolBundleReasoningEntry .reasoningExpandedBody .messageMarkdown > * {

@@ -29,10 +29,10 @@ import {browserMcpForThread} from './browserRoutes.js';
 import {claudeWebMcp,claudeSkills,claudeInput,claudeOfficeText} from './claudeHarness.js';
 import {claudeVisibleItems} from './claudeStreamAdapter.js';
 import {claudeForkCutoff} from './claudeSubagents.js';
+import type {ConversationTasksResponse} from '../shared/conversationTasks.js';
 import {overlayJournal} from './timelineJournal.js';
 import {importedTurnBoundary} from './migrationDisplay.js';
 import {readNativeClaudeUsage} from './claudeNativeUsage.js';
-import type {ConversationTasksResponse} from '../shared/conversationTasks.js';
 import { assertHistoryHeapHeadroom } from './historyReadScheduler.js';
 
 type RecordValue = Record<string, any>;
@@ -55,6 +55,8 @@ export function assertRuntimeModel(bridge: object, userId: string, params: unkno
   else assertCodexModelRequest(params);
 }
 
+/** Older turns that may ride along with the first page of a running turn. */
+const RUNNING_FIRST_PAGE_BYTES=4*1024*1024;
 export class ClaudeService {
   private closed = false;
   readonly bindings: ClaudeBindings;
@@ -161,6 +163,17 @@ export class ClaudeService {
       this.rememberArchive(row, source); this.storage.save(row);
     }
   }
+  tasks(userId:string,id:string):ConversationTasksResponse {
+    const row=this.row(id);
+    if(row.userId!==userId)throw new AppError('runtime_forbidden','无法读取其他用户的任务。');
+    return {supported:true,data:(row.nativeTasks??[]).filter(task=>task.kind==='agent'||task.background||task.wasBackground).map(task=>({
+      id:task.id,kind:task.kind??'unknown',description:task.description,
+      status:task.status==='running'&&!this.active.has(id)?'unknown':task.status,background:task.background,
+      ...(task.parentTaskId?{parentTaskId:task.parentTaskId}:{}),...(task.subagentType?{subagentType:task.subagentType}:{}),
+      ...(task.summary?{summary:task.summary}:{}),...(task.lastToolName?{lastToolName:task.lastToolName}:{}),
+      ...(task.updatedAt?{updatedAt:task.updatedAt}:{}),...(task.usage?{usage:task.usage}:{})
+    }))};
+  }
   private finishRuntime(threadId: string) {
     this.active.delete(threadId);
     this.runtimeLeases.get(threadId)?.(); this.runtimeLeases.delete(threadId);
@@ -184,17 +197,6 @@ export class ClaudeService {
       status: { type: this.active.has(row.id) ? "active" : "idle" }, turns: [], archived: row.archived };
   }
   list(userId: string, projectId: string) { return this.storage.list(userId, projectId).map(row => this.summary(row)); }
-  tasks(userId:string,id:string):ConversationTasksResponse {
-    const row=this.row(id);
-    if(row.userId!==userId)throw new AppError('runtime_forbidden','无法读取其他用户的任务。');
-    return {supported:true,data:(row.nativeTasks??[]).filter(task=>task.kind==='agent'||task.background||task.wasBackground).map(task=>({
-      id:task.id,kind:task.kind??'unknown',description:task.description,
-      status:task.status==='running'&&!this.active.has(id)?'unknown':task.status,background:task.background,
-      ...(task.parentTaskId?{parentTaskId:task.parentTaskId}:{}),...(task.subagentType?{subagentType:task.subagentType}:{}),
-      ...(task.summary?{summary:task.summary}:{}),...(task.lastToolName?{lastToolName:task.lastToolName}:{}),
-      ...(task.updatedAt?{updatedAt:task.updatedAt}:{}),...(task.usage?{usage:task.usage}:{})
-    }))};
-  }
   toolArchive(userId: string, threadId: string) {
     const row = this.row(threadId), archive = row.toolOutputArchive;
     if (row.userId !== userId) throw new AppError("runtime_forbidden", "无法读取其他用户的工具结果附件。");
@@ -260,7 +262,13 @@ export class ClaudeService {
       const userItem=current.user_item?JSON.parse(String(current.user_item)):null;
       const position=cursorMatch?Number(this.storage.db.prepare('SELECT COUNT(*) AS n FROM turns WHERE thread_id=? AND (created_at>? OR (created_at=? AND rowid>?))').get(row.id,current.created_at,current.created_at,current.rowid)?.n??0):Math.max(0,before);
       const total=this.count(row),next=position+1;
-      return {thread:{...this.summary(row),turns:[{id:String(current.id),status:current.status,items:claudeVisibleItems([...(userItem?[userItem]:[]),...page.items])}]},history:{totalItems:total,returnedItems:1,before,nextBefore:next,hasOlder:page.nextRowid!==null||next<total,nextCursor:page.nextRowid!==null?`claude-activity:${current.id}:${page.nextRowid}`:null}};
+      const turn={id:String(current.id),status:current.status,items:claudeVisibleItems([...(userItem?[userItem]:[]),...page.items])};
+      // First page of a running turn: its own activity usually fits easily, so the turns before it ride along, like the
+      // first page of a finished conversation. Otherwise opening a busy session shows one question and one answer and
+      // needs a scroll before any history appears.
+      const older=!cursorMatch&&page.nextRowid===null?this.turns(row,Math.min(100,Math.max(1,limit))-1,next,RUNNING_FIRST_PAGE_BYTES).map(entry=>Array.isArray(entry.items)?{...entry,items:claudeVisibleItems(entry.items)}:entry):[];
+      const nextBefore=next+older.length;
+      return {thread:{...this.summary(row),turns:[...older,turn]},history:{totalItems:total,returnedItems:older.length+1,before,nextBefore,hasOlder:page.nextRowid!==null||nextBefore<total,nextCursor:page.nextRowid!==null?`claude-activity:${current.id}:${page.nextRowid}`:null}};
     }
     const result=await migratedHistoryPresentation(this.storage,row,this.summary(row),before,Math.min(100,Math.max(1,limit)))??this.history(id,before,limit);
     const recovered=overlayJournal(result.thread,turnId=>this.store.readTimelinePreviewItems(row.id,turnId),before===0);
@@ -568,7 +576,7 @@ export class ClaudeService {
     if (method === "thread/name/set") { row.name = String(p.name); this.storage.save(row); return {}; }
     if (method === "thread/archive" || method === "thread/unarchive") { row.archived = method === "thread/archive"; this.storage.save(row); return {}; }
     if (method === "thread/settings/update") {
-      if(p.serviceTier==='fast'||p.service_tier==='fast')throw new AppError('unsupported_operation','当前尚未验证此账号的 Claude Fast 资格与计费，未应用 Codex service_tier 参数。');
+      if(['fast','ultrafast'].includes(p.serviceTier)||['fast','ultrafast'].includes(p.service_tier))throw new AppError('unsupported_operation','当前尚未验证此账号的 Claude Fast 资格与计费，未应用 Codex service_tier 参数。');
       const previous=this.store.getThreadExecutionSettings(row.id,row.userId),project=this.store.getProject(row.projectId,row.userId)!;
       const sandbox=p.sandbox??({':read-only':'read-only',':workspace':'workspace-write',':danger-full-access':'danger-full-access'} as Record<string,string>)[p.permissions]??previous?.sandbox??project.defaultSandbox;
       this.store.setThreadExecutionSettings(row.id,row.userId,sandbox,p.approvalPolicy??previous?.approvalPolicy??project.defaultApprovalPolicy);

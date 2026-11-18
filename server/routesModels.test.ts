@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { applyThreadPresentation, inlineContentDisposition, mergeModelProfiles, modelProfilesFromCatalog, sanitizeMcpServerStatus, sanitizeThreadPayloadForClient } from "./routes.js";
+import { applyThreadPresentation, inlineContentDisposition, mergeModelProfiles, orderGptByVersion, modelProfilesFromCatalog, sanitizeMcpServerStatus, sanitizeThreadPayloadForClient } from "./routes.js";
+
+it("unions Ultra Fast account entitlements without advertising unsupported reasoning levels", () => {
+  const catalog = { models: [{ slug: "gpt-6.2-sol", display_name: "GPT-6.2 Sol", visibility: "list", shell_type: "shell_command", supported_reasoning_levels: [{ effort: "low" }], service_tiers: [{ id: "ultrafast" }] }] };
+  const merged = mergeModelProfiles([...modelProfilesFromCatalog(catalog, "pro-a"), ...modelProfilesFromCatalog(catalog, "pro-b")]);
+  expect(merged).toHaveLength(1);
+  expect(merged[0].ultrafastAccounts).toEqual(["pro-a", "pro-b"]);
+});
 
 describe("sanitizeMcpServerStatus", () => {
   it("returns only presentation status, never connector credentials or tool schemas", () => {
@@ -186,9 +193,10 @@ describe("modelProfilesFromCatalog", () => {
     });
 
     expect(profiles.map((profile) => profile.id)).toEqual([
-      "gpt-6-astra:low",
+      // Newest version first, whatever the catalog's priority numbers say.
       "gpt-6.1-sol:max",
       "gpt-6.1-sol:low",
+      "gpt-6-astra:low",
       "gpt-6-sol:max",
       "gpt-6-luna:medium",
       "gpt-5.6-sol:high"
@@ -207,6 +215,7 @@ describe("applyThreadPresentation", () => {
         manualOrder: 0,
         model: "gpt-6-astra",
         reasoningEffort: "medium",
+        serviceTier: null,
         displayName: "Astra thread"
       },
       { model: "gpt-6-astra", reasoningEffort: "medium" }
@@ -218,5 +227,17 @@ describe("applyThreadPresentation", () => {
       configuredModel: "gpt-6-astra",
       configuredReasoningEffort: "medium"
     });
+  });
+});
+
+describe("GPT model order", () => {
+  it("lists the newest version first and the most capable tier first inside a version, leaving other models in place", () => {
+    const names = ["gpt-6.2-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6.2-astra", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+    const input = [...names.flatMap(model => ["xhigh", "high"].map(effort => ({ model, effort }))), { model: "claude-x", effort: "high" }, { model: "doubao-y", effort: "high" }];
+    const out = orderGptByVersion(input);
+    expect([...new Set(out.map(entry => entry.model))]).toEqual(["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "claude-x", "doubao-y"]);
+    expect(out.filter(entry => entry.model === "gpt-6.2-astra").map(entry => entry.effort)).toEqual(["xhigh", "high"]);
+    expect(out).toHaveLength(input.length);
+    expect(orderGptByVersion([{ model: "gpt-6.2-astra" }, { model: "gpt-6.2-sol" }]).map(entry => entry.model)).toEqual(["gpt-6.2-astra", "gpt-6.2-sol"]);
   });
 });

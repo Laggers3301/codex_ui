@@ -45,3 +45,9 @@ it("displays the actual stop type, including weekly and scoped weekly 99%",()=>{
     expect(reclaudeRemainingLabel(disabled,now)).toBe(label);
   }
 });
+it("names every weekly window instead of showing two identical model limits",()=>{
+  const weekly=(kind:string)=>({kind,percent:0,resetsAt:now+604800000,observedAt:now-10000,source:"response" as const});
+  const html=renderToStaticMarkup(<ReclaudeQuotaDetails account={{...account,windows:[...account.windows,weekly("seven_day_fable"),weekly("seven_day_sonnet_only"),weekly("seven_day_overage_included")]}} now={now}/>);
+  expect(html).toContain("Fable 周限");expect(html).toContain("Sonnet 周限");expect(html).toContain("周限 · overage included");
+  expect(html).not.toContain("模型周限");
+});

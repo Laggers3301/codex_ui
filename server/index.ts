@@ -1,3 +1,4 @@
+import { terminalSessionsFor } from "./terminalSessions.js";
 import { withClaudeService, getClaudeService } from "./claudeService.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -369,6 +370,7 @@ async function shutdownServer(signal: string) {
     await browserService.dispose();
     modelCatalogUpdater?.stop();
     closeAuthControl?.();
+    await terminalSessionsFor(bridge).close();
     bridge.stop();
     store.close();
     process.exit(0);

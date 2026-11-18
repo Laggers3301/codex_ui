@@ -1,3 +1,4 @@
+import type { StoredBackgroundTask } from './codexBackgroundTasks.js';
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -106,6 +107,8 @@ export interface ThreadPresentation {
   model: string | null;
   reasoningEffort: ReasoningEffort | null;
   displayName: string | null;
+  /** Conversation speed tier; null means Standard. */
+  serviceTier: "fast" | "ultrafast" | null;
 }
 
 export interface ThreadContextPin {
@@ -278,8 +281,21 @@ export class ProjectStore {
       thread_id TEXT NOT NULL, item_id TEXT NOT NULL, user_id TEXT NOT NULL,
       answer_json TEXT NOT NULL, PRIMARY KEY(thread_id, item_id)
     )`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS background_task_state (
+      thread_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, tasks_json TEXT NOT NULL
+    )`);
     this.sideChats = new SideChatStore(this.db, this);
     this.communication = new SessionCommunicationStore(this.db, this);
+  }
+
+  getBackgroundTasks(threadId: string, userId: string): StoredBackgroundTask[] {
+    const row = this.db.prepare('SELECT tasks_json FROM background_task_state WHERE thread_id=? AND user_id=?').get(threadId, userId) as {tasks_json:string}|undefined;
+    return row ? JSON.parse(row.tasks_json) : [];
+  }
+  saveBackgroundTasks(threadId: string, userId: string, tasks: StoredBackgroundTask[]): void {
+    if (this.getThreadOwner(threadId)?.userId !== userId) throw Error('Background task owner mismatch');
+    this.db.prepare('INSERT INTO background_task_state(thread_id,user_id,tasks_json) VALUES(?,?,?) ON CONFLICT(thread_id) DO UPDATE SET user_id=excluded.user_id,tasks_json=excluded.tasks_json')
+      .run(threadId, userId, JSON.stringify(tasks.slice(0, 100)));
   }
 
   getQuestionAnswer(threadId: string, itemId: string, userId: string): unknown | null {
@@ -772,7 +788,7 @@ export class ProjectStore {
     const placeholders = ids.map(() => "?").join(", ");
     const rows = this.db
       .prepare(
-        `SELECT thread_id, is_pinned, manual_order, model_override, reasoning_effort_override, display_name
+        `SELECT thread_id, is_pinned, manual_order, model_override, reasoning_effort_override, display_name, service_tier_override
          FROM thread_owners
          WHERE user_id = ? AND thread_id IN (${placeholders})`
       )
@@ -783,6 +799,7 @@ export class ProjectStore {
         model_override: string | null;
         reasoning_effort_override: string | null;
         display_name: string | null;
+        service_tier_override: string | null;
       }>;
     return new Map(rows.map((row) => [row.thread_id, {
       threadId: row.thread_id,
@@ -790,7 +807,8 @@ export class ProjectStore {
       manualOrder: typeof row.manual_order === "number" ? row.manual_order : null,
       model: row.model_override?.trim() || null,
       reasoningEffort: toReasoningEffort(row.reasoning_effort_override),
-      displayName: row.display_name?.trim() || null
+      displayName: row.display_name?.trim() || null,
+      serviceTier: row.service_tier_override === "fast" || row.service_tier_override === "ultrafast" ? row.service_tier_override : null
     }]));
   }
 
@@ -935,6 +953,13 @@ export class ProjectStore {
          WHERE thread_id = ? AND user_id = ?`
       )
       .run(pinned ? 1 : 0, manualOrder, cleanThreadId, cleanUserId);
+    return result.changes > 0 ? this.getThreadPresentation(cleanUserId, [cleanThreadId]).get(cleanThreadId) ?? null : null;
+  }
+
+  setThreadServiceTier(threadId: string, userId: string, serviceTier: "fast" | "ultrafast" | null): ThreadPresentation | null {
+    const cleanThreadId = threadId.trim(), cleanUserId = userId.trim();
+    if (!cleanThreadId || !cleanUserId) return null;
+    const result = this.db.prepare("UPDATE thread_owners SET service_tier_override = ? WHERE thread_id = ? AND user_id = ?").run(serviceTier, cleanThreadId, cleanUserId);
     return result.changes > 0 ? this.getThreadPresentation(cleanUserId, [cleanThreadId]).get(cleanThreadId) ?? null : null;
   }
 
@@ -1288,6 +1313,10 @@ export class ProjectStore {
     }
     if (!hasColumn("reasoning_effort_override")) {
       this.db.exec("ALTER TABLE thread_owners ADD COLUMN reasoning_effort_override TEXT");
+    }
+    // Speed tier chosen for this conversation ("fast" / "ultrafast"; NULL = standard). Stored per thread so phone and desktop agree.
+    if (!hasColumn("service_tier_override")) {
+      this.db.exec("ALTER TABLE thread_owners ADD COLUMN service_tier_override TEXT");
     }
     if (!hasColumn("display_name")) {
       this.db.exec("ALTER TABLE thread_owners ADD COLUMN display_name TEXT");

@@ -10,6 +10,7 @@ export interface ModelProfile extends RuntimeModelMetadata {
   effort: ReasoningEffort;
   displayName?: string;
   priority?: number;
+  ultrafastAccounts?: string[];
 }
 
 export interface CodexRateLimitWindow {
@@ -273,6 +274,8 @@ export interface ThreadSummary {
   pinned?: boolean;
   configuredModel?: string | null;
   configuredReasoningEffort?: ReasoningEffort | null;
+  /** The conversation's own speed tier (null = standard); shared by every device. */
+  configuredServiceTier?: "fast" | "ultrafast" | null;
   collaborationMode?: "plan" | "default";
   cwd: string;
   updatedAt: number;

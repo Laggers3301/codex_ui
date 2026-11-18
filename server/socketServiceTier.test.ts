@@ -40,8 +40,8 @@ it("forwards new-thread Fast and updates queued Fast Off without interrupting th
     await wait(m=>m.type==="hello");
     socket.send(JSON.stringify({type:"thread.start",requestId:"tier-new",projectId:project.id,prompt:"Fast test",serviceTier:"fast"}));
     const ack=await wait(m=>m.requestId==="tier-new");expect(ack.ok,ack.error).toBe(true);
-    expect(bridge.calls.find(c=>c.method==="thread/start")?.params.serviceTier).toBe("fast");
-    expect(bridge.calls.find(c=>c.method==="turn/start")?.params).toMatchObject({serviceTier:"fast",serviceTierForTurn:"priority"});
+    expect(bridge.calls.find(c=>c.method==="thread/start")?.params).toMatchObject({model:"gpt-6.2-sol",serviceTier:"fast"});
+    expect(bridge.calls.find(c=>c.method==="turn/start")?.params).toMatchObject({model:"gpt-6.2-sol",effort:"high",serviceTier:"fast",serviceTierForTurn:"priority"});
     socket.send(JSON.stringify({type:"turn.queue.add",requestId:"tier-queue",threadId:"tier-thread",prompt:"Next at standard speed",serviceTier:null}));
     const queued=await wait(m=>m.requestId==="tier-queue");expect(queued.ok,queued.error).toBe(true);
     const update=bridge.calls.findIndex(c=>c.method==="thread/settings/update");
@@ -49,6 +49,11 @@ it("forwards new-thread Fast and updates queued Fast Off without interrupting th
     expect(update).toBeGreaterThan(-1);expect(enqueue).toBeGreaterThan(update);
     expect(bridge.calls[update].params).toEqual({threadId:"tier-thread",serviceTier:null});
     expect(bridge.calls.some(c=>c.method==="turn/interrupt")).toBe(false);
+    socket.send(JSON.stringify({type:"turn.start",requestId:"tier-ultrafast",projectId:project.id,threadId:"tier-thread",model:"gpt-6.2-sol",prompt:"Ultra Fast test",serviceTier:"ultrafast"}));
+    const ultra=await wait(m=>m.requestId==="tier-ultrafast");expect(ultra.ok,ultra.error).toBe(true);
+    expect(bridge.calls.filter(c=>c.method==="turn/start").at(-1)?.params).toMatchObject({serviceTier:"ultrafast",serviceTierForTurn:"ultrafast"});
+    bridge.emit("modelCatalogUpdated", {updatedAt:"fixture-update"});
+    expect((await wait(m=>m.type==="models.updated")).data).toEqual({updatedAt:"fixture-update"});
     await new Promise(r=>setTimeout(r,20));
   } finally {
     socket.terminate();

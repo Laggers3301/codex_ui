@@ -320,6 +320,7 @@ function coalescedRead(path: string, options: RequestInit | undefined, run: (sig
     const controller = new AbortController();
     const created: Flight = { controller, waiters: 0, active: 0, promise: undefined as unknown as Promise<Settled> };
     created.promise = run(controller.signal).finally(() => { if (inFlightReads.get(key) === created) inFlightReads.delete(key); });
+    created.promise.catch(() => {}); // callers handle the outcome; an early abort must not surface as an unhandled rejection
     inFlightReads.set(key, created); flight = created;
   }
   const shared = flight; shared.waiters++; shared.active++;
@@ -362,15 +363,39 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       const detail = caught instanceof Error ? caught.message : String(caught);
       throw new Error(`网络请求失败 ${path}: ${detail}`);
     }
-    return { ok: response.ok, status: response.status, body: await response.json().catch(() => ({})) };
+    const body = await response.json().catch(() => {
+      // A success status with an unreadable body is a broken response, not an empty result.
+      if (response.ok && response.status !== 204 && response.status !== 205) {
+        throw new Error(`服务器响应无法解析（HTTP ${response.status}，${path.split("?")[0]}），请刷新后重试。`);
+      }
+      return {};
+    });
+    return { ok: response.ok, status: response.status, body };
   };
   const settled = await (coalescedRead(path, options, signal => run(signal)) ?? run(options?.signal ?? undefined));
   const { body } = settled;
   if (!settled.ok) {
-    const message = body.message ? `${body.error ?? "Request failed"}: ${body.message}` : body.error;
+    const error = body && typeof body === "object" ? body : {};
+    const message = error.message ? `${error.error ?? "Request failed"}: ${error.message}` : error.error;
     throw new Error(message ?? `Request failed: ${settled.status}`);
   }
   return body as T;
+}
+
+async function requestThreadPage(path: string, threadId: string, options?: RequestInit): Promise<ThreadReadResponse> {
+  const body = await request<unknown>(path, { ...options, cache: "no-store" });
+  const thread = body && typeof body === "object" && "thread" in body ? body.thread : null;
+  // Check before caching or putting the page into React state. Empty turns are
+  // valid, but a missing page must never masquerade as an empty conversation.
+  if (!thread || typeof thread !== "object" || !("id" in thread)
+    || typeof thread.id !== "string" || !thread.id.trim()
+    || !("turns" in thread) || !Array.isArray(thread.turns)) {
+    throw new Error("会话内容响应不完整，请稍后重新打开会话。");
+  }
+  if (thread.id !== threadId) {
+    throw new Error("返回的会话与请求的会话不一致，请稍后重新打开会话。");
+  }
+  return body as ThreadReadResponse;
 }
 
 export function listUsers(): Promise<{ data: UserProfile[]; defaultUserId: string; lockedToLoginUser?: boolean }> {
@@ -386,8 +411,11 @@ export function readReclaudeUsage(signal?: AbortSignal): Promise<{data:import(".
 export function readReclaudeAuthorization(signal?: AbortSignal): Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
   return request("/api/reclaude/authorization", {signal,cache:"no-store"});
 }
-export function startReclaudeAuthorization(orgId:string,requestId:string):Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
-  return request("/api/reclaude/authorization/start", {method:"POST",body:JSON.stringify({orgId,requestId}),signal:AbortSignal.timeout(30000)});
+export function readReclaudeOrganizations(signal?:AbortSignal):Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
+  return request("/api/reclaude/organizations", {signal,cache:"no-store"});
+}
+export function startReclaudeAuthorization(orgId:string,requestId:string,action:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationAction="reauthenticate",syncHistory=false):Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
+  return request("/api/reclaude/authorization/start", {method:"POST",body:JSON.stringify({orgId,requestId,action,syncHistory}),signal:AbortSignal.timeout(30000)});
 }
 export function cancelReclaudeAuthorization(id:string):Promise<{data:import("../shared/reclaudeAuthorization").ReclaudeAuthorizationStatus}> {
   return request("/api/reclaude/authorization/cancel", {method:"POST",body:JSON.stringify({id}),signal:AbortSignal.timeout(10000)});
@@ -536,6 +564,9 @@ export function listProjects(): Promise<{
 }> {
   return request("/api/projects");
 }
+export function readConversationTasks(projectId:string,threadId:string,signal?:AbortSignal):Promise<import('../shared/conversationTasks').ConversationTasksResponse>{
+  return request(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/tasks`,{cache:'no-store',signal});
+}
 
 export function createProject(input: {
   name: string;
@@ -594,9 +625,6 @@ export function listArchivedThreads(projectId: string, signal?:AbortSignal): Pro
 function subagentUrl(projectId: string, parentThreadId: string): string {
   return `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(parentThreadId)}/subagents`;
 }
-export function readConversationTasks(projectId:string,threadId:string,signal?:AbortSignal):Promise<import('../shared/conversationTasks').ConversationTasksResponse>{
-  return request(`/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/tasks`,{cache:'no-store',signal});
-}
 
 export function listSubagentThreads(projectId: string, parentThreadId: string, signal?: AbortSignal, options: { view?: "all" | "active" | "history"; q?: string; cursor?: string; limit?: number } = {}): Promise<import("./types").SubagentDirectoryResponse> {
   const params = new URLSearchParams();
@@ -611,7 +639,7 @@ export function readSubagentThread(projectId: string, parentThreadId: string, ag
   const params = new URLSearchParams({ limit: String(options.limit ?? 128) });
   if (options.beforeCursor) params.set("cursor", options.beforeCursor);
   else if (options.before) params.set("before", String(options.before));
-  return request(`${subagentUrl(projectId, parentThreadId)}/${encodeURIComponent(agentId)}?${params}`, { cache: "no-store", signal: options.signal });
+  return requestThreadPage(`${subagentUrl(projectId, parentThreadId)}/${encodeURIComponent(agentId)}?${params}`, agentId, { signal: options.signal });
 }
 
 export function readSubagentItemOutput(projectId: string, parentThreadId: string, agentId: string, itemId: string): Promise<{ data: { output: string } }> {
@@ -784,6 +812,17 @@ export function updateThreadModelProfile(
   });
 }
 
+export function updateThreadServiceTier(
+  projectId: string,
+  threadId: string,
+  serviceTier: "fast" | "ultrafast" | null
+): Promise<{ data: { serviceTier: "fast" | "ultrafast" | null } }> {
+  return request(`/api/projects/${projectId}/threads/${threadId}/service-tier`, {
+    method: "PATCH",
+    body: JSON.stringify({ serviceTier })
+  });
+}
+
 export function updateThreadOrder(projectId: string, threadIds: string[]): Promise<{ data: ThreadPresentation[] }> {
   return request(`/api/projects/${projectId}/threads/order`, {
     method: "PUT",
@@ -809,7 +848,7 @@ export function readThread(threadId: string, projectId?: string, options?: { bef
     params.set("limit", String(Math.min(THREAD_READ_MAX_LIMIT, Math.max(1, Math.floor(options.limit)))));
   }
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  return request(`/api/threads/${threadId}${suffix}`);
+  return requestThreadPage(`/api/threads/${encodeURIComponent(threadId)}${suffix}`, threadId);
 }
 
 export function readThreadItemOutput(threadId: string, itemId: string, projectId?: string): Promise<{ data: { output: string; bytes: number } }> {

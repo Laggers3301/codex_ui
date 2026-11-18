@@ -1,7 +1,9 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { createSpeechPreupload, reportSpeechTiming } from "./api";
 import { Mic, LoaderCircle, X } from "./PanelIcons";
-import { startVoiceAmbient, VOICE_AMBIENT_EVENT } from "./ambient/voiceAmbient";
+import { startVoiceAmbient, VOICE_AMBIENT_EVENT, type VoiceAmbientDetail } from "./ambient/voiceAmbient";
+import { VoiceWave } from "./mobile/VoiceWave";
 import "./voiceInput.css";
 
 /** The parent keys this component by user/thread, preventing cross-thread dictation. */
@@ -13,11 +15,32 @@ export const VoiceInput = memo(function VoiceInput({ onText, mobile = false }: {
   const [notice, setNotice] = useState("");
   const [noticePresent, setNoticePresent] = useState(false);
   const noticeOpen = phase !== "idle" || Boolean(error);
+  // While recording, a waveform replaces the capsule contents (phone) or the tool row (desktop); it fades out afterwards.
+  const waveOpen = phase === "recording";
+  const [waveHost, setWaveHost] = useState<HTMLElement | null>(null);
+  const [waveInset, setWaveInset] = useState(0);
+  const [wavePresent, setWavePresent] = useState(false);
+  const waveSink = useRef<((detail: VoiceAmbientDetail) => void) | null>(null);
+  useEffect(() => {
+    if (waveOpen) { setWavePresent(true); if (!mobile) setWaveHost(voiceRoot.current?.closest<HTMLElement>(".composerControlRow") ?? null); return; }
+    const timer = window.setTimeout(() => setWavePresent(false), 200);
+    return () => window.clearTimeout(timer);
+  }, [waveOpen]);
   useEffect(() => {
     if (noticeOpen) { setNoticePresent(true); setNotice(error || (phase === "recording" ? `${seconds}s · ${cancelHint ? "松开取消" : "点击结束，上滑取消"}` : phase === "permission" ? "正在打开麦克风…" : "正在识别中英文…")); return; }
     const timer = window.setTimeout(() => setNoticePresent(false), 240);
     return () => window.clearTimeout(timer);
   }, [noticeOpen, error, phase, seconds, cancelHint]);
+  // Desktop: the waveform covers the tool row up to the voice/send buttons.
+  useLayoutEffect(() => {
+    const actions = voiceRoot.current?.closest<HTMLElement>(".composerSendActions");
+    if (mobile || !waveHost || !actions || !wavePresent) return;
+    const measure = () => setWaveInset(Math.max(0, Math.round(waveHost.getBoundingClientRect().right - actions.getBoundingClientRect().left + 6)));
+    measure();
+    const observer = typeof ResizeObserver === "function" ? new ResizeObserver(measure) : null;
+    observer?.observe(waveHost); observer?.observe(actions);
+    return () => observer?.disconnect();
+  }, [mobile, waveHost, wavePresent]);
   type Recording = { cancelled: boolean; recorder: MediaRecorder | null; stream: MediaStream | null; controller: AbortController | null; timer: number; finalizeTimer: number; startedAt: number; stoppedAt: number; upload: ReturnType<typeof createSpeechPreupload> | null; stopAmbient: (() => void) | null };
   const voiceRoot = useRef<HTMLDivElement>(null);
   const current = useRef<Recording | null>(null);
@@ -123,8 +146,9 @@ export const VoiceInput = memo(function VoiceInput({ onText, mobile = false }: {
       recorder.onerror = () => { if (current.current === session) { stop(true); if (mounted.current) setError("录音中断，请检查麦克风"); } };
       recorder.start(2000); session.startedAt = performance.now(); setSeconds(0); setPhase("recording");
       const composer = voiceRoot.current?.closest(".composer:not(.temporaryAskComposer)");
-      if (composer) session.stopAmbient = startVoiceAmbient(stream, detail => {
-        composer.dispatchEvent(new CustomEvent(VOICE_AMBIENT_EVENT, { detail }));
+      session.stopAmbient = startVoiceAmbient(stream, detail => {
+        composer?.dispatchEvent(new CustomEvent(VOICE_AMBIENT_EVENT, { detail }));
+        waveSink.current?.(detail);
       });
       let elapsed = 0;
       session.timer = window.setInterval(() => { if (current.current !== session) return; elapsed++; setSeconds(elapsed); if (elapsed >= 600) stop(); }, 1000);
@@ -134,6 +158,10 @@ export const VoiceInput = memo(function VoiceInput({ onText, mobile = false }: {
       current.current = null; setPhase("idle"); setError(caught instanceof DOMException && caught.name === "NotAllowedError" ? "请在 Safari 的本网站设置中允许麦克风，然后重新录音" : "无法打开麦克风，请检查设备是否被占用");
     }
   }
+  const wave = wavePresent ? <div className={`${mobile ? "mobileUiVoiceWave" : "voiceWave"}${waveOpen ? "" : " closing"}`} inert={!waveOpen} style={mobile ? undefined : { right: waveInset }}>
+    <button type="button" className={mobile ? "mobileUiVoiceCancel" : "voiceWaveCancel"} aria-label="取消录音" onClick={() => { stop(true); setError(""); }}><X size={mobile ? 16 : 14} /></button>
+    <VoiceWave sink={waveSink} className={mobile ? "mobileUiVoiceCanvas" : "voiceWaveCanvas"} />
+  </div> : null;
   return <div ref={voiceRoot} className={mobile ? "mobileUiVoiceInput" : "voiceInput"}>
     <button type="button" className={`${mobile ? "mobileUiVoiceButton" : "iconButton voiceButton"} ${phase}`} aria-label={phase === "recording" ? "结束录音并转成文字" : "语音输入"}
       title="点击开始／结束录音；按住录音，上滑取消（最长 10 分钟）" disabled={phase === "converting" || phase === "permission"}
@@ -165,11 +193,13 @@ export const VoiceInput = memo(function VoiceInput({ onText, mobile = false }: {
       }}
       onPointerCancel={() => { const p = pointer.current; pointer.current = null; suppressClick.current = false; window.clearTimeout(p?.timer); if (p?.held && current.current?.recorder?.state === "recording") stop(true); setCancelHint(false); }}
       onClick={() => { if (suppressClick.current) { suppressClick.current = false; return; } if (phase === "recording") stop(); else if (phase === "idle") void start(); }}>
-      {phase === "converting" || phase === "permission" ? <LoaderCircle size={mobile ? 20 : 18} className="voiceSpinner" /> : <Mic size={mobile ? 20 : 18} />}
+      {phase === "converting" || phase === "permission" ? <LoaderCircle size={mobile ? 20 : 18} className="voiceSpinner" />
+        : phase === "recording" ? <span className={mobile ? "mobileUiStopGlyph" : "voiceStopGlyph"} aria-hidden="true" /> : <Mic size={mobile ? 20 : 18} />}
     </button>
     {noticePresent ? <div className={`voiceNotice${noticeOpen ? "" : " closing"}`} role="status" inert={!noticeOpen}>
       <span>{notice}</span>
-      <button type="button" aria-label="取消语音输入" onClick={() => { stop(true); setError(""); }}><X size={14} /></button>
+      {waveOpen && (mobile || waveHost) ? null : <button type="button" aria-label="取消语音输入" onClick={() => { stop(true); setError(""); }}><X size={14} /></button>}
     </div> : null}
+    {mobile ? wave : wave && waveHost ? createPortal(wave, waveHost) : null}
   </div>;
 });

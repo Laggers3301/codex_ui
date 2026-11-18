@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import type { AccountPoolBridge, ModelCatalogTarget } from "./accountPoolBridge.js";
 import { defaults, serverConfig } from "./config.js";
 import {applyPoolContextDefaults} from "./modelContextDefaults.js";
+import { readCatalogModels } from "./modelCatalogSource.js";
 
 const execFileAsync = promisify(execFile);
 const MAX_CATALOG_BYTES = 1024 * 1024;
@@ -125,6 +126,7 @@ export class ModelCatalogAutoUpdater {
   private readonly etags = new Map<string, string>();
   private readonly pendingCatalogs = new Map<string, string>();
   private clientVersion: string | null = null;
+  private readonly nativeCatalogStamps = new Map<string, string>();
 
   constructor(
     private readonly pool: AccountPoolBridge,
@@ -161,10 +163,12 @@ export class ModelCatalogAutoUpdater {
   }
 
   private async runTick(): Promise<void> {
+    this.syncNativeCatalogs();
     let refreshFailed = false;
     if (Date.now() >= this.nextRefreshAt) {
-      const version = await this.version();
-      for (const target of this.pool.automaticModelCatalogTargets()) {
+      const targets = this.pool.automaticModelCatalogTargets();
+      const version = targets.length ? await this.version() : "";
+      for (const target of targets) {
         try {
           const result = await fetchCatalog(target, version, this.etags.get(target.id));
           if (result.etag) this.etags.set(target.id, result.etag);
@@ -193,5 +197,44 @@ export class ModelCatalogAutoUpdater {
         this.logger.warn({ accountId, error: error instanceof Error ? error.message : String(error) }, "模型目录重载失败；稍后重试");
       }
     }
+  }
+
+  /** Native Codex fetches account-authorized metadata. Publish changes to every
+   * connected UI without replacing catalogs, restarting turns or rotating auth. */
+  private syncNativeCatalogs(): void {
+    let changed = false;
+    const accounts: Record<string, unknown>[] = [];
+    for (const target of this.pool.uiModelCatalogTargets()) {
+      if (path.basename(target.catalogPath) !== "models_cache.json") continue;
+      try {
+        const stat = fs.statSync(target.catalogPath);
+        const stamp = `${target.catalogPath}:${stat.mtimeMs}:${stat.size}`;
+        const models = readCatalogModels(target.catalogPath).filter(m => m.visibility === "list");
+        accounts.push({ accountId: target.id, source: "native", models: models.map(model => ({
+          model: model.slug, displayName: model.display_name,
+          reasoningLevels: model.supported_reasoning_levels,
+          speedTiers: model.additional_speed_tiers, serviceTiers: model.service_tiers,
+          contextWindow: model.context_window, maxContextWindow: model.max_context_window,
+          inputModalities: model.input_modalities
+        })) });
+        if (this.nativeCatalogStamps.get(target.id) !== stamp) {
+          this.nativeCatalogStamps.set(target.id, stamp); changed = true;
+        }
+      } catch (error) {
+        this.logger.warn({ accountId: target.id, error: error instanceof Error ? error.message : String(error) }, "原生目录同步失败；保留已发布模型");
+      }
+    }
+    if (!changed) return;
+    const updatedAt = new Date().toISOString();
+    const file = path.join(serverConfig.dataDir, "native-model-catalog-sync.json"), temporary = `${file}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(temporary, JSON.stringify({ updatedAt, accounts }, null, 2) + "\n", { mode: 0o600 });
+      fs.renameSync(temporary, file);
+    } catch (error) {
+      this.logger.warn({ error: error instanceof Error ? error.message : String(error) }, "模型目录同步状态写入失败");
+    } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
+    this.onApplied();
+    this.pool.emit("modelCatalogUpdated", { updatedAt });
+    this.logger.info({ accounts: accounts.length, updatedAt }, "原生模型目录、推理档位和速度权限已同步到网页");
   }
 }

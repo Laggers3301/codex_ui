@@ -32,6 +32,8 @@ export const ComposerLongText = forwardRef<ComposerLongTextHandle, {
 
   useLayoutEffect(() => {
     if (!open) return;
+    // Marks the page as locked while the dialog is open (a body:has() rule restyled the document on every mutation).
+    document.body.classList.add("composerLongTextOpen");
     const dialog = dialogRef.current!;
     const viewport = window.visualViewport;
     const update = () => {
@@ -53,6 +55,7 @@ export const ComposerLongText = forwardRef<ComposerLongTextHandle, {
     viewport?.addEventListener("resize", update);
     viewport?.addEventListener("scroll", update);
     return () => {
+      document.body.classList.remove("composerLongTextOpen");
       window.removeEventListener("resize", update);
       viewport?.removeEventListener("resize", update);
       viewport?.removeEventListener("scroll", update);

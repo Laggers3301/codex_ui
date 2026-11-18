@@ -4,6 +4,8 @@ import { QueuedMessages } from "./QueuedMessages";
 import { confirmQueuedSubmission, restoreQueuedSubmission, type QueuedSubmission } from "./queuedSubmissions";
 import { MobileComposerSettings } from "./MobileComposerSettings";
 import { MobileModelFields } from "./MobileModelFields";
+import { ComposerSpeedIcon, ComposerSpeedSelect, canUseUltrafast, composerSpeedOptions, composerSpeedTitle, effectiveComposerSpeed, readComposerSpeed, type ComposerSpeed } from "./ComposerSpeed";
+import { newConversationDefaults } from "../shared/newConversationDefaults";
 import { useMobilePreview } from "./mobile/useMobilePreview";
 import { readMobileResume, writeMobileResume } from "./mobile/mobileResume";
 import { useMobileViewport } from "./mobile/useMobileViewport";
@@ -40,7 +42,8 @@ import { resolvePromptTopAnchor } from "./promptTopAnchor";
 import { useComposerPrediction } from "./useComposerPrediction";
 import { usePopoverEscape } from "./usePopoverEscape";
 import { useMobileHeaderControls } from "./useMobileHeaderControls";
-import { installMobileClickHaptics } from "./mobileHaptics";
+import { haptic, hapticsEnabled, installMobileClickHaptics, setHapticsEnabled } from "./mobileHaptics";
+import { installDeferredTouchPress, longPressDelay, SIDEBAR_SWIPE_EVENT } from "./touchPress";
 import { useMobileComposerMotion } from "./useMobileComposerMotion";
 import { useMobileComposerControls } from "./useMobileComposerControls";
 import { isUsableThreadPage } from "./threadPageCache";
@@ -146,6 +149,7 @@ import { ThreadSchedules, threadScheduleSummary } from "./ThreadSchedules";
 import { SubagentToolCard } from "./SubagentActivity";
 import { ConversationTasks } from "./ConversationTasks";
 import { conversationTasksEvent } from "./conversationTasks";
+import { isInternalRuntimeUserText } from "./runtimeUserMessages";
 import { observeComposerViewportMetrics } from "./composerViewportMetrics";
 import { observeShellPresentation } from "./shellPresentation";
 import { SubagentAvatar } from "./SubagentAvatar";
@@ -223,6 +227,7 @@ import {
   updateLocalSendSettings,
   updateProject,
   updateThreadModelProfile,
+  updateThreadServiceTier,
   updateThreadContextConfig,
   updateThreadContextPin,
   updateThreadOrder,
@@ -456,7 +461,10 @@ function PolishedSelect<T extends string>({
   className = "",
   glass = false,
   native = false,
-  title
+  title,
+  heading,
+  triggerIcon,
+  iconLabel
 }: {
   value: T;
   options: PolishedSelectOption<T>[];
@@ -466,6 +474,12 @@ function PolishedSelect<T extends string>({
   glass?: boolean;
   native?: boolean;
   title?: string;
+  /** Optional caption row, in the same style as the model menu's "选择模型". */
+  heading?: string;
+  /** Icon-only trigger (the selected value is shown in the menu and in the tooltip). */
+  triggerIcon?: ReactNode;
+  /** Accessible name for an icon-only trigger; the current value is appended. */
+  iconLabel?: string;
 }) {
   const [open, setOpen] = useState(false);
   const menuPresence = useExitPresence(open);
@@ -481,7 +495,7 @@ function PolishedSelect<T extends string>({
       const trigger = triggerRef.current, menu = menuRef.current;
       if (!trigger || !menu) return;
       const viewport = window.visualViewport;
-      const next = selectMenuPosition(trigger.getBoundingClientRect(), className.includes("topbarPolicySelect") ? 188 : 230,
+      const next = selectMenuPosition(trigger.getBoundingClientRect(), className.includes("topbarPolicySelect") ? 188 : className.includes("v2SpeedPicker") ? 176 : 230,
         menu.scrollHeight + menu.offsetHeight - menu.clientHeight,
         { width: viewport?.width ?? innerWidth, height: viewport?.height ?? innerHeight, left: viewport?.offsetLeft, top: viewport?.offsetTop });
       setMenuPosition(current => current && current.left === next.left && current.top === next.top && current.width === next.width && current.maxHeight === next.maxHeight ? current : next);
@@ -532,20 +546,22 @@ function PolishedSelect<T extends string>({
         className={`polishedSelectTrigger${glass ? " topbarGlassControl" : ""}`}
         type="button"
         disabled={disabled}
-        title={title}
+        title={triggerIcon && title ? `${title}（当前：${selected?.label ?? value}）` : title}
+        aria-label={triggerIcon && iconLabel ? `${iconLabel}：${selected?.label ?? value}` : undefined}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
         onClick={() => setOpen((current) => !current)}
       >
-        <span>{selected?.label ?? value}</span>
-        <span className="polishedSelectChevron" aria-hidden="true" />
+        {triggerIcon ?? <span>{selected?.label ?? value}</span>}
+        {triggerIcon ? null : <span className="polishedSelectChevron" aria-hidden="true" />}
         {glass ? <ComposerGlassMaterial variant="topbar" /> : null}
       </button>
       {menuPresence.present ? createPortal((
         <div className={`polishedSelectFloatingLayer ${className}`} style={{ position: "fixed", inset: 0, zIndex: 10050, pointerEvents: "none" }}>
         <div ref={menuRef} id={menuId} className={`polishedSelectMenu${menuPresence.closing ? " uiClosing" : ""}`} role="listbox" aria-hidden={menuPresence.closing} inert={menuPresence.closing}
           style={{ position: "fixed", left: menuPosition?.left ?? 0, top: menuPosition?.top ?? 0, right: "auto", bottom: "auto", width: menuPosition?.width ?? 230, maxHeight: menuPosition?.maxHeight ?? 360, visibility: menuPosition ? "visible" : "hidden", pointerEvents: "auto" }}>
+          {heading ? <div className="groupedModelHeading">{heading}</div> : null}
           {options.map((option) => (
             <button
               className={`polishedSelectOption ${option.value === value ? "selected" : ""}`}
@@ -839,6 +855,7 @@ interface PromptRequestContext {
   threadId: string | null;
   model: string;
   reasoningEffort: ReasoningEffort;
+  serviceTier?: "fast" | "ultrafast" | null;
   collaborationMode: "plan" | "default";
   sentPromptText: string;
   visibleText: string;
@@ -1335,20 +1352,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isThreadItem(value: unknown): value is ThreadItem {
   return isRecord(value) && typeof (value as { id?: unknown }).id === "string";
-}
-
-function isInternalRuntimeUserText(value: string): boolean {
-  const text = value.trimStart();
-  return text.startsWith("<environment_context>")
-    || text.startsWith("<codex_internal_context_recovery>")
-    || text.startsWith("<codex_internal_continuation_recovery>")
-    || text.startsWith("<codex_internal_retry>")
-    || text.startsWith("<recommended_plugins>")
-    || text.startsWith("<permissions instructions>")
-    || text.startsWith("<app-context>")
-    || text.startsWith("<codex_document_context>")
-    || /^# AGENTS\.md instructions(?:\r?\n|$)/.test(text)
-    || /^<skill>\s*<name>[^<]+<\/name>\s*<path>[^<]+SKILL\.md<\/path>/.test(text);
 }
 
 function isInternalRuntimeUserMessage(item: ThreadItem): boolean {
@@ -1902,7 +1905,9 @@ function projectNameFromPath(rootPath: string): string {
   return rootPath.replace(/\/+$/, "").split("/").filter(Boolean).at(-1) ?? "Project";
 }
 
+const defaultModelProfileId = `${newConversationDefaults.model}:${newConversationDefaults.reasoningEffort}`;
 const fallbackModelProfiles: ModelProfile[] = [
+  { id: defaultModelProfileId, label: "GPT-6.2 Sol high", model: newConversationDefaults.model, effort: newConversationDefaults.reasoningEffort },
   { id: "gpt-6-astra:max", label: "GPT-6-Astra max", model: "gpt-6-astra", effort: "max" },
   { id: "gpt-6-astra:xhigh", label: "GPT-6-Astra xhigh", model: "gpt-6-astra", effort: "xhigh" },
   { id: "gpt-6-astra:high", label: "GPT-6-Astra high", model: "gpt-6-astra", effort: "high" },
@@ -1946,7 +1951,6 @@ const fallbackModelProfiles: ModelProfile[] = [
   ...claudePendingProfiles(),
 ];
 
-const defaultModelProfileId = "gpt-6.1-sol:xhigh";
 const hiddenModelIds = new Set([
   "gpt-5.3-codex-spark",
   "gpt-5.4",
@@ -3691,10 +3695,6 @@ function isUltraModelProfile(profile: ModelProfile): boolean {
     || profile.label.toLowerCase().includes("ultra");
 }
 
-function modelProfileIdFor(model: string, effort: ReasoningEffort, profiles: ModelProfile[]): string {
-  return profiles.find((profile) => profile.model === model && profile.effort === effort)?.id ?? profiles[0]?.id ?? defaultModelProfileId;
-}
-
 function formatNumber(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return "-";
@@ -4005,7 +4005,7 @@ function QuotaPopover({ quota, pool, loading, closing, userId, reclaudeStatus, c
           ) : null}
         </>
       ) : selectedQuota ? <AccountQuotaDetails quota={selectedQuota} /> : <p>{loading ? "正在读取额度…" : "暂未读取到额度"}</p>}
-      {selectedClaude || (reclaudeStatus && !claudeAccounts.length) ? <button className="reclaudeAuthEntry" type="button" onClick={() => onReauthenticate(selectedClaude?.orgId)}>重新认证 ReClaude</button> : null}
+      {reclaudeStatus ? <button className="reclaudeAuthEntry" type="button" onClick={() => onReauthenticate(selectedClaude?.orgId)}>管理 ReClaude 组织</button> : null}
     </section>
   );
 }
@@ -4334,13 +4334,7 @@ const sidebarProjectOrderKey = (userId: string) => `codex-v2-project-order-${use
 const sidebarProjectSelectionKey = (userId: string) => `codex-v2-project-${userId}`;
 const sidebarThreadsCacheKey = (userId: string, projectId: string) => `codex-v2-threads-${userId}-${projectId}`;
 const sidebarExpandedProjectsKey = (userId: string) => `codex-v2-expanded-projects-${userId}`;
-const modelPreferenceStorageKey = (userId: string, projectId: string) => `codex-v2-model-${encodeURIComponent(userId)}-${encodeURIComponent(projectId)}`;
 const threadModelPreferenceStorageKey = (userId: string, threadId: string) => `codex-v2-thread-model-${encodeURIComponent(userId)}-${encodeURIComponent(threadId)}`;
-const codexFastModeStorageKey = (userId: string) => `codex-v2-codex-fast-mode-${encodeURIComponent(userId)}`;
-
-function resolveNativeServiceTier(enabled: boolean): "fast" | null {
-  return enabled ? "fast" : null;
-}
 
 function lookupThreadModelProfileId(userId: string, threadId: string, profiles: ModelProfile[]): string | null {
   if (typeof window === "undefined") {
@@ -4664,7 +4658,9 @@ export function App() {
     const selectedId = window.localStorage.getItem(sidebarProjectSelectionKey(userId)) ?? "";
     return selectedId ? [selectedId] : [];
   });
-  const [codexFastModeEnabled, setCodexFastModeEnabled] = useState(() => storedBoolean(codexFastModeStorageKey(getApiUserId())));
+  // Speed belongs to the conversation (saved on the server, so phone and desktop agree); only a new-thread draft keeps it locally.
+  const [draftSpeed, setDraftSpeed] = useState<ComposerSpeed>("standard");
+  const speedSavingRef = useRef(new Set<string>());
   const [threadSearch, setThreadSearch] = useState("");
   const [threadSearchLoading, setThreadSearchLoading] = useState(false);
   const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
@@ -4717,6 +4713,30 @@ export function App() {
   const [selectedThread, setSelectedThread] = useState<ThreadSummary | null>(null);
   const mobileHeader = useMobileHeaderControls(selectedThread?.id ?? "new");
   useEffect(installMobileClickHaptics, []);
+  useEffect(installDeferredTouchPress, []);
+  // A drawer swipe that is recognised first wins: a row hold that has not started reordering yet is withdrawn.
+  useEffect(() => {
+    const withdraw = () => {
+      if (threadPointerDragRef.current && !threadPointerDragRef.current.active) clearThreadDragState();
+      const project = projectPointerDragRef.current;
+      if (project && !project.active) {
+        if (projectLongPressTimerRef.current !== null) window.clearTimeout(projectLongPressTimerRef.current);
+        projectLongPressTimerRef.current = null;
+        projectPointerDragRef.current = null;
+      }
+    };
+    window.addEventListener(SIDEBAR_SWIPE_EVENT, withdraw);
+    return () => window.removeEventListener(SIDEBAR_SWIPE_EVENT, withdraw);
+  }, []);
+  const [hapticsOn, setHapticsOn] = useState(hapticsEnabled);
+  // The phone shell is marked on <html> once. A root-anchored :has(.mobileChatShell) rule used to be re-matched
+  // on every DOM mutation and restyled ~1,400 elements each time a tool group expanded.
+  useLayoutEffect(() => {
+    if (!mobileNext) return;
+    const root = document.documentElement;
+    root.setAttribute("data-mobile-shell", "");
+    return () => root.removeAttribute("data-mobile-shell");
+  }, [mobileNext]);
   const threadGoal = useThreadGoal(selectedThread?.id ?? null, selectedUserId);
   const threadSchedules = useThreadSchedules(selectedProjectId, selectedThread?.id ?? "");
   const [scheduleEditor, setScheduleEditor] = useState<{ id: string | null; key: number }>({ id: null, key: 0 });
@@ -4914,7 +4934,7 @@ export function App() {
       return {...profile,availability:account.state==="disabled"?"disabled":"ready",unavailableReason:account.state==="disabled"?account.message:undefined};
     }));
   },[reclaudeUsage]);
-  const [newThreadModelProfileId, setNewThreadModelProfileId] = useState(defaultModelProfileId);
+  const [newThreadModelProfileId, setNewThreadModelProfileId] = useState<string | null>(null);
   const [savingThreadModel, setSavingThreadModel] = useState(false);
   const [sandbox, setSandbox] = useState<SandboxMode>("danger-full-access");
   const executionSettingsVersionRef = useRef(0);
@@ -5124,7 +5144,7 @@ export function App() {
   const temporaryAsk = boundSideChats.session?.ask ?? null;
   const temporaryThread = boundSideChats.session?.thread ?? null;
   const temporaryPrompt = boundSideChats.session?.draft ?? "";
-  const temporaryModelProfileId = boundSideChats.session?.modelProfileId ?? defaultModelProfileId;
+  const temporaryModelProfileId = boundSideChats.session?.modelProfileId ?? "gpt-6.1-sol:xhigh";
   const temporaryShowsStop = Boolean(temporaryAsk && ["starting", "running"].includes(temporaryAsk.status));
   const temporaryStopBusy = Boolean(temporaryAsk && (queuedInterruptPrompts[temporaryAsk.requestId]
     || (temporaryAsk.turnId && interruptingTurns[temporaryAsk.turnId])));
@@ -5206,7 +5226,7 @@ export function App() {
     window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".composerRichInput")?.focus());
   }
   const draftModelProfile = useMemo(
-    () => modelProfileById(newThreadModelProfileId, modelProfiles),
+    () => modelProfileById(newThreadModelProfileId ?? defaultModelProfileId, modelProfiles),
     [newThreadModelProfileId, modelProfiles]
   );
   const selectableModelProfiles = useMemo(() => {
@@ -5229,7 +5249,28 @@ export function App() {
     () => modelProfileById(activeModelProfileId, selectableModelProfiles),
     [activeModelProfileId, selectableModelProfiles]
   );
-  const resolveServiceTier=(enabled:boolean,model=selectedModelProfile.model)=>resolveNativeServiceTier(enabled&&!isReclaudeModel(model));
+  const speedAccountId = selectedThread ? accountPool?.currentThreadAccountId ?? "unknown" : undefined;
+  const codexSpeed: ComposerSpeed = selectedThread?.id ? readComposerSpeed(selectedThread.configuredServiceTier ?? null) : draftSpeed;
+  const activeComposerSpeed = effectiveComposerSpeed(codexSpeed, selectedModelProfile, speedAccountId);
+  const changeComposerSpeed = (speed: ComposerSpeed) => {
+    const thread = selectedThreadRef.current;
+    const projectId = selectedProjectIdRef.current;
+    if (!thread?.id || !projectId) { setDraftSpeed(speed); return; }
+    const previous = readComposerSpeed(thread.configuredServiceTier ?? null);
+    const tier = speed === "standard" ? null : speed;
+    applyThreadServiceTier(thread.id, tier);
+    speedSavingRef.current.add(thread.id);
+    void updateThreadServiceTier(projectId, thread.id, tier).catch((caught) => {
+      applyThreadServiceTier(thread.id, previous === "standard" ? null : previous);
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }).finally(() => { speedSavingRef.current.delete(thread.id); });
+  };
+  const resolveServiceTier = (speed: ComposerSpeed, model = selectedModelProfile.model) => {
+    if (isReclaudeModel(model)) return null;
+    const profile = modelProfiles.find(profile => profile.model === model) ?? selectedModelProfile;
+    const effective = effectiveComposerSpeed(speed, profile, model === selectedModelProfile.model ? speedAccountId : undefined);
+    return effective === "standard" ? null : effective;
+  };
   const temporaryModelProfile = useMemo(
     () => modelProfileById(temporaryModelProfileId, modelProfiles),
     [temporaryModelProfileId, modelProfiles]
@@ -5371,7 +5412,7 @@ export function App() {
         prompt: text,
         model: temporaryModelProfile.model,
         reasoningEffort: temporaryModelProfile.effort,
-        serviceTier: resolveServiceTier(codexFastModeEnabled, temporaryModelProfile.model),
+        serviceTier: resolveServiceTier(codexSpeed, temporaryModelProfile.model),
         sandbox,
         approvalPolicy,
       } : {
@@ -5384,7 +5425,7 @@ export function App() {
         prompt: text,
         model: temporaryModelProfile.model,
         reasoningEffort: temporaryModelProfile.effort,
-        serviceTier: resolveServiceTier(codexFastModeEnabled, temporaryModelProfile.model),
+        serviceTier: resolveServiceTier(codexSpeed, temporaryModelProfile.model),
         sandbox,
         approvalPolicy,
       });
@@ -5826,6 +5867,7 @@ export function App() {
     messageElementsRef.current.clear();
     stopSearchScroll();
     setSelectedThread(null);
+    setNewThreadModelProfileId(null);
     setThreadSearchPanel(null);
     clearSearchHighlights();
     setOpeningThreadId(null);
@@ -6555,6 +6597,7 @@ export function App() {
     if (next === threadsRef.current) {
       return;
     }
+    haptic("snap");
     threadSearchRequestRef.current += 1;
     threadsRef.current = next;
     setThreads(next);
@@ -6587,6 +6630,7 @@ export function App() {
     if (!id) return;
     const rowBounds = row.getBoundingClientRect();
     const after = y > rowBounds.top + rowBounds.height / 2;
+    if (threadDropTargetRef.current?.id !== id) haptic("select");
     threadDropTargetRef.current = { id, after };
     setDragOverThreadId((current) => current === id ? current : id);
     setDragOverThreadAfter(after);
@@ -6994,7 +7038,6 @@ export function App() {
     if (firstUserInitialization) {
       setApiUserId(selectedUserId);
       setPushEnabled(storedBooleanWithDefault(`codex-web-push:${selectedUserId}`, false));
-      setCodexFastModeEnabled(storedBoolean(codexFastModeStorageKey(selectedUserId)));
       const savedAutoSendPreference = storedBooleanWithDefault(autoSendPreferenceStorageKey(selectedUserId), false);
       autoSendEnabledRef.current = savedAutoSendPreference;
       setAutoSendGeneratedFiles(savedAutoSendPreference);
@@ -7011,7 +7054,7 @@ export function App() {
     const savedAutoSendPreference = storedBooleanWithDefault(autoSendPreferenceStorageKey(selectedUserId), false);
     autoSendEnabledRef.current = savedAutoSendPreference;
     setAutoSendGeneratedFiles(savedAutoSendPreference);
-    setCodexFastModeEnabled(storedBoolean(codexFastModeStorageKey(selectedUserId)));
+    setDraftSpeed("standard");
     autoSentGeneratedFileKeysRef.current.clear();
     autoSendInFlightFileKeysRef.current.clear();
     threadProjectIdsRef.current.clear();
@@ -7080,12 +7123,7 @@ export function App() {
     setFilePreview(null);
     setFilePreviewObjectUrl("");
     setPendingDeleteThreadId(null);
-    const savedModelProfileId = window.localStorage.getItem(modelPreferenceStorageKey(selectedUserId, selectedProject.id));
-    setNewThreadModelProfileId(savedModelProfileId || modelProfileIdFor(
-      selectedProject.defaultModel || "gpt-6.1-sol",
-      selectedProject.defaultReasoningEffort || "xhigh",
-      modelProfiles
-    ));
+    setNewThreadModelProfileId(null);
     setSandbox(selectedProject.defaultSandbox || "danger-full-access");
     setApprovalPolicy(selectedProject.defaultApprovalPolicy || "never");
     setLocalMessages([]);
@@ -7108,6 +7146,26 @@ export function App() {
     }, 260);
     return () => window.clearTimeout(timer);
   }, [selectedUserId, selectedProjectId, threadSearch]);
+
+  // Coming back to this device (tab, app switch, wake) re-reads the list, which carries each conversation's saved speed.
+  const refreshThreadsRef = useRef(refreshThreads);
+  refreshThreadsRef.current = refreshThreads;
+  useEffect(() => {
+    let last = 0;
+    const resync = () => {
+      if (document.visibilityState !== "visible" || Date.now() - last < 2000) return;
+      last = Date.now();
+      void refreshThreadsRef.current();
+    };
+    document.addEventListener("visibilitychange", resync);
+    window.addEventListener("focus", resync);
+    window.addEventListener("pageshow", resync);
+    return () => {
+      document.removeEventListener("visibilitychange", resync);
+      window.removeEventListener("focus", resync);
+      window.removeEventListener("pageshow", resync);
+    };
+  }, []);
 
   useEffect(() => {
     const openSearch = () => setGlobalSearchOpen(true);
@@ -7227,7 +7285,7 @@ export function App() {
       setNewThreadModelProfileId((current) => (
         nextProfiles.some((profile) => profile.id === current && modelIsAvailable(profile))
           ? current
-          : modelProfileIdFor(response.defaultModel, response.defaultReasoningEffort, nextProfiles)
+          : null
       ));
     } catch (caught) {
       setModelProfiles(fallbackModelProfiles);
@@ -7672,6 +7730,14 @@ export function App() {
       }
       const visibleThreadIds = new Set(visibleThreads.map((thread) => thread.id));
       const currentThread = selectedThreadRef.current;
+      // The list carries each conversation's saved speed: adopt another device's change for the open thread and for cached views.
+      for (const listed of visibleThreads) {
+        if (speedSavingRef.current.has(listed.id) || listed.configuredServiceTier === undefined) continue;
+        const open = currentThread?.id === listed.id ? currentThread : undefined;
+        const cached = threadViewCacheRef.current.get(`${projectId}:${listed.id}`)?.thread;
+        const known = open ?? cached;
+        if (known && (listed.configuredServiceTier ?? null) !== (known.configuredServiceTier ?? null)) applyThreadServiceTier(listed.id, listed.configuredServiceTier ?? null);
+      }
       if (currentThread?.id && search.trim() && !visibleThreadIds.has(currentThread.id)) {
         selectedThreadRef.current = null;
         setSelectedThread(null);
@@ -7975,6 +8041,26 @@ export function App() {
     }
   }
 
+  function applyThreadServiceTier(threadId: string, serviceTier: "fast" | "ultrafast" | null) {
+    // Reopening a conversation can render from these snapshots; they must not bring back an older tier.
+    for (const [key, entry] of threadViewCacheRef.current) {
+      if (key.endsWith(`:${threadId}`)) threadViewCacheRef.current.set(key, { ...entry, thread: { ...entry.thread, configuredServiceTier: serviceTier } });
+    }
+    for (const [key, entry] of threadPageCacheRef.current) {
+      if (key.endsWith(`:${threadId}`)) threadPageCacheRef.current.set(key, { ...entry, thread: { ...entry.thread, configuredServiceTier: serviceTier } });
+    }
+    setThreads((current) => {
+      const next = current.map((thread) => (thread.id === threadId ? { ...thread, configuredServiceTier: serviceTier } : thread));
+      threadsRef.current = next;
+      return next;
+    });
+    if (selectedThreadRef.current?.id === threadId) {
+      const nextThread = { ...selectedThreadRef.current, configuredServiceTier: serviceTier };
+      selectedThreadRef.current = nextThread;
+      setSelectedThread(nextThread);
+    }
+  }
+
   async function changeConversationModelProfile(nextProfileId: string) {
     const thread = selectedThreadRef.current;
     const profile = thread
@@ -7984,9 +8070,6 @@ export function App() {
     const isCatalogProfile = modelProfiles.some((item) => item.id === profile.id);
     if (!thread?.id) {
       setNewThreadModelProfileId(profile.id);
-      if (selectedProjectIdRef.current) {
-        window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, selectedProjectIdRef.current), profile.id);
-      }
       return;
     }
     const projectId = selectedProjectIdRef.current;
@@ -8005,8 +8088,6 @@ export function App() {
       setTurnRecoveries(current=>({...current,[`${selectedUserId}:${thread.id}`]:{...current[`${selectedUserId}:${thread.id}`],job:null}}));
     }
     if (isCatalogProfile) {
-      setNewThreadModelProfileId(profile.id);
-      window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, projectId), profile.id);
       window.localStorage.setItem(threadModelPreferenceStorageKey(selectedUserId, thread.id), profile.id);
     } else {
       window.localStorage.removeItem(threadModelPreferenceStorageKey(selectedUserId, thread.id));
@@ -8978,9 +9059,7 @@ export function App() {
         setPrompt("");
         return true;
       }
-      const next = !codexFastModeEnabled;
-      setCodexFastModeEnabled(next);
-      window.localStorage.setItem(codexFastModeStorageKey(selectedUserId), String(next));
+      changeComposerSpeed(activeComposerSpeed === "fast" ? "standard" : "fast");
       setPrompt("");
       return true;
     }
@@ -9361,7 +9440,7 @@ export function App() {
         const accepted = waitForQuestionAnswerAck(requestId, "尚未确认排队消息已被接收，草稿和附件仍保留，请核对后重试。");
         codexSocket.send({
           type: "turn.queue.add",
-          serviceTier: resolveServiceTier(codexFastModeEnabled),
+          serviceTier: resolveServiceTier(codexSpeed),
           requestId,
           projectId: selectedProject.id,
           threadId: selectedThread.id,
@@ -9395,6 +9474,7 @@ export function App() {
       remoteDraftId: selectedThread ? undefined : remoteDraftId,
       model: selectedModelProfile.model,
       reasoningEffort: selectedModelProfile.effort,
+      serviceTier: resolveServiceTier(codexSpeed),
       sentPromptText,
       visibleText,
       collaborationMode: planMode ? "plan" : "default"
@@ -9424,7 +9504,7 @@ export function App() {
           model: selectedModelProfile.model,
           reasoningEffort: selectedModelProfile.effort,
           collaborationMode: planMode ? "plan" : "default",
-          serviceTier: resolveServiceTier(codexFastModeEnabled),
+          serviceTier: resolveServiceTier(codexSpeed),
           sandbox,
           approvalPolicy
         }
@@ -9439,7 +9519,7 @@ export function App() {
           model: selectedModelProfile.model,
           reasoningEffort: selectedModelProfile.effort,
           collaborationMode: planMode ? "plan" : "default",
-          serviceTier: resolveServiceTier(codexFastModeEnabled),
+          serviceTier: resolveServiceTier(codexSpeed),
           sandbox,
           approvalPolicy,
           ...(threadContextFeatureEnabled && hasContextConfigOverride(newThreadContextConfig)
@@ -9667,6 +9747,7 @@ export function App() {
       threadId: null,
       model: selectedModelProfile.model,
       reasoningEffort: selectedModelProfile.effort,
+      serviceTier: resolveServiceTier(codexSpeed),
       sentPromptText: continuation.sentPromptText,
       visibleText: continuation.visibleText,
       collaborationMode: planMode ? "plan" : "default"
@@ -9681,7 +9762,7 @@ export function App() {
         model: selectedModelProfile.model,
         reasoningEffort: selectedModelProfile.effort,
         collaborationMode: planMode ? "plan" : "default",
-        serviceTier: resolveServiceTier(codexFastModeEnabled),
+        serviceTier: resolveServiceTier(codexSpeed),
         sandbox,
         approvalPolicy,
         ...(threadContextFeatureEnabled && hasContextConfigOverride(newThreadContextConfig)
@@ -9991,6 +10072,10 @@ export function App() {
   }
 
   function handleSocketMessage(message: SocketMessage) {
+    if (message.type === "models.updated") {
+      void refreshModels();
+      return;
+    }
     if (message.type === "side.chat") {
       const change = message.data as SideChatChange | undefined;
       if (!change?.parentThreadId || !change.userId || !change.id) return;
@@ -10450,6 +10535,7 @@ export function App() {
           }).catch((caught) => setError(`远程目录保存失败，请在右侧重新选择：${caught instanceof Error ? caught.message : String(caught)}`));
         }
         if (requestContext?.threadId === null) {
+          setDraftSpeed("standard");
           setNewThreadContextPin("");
           setNewThreadContextConfig(emptyThreadContextConfig());
         }
@@ -10458,7 +10544,6 @@ export function App() {
           if (requestContext.projectId) {
             if (createdProfile) {
               window.localStorage.setItem(threadModelPreferenceStorageKey(selectedUserId, newThread.id), createdProfile.id);
-              window.localStorage.setItem(modelPreferenceStorageKey(selectedUserId, requestContext.projectId), createdProfile.id);
             } else {
               window.localStorage.removeItem(threadModelPreferenceStorageKey(selectedUserId, newThread.id));
             }
@@ -10470,6 +10555,7 @@ export function App() {
           pinned: false,
           configuredModel: requestContext?.model ?? newThread.configuredModel ?? null,
           configuredReasoningEffort: requestContext?.reasoningEffort ?? newThread.configuredReasoningEffort ?? null,
+          configuredServiceTier: newThread.configuredServiceTier ?? (requestContext?.threadId === null ? requestContext.serviceTier ?? null : null),
           turns: newThread.turns ?? []
         };
         const normalizedThreadWithStoredModel = sanitizeThreadForRender(applyStoredThreadModelProfile(selectedUserId, normalizedThread, modelProfiles));
@@ -10898,6 +10984,7 @@ export function App() {
   function closeSubagentReview() {
     for (const frame of subagentPanelFramesRef.current) window.cancelAnimationFrame(frame);
     setSubagentPanelVisible(false);
+    if (rightWorkspaceTab === 'agents' && window.matchMedia('(max-width: 720px)').matches) setRightWorkspaceOpen(false);
     if (subagentPanelCloseTimerRef.current !== null) window.clearTimeout(subagentPanelCloseTimerRef.current);
     subagentPanelCloseTimerRef.current = window.setTimeout(() => {
       setSubagentReview(null);
@@ -10909,6 +10996,7 @@ export function App() {
     const projectId = subagentReview?.projectId;
     const parentThreadId = subagentReview?.threadId;
     const kind = itemKind(item);
+    if (isInternalRuntimeUserMessage(item)) return null;
     if (parseAgentOperation(item)) return <SubagentToolCard item={item} onOpenAgent={openSubagentReview} knownAgents={conversationAgents} />;
     if (kind === "reasoning") {
       return reasoningItemDisplayText(item) ? renderToolBundleGroup(bundleId, [item], 0, agentId, projectId, turn.id, { readOnly: true }) : null;
@@ -11860,7 +11948,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     setTerminalVisible(false);
     if (terminalCloseTimerRef.current !== null) window.clearTimeout(terminalCloseTimerRef.current);
     terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390);
-  }, content: <LazyPane label="终端"><TerminalPanel key={terminalProjectId} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={false} onClose={() => { setTerminalVisible(false); terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390); }} /></LazyPane> });
+  }, content: <LazyPane label="终端"><TerminalPanel key={terminalProjectId} closing={!terminalVisible} projectId={terminalProjectId} projectName={projects.find(project => project.id === terminalProjectId)?.name ?? "工作区"} split={false} onClose={() => { setTerminalVisible(false); terminalCloseTimerRef.current = window.setTimeout(() => { setTerminalProjectId(null); terminalCloseTimerRef.current = null; }, 390); }} /></LazyPane> });
   for (const id of rightUtilityTabs) {
     const title = ({ remote: "远程文件", goal: "持续目标", schedules: "定时任务", outputs: "输出内容", sources: "来源", feishu: "飞书办公", resources: "主机资源", communication: "会话通信" })[id] ?? id;
     rightTabs.push({ id, title, icon: id as "remote" | "goal" | "schedules" | "outputs" | "sources" | "feishu" | "resources" | "communication", attention: id === "feishu" && feishuPendingCount > 0, onClose: () => closeUtilityWindow(id), content:
@@ -11901,23 +11989,12 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           : threadContextFeatureEnabled ? `新会话上下文 ${contextConfigShortLabel(newThreadContextConfig)}` : "会话状态"}</span>}
                     </button>
                   ) : null}
-                  speed={!isReclaudeModel(selectedModelProfile.model) ? mobileHeader.mobile ? <label className="mobileSettingRow"><span>速度</span><select aria-label="速度" value={codexFastModeEnabled ? "fast" : "standard"} onChange={event => {
-                    const next = event.target.value === "fast"; setCodexFastModeEnabled(next);
-                    window.localStorage.setItem(codexFastModeStorageKey(selectedUserId), String(next));
-                  }}><option value="standard">标准</option><option value="fast">快速</option></select></label> : <button
-                    className={`iconTextButton v2FastModeButton ${codexFastModeEnabled ? "v2FastModeButtonActive" : ""}`}
-                    type="button"
-                    onClick={() => {
-                      const next = !codexFastModeEnabled;
-                      setCodexFastModeEnabled(next);
-                      if (typeof window !== "undefined") {
-                        window.localStorage.setItem(codexFastModeStorageKey(selectedUserId), String(next));
-                      }
-                    }}
-                    title={codexFastModeEnabled ? "已开启 Fast 模式（下次请求会带 service_tier: fast）" : "开启 Fast 模式"}
-                  >
-                    <span>{codexFastModeEnabled ? "Fast On" : "Fast Off"}</span>
-                  </button> : null}
+                  speed={!isReclaudeModel(selectedModelProfile.model) ? (mobileHeader.mobile
+                    ? <ComposerSpeedSelect mobile value={activeComposerSpeed}
+                        ultrafast={canUseUltrafast(selectedModelProfile, speedAccountId)} onChange={changeComposerSpeed} />
+                    // Desktop: the same floating menu as the other composer pickers, not the browser's native list.
+                    : <PolishedSelect<ComposerSpeed> className={`v2SpeedPicker${activeComposerSpeed === "standard" ? "" : " v2SpeedPickerActive"}`} value={activeComposerSpeed} title={composerSpeedTitle} heading="选择速度" iconLabel="速度" triggerIcon={<ComposerSpeedIcon speed={activeComposerSpeed} />}
+                        options={composerSpeedOptions(canUseUltrafast(selectedModelProfile, speedAccountId))} onChange={changeComposerSpeed} />) : null}
                   tasks={selectedProject && selectedThread ? <ConversationTasks key={`tasks:${selectedUserId}:${selectedThread.id}`} userId={selectedUserId} projectId={selectedProject.id} threadId={selectedThread.id}
                     plainTrigger={mobileNext}
                     triggerLabel={mobileHeader.mobile ? "会话任务" : undefined}
@@ -12217,7 +12294,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
     {id:"send-markdown",label:"发送对话记录到本机",disabled:!selectedThread||exportingThread,action:()=>void exportCurrentThread(true,"markdown")},
     {id:"settings",label:"设备与导出设置",action:()=>void openSettingsDialog()},
     {id:"quota",label:"用量与重置时间",action:()=>{setMobileOptionsRequest(value=>value+1);setQuotaPopoverPinned(true);setQuotaPopoverOpen(true);void refreshQuota(false,{force:true,background:true});}},
-    {id:"leaderboard",label:"用量排行",action:()=>{setLeaderboardOpen(true);void refreshLeaderboard(false,false);}}
+    {id:"leaderboard",label:"用量排行",action:()=>{setLeaderboardOpen(true);void refreshLeaderboard(false,false);}},
+    {id:"haptics",label:hapticsOn?"触感反馈：开":"触感反馈：关",active:hapticsOn,action:()=>{const next=!hapticsOn;setHapticsEnabled(next);setHapticsOn(next);if(next)haptic("success");}}
   ];
 
 
@@ -13207,7 +13285,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                           setDraggingProjectId(project.id);
                           setProjectGhostPosition({ x: drag.x, y: drag.y });
                           projectLongPressTimerRef.current = null;
-                        }, 180);
+                        }, longPressDelay(event.pointerType));
                       }}
                       onPointerMove={moveProjectDrag}
                       onPointerUp={() => {
@@ -13327,6 +13405,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         const drag = threadPointerDragRef.current;
                         if (!drag || drag.pointerId !== event.pointerId) return;
                         drag.active = true;
+                        haptic("snap");
                         const move = (pointer: PointerEvent) => moveThreadDragAt(pointer.pointerId, pointer.clientX, pointer.clientY);
                         const up = (pointer: PointerEvent) => {
                           if (threadPointerDragRef.current?.pointerId !== pointer.pointerId) return;
@@ -13354,7 +13433,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         setDraggingThreadId(thread.id);
                         setThreadGhostPosition({ x: drag.x, y: drag.y });
                         threadLongPressTimerRef.current = null;
-                      }, 180);
+                      }, longPressDelay(event.pointerType));
                     }}
                     onDragStart={(event) => event.preventDefault()}
                     onPointerMove={moveThreadDrag}

@@ -190,6 +190,24 @@ describe("Claude conversation switching",()=>{
     const other=await f.start();await expect(f.service.readHistory(other,0,17,cursors[0])).rejects.toMatchObject({code:'invalid_cursor'});
     const previous=await f.service.readHistory(id,page.history.nextBefore,17);expect(previous.thread.turns[0].id).toBe(older);
   });
+  it('opens a running conversation with its earlier turns, not just the running question, and pages on without gaps',async()=>{
+    const f=fixture(),id=await f.start(),ids:string[]=[];
+    for(let i=0;i<5;i++){const turn=randomUUID();ids.push(turn);
+      f.service.storage.saveTurn(id,{id:turn,status:'completed',items:[{id:`u${i}`,type:'userMessage',text:`q${i}`},{id:`a${i}`,type:'agentMessage',text:`answer ${i}`}]});}
+    const running=randomUUID(),user={id:'uRun',type:'userMessage',text:'running question'};
+    f.service.storage.saveTurn(id,{id:running,status:'inProgress',items:[user]});
+    f.store.saveTimelineItem(id,running,{id:'claude-tool::run1',type:'dynamicToolCall',tool:'Read',output:'done',status:'completed'});
+    const first=await f.service.readHistory(id,0,120);
+    expect(first.thread.turns.map((t:any)=>t.id)).toEqual([...ids,running]);
+    expect(first.thread.turns.at(-1)!.items.some((item:any)=>item.id==='uRun')).toBe(true);
+    expect(first.history).toMatchObject({returnedItems:6,before:0,nextBefore:6,hasOlder:false,nextCursor:null});
+    // A small page still leaves older history reachable through nextBefore, with no turn repeated.
+    const small=await f.service.readHistory(id,0,3);
+    expect(small.thread.turns.map((t:any)=>t.id)).toEqual([ids[3],ids[4],running]);
+    expect(small.history).toMatchObject({returnedItems:3,nextBefore:3,hasOlder:true});
+    const rest=await f.service.readHistory(id,small.history.nextBefore,3);
+    expect(rest.thread.turns.map((t:any)=>t.id)).toEqual([ids[0],ids[1],ids[2]]);
+  });
   it('retains an active journal cursor when a turn completes, then uses immutable items on refresh',async()=>{
     const f=fixture(),id=await f.start(),turnId=randomUUID(),user={id:'u',type:'userMessage',text:'query'};
     f.service.storage.saveTurn(id,{id:turnId,status:'inProgress',items:[user]});

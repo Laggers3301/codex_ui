@@ -1,13 +1,18 @@
 /** Local-only amplitude envelope; no samples leave the browser through this channel. */
 export const VOICE_AMBIENT_EVENT = "codex-voice-ambient";
-export type VoiceAmbientDetail = { recording: boolean; level: number };
+/** `level` is the smoothed envelope; `instant` is the unsmoothed loudness of the latest block (for waveforms). */
+export type VoiceAmbientDetail = { recording: boolean; level: number; instant?: number };
 
-export function voiceEnvelope(samples: Float32Array, previous: number, elapsedMs: number) {
+/** Loudness of one block of samples, 0..1. Quiet room noise maps to 0; speech dynamics are compressed. */
+export function voiceInstant(samples: Float32Array) {
   let power = 0;
   for (const sample of samples) power += Number.isFinite(sample) ? sample * sample : 0;
   const rms = samples.length ? Math.sqrt(power / samples.length) : 0;
-  // Ignore quiet room noise; compress speech dynamics instead of flashing on peaks.
-  const target = Math.max(0, Math.min(1, (20 * Math.log10(Math.max(rms, 1e-6)) + 52) / 34));
+  return Math.max(0, Math.min(1, (20 * Math.log10(Math.max(rms, 1e-6)) + 52) / 34));
+}
+
+export function voiceEnvelope(samples: Float32Array, previous: number, elapsedMs: number) {
+  const target = voiceInstant(samples);
   const prior = Number.isFinite(previous) ? Math.max(0, Math.min(1, previous)) : 0;
   const dt = Number.isFinite(elapsedMs) ? Math.max(0, Math.min(100, elapsedMs)) : 0;
   return prior + (target - prior) * (1 - Math.exp(-dt / (target > prior ? 130 : 420)));
@@ -67,7 +72,7 @@ export function startVoiceAmbient(stream: MediaStream, publish: (detail: VoiceAm
         const now = performance.now();
         level = voiceEnvelope(samples, level, now - last);
         last = now;
-        publish({ recording: true, level });
+        publish({ recording: true, level, instant: voiceInstant(samples) });
       } catch {
         releaseAnalysis();
         publish({ recording: true, level: 0 });

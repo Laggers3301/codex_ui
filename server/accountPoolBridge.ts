@@ -1,4 +1,5 @@
 import { assertCodexModelRequest } from "./agentRuntimeGuard.js";
+import { codexHasCredits, codexRemainingPercent } from "../shared/codexAllowance.js";
 import { EventEmitter } from "node:events";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -20,6 +21,8 @@ import {authDiagnostic, type AuthDiagnostic, type AuthPhase} from "./authDiagnos
 import { ProviderTurnProtocol } from "./providerProtocol.js";
 import { validateModelRequest } from "./modelRequestValidation.js";
 import { nativeModelDiscoveryEnabled } from "./nativeModelDiscovery.js";
+import { modelCatalogSource, readCatalogModels, accountModelSupportsUltrafast } from "./modelCatalogSource.js";
+import { assertServiceTierEnabled } from "./serviceTier.js";
 import { BranchConflictError } from "./largeThreadFork.js";
 import type {AccountReplacementConfirmation} from "./deviceAuthorization.js";
 
@@ -182,23 +185,6 @@ function safeAbsoluteDirectory(value: unknown, field: string): string {
   return resolved;
 }
 
-function rawRateWindow(limits: unknown): JsonRecord {
-  const root = asRecord(limits);
-  const snapshot = asRecord(root.rateLimits);
-  const primary = asRecord(snapshot.primary);
-  if (Object.keys(primary).length) {
-    return primary;
-  }
-  return asRecord(root.primary);
-}
-
-function remainingPercent(limits: unknown): number {
-  const used = rawRateWindow(limits).usedPercent;
-  return typeof used === "number" && Number.isFinite(used)
-    ? Math.max(0, Math.min(100, 100 - used))
-    : -1;
-}
-
 function creditBalance(limits: unknown): number {
   const root = asRecord(limits);
   const rateLimits = asRecord(root.rateLimits);
@@ -217,6 +203,8 @@ export interface AccountRoutingCandidate {
   health: "ready" | "degraded" | "starting";
   remainingPercent: number;
   creditBalance: number;
+  /** Whether Credits can pay for requests; derived from creditBalance when omitted. */
+  hasCredits?: boolean;
   activeRequests: number;
   assignedThreadCount: number;
 }
@@ -233,6 +221,11 @@ export function selectAccountCandidate<T extends AccountRoutingCandidate>(accoun
   const candidates = healthy.length ? healthy : accounts;
   const allQuotaExhausted = candidates.every((account) => account.remainingPercent === 0);
   return [...candidates].sort((left, right) => {
+    // Spend subscription allowance first, then use Credits before exhausted
+    // accounts. Credits are money, so never compare their amount to a percent.
+    const tier = (account: AccountRoutingCandidate) => account.remainingPercent > 0 ? 3 : (account.hasCredits ?? account.creditBalance > 0) ? 2 : account.remainingPercent >= 0 ? 1 : 0;
+    const tierDifference = tier(right) - tier(left);
+    if (tierDifference) return tierDifference;
     const remainingDifference = right.remainingPercent - left.remainingPercent;
     if (remainingDifference) return remainingDifference;
     if (allQuotaExhausted && left.creditBalance !== right.creditBalance) {
@@ -272,10 +265,8 @@ export function accountAppServerArgs(codexHome: string, kind: "codex-account" | 
 }
 
 function accountSupportedModels(codexHome: string): Set<string> | null {
-  const modelCatalogPath = path.join(codexHome, MODEL_CATALOG_FILENAME);
   try {
-    const catalog = JSON.parse(fs.readFileSync(modelCatalogPath, "utf8")) as { models?: unknown[] };
-    const models = Array.isArray(catalog.models) ? catalog.models : [];
+    const models = readCatalogModels(modelCatalogSource(codexHome));
     return new Set(models.flatMap((entry) => {
       const model = asRecord(entry);
       return typeof model.slug === "string" && model.visibility === "list" ? [model.slug] : [];
@@ -285,6 +276,11 @@ function accountSupportedModels(codexHome: string): Set<string> | null {
     // routing behavior instead of disabling the account entirely.
     return null;
   }
+}
+
+function accountSupportsModel(account: AccountRuntime, model: string): boolean {
+  const models = accountSupportedModels(account.codexHome);
+  return models === null || models.has(model);
 }
 
 function createAccountBridge(codexHome: string, accountId: string, adoptCandidate = false, kind: "codex-account" | "api-provider" = "codex-account"): CodexBridge {
@@ -1016,6 +1012,10 @@ export class AccountPoolBridge extends EventEmitter {
       }));
   }
 
+  uiModelCatalogTargets(): ModelCatalogTarget[] {
+    return this.modelCatalogTargets().map(target => ({ ...target, catalogPath: modelCatalogSource(target.codexHome) }));
+  }
+
   /** Native Codex owns its remote discovery/cache; UI catalog sources stay
    * independent and are still returned by modelCatalogTargets(). */
   automaticModelCatalogTargets(): ModelCatalogTarget[] {
@@ -1185,7 +1185,12 @@ export class AccountPoolBridge extends EventEmitter {
       if (startingProcessId) this.processAccounts.delete(startingProcessId);
       return result;
     } catch (error) {
-      if (startingProcessId) this.processAccounts.delete(startingProcessId);
+      if (startingProcessId) {
+        // A failed/timed-out exec is not proof that the PTY exited. Terminate
+        // on its original runtime before dropping the routing information.
+        await this.invokeAccount(account, "command/exec/terminate", { processId: startingProcessId }, 10_000)
+          .then(() => this.processAccounts.delete(startingProcessId)).catch(() => {});
+      }
       if (error instanceof Error && "code" in error && ['unsupported_model_capability','memory_pressure'].includes(String(error.code))) throw error;
       account.health = "degraded";
       account.lastError = error instanceof Error ? error.message : String(error);
@@ -1218,7 +1223,7 @@ export class AccountPoolBridge extends EventEmitter {
     const account = this.accountsById.get(accountId);
     if (!account) throw new Error(`Unknown account-pool account: ${accountId}`);
     const model = asRecord(params).model;
-    if (typeof model === "string" && account.supportedModels && !account.supportedModels.has(model)) {
+    if (typeof model === "string" && !accountSupportsModel(account, model)) {
       throw new Error(`Account ${accountId} does not support model ${model}.`);
     }
     const result = await this.invokeAccount(account, "thread/start", params, timeoutMs);
@@ -1348,13 +1353,15 @@ export class AccountPoolBridge extends EventEmitter {
 
   private async accountForRequest(method: string, params: unknown): Promise<AccountRuntime> {
     assertCodexModelRequest(params);
+    const { serviceTier, serviceTierForTurn } = asRecord(params);
+    assertServiceTierEnabled(serviceTier, serviceTierForTurn);
     const threadId = threadIdFromParams(params);
     if (threadId) {
       const known = this.accountsById.get(this.threadAccounts.get(threadId) ?? "");
       const account = known ?? await this.discoverThreadAccount(threadId);
       const requestedModel = asRecord(params).model;
       if (method === "turn/start" && typeof requestedModel === "string"
-        && account.supportedModels && !account.supportedModels.has(requestedModel)) {
+        && !accountSupportsModel(account, requestedModel)) {
         throw new Error(`当前会话属于 ${account.label}，不能直接切换到 ${requestedModel}。请从上一轮回答创建分支，迁移到对应供应商后继续。`);
       }
       return account;
@@ -1362,8 +1369,9 @@ export class AccountPoolBridge extends EventEmitter {
     const processId = processIdFromParams(params);
     const processAccount = processId ? this.accountsById.get(this.processAccounts.get(processId) ?? "") : undefined;
     if (processAccount) return processAccount;
+    if (method.startsWith("command/exec/")) throw new Error("Terminal process routing is no longer available.");
     const requestedModel = typeof asRecord(params).model === "string" ? String(asRecord(params).model) : undefined;
-    return this.chooseAccount(requestedModel);
+    return this.chooseAccount(requestedModel, asRecord(params).serviceTier);
   }
 
   private async discoverThreadAccount(threadId: string): Promise<AccountRuntime> {
@@ -1379,9 +1387,10 @@ export class AccountPoolBridge extends EventEmitter {
     return account;
   }
 
-  private chooseAccount(model?: string): AccountRuntime {
+  private chooseAccount(model?: string, serviceTier?: unknown): AccountRuntime {
     const compatibleAccounts = model
-      ? this.accounts.filter((account) => account.supportedModels === null || account.supportedModels.has(model))
+      ? this.accounts.filter((account) => accountSupportsModel(account, model)
+        && (serviceTier !== "ultrafast" || accountModelSupportsUltrafast(account.codexHome, model)))
       // A pay-as-you-go provider must only be chosen explicitly by model;
       // it must not become the implicit default when quota data is absent.
       : this.accounts.filter((account) => account.id !== "ark-pay");
@@ -1391,8 +1400,9 @@ export class AccountPoolBridge extends EventEmitter {
     const selected = selectAccountCandidate(compatibleAccounts.map((account) => ({
       id: account.id,
       health: account.health,
-      remainingPercent: remainingPercent(account.cache?.limits),
+      remainingPercent: codexRemainingPercent(account.cache?.limits),
       creditBalance: creditBalance(account.cache?.limits),
+      hasCredits: codexHasCredits(account.cache?.limits),
       activeRequests: account.activeRequests,
       assignedThreadCount: this.assignedThreadCount(account.id)
     })));
@@ -1548,7 +1558,7 @@ export class AccountPoolBridge extends EventEmitter {
 
   canThreadUseModel(threadId: string, model: string): boolean {
     const account = this.accountsById.get(this.threadAccounts.get(threadId) ?? "");
-    return !account?.supportedModels || account.supportedModels.has(model);
+    return !account || accountSupportsModel(account, model);
   }
 
   /** Select the best current account for a branch, independently of its source. */
@@ -1562,17 +1572,15 @@ export class AccountPoolBridge extends EventEmitter {
       ? this.accountsById.get(forcedTargetAccountId)
       : this.chooseAccount(model);
     if (!target) throw new Error(`Unknown account-pool account: ${forcedTargetAccountId}`);
-    if (model && target.supportedModels && !target.supportedModels.has(model)) {
+    if (model && !accountSupportsModel(target, model)) {
       throw new Error(`Account ${target.id} does not support model ${model}.`);
     }
     if (requiredMemoryBytes !== undefined) {
       if (!Number.isFinite(requiredMemoryBytes) || requiredMemoryBytes < 0) throw new Error("Invalid branch memory budget.");
       const eligible = (account: AccountRuntime) => {
-        const remaining = remainingPercent(account.cache?.limits);
-        const credits = creditBalance(account.cache?.limits);
         if (account.kind !== "codex-account" || account.health !== "ready" || account.authFailureCode
-          || model && account.supportedModels && !account.supportedModels.has(model)
-          || remaining === 0 && credits <= 0) return false;
+          || model && !accountSupportsModel(account, model)
+          || codexRemainingPercent(account.cache?.limits) === 0 && !codexHasCredits(account.cache?.limits)) return false;
         const available = account.bridge.getMemoryHeadroom();
         return available !== null && Number.isFinite(available) && available >= requiredMemoryBytes;
       };
@@ -1582,7 +1590,7 @@ export class AccountPoolBridge extends EventEmitter {
         const alternatives = forcedTargetAccountId ? [] : this.accounts.filter(eligible);
         if (!alternatives.length) throw new BranchConflictError("当前没有支持同一模型且内存余量足够的 GPT 账号，已安全停止分支；原会话未修改。");
         const selected = selectAccountCandidate(alternatives.map(account => ({ id: account.id, health: account.health,
-          remainingPercent: remainingPercent(account.cache?.limits), creditBalance: creditBalance(account.cache?.limits), activeRequests: account.activeRequests,
+          remainingPercent: codexRemainingPercent(account.cache?.limits), creditBalance: creditBalance(account.cache?.limits), hasCredits: codexHasCredits(account.cache?.limits), activeRequests: account.activeRequests,
           assignedThreadCount: this.assignedThreadCount(account.id) })));
         target = this.accountsById.get(selected.id)!;
       }

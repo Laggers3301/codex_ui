@@ -8,7 +8,7 @@ import "./TerminalPanel.css";
 
 const splitStorageKey = "codex-web-terminal-split-percent";
 
-export function TerminalPanel({ projectId, projectName, split, onClose }: { projectId: string; projectName: string; split: boolean; onClose: () => void }) {
+export function TerminalPanel({ projectId, projectName, split, closing = false, onClose }: { projectId: string; projectName: string; split: boolean; closing?: boolean; onClose: () => void }) {
   const host = useRef<HTMLDivElement>(null);
   const panel = useRef<HTMLElement>(null);
   const resizing = useRef(false);
@@ -51,7 +51,7 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
     document.body.style.userSelect = previousBodyStyle.current.userSelect;
   };
   useEffect(() => {
-    if (!host.current) return;
+    if (closing || !host.current) return;
     const processId = `term-${crypto.randomUUID()}`;
     const terminalTheme = () => document.documentElement.dataset.theme === "light"
       ? { background: "#f5f7f4", foreground: "#26312a", cursor: "#26312a", selectionBackground: "#b1d9c2" }
@@ -63,6 +63,13 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
     fit.fit();
     let disconnectedNoticeShown = false;
     let started = false;
+    let ended = false;
+    let stopping = false;
+    const stop = () => {
+      ended = true;
+      submitLine.current = async () => false;
+      if (started && !stopping) { stopping = true; send("command.terminate"); }
+    };
     let pendingInput = "";
     let inputTimer: number | null = null;
     let resizeTimer: number | null = null;
@@ -83,6 +90,11 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
       }
       if (message.type === "ack" && message.requestId?.startsWith(processId) && !message.ok) {
         term.write(`\r\n[${message.error ?? "命令失败"}]\r\n`);
+        stop();
+      }
+      if (message.type === "ack" && message.requestId === `${processId}-start` && message.ok) {
+        ended = true;
+        term.write("\r\n[终端已退出]\r\n");
       }
     });
     const flushInput = () => {
@@ -122,7 +134,7 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
       return ok;
     };
     submitLine.current = async (value: string) => {
-      if (!started) return false;
+      if (!started || ended) return false;
       if (resizeTimer !== null) { window.clearTimeout(resizeTimer); resizeTimer = null; }
       // Resize must be acknowledged by the PTY before Readline receives the line.
       if (!await syncSize()) return false;
@@ -130,6 +142,7 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
       return send("command.write", { data: `${value}\r` });
     };
     const input = term.onData(data => {
+      if (ended) return;
       pendingInput += data;
       // One short write per typing burst avoids a round trip for each byte.
       if (data.includes("\r") || data.includes("\n")) flushInput();
@@ -140,7 +153,7 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
       if (resizeTimer !== null) window.clearTimeout(resizeTimer);
       resizeTimer = window.setTimeout(() => {
         resizeTimer = null;
-        if (started && term.cols >= 20 && term.rows >= 5) {
+        if (started && !ended && term.cols >= 20 && term.rows >= 5) {
           void syncSize();
         }
       }, 16);
@@ -149,7 +162,7 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
     const themeObserver = new MutationObserver(() => { term.options.theme = terminalTheme(); });
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
     const start = () => {
-      if (started) return;
+      if (started || ended) return;
       try {
         fit.fit();
         codexSocket.send({ type: "command.exec", requestId: `${processId}-start`, processId,
@@ -161,13 +174,14 @@ export function TerminalPanel({ projectId, projectName, split, onClose }: { proj
     const unsubscribeStatus = codexSocket.subscribeStatus(status => {
       if (status === "open") start();
       if (status === "closed" && started && !disconnectedNoticeShown) {
+        stop();
         term.write("\r\n[连接断开，请关闭并重新打开终端]\r\n");
         disconnectedNoticeShown = true;
       }
     });
     start();
-    return () => { submitLine.current = async () => false; themeObserver.disconnect(); resize.disconnect(); if (inputTimer !== null) window.clearTimeout(inputTimer); if (resizeTimer !== null) window.clearTimeout(resizeTimer); for (const finish of resizeRequests.values()) finish(false); input.dispose(); unsubscribe(); unsubscribeStatus(); if (started) send("command.terminate"); term.dispose(); };
-  }, [projectId]);
+    return () => { submitLine.current = async () => false; themeObserver.disconnect(); resize.disconnect(); if (inputTimer !== null) window.clearTimeout(inputTimer); if (resizeTimer !== null) window.clearTimeout(resizeTimer); for (const finish of resizeRequests.values()) finish(false); input.dispose(); unsubscribe(); unsubscribeStatus(); stop(); term.dispose(); };
+  }, [projectId, closing]);
   return <aside ref={panel} className={`webTerminalPanel uiGlassSurface${visible ? " open" : ""}${resizing.current ? " resizing" : ""}`} style={split ? { flexBasis: `${splitPercent}%` } : undefined} role="dialog" aria-label={`${projectName} 交互终端`}>
     {split ? <div className="webTerminalSplitHandle" role="separator" aria-orientation="horizontal" aria-label="拖动调整终端与文件变更区域高度" aria-valuemin={20} aria-valuemax={75} aria-valuenow={Math.round(splitPercent)} tabIndex={0} onPointerDown={event => {
       event.preventDefault();

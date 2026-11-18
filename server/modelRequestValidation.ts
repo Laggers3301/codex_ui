@@ -1,16 +1,22 @@
 import fs from "node:fs";
-import path from "node:path";
 import { AppError } from "./appErrors.js";
+import { modelCatalogSource, accountModelSupportsUltrafast } from "./modelCatalogSource.js";
+import { assertServiceTierEnabled } from "./serviceTier.js";
 const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
 const catalogs = new Map<string, { stamp: number; size: number; models: Record<string, unknown>[] }>();
 
 /** Validate only explicitly declared capabilities. Unknown metadata is not a
  * reason to deny a working model. Never silently drop images/schema/effort. */
 export function validateModelRequest(home: string, method: string, value: unknown): void {
-  if (!["turn/start", "thread/start", "thread/queue/add", "thread/queue/start"].includes(method)) return;
   const p = record(value);
-  if (typeof p.model !== "string") return;
-  const file = path.join(home, "model-catalog-gpt-5.6-sol-long-context.json");
+  assertServiceTierEnabled(p.serviceTier, p.serviceTierForTurn);
+  if (!["turn/start", "thread/start", "thread/queue/add", "thread/queue/start"].includes(method)) return;
+  const modelId = p.model ?? record(record(p.collaborationMode).settings).model;
+  if (typeof modelId !== "string") return;
+  if ((p.serviceTier === "ultrafast" || p.serviceTierForTurn === "ultrafast") && !accountModelSupportsUltrafast(home, modelId)) {
+    throw new AppError("unsupported_model_capability", `当前账号未开放 ${modelId} 的 Ultra Fast，请选择标准或 Fast。`);
+  }
+  const file = modelCatalogSource(home);
   let models: Record<string, unknown>[];
   try {
     const stat = fs.statSync(file), cached = catalogs.get(file);
@@ -22,7 +28,7 @@ export function validateModelRequest(home: string, method: string, value: unknow
       catalogs.set(file, { stamp: stat.mtimeMs, size: stat.size, models });
     }
   } catch { return; }
-  const model = models.find(m => m.slug === p.model);
+  const model = models.find(m => m.slug === modelId);
   if (!model) return;
   const deny = (message: string): never => { throw new AppError("unsupported_model_capability", message); };
   const modalities = Array.isArray(model.input_modalities) ? model.input_modalities : null;

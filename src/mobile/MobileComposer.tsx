@@ -8,7 +8,7 @@ import { mobileShapeHaptic } from "../mobileHaptics";
 const pages = { session: "会话操作", workspace: "工作区工具", settings: "设置与用量" };
 const groupFor = (id: string) => ["goal", "export", "send-markdown", "archive-list", "archive-current"].includes(id) ? "session"
   : ["writing", "worktree", "terminal", "browser", "hooks"].includes(id) ? "workspace"
-  : ["settings", "quota", "leaderboard"].includes(id) ? "settings" : "root";
+  : ["settings", "quota", "leaderboard", "haptics"].includes(id) ? "settings" : "root";
 
 export type MobileAction = { id: string; label: string; action: () => void; disabled?: boolean; active?: boolean };
 export function MobileComposer({ scope, userId, value, onChange, editor, activity, extras, chips, model, actions, menu, fileInput, active = false }: {

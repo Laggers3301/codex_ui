@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
-import { mobileHaptic } from "./mobileHaptics";
+import { haptic } from "./mobileHaptics";
+import { SIDEBAR_SWIPE_EVENT } from "./touchPress";
 
 export function sidebarSwipeIntent(dx: number, dy: number, open: boolean): "wait" | "ignore" | "drag" {
   const ax = Math.abs(dx), ay = Math.abs(dy);
@@ -86,7 +87,7 @@ export function useMobileSidebar(collapsed: boolean, change: (collapsed: boolean
       else timer.current = setTimeout(() => { if (version === generation.current) { timer.current = null; state.current.change(true); } }, SETTLE_MS);
       return;
     }
-    mobileHaptic();
+    haptic("snap");
     if (open && !isOpen(p)) {
       beginMotion(p, false); place(p, -width()); setShown(p, true);
       void p.panel.offsetWidth; // commit the off-screen pose before animating
@@ -97,11 +98,13 @@ export function useMobileSidebar(collapsed: boolean, change: (collapsed: boolean
   };
   useEffect(() => {
     let frame = 0, pendingOffset = 0, suppressClickUntil = 0;
-    let drag: { x: number; y: number; open: boolean; active: boolean; dx: number; parts: Parts | null } | null = null;
+    let drag: { x: number; y: number; open: boolean; active: boolean; ignored?: boolean; dx: number; parts: Parts | null } | null = null;
     const paint = () => { frame = 0; if (drag?.parts) place(drag.parts, pendingOffset); };
     const start = (event: TouchEvent) => {
       if (!window.matchMedia("(max-width: 720px)").matches || event.touches.length !== 1 || settling.current) return;
       const target = event.target as Element;
+      // A row long-press that already started reordering owns this touch.
+      if (document.body.classList.contains("v2ThreadDragActive")) return;
       const touch = event.touches[0], parts = find();
       if (!parts) return;
       const open = isOpen(parts);
@@ -124,13 +127,18 @@ export function useMobileSidebar(collapsed: boolean, change: (collapsed: boolean
     const move = (event: TouchEvent) => {
       if (!drag || event.touches.length !== 1) return;
       const dx = sign * (event.touches[0].clientX - drag.x), dy = event.touches[0].clientY - drag.y;
+      if (drag.ignored) return;
+      if (document.body.classList.contains("v2ThreadDragActive")) { drag = null; return; }
       if (!drag.active) {
         const intent = sidebarSwipeIntent(dx, dy, drag.open);
-        if (intent === "ignore") { drag = null; return; }
+        // A scroll or counter-swipe is not a tap either: keep the touch until it ends so its click is dropped.
+        if (intent === "ignore") { drag.ignored = true; window.dispatchEvent(new Event(SIDEBAR_SWIPE_EVENT)); return; }
         if (intent === "wait") return;
         if (timer.current) clearTimeout(timer.current);
         generation.current++;
         drag.active = true;
+        // Withdraw anything the row under the finger had started: pressed look, pending long press.
+        window.dispatchEvent(new Event(SIDEBAR_SWIPE_EVENT));
         beginMotion(drag.parts!, false);
         if (!drag.open) { place(drag.parts!, -width()); setShown(drag.parts!, true); }
       }
@@ -144,11 +152,14 @@ export function useMobileSidebar(collapsed: boolean, change: (collapsed: boolean
     };
     const finish = (cancelled = false) => {
       cancelAnimationFrame(frame); frame = 0;
+      if (drag?.ignored) suppressClickUntil = performance.now() + 400;
       if (!drag?.active) { drag = null; return; }
       suppressClickUntil = performance.now() + 400; // a recognised swipe never also selects the row under the finger
       const wasOpen = drag.open, parts = drag.parts!;
       const open = cancelled ? wasOpen : Math.abs(drag.dx) > Math.min(90, width() * .25) ? !wasOpen : wasOpen;
       drag = null;
+      // The drawer clicked into a new position: one firm tick (a bounce back to where it was stays silent).
+      if (open !== wasOpen) haptic("snap");
       // Commit React's mirror only when the result differs from what it holds.
       settle(parts, open, true, ++generation.current);
     };

@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import { chromium, expect } from "@playwright/test";
 
-const children=[],errors=[];
+const children=[],errors=[],controlLayouts=[];
 let browser;
 const evidence="output/qa/reclaude-preauth";
 await fs.mkdir(evidence,{recursive:true});
@@ -27,6 +27,7 @@ try {
   await context.request.post(origin+"/api/auth/login");
   await context.addInitScript(project=>{
     localStorage.setItem("codex-web-user-id","admin");
+    localStorage.setItem("codex-v2-codex-fast-mode-admin","true");
     localStorage.setItem("codex-v2-project-admin",project);
     localStorage.setItem("codex-v2-expanded-projects-admin",JSON.stringify([project]));
   },meta.projectId);
@@ -68,6 +69,26 @@ try {
     assert.ok(await page.locator(".accountPoolPopover").evaluate(node=>{const r=node.getBoundingClientRect();return r.left>=0&&r.right<=innerWidth+1;}));
     await page.screenshot({path:`${evidence}/${mobile?"phone":"desktop"}-shared-quota.png`});
     await quota.dispatchEvent("click");
+  }
+  // Tasks share the real composer controls, including narrow phone layouts.
+  for(const width of [1440,393,360]) {
+    const mobile=width<720;
+    await page.setViewportSize({width,height:mobile?852:1000});
+    if(mobile)await page.locator('.conversation > .composer .composerRichInput').click();
+    const tools=page.locator('.conversation > .composer .composerControlRow .composerTools');
+    const trigger=tools.locator('.conversationTasksTrigger');
+    await expect(trigger).toBeVisible();
+    await page.evaluate(()=>Promise.all(document.getAnimations().filter(animation=>animation.effect?.getTiming().iterations!==Infinity).map(animation=>animation.finished.catch(()=>{}))));
+    const metrics=await tools.evaluate(node=>[node.querySelector('.v2ContextStatusButton'),node.querySelector('.conversationTasksTrigger'),node.querySelector('.groupedModelPicker .polishedSelectTrigger')].map(control=>{const r=control.getBoundingClientRect(),s=getComputedStyle(control);return {x:r.x,y:r.y,width:r.width,height:r.height,center:r.y+r.height/2,radius:s.borderRadius,font:s.fontSize,background:s.backgroundColor,labelWidth:control.querySelector('span')?.getBoundingClientRect().width,labelNaturalWidth:control.querySelector('span')?.scrollWidth};}));
+    controlLayouts.push({width,metrics});
+    await fs.writeFile(`${evidence}/task-control-layouts.json`,JSON.stringify(controlLayouts,null,2)+'\n');
+    assert.ok(metrics[2].labelWidth>=metrics[2].labelNaturalWidth-1,'Model label must remain readable beside the other controls');
+    assert.ok(metrics.every(box=>Math.abs(box.center-metrics[0].center)<2),'Tasks, context and model must stay on one row');
+    assert.ok(metrics.every(box=>box.x>=0&&box.x+box.width<=width+1),'Controls must stay inside the viewport');
+    assert.equal(metrics[1].height,metrics[0].height);assert.equal(metrics[1].radius,metrics[0].radius);assert.equal(metrics[1].font,metrics[0].font);assert.equal(metrics[1].background,metrics[0].background);
+    await page.locator('.conversation > .composer .composerControlRow').screenshot({path:`${evidence}/task-controls-${width}.png`});
+    await trigger.click();const tasks=page.getByRole('dialog',{name:'子代理',exact:true});await expect(tasks).toBeVisible();
+    await page.keyboard.press('Escape');await expect(page.locator('.conversationTasksDialog')).toHaveCount(0);
   }
   await page.setViewportSize({width:1440,height:1000});
   await post("claude-begin");
@@ -134,7 +155,42 @@ try {
     else {assert.equal(branchBodies.at(-1).targetAccountId,"100002");assert.equal(branchBodies.at(-1).reasoningEffort,"max");}
   }
   assert.equal(branchBodies.length,2);assert.deepEqual(errors,[]);
-  const results={desktopAndPhoneMenus:true,unconnectedModelsDisabled:true,noFakeReasoningTiers:true,streamedTextVisible:true,fullSnapshotDeduplicated:true,nativeApprovalVisible:true,declineDelivered:true,reloadPreservesTimeline:true,nativeInferenceTurns:0,errors};
+  // These model requests are intercepted before the isolated backend. A saved
+  // Codex Fast preference must never turn Claude requests or /fast into Fast.
+  let fastModel='reclaude-sonnet@1';const capturedPrompts=[];
+  await page.route(url=>url.pathname==='/api/threads/main-a',async route=>{
+    const response=await route.fetch(),data=await response.json();
+    data.thread.configuredModel=fastModel;data.thread.model=fastModel;
+    await route.fulfill({response,json:data});
+  });
+  await context.routeWebSocket('**/ws*',socket=>{
+    const server=socket.connectToServer();server.onMessage(message=>socket.send(message));
+    socket.onMessage(message=>{
+      const data=JSON.parse(String(message));
+      if(['turn.start','thread.start','turn.queue.add'].includes(data.type)){
+        capturedPrompts.push(data);socket.send(JSON.stringify({type:'error',requestId:data.requestId,ok:false,error:'已拦截隔离测试请求。'}));
+      }else server.send(message);
+    });
+  });
+  for(const width of [1440,360]){
+    await page.setViewportSize({width,height:width<720?852:1000});
+    await page.goto(`${origin}/?project=${meta.projectId}&thread=main-a`,{waitUntil:'domcontentloaded'});
+    const editor=page.locator('.conversation > .composer .composerRichInput');await editor.click();
+    await expect(page.locator('.conversation > .composer .groupedModelPicker')).toHaveAttribute('data-runtime','claude-code');
+    await expect(page.locator('.conversation > .composer').getByRole('button',{name:/^Fast /})).toHaveCount(0);
+    await expect(page.locator('.conversation > .composer .conversationTasksTrigger')).toBeVisible();
+    const before=capturedPrompts.length;await editor.fill('/fast');await page.getByRole('button',{name:'发送',exact:true}).click();
+    await expect(page.locator('#conversation-messages')).toContainText('Claude 模型不支持 Fast 模式。');assert.equal(capturedPrompts.length,before);
+    assert.equal(await page.evaluate(()=>localStorage.getItem('codex-v2-codex-fast-mode-admin')),'true');
+    await editor.fill('验证 Claude 不继承 Fast 设置');await page.getByRole('button',{name:'发送',exact:true}).click();
+    await expect.poll(()=>capturedPrompts.length).toBe(before+1);assert.equal(capturedPrompts.at(-1).model,fastModel);assert.notEqual(capturedPrompts.at(-1).serviceTier,'fast');
+  }
+  fastModel='gpt-6.1-sol';await page.setViewportSize({width:1440,height:1000});await page.reload({waitUntil:'domcontentloaded'});
+  await expect(page.locator('.conversation > .composer').getByRole('button',{name:'Fast On',exact:true})).toBeVisible();
+  assert.equal((await (await context.request.get(origin+'/api/__test/state')).json()).starts.length,0);
+  assert.deepEqual(errors,[]);
+  const results={taskControlsSameRow:true,taskControlsMatchingStyle:true,claudeFastHidden:true,claudeFastShortcutBlocked:true,claudeRequestsNotFast:true,codexFastPreferencePreserved:true,desktopAndPhoneMenus:true,unconnectedModelsDisabled:true,noFakeReasoningTiers:true,streamedTextVisible:true,fullSnapshotDeduplicated:true,nativeApprovalVisible:true,declineDelivered:true,reloadPreservesTimeline:true,nativeInferenceTurns:0,errors};
+  await fs.writeFile(`${evidence}/task-control-layouts.json`,JSON.stringify(controlLayouts,null,2)+'\n');
   await fs.writeFile(`${evidence}/results.json`,JSON.stringify(results,null,2)+"\n");console.log(JSON.stringify(results,null,2));
 } finally {
   await browser?.close();

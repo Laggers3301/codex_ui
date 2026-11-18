@@ -52,3 +52,9 @@ it("aggregates controls, preserves callbacks, closes safely and resets on thread
     expect(panel.open).toBe(false);
   } finally { await act(() => root.unmount()); node.remove(); vi.unstubAllGlobals(); vi.useRealTimers(); }
 });
+
+it("lists the desktop controls left to right as tasks, context, speed, model", () => {
+  const html = renderToStaticMarkup(<MobileComposerSettings mobile={false} scope="thread" label="Astra"
+    context={<button>上下文</button>} speed={<button>速度</button>} tasks={<button>任务</button>} model={<button>模型</button>} />);
+  expect([...html.matchAll(/<button>(.*?)<\/button>/g)].map(match => match[1])).toEqual(["任务", "上下文", "速度", "模型"]);
+});

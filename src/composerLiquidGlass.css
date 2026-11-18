@@ -89,7 +89,7 @@
 .conversation > .composer.composerLiquidGlass .composerControlRow .v2ComposerPlus:hover { background:rgba(127,138,130,.10) !important; }
 .conversation > .composer.composerLiquidGlass .composerControlRow .sendButton.primary { background:var(--ui-action-primary-bg,#e6e8e2) !important; color:var(--ui-action-primary-text,#242724) !important; }
 .conversation > .composer.composerLiquidGlass .composerControlRow .sendButton.stopMode { background:var(--ui-contrast) !important; color:var(--ui-surface) !important; }
-.conversation > .composer.composerLiquidGlass .composerControlRow .voiceButton.recording { color:#ed7771 !important; }
+.conversation > .composer.composerLiquidGlass .composerControlRow .voiceButton.recording { color:var(--text) !important; }
 .conversation > .composer.composerLiquidGlass .composerControlRow .v2FastModeButtonActive { background:var(--ui-control-glass-active) !important; color:var(--ui-content) !important; }
 .conversation > .composer.composerLiquidGlass .composerControlRow button:focus-visible { outline:2px solid var(--ui-content-muted); outline-offset:3px; }
 :is(.composerLiquidGlass .groupedModelMenu,.composerLiquidGlass .groupedModelCascade,.composerSlashMenu,#v2PlusMenu,.contextDialog,.composerLiquidGlass .composerFormatToolbar,.composerLiquidGlass .composerFormatTypeMenu,.composerLiquidGlass .voiceNotice) {

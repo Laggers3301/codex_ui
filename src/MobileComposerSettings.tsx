@@ -43,7 +43,8 @@ export function MobileComposerSettings({ mobile, label, scope, context, speed, t
     document.addEventListener('keydown', key, true);
     return () => document.removeEventListener('keydown', key, true);
   }, [open]);
-  if (!mobile) return <>{context}{speed}{tasks}{model}</>;
+  // Desktop order, left to right: tasks, context, speed (⚡), model.
+  if (!mobile) return <>{tasks}{context}{speed}{model}</>;
   return <>
     <button ref={trigger} className="mobileComposerSettingsTrigger" type="button" aria-label="会话设置" aria-haspopup="dialog" aria-expanded={open} onClick={() => { clearTimeout(closeTimer.current); setClosing(false); setOpen(true); }}>
       <span>{label}</span><ChevronDown size={14} />

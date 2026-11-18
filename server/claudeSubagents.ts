@@ -57,6 +57,19 @@ export async function claudeSubagentPage(storage:ClaudeSessionStorage,row:Claude
 }
 export async function claudeSubagentReferencePage(found:{file:string;cutoff:number;maxEndOffset?:number},id:string,before=0,limit=100){
   const page=await boundedRows(found.file,before,found.cutoff,limit,found.maxEndOffset),adapter=new ClaudeStreamAdapter(id,`claude-agent-page:${page.before}`,()=>{});
-  for(const record of page.rows)adapter.accept(record);
+  for(const [index,record] of page.rows.entries()){
+    // Native JSONL user prompts are history, not live tool-result envelopes.
+    // The streaming adapter handles tool results separately and would otherwise
+    // omit the original instruction from the child's conversation.
+    if(record.type==='user'){
+      const value=record.message?.content,content=typeof value==='string'?[{type:'text',text:value}]:Array.isArray(value)?value.filter(block=>block?.type==='text'&&typeof block.text==='string'):[];
+      if(content.length){
+        const id=typeof record.uuid==='string'?record.uuid:`history:${page.before}:${index}`;
+        adapter.recordUserInput(id,content);
+        const item=adapter.items.get(`claude-user:${id}`);if(item&&typeof record.timestamp==='string')item.timelineAt=record.timestamp;
+      }
+    }
+    adapter.accept(record);
+  }
   return {thread:{id,name:`Claude · ${id}`,turns:[{id:`claude-agent-page:${page.before}`,status:'unknown',items:claudeVisibleItems([...adapter.items.values()],{includeSubagents:true})}]},history:{totalItems:null,returnedItems:page.rows.length,before,nextBefore:page.before,hasOlder:page.hasOlder,nextCursor:page.hasOlder?String(page.before):null}};
 }

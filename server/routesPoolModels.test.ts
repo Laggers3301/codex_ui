@@ -50,6 +50,14 @@ it('serves installed pool catalogs even when the default account is stale or the
       expect(data.filter((m:{runtime?:string})=>m.runtime==='claude-code').every((m:{availability:string})=>m.availability==='not-connected')).toBe(true);
       expect(new Set(data.map((m:{id:string})=>m.id)).size).toBe(data.length);
     }
+    const fresh = path.join(homes[1], 'models_cache.json');
+    fs.writeFileSync(fresh, JSON.stringify({models:[model('gpt-6.1-sol'), model('gpt-6.1-terra'), {...model('gpt-6.2-sol'), additional_speed_tiers:['fast','ultrafast']}]}));
+    // No manual invalidation/restart: native cache changes update HTTP and routing.
+    const refreshed = (await app.inject({method:'GET',url:'/api/models'})).json().data;
+    expect(refreshed.filter((m:{model:string})=>m.model==='gpt-6.2-sol')).toHaveLength(2);
+    expect(refreshed.find((m:{model:string})=>m.model==='gpt-6.2-sol').ultrafastAccounts).toEqual(['new']);
+    expect(pool.getBranchRoutingDecision('fixture-thread','gpt-6.2-sol').targetAccount.id).toBe('new');
+    expect(vi.mocked(execFileSync)).not.toHaveBeenCalled();
     expect(pool.getBranchRoutingDecision('fixture-thread','gpt-6.1-terra').targetAccount.id).toBe('new');
     await expect(pool.request("thread/start", {model:"reclaude-sonnet"})).rejects.toMatchObject({code:"runtime_not_connected"});
     await expect(pool.startThreadOnAccount("old", {model:"reclaude-sonnet"})).rejects.toMatchObject({code:"runtime_not_connected"});

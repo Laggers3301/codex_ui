@@ -41,7 +41,7 @@
 .composerLongTextDialog:not([open]) { display: none; }
 .composerLongTextDialog[open] { display: flex; flex-direction: column; }
 .composerLongTextDialog::backdrop { background: rgba(0, 0, 0, .48); }
-body:has(.composerLongTextDialog[open]) { overflow: hidden; }
+body.composerLongTextOpen { overflow: hidden; }
 .composerLongTextDialog > header {
   display: flex;
   align-items: center;

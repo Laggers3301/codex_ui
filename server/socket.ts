@@ -1,6 +1,8 @@
+import { terminalCommand, terminalSessionsFor, type TerminalSessions } from "./terminalSessions.js";
 import { assertRuntimeModel, effectiveRuntimeModel, getClaudeService } from "./claudeService.js";
 import { getRuntimeHistoryTransfer } from "./runtimeHistoryTransfer.js";
 import { isReclaudeModel } from "../shared/agentRuntime.js";
+import { newConversationDefaults } from "../shared/newConversationDefaults.js";
 import { createHash, randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import fs, { type FileHandle } from "node:fs/promises";
@@ -60,6 +62,13 @@ import { parseQuestionTool, readLiveQuestionNotification } from "../src/question
 import { meaningfulTurnProgressMethod, phaseFromProbe, TurnWatchdog, type WatchdogProbeClaim, type WatchdogTurn } from "./turnWatchdog.js";
 import { LatestTaskQueue } from "./streamBatch.js";
 import { requestedServiceTier, requestedTurnServiceTier } from "./serviceTier.js";
+
+/** The speed tier belongs to the conversation: remember what the user chose so every device shows the same one. */
+function rememberThreadTier(store: ProjectStore, threadId: string, userId: string, value: unknown) {
+  if (value === undefined) return;
+  const tier = value === "fast" || value === "ultrafast" ? value : null;
+  try { store.setThreadServiceTier(threadId, userId, tier); } catch (error) { console.warn("Saving the thread speed tier failed", error); }
+}
 import type { LiveAgentMessage } from "./liveState.js";
 import { reconcileSideChat, settleClosedSideChat, SideChatError } from "./sideChats.js";
 import { forkSideChatContext } from "./sideChatFork.js";
@@ -531,8 +540,8 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   browserService?.on("changed", browserChanged);
   wss.on("close", () => browserService?.off("changed", browserChanged));
   const liveStates = new Map<string, LiveStateStore>();
-  const processOwners = new Map<string, string>();
-  const processSockets = new Map<string, WebSocket>();
+  const terminals = terminalSessionsFor(bridge);
+  const processOwners = terminals.owners;
   const pendingApprovalOwners = new Map<number | string, string>();
   const pendingApprovalTurns = new Map<number | string, { userId: string; accountId: string | null; threadId: string; turnId: string | null }>();
   const turnOwners = new Map<string, string>();
@@ -719,6 +728,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
   // only sockets that miss a full ping interval so the client reconnects itself.
   const heartbeat = setInterval(() => {
     const deletedUsers = deletedWebUserIds();
+    terminals.sweep(user => deletedUsers.has(user));
     for (const client of wss.clients) {
       const userClient = client as UserWebSocket;
       if (userClient.codexUserId && deletedUsers.has(userClient.codexUserId)) {
@@ -734,6 +744,9 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
     }
   }, 15_000);
   wss.on("close", () => clearInterval(heartbeat));
+  const modelCatalogUpdated = (data: unknown) => broadcast(wss, { type: "models.updated", data });
+  bridge.on("modelCatalogUpdated", modelCatalogUpdated);
+  wss.on("close", () => bridge.off("modelCatalogUpdated", modelCatalogUpdated));
 
   const liveStateFor = (userId: string): LiveStateStore => {
     let state = liveStates.get(userId);
@@ -1273,7 +1286,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
         ws.close(1008, "Account access revoked.");
         return;
       }
-      void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), processOwners, processSockets, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission, (requestId) => {
+      void handleClientMessage(ws, bridge, rawCompactFilter, store, liveStateFor(sessionUserId), terminals, pendingApprovalOwners, pendingApprovalTurns, turnWatchdog, guards, sessionUserId, raw.toString("utf8"), startNextQueuedTurn, steerQueuedSubmission, (requestId) => {
         const pending = pendingApprovalTurns.get(requestId);
         if (pending) processBridgeNotification({ method: "serverRequest/resolved", accountId: pending.accountId, params: { threadId: pending.threadId, requestId } } as RpcEnvelope);
       }, browserService, (threadId, itemId) => sendToUser(wss, sessionUserId, {
@@ -1307,14 +1320,7 @@ export function attachSocketServer(httpServer: HttpServer, bridge: CodexBridge, 
             : status.type ? "当前未发现待批准操作，已更新运行状态。" : "暂时无法确认运行状态，请稍后重新核对。" };
       });
     });
-    ws.on("close", () => {
-      for (const [processId, socket] of processSockets) {
-        if (socket !== ws) continue;
-        processSockets.delete(processId);
-        processOwners.delete(processId);
-        void bridge.request("command/exec/terminate", { processId }, 10_000).catch(() => undefined);
-      }
-    });
+    ws.on("close", () => terminals.closeSocket(ws));
   });
 
   return wss;
@@ -1326,8 +1332,7 @@ async function handleClientMessage(
   rawCompactFilter: RawCompactFilter,
   store: ProjectStore,
   liveState: LiveStateStore,
-  processOwners: Map<string, string>,
-  processSockets: Map<string, WebSocket>,
+  terminals: TerminalSessions,
   pendingApprovalOwners: Map<number | string, string>,
   pendingApprovalTurns: Map<number | string, { userId: string; accountId: string | null; threadId: string; turnId: string | null }>,
   turnWatchdog: TurnWatchdog,
@@ -1406,8 +1411,13 @@ async function handleClientMessage(
         if (!question) {
           throw new Error("Prompt is required.");
         }
-        const model = effectiveRuntimeModel(bridge,sessionUserId,pickString(message.model, project.defaultModel).trim() || project.defaultModel);
-        const reasoningEffort = pickReasoningEffort(message.reasoningEffort, project.defaultReasoningEffort);
+        const requestedModel = pickString(message.model).trim();
+        const defaultModel = side ? project.defaultModel : newConversationDefaults.model;
+        const model = effectiveRuntimeModel(bridge, sessionUserId, requestedModel || defaultModel);
+        const defaultEffort = !side && (requestedModel || defaultModel) === newConversationDefaults.model
+          ? newConversationDefaults.reasoningEffort
+          : project.defaultReasoningEffort;
+        const reasoningEffort = pickReasoningEffort(message.reasoningEffort, defaultEffort);
         const requestedContextConfig = !threadContextFeatureEnabled || message.contextConfig === undefined
           ? null
           : resolveThreadContextConfig("", threadStartContextConfigSchema.parse(message.contextConfig));
@@ -1479,6 +1489,7 @@ async function handleClientMessage(
             }
             store.setThreadExecutionSettings(threadId, sessionUserId,
               pickSandbox(message.sandbox, project.defaultSandbox), pickApprovalPolicy(message.approvalPolicy, project.defaultApprovalPolicy));
+            rememberThreadTier(store, threadId, sessionUserId, message.serviceTier);
             if (browserMcp?.bindingId) bindBrowserMcpThread(browserMcp.bindingId, threadId, store);
             if (requestedContextConfig) {
               store.setThreadContextConfig(threadId, sessionUserId, {
@@ -1629,6 +1640,7 @@ async function handleClientMessage(
                   : undefined
               }, 30_000);
               store.setThreadExecutionSettings(threadId, sessionUserId, executionSandbox, executionApproval);
+              rememberThreadTier(store, threadId, sessionUserId, message.serviceTier);
               const turnParams = {
                 ...requestedTurnServiceTier(message.serviceTier),
                 threadId,
@@ -1728,6 +1740,7 @@ async function handleClientMessage(
           { userId: sessionUserId, requestId },
           async () => {
             const tier = requestedServiceTier(message.serviceTier);
+            rememberThreadTier(store, threadId, sessionUserId, message.serviceTier);
             if (message.serviceTier !== undefined) {
               // Updates subsequent turns only, never the generation in flight.
               await bridge.request("thread/settings/update", { threadId, ...tier });
@@ -1970,13 +1983,9 @@ async function handleClientMessage(
         const processId = pickString(message.processId, `cmd-${randomUUID()}`);
         const tty = pickBoolean(message.tty, true);
         const disableTimeout = pickBoolean(message.disableTimeout, false);
-        processOwners.set(processId, sessionUserId);
-        processSockets.set(processId, ws);
-        let result: unknown;
-        try { result = await bridge.request(
-          "command/exec",
+        const result = await terminals.execute(processId, sessionUserId, ws,
           {
-            command,
+            command: terminalCommand(command),
             processId,
             tty,
             streamStdin: true,
@@ -1989,10 +1998,7 @@ async function handleClientMessage(
             sandboxPolicy: sandboxPolicy(project, pickSandbox(message.sandbox, project.defaultSandbox))
           },
           disableTimeout ? 86_400_000 : 180_000
-        ); } finally {
-          processOwners.delete(processId);
-          processSockets.delete(processId);
-        }
+        );
         send(ws, { type: "ack", requestId, ok: true, data: { processId, result } });
         break;
       }
@@ -2003,17 +2009,14 @@ async function handleClientMessage(
         if (!processId) {
           throw new Error("processId is required.");
         }
-        if (processOwners.get(processId) !== sessionUserId) {
-          throw new Error("Process is not visible for this logged-in user.");
-        }
-        const result = await bridge.request("command/exec/write", { processId, deltaBase64: Buffer.from(data, "utf8").toString("base64") });
+        const result = await terminals.control(processId, sessionUserId, ws, "command/exec/write", { deltaBase64: Buffer.from(data, "utf8").toString("base64") });
         send(ws, { type: "ack", requestId, ok: true, data: result });
         break;
       }
 
       case "command.resize": {
         const processId = pickString(message.processId);
-        if (!processId || processOwners.get(processId) !== sessionUserId) {
+        if (!processId) {
           throw new Error("Process is not visible for this logged-in user.");
         }
         const size = message.size as { cols?: unknown; rows?: unknown } | undefined;
@@ -2022,7 +2025,7 @@ async function handleClientMessage(
         if (!Number.isInteger(cols) || cols < 20 || cols > 400 || !Number.isInteger(rows) || rows < 5 || rows > 200) {
           throw new Error("Invalid terminal size.");
         }
-        const result = await bridge.request("command/exec/resize", { processId, size: { cols, rows } });
+        const result = await terminals.control(processId, sessionUserId, ws, "command/exec/resize", { size: { cols, rows } });
         send(ws, { type: "ack", requestId, ok: true, data: result });
         break;
       }
@@ -2032,12 +2035,7 @@ async function handleClientMessage(
         if (!processId) {
           throw new Error("processId is required.");
         }
-        if (processOwners.get(processId) !== sessionUserId) {
-          throw new Error("Process is not visible for this logged-in user.");
-        }
-        const result = await bridge.request("command/exec/terminate", { processId });
-        processOwners.delete(processId);
-        processSockets.delete(processId);
+        const result = await terminals.terminate(processId, sessionUserId, ws);
         send(ws, { type: "ack", requestId, ok: true, data: result });
         break;
       }

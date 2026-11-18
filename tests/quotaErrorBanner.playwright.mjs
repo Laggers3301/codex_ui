@@ -5,7 +5,7 @@ import {createHmac} from 'node:crypto';
 // Production static assets only. Every API and WebSocket is a private fixture.
 const origin=process.env.QA_ORIGIN??'http://127.0.0.1:4574';
 if(process.env.QA_FIXTURE_AUTH==='1'&&process.env.QA_QUOTA_FROM_API==='1')throw new Error('Fixture credentials cannot verify production quota');
-const secret=process.env.QA_FIXTURE_AUTH==='1'?'fixture-only-session-secret':(await fs.readFile(new URL('../data/auth/session-secret',import.meta.url),'utf8')).trim();
+const secret=process.env.QA_FIXTURE_AUTH==='1'?'fixture-only-session-secret':(await fs.readFile(new URL('../../data/auth/session-secret',import.meta.url),'utf8')).trim();
 const payload=Buffer.from(JSON.stringify({u:'qa-user',exp:Date.now()+300000})).toString('base64url');
 const cookie=payload+'.'+createHmac('sha256',secret).update(payload).digest('base64url');
 let liveQuota=null;
@@ -18,7 +18,7 @@ if(process.env.QA_QUOTA_FROM_API==='1'){
   }
   assert.ok(liveQuota.status==='ready'&&Date.now()-Date.parse(liveQuota.updatedAt)<120000,'live quota must be fresh rather than a pre-restart cache');
 }
-const evidence=process.env.QA_TERRA_PICKER==='1'?'./output/qa/terra-picker-20261027':'./output/qa/quota-error-banner-20261025'+(liveQuota?'/real-quota':'');await fs.mkdir(evidence,{recursive:true,mode:0o700});
+const evidence=process.env.QA_TERRA_PICKER==='1'?'../data/backend/terra-picker-20261027':'../data/backend/quota-error-banner-20261025'+(liveQuota?'/real-quota':'');await fs.mkdir(evidence,{recursive:true,mode:0o700});
 const expectedReset=liveQuota?new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(new Date(liveQuota.periods.find(p=>p.label==='weekly').resetsAt)):'2099/10/26 00:00';
 const project={id:'quota-project',name:'额度横条隔离验收',rootPath:'/fixture',userId:'qa',defaultModel:'kimi-k3',defaultReasoningEffort:'medium',defaultSandbox:'danger-full-access',defaultApprovalPolicy:'never'};
 const thread={id:'quota-thread',name:'额度错误测试',cwd:'/fixture',createdAt:1,updatedAt:1,status:'active',configuredModel:'kimi-k3',turns:[{id:'quota-turn',status:'running',items:[{id:'quota-user',type:'userMessage',text:'额度横条隔离验收问题'}]}]};
@@ -49,7 +49,7 @@ try {
       else if(p.endsWith('/context')||p.endsWith('/side-chat'))json={data:null};
       else if(p.endsWith('/subagents'))json={data:[],page:{total:0,activeCount:0,historyCount:0,hasMore:false}};
       else if(p==='/api/pets')json={pets:[],activePetId:null,visible:false,position:null};
-      else if(p==='/api/codex/account-pool')json={data:{accounts:['100004','100001','100002','100003'].map(id=>({id,label:id,health:process.env.QA_ACCOUNT_CACHE==='1'?'degraded':'ready',lastError:process.env.QA_ACCOUNT_CACHE==='1'?'rateLimits: Timed out waiting for Codex response':null,kind:'codex-account',quota:{account:{type:'chatgpt'},rateLimits:{primary:{usedPercent:10,windowDurationMins:300,resetsAt:null}},resetCredits:null,usage:null,errors:[],updatedAt:new Date().toISOString()}})),currentThreadAccountId:null}};
+      else if(p==='/api/codex/account-pool')json={data:{accounts:['260707','260803','260831','260901'].map(id=>({id,label:id,health:process.env.QA_ACCOUNT_CACHE==='1'?'degraded':'ready',lastError:process.env.QA_ACCOUNT_CACHE==='1'?'rateLimits: Timed out waiting for Codex response':null,kind:'codex-account',quota:{account:{type:'chatgpt'},rateLimits:{primary:{usedPercent:10,windowDurationMins:300,resetsAt:null}},resetCredits:null,usage:null,errors:[],updatedAt:new Date().toISOString()}})),currentThreadAccountId:null}};
       else if(p==='/api/codex/provider-quotas')json={data:{loading:false,items:[liveQuota??{id:'ark',name:'Ark',status:'ready',updatedAt:new Date().toISOString(),stale:false,message:null,periods:[{label:'session',usedPercent:0,resetsAt:'2099-10-25T20:13:47+08:00'},{label:'weekly',usedPercent:100,resetsAt:'2099-10-26T00:00:00+08:00'}]}]}};
       else if(p==='/api/models')json={data:[{id:'kimi',label:'kimi-k3 medium',model:'kimi-k3',effort:'medium'},...(process.env.QA_TERRA_PICKER==='1'?['max','xhigh','high','medium','low'].map(effort=>({id:'gpt-6.1-terra:'+effort,label:'GPT-6.1-Terra '+effort,model:'gpt-6.1-terra',effort})):[])]};
       await route.fulfill({json});
@@ -71,6 +71,7 @@ try {
     const text=await banner.innerText();assert.ok(text.includes(expectedReset)&&text.includes('官方额度查询'));
     const box=await banner.boundingBox();assert.ok(box.x>=-1&&box.x+box.width<=page.viewportSize().width+1);
     await page.screenshot({path:`${evidence}/${mobile?'phone':'desktop'}-${theme}-banner.png`});
+    if (mobile) await page.locator('.mobileHeaderTitle').click();
     await page.locator('.quotaButton').click();const tab=page.locator('[data-account-id="provider:ark"]');await tab.waitFor();await page.waitForTimeout(300);
     if(process.env.QA_ACCOUNT_CACHE==='1'){
       assert.equal(await page.locator('.accountPoolTab.degraded[data-account-id]:not([data-account-id^="provider:"])').count(),0);

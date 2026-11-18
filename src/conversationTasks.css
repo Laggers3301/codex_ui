@@ -2,7 +2,7 @@
 .conversationTasksTrigger>.accountUpdateIndicator {position:absolute;top:1px;right:1px;margin:0;}
 /* Reuse the Context/Fast control material, without its auto margin or the
    mobile plan-mode rule that hides Fast. The compact phone dock still owns visibility. */
-.conversation>.composer .composerControlRow .composerTools>.conversationTasksTrigger {display:inline-flex!important;flex:0 0 auto;margin-left:0!important;gap:5px;}
+.conversation>.composer .composerControlRow .composerTools>.conversationTasksTrigger {display:inline-flex!important;flex:0 0 auto;order:87;margin-left:0!important;gap:5px;}
 .conversationTasksCount {opacity:.75;}
 .conversationTasksScrim {z-index:12060;}
 .taskNotificationDialog.conversationTasksDialog {width:min(820px,100%);height:min(640px,82dvh);max-height:calc(100dvh - 32px);display:flex;flex-direction:column;overflow:hidden;}

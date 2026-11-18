@@ -28,4 +28,17 @@
 .voiceSpinner { animation:voiceSpin .9s linear infinite; }
 @keyframes voiceSpin { to { transform:rotate(360deg); } }
 @keyframes voicePulse { 50% { opacity:.55; } }
-@media(prefers-reduced-motion:reduce) { .voiceButton,.voiceNotice,.voiceSpinner { animation:none!important; transition:none!important; } }
+/* Recording (desktop): a scrolling bar waveform covers the tool row, between a cancel button and the stop/send buttons. */
+.conversation > .composer .composerControlRow { position:relative; }
+.conversation > .composer .composerControlRow > .composerTools { transition:opacity .18s ease; }
+.conversation > .composer .composerControlRow:has(.voiceWave:not(.closing)) > .composerTools { opacity:0; pointer-events:none; }
+.voiceWave { position:absolute; left:0; top:0; bottom:0; z-index:2; display:flex; align-items:center; gap:8px; animation:voiceWaveEnter .22s ease both; }
+.voiceWave.closing { animation:voiceWaveExit .2s ease both; pointer-events:none; }
+.voiceWaveCancel { display:grid; place-items:center; flex:none; width:28px; height:28px; padding:0; border:0; border-radius:50%; background:var(--ui-hover); color:var(--text); cursor:pointer; transition:filter .15s ease; }
+.voiceWaveCancel:hover { filter:brightness(1.2); }
+.voiceWaveCanvas { flex:1; min-width:0; height:100%; color:var(--text); -webkit-mask-image:linear-gradient(to right,transparent,#000 14%); mask-image:linear-gradient(to right,transparent,#000 14%); }
+.voiceButton.recording { color:var(--text)!important; animation:none; }
+.voiceStopGlyph { display:block; width:11px; height:11px; border-radius:2.5px; background:currentColor; }
+@keyframes voiceWaveEnter { from { opacity:0; } to { opacity:1; } }
+@keyframes voiceWaveExit { from { opacity:1; } to { opacity:0; } }
+@media(prefers-reduced-motion:reduce) { .voiceButton,.voiceNotice,.voiceSpinner,.voiceWave { animation:none!important; transition:none!important; } }

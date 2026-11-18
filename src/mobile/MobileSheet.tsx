@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { useMobileLayer } from "./MobileLayerProvider";
+import { haptic } from "../mobileHaptics";
 
 /** Phone-only sheet: a single focus/exit/back contract, no business requests. */
 export function MobileSheet({ title, open, onClose, children, keepMounted = false }: { title: string; open: boolean; onClose: () => void; children: ReactNode; keepMounted?: boolean }) {
@@ -18,7 +19,7 @@ export function MobileSheet({ title, open, onClose, children, keepMounted = fals
     onClick={event => {
       if (event.target !== event.currentTarget) return;
       const box = event.currentTarget.getBoundingClientRect();
-      if (event.clientY < box.top || event.clientY > box.bottom || event.clientX < box.left || event.clientX > box.right) onClose();
+      if (event.clientY < box.top || event.clientY > box.bottom || event.clientX < box.left || event.clientX > box.right) { haptic("tap"); onClose(); }
     }}>
     <div className="mobileUiSheetHandle" aria-hidden="true" />
     <header><h2 id={heading}>{title}</h2><button type="button" aria-label={`关闭${title}`} onClick={onClose}><X size={20} /></button></header>

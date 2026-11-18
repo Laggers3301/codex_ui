@@ -14,12 +14,11 @@
   .topbar { transition: var(--ui-theme-transition); }
   :is(.errorBanner, .turnStoppedNotice) { transition: var(--ui-theme-transition); }
   .branchToolArchive { transition: none; }
-  /* Right panel: the transcript follows the panel's width frame by frame. A single
-     layout per frame is cheap (~1ms); the expensive part of the old sidebar motion
-     was restyling every sidebar row, which is handled separately below. The 4th
-     grid track is `auto`, so animating the panel's own width animates the column. */
-  .diffReviewPanel { transition: width .38s cubic-bezier(.22,1,.36,1), opacity .25s ease, transform .38s cubic-bezier(.22,1,.36,1), visibility 0s linear .38s; }
-  .workspace.diffPanelOpen .diffReviewPanel { transition: width .38s cubic-bezier(.22,1,.36,1), opacity .28s ease, transform .38s cubic-bezier(.22,1,.36,1), visibility 0s; }
+  /* Right panel, same recipe as the sidebar: the layout snaps to its final state once (animating the panel's width
+     re-laid out the whole transcript on every frame) and shellPresentation.ts runs the slide on the compositor.
+     A closing panel is lifted out of the grid (data-right-closing) so it can slide away over the widened transcript. */
+  .diffReviewPanel, .workspace.diffPanelOpen .diffReviewPanel { transition: none; }
+  .workspace > .rightWorkspace.diffReviewPanel[data-right-closing] { position: absolute; top: 0; right: 0; bottom: 0; z-index: 6; will-change: transform, opacity; }
   .workspace.diffPanelResizing .diffReviewPanel { transition: none; }
 
   :root { --shell-motion-delta: calc(var(--v2-sidebar-width, 280px) - var(--v2-collapsed-sidebar-width, 56px)); }

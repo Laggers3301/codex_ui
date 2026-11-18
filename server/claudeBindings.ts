@@ -15,6 +15,9 @@ export interface ClaudeIntegrationConfig {
   home: string; executable: string; storageDirectory: string;
   /** ReClaude CLI itself, not the Claude process wrapper. Enables web reauth. */
   reclaudeExecutable?: string;
+  /** Trusted local claude-account-sync, supporting its documented path env
+   * overrides. Optional: selecting an organization never implies a history copy. */
+  accountSyncExecutable?: string;
   /** Legacy bindings used only when a shared pool is not configured. */
   users?: Record<string, { workspaceRoot: string; orgIds: string[] }>;
   /** One account pool for every web user, with separate user workspaces. */
@@ -93,7 +96,52 @@ export class ClaudeBindings {
     }
     return owner;
   }
-  orgIds(userId: string): string[] { return [...new Set([...(this.owner(userId)?.orgIds??[]),...(this.config.remoteAccounts??[]).filter(row=>row.userId===userId).map(row=>row.orgId),...(this.config.privateAccounts??[]).filter(row=>row.userId===userId).map(row=>row.orgId)])]; }
+  canManageOrganizations(userId: string): boolean { return !!this.owner(userId); }
+  /** The device directory ReClaude currently treats as default (read-only; never exposes device secrets). */
+  currentOrganization(): { orgId: string; deviceId: string } | null {
+    try {
+      const root = path.join(this.config.home, ".rec", "claude");
+      const deviceId = fs.readFileSync(path.join(root, "current"), "utf8").trim();
+      if (!/^[0-9]+$/.test(deviceId)) return null;
+      const device = read(path.join(root, "accounts", deviceId, "device.json"));
+      const orgId = String(device.org_id);
+      return /^[0-9]+$/.test(orgId) ? { orgId, deviceId } : null;
+    } catch { return null; }
+  }
+  private organizationScope(userId: string): string { return this.config.sharedUsers ? "shared" : `user:${userId}`; }
+  private managedCache?: { key: string; value: Record<string, string[]> };
+  /** Organizations bound from the web UI. The registry is small and read often, so it is memoised by file stat. */
+  private managedOrganizations(): Record<string, string[]> {
+    const file = path.join(this.config.storageDirectory, "organizations.json");
+    try {
+      const stat = fs.statSync(file), key = `${stat.mtimeMs}:${stat.size}`;
+      if (this.managedCache?.key === key) return this.managedCache.value;
+      const value = read(file);
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid registry");
+      for (const ids of Object.values(value)) if (!Array.isArray(ids) || ids.some(id => typeof id !== "string" || !/^[0-9]+$/.test(id))) throw new Error("invalid registry");
+      this.managedCache = { key, value };
+      return value as Record<string, string[]>;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+      throw new AppError("runtime_not_connected", "组织绑定记录暂不可读，请检查服务存储后重试。");
+    }
+  }
+  /** Shared-pool organizations: the configured list plus those bound through the web UI. */
+  private sharedOrgIds(userId: string): string[] {
+    const owner = this.owner(userId);
+    return owner ? [...new Set([...owner.orgIds, ...(this.managedOrganizations()[this.organizationScope(userId)] ?? [])])] : [];
+  }
+  orgIds(userId: string): string[] { return [...new Set([...this.sharedOrgIds(userId),...(this.config.remoteAccounts??[]).filter(row=>row.userId===userId).map(row=>row.orgId),...(this.config.privateAccounts??[]).filter(row=>row.userId===userId).map(row=>row.orgId)])]; }
+  /** Called only after the CLI successfully authorizes the organization. The exclusive lifecycle lease serializes this update across web backends. */
+  addOrganization(userId: string, orgId: string): void {
+    if (!this.owner(userId) || !/^[0-9]+$/.test(orgId)) throw new AppError("runtime_forbidden", "无权绑定此组织。");
+    const all = { ...this.managedOrganizations() }, scope = this.organizationScope(userId);
+    all[scope] = [...new Set([...(all[scope] ?? []), orgId])];
+    const file = path.join(this.config.storageDirectory, "organizations.json"), temporary = `${file}.${process.pid}.partial`;
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(temporary, JSON.stringify(all), { mode: 0o600 }); fs.renameSync(temporary, file);
+    this.managedCache = undefined;
+  }
   effectiveModel(userId: string, model: string): string {
     const match = model.match(/^(reclaude-[a-z][a-z0-9-]*)@([0-9]+)$/);
     if (!match) return model;
@@ -139,7 +187,7 @@ export class ClaudeBindings {
       try {
         if (!fs.realpathSync(configRoot).startsWith(`${fs.realpathSync(base)}${path.sep}`)) continue;
         const device = read(path.join(base, "device.json"));
-        if (typeof device.sk !== "string" || !device.sk || !(location.account?location.account.orgId===String(device.org_id):owner.orgIds.includes(String(device.org_id)))) continue;
+        if (typeof device.sk !== "string" || !device.sk || !(location.account?location.account.orgId===String(device.org_id):this.sharedOrgIds(userId).includes(String(device.org_id)))) continue;
         const native = read(path.join(configRoot, ".claude.json"));
         const uuid = native.oauthAccount?.accountUuid;
         // ReClaude user_email/org_id/device_id are NOT Claude account identity.

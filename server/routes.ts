@@ -1,4 +1,6 @@
 import { claudePendingProfiles, isReclaudeModel } from "../shared/agentRuntime.js";
+import { newConversationDefaults } from "../shared/newConversationDefaults.js";
+import { CodexBackgroundTasks } from "./codexBackgroundTasks.js";
 import { assertRuntimeModel, effectiveRuntimeModel, getClaudeService } from "./claudeService.js";
 import { getRuntimeHistoryTransfer } from "./runtimeHistoryTransfer.js";
 import fs from "node:fs";
@@ -27,6 +29,7 @@ import { inheritedBillingTurnIds } from "./leaderboardForkUsage.js";
 import { billingLines } from "./billingLines.js";
 import { authenticatedUserFromHeaders, deletedWebUserIds, isDeletedWebUser, webUserDisplayNames } from "./auth.js";
 import { AppError } from "./appErrors.js";
+import { assertServiceTierEnabled, ultrafastDisabled } from "./serviceTier.js";
 import { memberRealName } from "../shared/memberDirectory.js";
 import { mintBrowserMcpConfig, bindBrowserMcpThread, browserMcpForThread } from "./browserRoutes.js";
 import {claudeSubagentDirectory,claudeSubagentPage} from './claudeSubagents.js';
@@ -270,6 +273,10 @@ const threadModelProfileSchema = z.object({
   reasoningEffort: effortSchema
 }).strict();
 
+const threadServiceTierSchema = z.object({
+  serviceTier: z.enum(["fast", "ultrafast"]).nullable()
+}).strict();
+
 const threadOrderSchema = z.object({
   threadIds: z.array(z.string().trim().min(1).max(256)).min(1).max(500)
 }).superRefine((value, context) => {
@@ -284,6 +291,7 @@ const fallbackCodexModels: Array<{
   priority: number;
   efforts: ReasoningEffort[];
 }> = [
+  { slug: newConversationDefaults.model, displayName: "GPT-6.2 Sol", priority: 0, efforts: [newConversationDefaults.reasoningEffort] },
   { slug: "gpt-6-astra", displayName: "GPT-6-Astra", priority: 1, efforts: ["ultra", "max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-6.1-sol", displayName: "GPT-6.1-Sol", priority: 1.5, efforts: ["max", "xhigh", "high", "medium", "low"] },
   { slug: "gpt-6.1-terra", displayName: "GPT-6.1-Terra", priority: 1.75, efforts: ["max", "xhigh", "high", "medium", "low"] },
@@ -325,6 +333,7 @@ export type PublicModelProfile = {
   effort: ReasoningEffort;
   displayName: string;
   priority: number;
+  ultrafastAccounts?: string[];
 };
 
 let modelCatalogCache: { key: string; expiresAt: number; data: PublicModelProfile[] } | null = null;
@@ -358,7 +367,7 @@ function fallbackModelProfiles(): PublicModelProfile[] {
   return fallbackCodexModels.flatMap((model) => profilesForModel(model, model.efforts));
 }
 
-export function modelProfilesFromCatalog(catalog: unknown): PublicModelProfile[] {
+export function modelProfilesFromCatalog(catalog: unknown, accountId?: string): PublicModelProfile[] {
   const models = Array.isArray(asRecord(catalog).models) ? (asRecord(catalog).models as unknown[]) : [];
   const profiles = models.flatMap((entry) => {
     const record = asRecord(entry);
@@ -390,10 +399,39 @@ export function modelProfilesFromCatalog(catalog: unknown): PublicModelProfile[]
       .map((level) => asRecord(level).effort)
       .filter(isReasoningEffort);
     const uniqueEfforts = Array.from(new Set(efforts.length ? efforts : [defaults.reasoningEffort]));
-    return profilesForModel({ slug, displayName, priority }, uniqueEfforts);
+    const ultrafast = Array.isArray(record.additional_speed_tiers) && record.additional_speed_tiers.includes("ultrafast")
+      || Array.isArray(record.service_tiers) && record.service_tiers.some(tier => asRecord(tier).id === "ultrafast");
+    return profilesForModel({ slug, displayName, priority }, uniqueEfforts).map(profile => ({
+      ...profile, ...(ultrafast && accountId && !ultrafastDisabled() ? { ultrafastAccounts: [accountId] } : {})
+    }));
   });
 
-  return profiles.sort((left, right) => left.priority - right.priority || effortOrder[left.effort] - effortOrder[right.effort] || left.label.localeCompare(right.label));
+  return orderGptByVersion(profiles.sort((left, right) => left.priority - right.priority || effortOrder[left.effort] - effortOrder[right.effort] || left.label.localeCompare(right.label)));
+}
+
+const gptTierRank: Record<string, number> = { astra: 0, sol: 1, terra: 2, luna: 3 };
+function gptSlugOrder(slug: string): { version: number[]; tier: number } | null {
+  const match = /^gpt-(\d+(?:\.\d+)*)-([a-z]+)$/.exec(slug);
+  return match ? { version: match[1].split(".").map(Number), tier: gptTierRank[match[2]] ?? 9 } : null;
+}
+
+/**
+ * GPT models list newest version first, and within a version the most capable tier first (Astra, Sol, Terra,
+ * Luna), instead of following the catalog's priority numbers, which could leave 6.2 Astra below 6.1 Terra.
+ * Non-GPT entries keep their positions; each model keeps its own effort order.
+ */
+export function orderGptByVersion<T extends { model: string }>(profiles: T[]): T[] {
+  const gpt = profiles.filter(profile => gptSlugOrder(profile.model));
+  const ordered = [...gpt].sort((left, right) => {
+    const a = gptSlugOrder(left.model)!, b = gptSlugOrder(right.model)!;
+    for (let i = 0; i < Math.max(a.version.length, b.version.length); i++) {
+      const diff = (b.version[i] ?? 0) - (a.version[i] ?? 0);
+      if (diff) return diff;
+    }
+    return a.tier - b.tier;
+  });
+  let next = 0;
+  return profiles.map(profile => gptSlugOrder(profile.model) ? ordered[next++] : profile);
 }
 
 export function mergeModelProfiles(profiles: PublicModelProfile[]): PublicModelProfile[] {
@@ -401,20 +439,31 @@ export function mergeModelProfiles(profiles: PublicModelProfile[]): PublicModelP
   // because the default account is busy and still uses an older catalog.
   // Keep first-source presentation and retain per-account routing validation.
   const unique = new Map<string, PublicModelProfile>();
-  for (const profile of profiles) if (!unique.has(profile.id)) unique.set(profile.id, profile);
-  return [...unique.values()].sort((left, right) => left.priority - right.priority || effortOrder[left.effort] - effortOrder[right.effort] || left.label.localeCompare(right.label));
+  for (const profile of profiles) {
+    const previous = unique.get(profile.id);
+    if (!previous) unique.set(profile.id, profile);
+    else if (profile.ultrafastAccounts?.length) unique.set(profile.id, {
+      ...previous, ultrafastAccounts: [...new Set([...(previous.ultrafastAccounts ?? []), ...profile.ultrafastAccounts])]
+    });
+  }
+  return orderGptByVersion([...unique.values()].sort((left, right) => left.priority - right.priority || effortOrder[left.effort] - effortOrder[right.effort] || left.label.localeCompare(right.label)));
 }
 
-function listModelProfiles(poolCatalogPaths: readonly string[] = []): PublicModelProfile[] {
+function listModelProfiles(poolSources: readonly { id: string; catalogPath: string }[] = []): PublicModelProfile[] {
   const now = Date.now();
-  const key = JSON.stringify(poolCatalogPaths);
+  const key = JSON.stringify(poolSources.map(source => {
+    try { return [source.id, source.catalogPath, fs.statSync(source.catalogPath).mtimeMs]; }
+    catch { return [source.id, source.catalogPath]; }
+  }));
   if (modelCatalogCache && modelCatalogCache.key === key && modelCatalogCache.expiresAt > now) {
     return modelCatalogCache.data;
   }
 
   const profiles: PublicModelProfile[] = [];
   let debugAvailable = false;
-  try {
+  // Account-local sources own availability and removals. A separate CLI probe
+  // pinned to an old catalog would resurrect retired models after discovery.
+  if (!poolSources.length) try {
     const debugArgs = ["debug", "models"];
     const configuredCodexHome = process.env.CODEX_HOME?.trim();
     if (configuredCodexHome) {
@@ -438,10 +487,11 @@ function listModelProfiles(poolCatalogPaths: readonly string[] = []): PublicMode
     // Installed pool/provider catalogs remain usable if the default CLI probe
     // fails. Do not replace valid catalogs from other accounts with a fallback.
   }
-  for (const catalogPath of new Set([...poolCatalogPaths, ...(process.env.CODEX_WEB_EXTRA_MODEL_CATALOGS ?? "").split(path.delimiter).filter(Boolean)])) {
+  const sources = [...poolSources, ...(process.env.CODEX_WEB_EXTRA_MODEL_CATALOGS ?? "").split(path.delimiter).filter(Boolean).map(catalogPath => ({ id: "", catalogPath }))];
+  for (const { id, catalogPath } of sources) {
     try {
       if (fs.statSync(catalogPath).size > 2 * 1024 * 1024) throw new Error("Model catalog exceeds byte budget");
-      profiles.push(...modelProfilesFromCatalog(JSON.parse(fs.readFileSync(catalogPath, "utf8"))));
+      profiles.push(...modelProfilesFromCatalog(JSON.parse(fs.readFileSync(catalogPath, "utf8")), id || undefined));
     } catch (error) {
       console.warn(`Unable to read extra model catalog ${catalogPath}:`, error);
     }
@@ -2682,7 +2732,8 @@ export function applyThreadPresentation(
     ...asRecord(thread),
     pinned: presentation?.pinned === true,
     configuredModel: modelPresentation.model,
-    configuredReasoningEffort: modelPresentation.reasoningEffort
+    configuredReasoningEffort: modelPresentation.reasoningEffort,
+    configuredServiceTier: presentation?.serviceTier ?? null
   };
 }
 
@@ -2701,7 +2752,8 @@ function sortThreadsForUser(store: ProjectStore, userId: string, items: unknown[
         name: presentation?.displayName ?? record.name,
               pinned: presentation?.pinned === true,
               configuredModel: modelPresentation?.model ?? null,
-              configuredReasoningEffort: modelPresentation?.reasoningEffort ?? null
+              configuredReasoningEffort: modelPresentation?.reasoningEffort ?? null,
+              configuredServiceTier: presentation?.serviceTier ?? null
             }
           : item,
         pinned: presentation?.pinned === true,
@@ -3076,8 +3128,10 @@ function deferLargeToolOutputs(threadValue: unknown): void {
 }
 
 export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store: ProjectStore, options: { backgroundIndexing?: boolean; browserTools?: boolean } = {}): void {
-  const availableModelProfiles = () => listModelProfiles(isAccountPoolBridge(bridge) ? bridge.modelCatalogTargets().map(target => target.catalogPath) : []);
+  const availableModelProfiles = () => listModelProfiles(isAccountPoolBridge(bridge) ? bridge.uiModelCatalogTargets() : []);
   const claudeService = getClaudeService(bridge);
+  const backgroundTasks = new CodexBackgroundTasks(bridge, store);
+  app.addHook('onClose', async () => { backgroundTasks.close(); });
   const historyTransfers = getRuntimeHistoryTransfer(bridge,store);
   registerProviderQuotaRoutes(app, request => userIdFromRequest(request, store));
   registerSideChatRoutes(app, bridge, store, request => userIdFromRequest(request, store));
@@ -3345,8 +3399,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     return {
     data: [...availableModelProfiles(), ...(profiles.length ? profiles : claudePendingProfiles())],
     reclaudeQuota: getClaudeService(bridge)?.storage.quota(),
-    defaultModel: defaults.model,
-    defaultReasoningEffort: defaults.reasoningEffort
+    defaultModel: newConversationDefaults.model,
+    defaultReasoningEffort: newConversationDefaults.reasoningEffort
   };});
 
   app.get("/api/reclaude/usage", async (request, reply) => {
@@ -3361,6 +3415,12 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     reply.header("Cache-Control", "private, no-store");
     if (!claudeService) return { data: { enabled: false, organizations: [], operation: null } };
     return { data: claudeService.authorization.status(userIdFromRequest(request, store)) };
+  });
+  app.get("/api/reclaude/organizations", async (request, reply) => {
+    reply.header("Cache-Control", "private, no-store");
+    if (!claudeService) return { data: { enabled: false, organizations: [], operation: null } };
+    try { return { data: await claudeService.authorization.refreshOrganizations(userIdFromRequest(request, store)) }; }
+    catch (error) { return reply.code(error instanceof AppError && error.code === "runtime_forbidden" ? 403 : 409).send({ error: error instanceof AppError ? error.message : "组织列表暂不可用。" }); }
   });
   app.get<{Params:{threadId:string};Querystring:{start?:string;end?:string}}>("/api/threads/:threadId/history-image",async(request,reply)=>{
     const user=userIdFromRequest(request,store),id=request.params.threadId;
@@ -3378,14 +3438,16 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       return reply.send(image.stream);
     }catch{return reply.code(400).send({error:'原图位置或编码无法确认，历史未修改。'});}
   });
-  app.post<{Body:{orgId?:string;requestId?:string}}>("/api/reclaude/authorization/start", async (request, reply) => {
+  app.post<{Body:{orgId?:string;requestId?:string;action?:unknown;syncHistory?:unknown}}>("/api/reclaude/authorization/start", async (request, reply) => {
     reply.header("Cache-Control", "private, no-store");
     if (request.headers["sec-fetch-site"] === "cross-site") return reply.code(403).send({error:"请从当前网页发起认证。"});
     if (!claudeService) return reply.code(404).send({error:"ReClaude 尚未配置。"});
     try {
       const body = request.body ?? {};
       if (typeof body.orgId !== "string" || typeof body.requestId !== "string") return reply.code(400).send({error:"缺少组织或认证请求标识。"});
-      return { data: claudeService.authorization.start(userIdFromRequest(request, store), body.orgId, body.requestId) };
+      if (body.action !== undefined && body.action !== "reauthenticate" && body.action !== "bind" && body.action !== "use") return reply.code(400).send({ error: "组织操作无效。" });
+      if (body.syncHistory !== undefined && typeof body.syncHistory !== "boolean") return reply.code(400).send({ error: "历史同步选项无效。" });
+      return { data: claudeService.authorization.start(userIdFromRequest(request, store), body.orgId, body.requestId, body.action, body.syncHistory) };
     } catch (error) {
       const known = error instanceof AppError;
       return reply.code(known && error.code === "runtime_forbidden" ? 403 : known && error.code === "invalid_request" ? 400 : 409)
@@ -4250,7 +4312,7 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
       const userId=userIdFromRequest(request,store),project=store.getProject(request.params.id,userId);
       if(!project)return reply.code(404).send({error:'Project not found.'});
       if(!store.userCanAccessThread(request.params.threadId,userId,project.id))return reply.code(403).send({error:'Thread is not visible for this logged-in user.'});
-      return claudeService?.owns(request.params.threadId)?claudeService.tasks(userId,request.params.threadId):{data:[],supported:false};
+      return claudeService?.owns(request.params.threadId)?claudeService.tasks(userId,request.params.threadId):await backgroundTasks.read(userId,request.params.threadId);
     }catch(error){return reply.code(errorStatus(error)).send({error:error instanceof Error?error.message:String(error)});}
   });
 
@@ -4414,6 +4476,23 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
         return reply.code(404).send({ error: "Thread not found." });
       }
       return { data };
+    } catch (error) {
+      return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  // The speed tier belongs to the conversation, so every device sees the same one and other conversations are untouched.
+  app.patch<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/service-tier", async (request, reply) => {
+    try {
+      const userId = userIdFromRequest(request, store);
+      const project = store.getProject(request.params.id, userId);
+      if (!project) return reply.code(404).send({ error: "Project not found." });
+      if (!store.userCanAccessThread(request.params.threadId, userId, project.id)) return reply.code(404).send({ error: "Thread not found." });
+      const input = threadServiceTierSchema.parse(request.body);
+      assertServiceTierEnabled(input.serviceTier);
+      const data = store.setThreadServiceTier(request.params.threadId, userId, input.serviceTier);
+      if (!data) return reply.code(404).send({ error: "Thread not found." });
+      return { data: { serviceTier: data.serviceTier } };
     } catch (error) {
       return reply.code(errorStatus(error)).send({ error: error instanceof Error ? error.message : String(error) });
     }
