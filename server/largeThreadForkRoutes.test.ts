@@ -17,15 +17,16 @@ vi.mock("./largeThreadFork.js", async () => ({ ...await vi.importActual<typeof i
 vi.mock("./threadFallback.js", async () => ({ ...await vi.importActual<typeof import("./threadFallback.js")>("./threadFallback.js"), findThreadJsonlPathById: vi.fn(), threadJsonlSessionsRoot: vi.fn() }));
 
 describe("large legacy branch route", () => {
-  it("registers exact history under the selected target and resumes without native fork projection", async () => {
+  it.each(["completed","interrupted"])("registers exact history through a %s turn and preserves native compaction without a model turn", async status => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "branch-route-test-"));
     const homes = [path.join(root, "a"), path.join(root, "b")];
     for (const home of homes) fs.mkdirSync(path.join(home, "sessions"), { recursive: true });
     const sourcePath = path.join(homes[0], "sessions", "source.jsonl");
     const source = [{ type: "session_meta", payload: { id: "source", history_mode: "legacy" } },
+      { type: "compacted", payload: { message:"已有压缩检查点",replacement_history:[{type:"message",role:"user",content:[{type:"input_text",text:"保留既有任务和已完成步骤"}]}] } },
       { type: "event_msg", payload: { type: "task_started", turn_id: "one" } },
       { type: "response_item", payload: { type: "message", role: "user", content: "原问题" } },
-      { type: "event_msg", payload: { type: "task_complete", turn_id: "one" } }].map(v => JSON.stringify(v)).join("\n") + "\n";
+      { type: "event_msg", payload: { type: status === "interrupted" ? "turn_aborted" : "task_complete", turn_id: "one",...(status === "interrupted" ? {reason:"interrupted"} : {}) } }].map(v => JSON.stringify(v)).join("\n") + "\n";
     fs.writeFileSync(sourcePath, source);
     vi.mocked(fallback.findThreadJsonlPathById).mockResolvedValue(sourcePath);
     vi.mocked(fallback.threadJsonlSessionsRoot).mockReturnValue(path.join(homes[0], "sessions"));

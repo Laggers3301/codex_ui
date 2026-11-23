@@ -280,16 +280,37 @@ app.get("/api/__test/state", async () => ({ fixture: "bound-side-chats", project
   calls: bridge.calls, starts:bridge.starts, taskToolOutputs: bridge.taskToolOutputs, questionResponses: bridge.questionResponses, questionOutputs: bridge.questionOutputs, resourceReads, networkProbes, pendingApprovals: bridge.pending, approvalResponses: bridge.approvalResponses, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
 app.get("/api/projects", async () => ({ data: [project], projectRoot: root }));
 app.get("/api/users", async () => ({ data: [{ id: "admin", name: "admin" }], defaultUserId: "admin" }));
-app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }, ...(process.env.RECLAUDE_FIXTURE_TEST === "1" ? claudePendingProfiles() : [])] }));
+app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" },
+  ...(process.env.MIGRATION_FIXTURE_TEST === "1" ? [{id:"sol62",label:"GPT 6.2 Sol",model:"gpt-6.2-sol",effort:"high"},{id:"claude-test",label:"Claude",model:"reclaude-sonnet@1",effort:"high",availability:"ready"}] : []),
+  ...(process.env.RECLAUDE_FIXTURE_TEST === "1" ? claudePendingProfiles() : [])] }));
 app.get("/api/pets", async () => ({ pets: [], activePetId: null, visible: false, position: null }));
-app.get("/api/codex/account-pool", async () => ({ data: { strategy: "single-account", accounts: [] } }));
-app.get<{ Params: { id: string } }>("/api/projects/:id/threads", async () => ({ data: ["main-a", "main-b", "main-c"].map(id => threads.get(id)), hiddenThreadIds: [...store.sideChats.threadIds("admin", project.id)] }));
+app.get("/api/codex/account-pool", async () => ({ data: { strategy: "single-account", accounts: process.env.MIGRATION_FIXTURE_TEST === "1" ? [{id:"260831",label:"GPT 0831",kind:"codex-account",health:"ready",selectedForNewThreads:true,assignedThreadCount:0,activeRequests:0,lastError:null,lastCheckedAt:null,
+  quota:{account:{type:"chatgpt",planType:"pro"},rateLimits:null,rateLimitsByLimitId:{},resetCredits:null,usage:null,errors:[],updatedAt:new Date().toISOString()}}] : [] } }));
+app.get<{ Params: { id: string } }>("/api/projects/:id/threads", async () => ({ data: process.env.MIGRATION_FIXTURE_TEST === "1" ? [...threads.values()] : ["main-a", "main-b", "main-c"].map(id => threads.get(id)), hiddenThreadIds: [...store.sideChats.threadIds("admin", project.id)] }));
 app.get<{ Params: { threadId: string } }>("/api/threads/:threadId", async (request, reply) => {
   if (!store.userCanAccessThread(request.params.threadId, user(request), project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
   const thread = threads.get(request.params.threadId)!;
   const answered: string[] = store.answeredQuestionItemIds(thread.id, user(request));
   return { thread: { ...thread, answeredQuestionItemIds: answered, questionAnswers: Object.fromEntries(answered.map(id => [id, store.getQuestionAnswer(thread.id, id, user(request))])) }, history: { totalItems: thread.turns.reduce((count, turn) => count + turn.items.length, 0), returnedItems: thread.turns.reduce((count, turn) => count + turn.items.length, 0), before: 0, hasOlder: false } };
 });
+// Exercise the real App migration flow with isolated storage and simulated
+// native forks. Native history/cutoff preservation is checked by route tests.
+if (process.env.MIGRATION_FIXTURE_TEST === "1") {
+  app.post<{Body:{threadId:string}}>("/api/__test/interrupted-before-answer", async request => {
+    const thread=threads.get(request.body.threadId)!;
+    const turn={id:randomUUID(),status:"interrupted",items:[{id:randomUUID(),type:"userMessage",text:"中断在回答开始前的最后一轮"}]};
+    thread.turns.push(turn);thread.status="idle";
+    return {turnId:turn.id};
+  });
+  app.post<{Params:{threadId:string;id:string};Body:{turnId:string;model?:string;targetAccountId?:string;reasoningEffort?:string}}>("/api/projects/:id/threads/:threadId/branch", async (request,reply) => {
+    if(!store.userCanAccessThread(request.params.threadId,user(request),request.params.id))return reply.code(403).send({error:"No access"});
+    const result=await bridge.request("thread/fork",{threadId:request.params.threadId,...request.body});
+    const thread=(result as any).thread;
+    Object.assign(thread,{name:"迁移后的测试会话",configuredModel:request.body.model??"gpt-6.1-sol",configuredReasoningEffort:request.body.reasoningEffort??"high"});
+    store.registerThreadOwner({threadId:thread.id,userId:"admin",projectId:project.id,rootPath:root,model:thread.configuredModel,reasoningEffort:thread.configuredReasoningEffort});
+    return {data:{thread,turn:null,sourceThreadId:request.params.threadId,sourceTurnId:request.body.turnId,branchMode:"cross-account-native"}};
+  });
+}
 app.setNotFoundHandler(async (request, reply) => {
   if (request.url.includes("/execution-settings")) return { data: { sandbox: "read-only", approvalPolicy: "never" } };
   if (request.url.includes("/context")) return { data: null };

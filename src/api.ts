@@ -712,7 +712,7 @@ export function deleteSideChat(side: SideChat): Promise<{ ok: boolean; data: Sid
 }
 
 export interface BranchProgress {phase:string;stage?:'snapshot'|'display'|'import';totalMessages:number;importedMessages:number;displayItems?:number;updatedAt:number;error?:string}
-export interface BranchResponse { data: { thread: ThreadSummary; turn: { turn?: { id?: string } } | null; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null; branchMode: "native" | "cross-account-native" | "legacy-stream-import" | "legacy-tool-archive" | "cross-runtime" } }
+export interface BranchResponse { data: { thread: ThreadSummary; turn: { turn?: { id?: string } } | null; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null; branchMode: "native" | "cross-account-native" | "legacy-stream-import" | "legacy-tool-archive" | "cross-runtime"; warnings?: string[]; historySourceUrl?: string } }
 export async function branchThread(
   projectId: string,
   threadId: string,

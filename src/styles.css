@@ -4162,6 +4162,9 @@ pre,
 .branchToolArchive a { color:var(--ui-content); white-space:nowrap; }
 .branchToolArchive.uiGlassSurface { border:0; color:var(--ui-content-muted); }
 .branchToolArchive button { margin-left:auto; border:0; background:transparent; color:inherit; display:flex; align-items:center; padding:4px; }
+.threadMigrationNotice { flex-wrap:wrap; overflow-wrap:anywhere; }
+.threadMigrationNotice>div { flex:1 1 220px; min-width:0; }
+.threadMigrationNotice details p { margin:4px 0; }
 .branchToolArchive.closing { animation:branchArchiveOut 240ms cubic-bezier(.4,0,.2,1) both; }
 @keyframes branchArchiveIn { from{opacity:0;transform:translateY(-6px)} to{opacity:1;transform:translateY(0)} }
 @keyframes branchArchiveOut { from{opacity:1;transform:translateY(0)} to{opacity:0;transform:translateY(-6px)} }
