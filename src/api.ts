@@ -42,7 +42,8 @@ export function readHostResources(signal: AbortSignal): Promise<{ data: import("
   return request("/api/system/resources", { signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]) });
 }
 export function checkHostNetwork(signal: AbortSignal): Promise<{ data: import("../shared/hostResources").HostNetworkProbeResult }> {
-  return request("/api/system/network/check", { method: "POST", signal: AbortSignal.any([signal, AbortSignal.timeout(12_000)]) });
+  // Keep a valid media type when a reverse proxy forwards this POST as chunked.
+  return request("/api/system/network/check", { method: "POST", body: JSON.stringify({}), signal: AbortSignal.any([signal, AbortSignal.timeout(12_000)]) });
 }
 export function readCommunication(threadId: string, signal?: AbortSignal): Promise<{ data: import("../shared/sessionCommunication").CommunicationSnapshot }> {
   return request(`/api/threads/${encodeURIComponent(threadId)}/communication`, { signal });
