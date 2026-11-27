@@ -66,10 +66,11 @@ export class RuntimeHistoryTransfer {
     const row=this.get(id);
     if(!row||row.userId!==userId||row.projectId!==projectId||row.sourceThreadId!==sourceThreadId)return null;
     const interrupted=row.phase!=='completed'&&!row.error&&!this.active.has(id);
+    const completed = row.phase === 'completed' ? this.result(row) : null;
     return {phase:row.error?'failed':interrupted?'interrupted':row.phase,stage:row.stage,totalMessages:row.messageCount,importedMessages:row.importedCount,displayItems:row.displayItems,
       updatedAt:row.updatedAt??row.createdAt,model:row.targetModel,error:row.error,
       reasoningEffort:row.targetReasoningEffort,sourceTurnId:row.sourceTurnId,
-      ...(row.phase==='completed'?{targetThreadId:row.targetThreadId}:{} )};
+      ...(completed ? { targetThreadId: completed.threadId, warnings: completed.warnings, historySourceUrl: completed.historySourceUrl } : {})};
   }
   async startBackground(input:TransferRequest):Promise<void>{
     let failure:unknown;

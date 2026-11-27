@@ -25,7 +25,7 @@ try {
   const vite=start(["--max-old-space-size=768","node_modules/vite/bin/vite.js","--config","tests/boundSideChats.vite.config.mjs"],{BOUND_SIDE_CHAT_TEST_BACKEND:meta.origin});
   await ready(vite,output=>output.includes("http://127.0.0.1:5212/"));
   const origin="http://127.0.0.1:5212";
-  browser=await chromium.launch({headless:true});
+  browser=await chromium.launch({headless:true,channel:process.env.MIGRATION_BROWSER_CHANNEL});
   const context=await browser.newContext({viewport:{width:1440,height:1000},serviceWorkers:"block"});
   assert.equal((await context.request.post(origin+"/api/auth/login")).status(),200);
   await context.addInitScript(project=>{
@@ -75,9 +75,42 @@ try {
   await expect(page.locator(".errorBanner")).toContainText("用于选中复制的完整错误详情");await expect(notice).toBeVisible();
   await editor.fill("继续迁移后的原任务");await editor.press("Enter");await expect(notice).toHaveCount(0);
   await expect.poll(async()=>(await state()).starts.length).toBe(1);
+
+  await page.locator('[data-thread-id="main-a"] .threadSelectButton').click({button:"right"});
+  await page.getByRole("menuitem",{name:"迁移会话",exact:true}).click();
+  await dialog.getByRole("button",{name:/目标账号/}).click();
+  await page.getByRole("option",{name:"ReClaude",exact:true}).click();
+  const claudePost = page.waitForResponse(response => response.request().method() === "POST" && new URL(response.url()).pathname.endsWith("/branch"));
+  const claudeStatus = page.waitForResponse(response => response.request().method() === "GET" && response.url().includes("/branch-status/"));
+  await dialog.getByRole("button",{name:"创建并打开",exact:true}).click();
+  assert.equal((await claudePost).status(), 202);
+  const {data:{result}} = await (await claudeStatus).json();
+  assert.equal(result.data.branchMode, "cross-runtime");
+  assert.equal(result.data.sourceTurnId, last.turnId);
+  const claudeChild = result.data.thread.id;
+  assert.ok(claudeChild && claudeChild !== "main-a" && claudeChild !== child);
+  await expect(dialog).toHaveCount(0);
+  await expect(notice.getByRole("link", { name:"下载完整源记录" })).toHaveAttribute("href", result.data.historySourceUrl);
+  await notice.getByText("迁移说明", { exact:true }).click();
+  await expect(notice).toContainText("已保留中断轮次的用户消息");
+  await expect(page.locator("#conversation-messages")).toContainText("中断在回答开始前的最后一轮");
+  assert.equal(branches.length, 2);
+  assert.equal(branches[1].turnId, last.turnId);
+  assert.equal(branches[1].model, "reclaude-sonnet@1");
+  assert.equal(branches[1].background, true);
+  assert.ok(branches[1].operationId);
+  assert.equal(branches[1].targetAccountId, undefined);
+  assert.equal((await state()).starts.length, 1, "creating a ReClaude branch must not send a model turn");
+  await editor.fill("继续 ReClaude 迁移后的任务");
+  await editor.press("Enter");
+  await expect(notice).toHaveCount(0);
+  await expect.poll(async() => (await state()).starts.at(-1)).toMatchObject({
+    threadId: claudeChild, model: "reclaude-sonnet@1", text: "继续 ReClaude 迁移后的任务"
+  });
+
   assert.deepEqual(errors,[]);
-  const result={isolatedDatabase:true,interruptedTurnBranch:true,contextMenuGptModel:true,originalTurnSelected:true,nativeBranchWithoutModelTurn:true,noticeAtTop:true,noticeIsolatedByThread:true,noticeRetainedOnFailure:true,noticeClearedOnAcceptedInput:true,phoneWithinViewport:true,errors};
-  await fs.writeFile(evidence+"/results.json",JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));
+  const checks={isolatedDatabase:true,interruptedTurnBranch:true,contextMenuGptModel:true,crossRuntimeReClaude:true,originalTurnSelected:true,branchWithoutModelTurn:true,noticeAtTop:true,noticeIsolatedByThread:true,noticeRetainedOnFailure:true,noticeClearedOnAcceptedInput:true,phoneWithinViewport:true,errors};
+  await fs.writeFile(evidence+"/results.json",JSON.stringify(checks,null,2));console.log(JSON.stringify(checks,null,2));
 } finally {
   await browser?.close();
   for(const child of children.reverse())if(child.exitCode===null){const exited=new Promise(resolve=>child.once("exit",resolve));child.kill("SIGTERM");await exited;}

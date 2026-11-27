@@ -1,6 +1,6 @@
 import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { TransferReceipt } from "../src/TransferReceipt";
+import { TransferReceipt } from "../src/TransferReceiptCard";
 import { TRANSFER_RECEIPT_HOLD_MS } from "../src/transferReceipt";
 import "../src/styles.css";
 

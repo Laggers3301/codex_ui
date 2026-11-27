@@ -78,7 +78,7 @@ import { classifyProviderFailure, type ProviderFailureNotice } from "./providerF
 import { finishActiveTurn, pendingTurnStart, rememberTerminalTurn } from "./turnLifecycle";
 import { localMessageBelongsToThread } from "./localMessageScope";
 import { isSuccessfulTransferReceipt, TRANSFER_RECEIPT_HOLD_MS } from "./transferReceipt";
-import { TransferReceipt } from "./TransferReceipt";
+import { TransferReceipt } from "./TransferReceiptCard";
 import "./threadContextMenu.css";
 import "./sideChatDock.css";
 import { downloadBrowserFile, shareBrowserFile } from "./browserFileActions";
@@ -146,9 +146,9 @@ import { localizedSkill, skillSection } from "./skillLocalization";
 import { GoalProgress } from "./GoalProgress";
 import { useThreadGoal } from "./threadGoal";
 import { useThreadSchedules } from "./threadSchedules";
-import { ThreadSchedules, threadScheduleSummary } from "./ThreadSchedules";
+import { ThreadSchedules, threadScheduleSummary } from "./ThreadSchedulesPanel";
 import { SubagentToolCard } from "./SubagentActivity";
-import { ConversationTasks } from "./ConversationTasks";
+import { ConversationTasks } from "./ConversationTasksPanel";
 import { conversationTasksEvent } from "./conversationTasks";
 import { isInternalRuntimeUserText } from "./runtimeUserMessages";
 import { observeComposerViewportMetrics } from "./composerViewportMetrics";
@@ -6241,7 +6241,7 @@ export function App() {
       });
       threadProjectIdsRef.current.set(normalizedThread.id, project.id);
       if(migration)setMigrationNotices(current=>({...current,[`${selectedUserId}:${project.id}:${normalizedThread.id}`]:{
-        text:"已创建迁移分支，原会话及历史记录保留。迁移不会清空原有上下文。",
+        text:"已创建迁移分支，原会话及历史记录保留。",
         historySourceUrl:response.data.historySourceUrl,warnings:response.data.warnings
       }}));
       setThreads((current) => {

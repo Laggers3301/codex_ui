@@ -4,7 +4,7 @@ import type { ThreadSchedule } from "./threadSchedules";
 let scheduleStatusLabel: (schedule: ThreadSchedule) => string;
 beforeAll(async () => {
   vi.stubGlobal("localStorage", {getItem: () => null, setItem: () => undefined});
-  ({scheduleStatusLabel} = await import("./ThreadSchedules"));
+  ({scheduleStatusLabel} = await import("./ThreadSchedulesPanel"));
 });
 
 const schedule = (overrides: Partial<ThreadSchedule>): ThreadSchedule => ({

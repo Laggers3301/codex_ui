@@ -351,13 +351,14 @@ describe("bidirectional runtime history transfer",()=>{
     await expect(f.migrate(first.threadId,'reclaude-sonnet@1')).rejects.toMatchObject({code:'migration_identity_mismatch'});
     expect(f.service.storage.quota().used).toBe(used);expect(fs.readFileSync(file)).toEqual(before);
   });
-  it("branches a Codex snapshot only through the selected turn and binds retries to that target",async()=>{
+  it("branches a Codex snapshot through an interrupted turn with no answer and binds retries to that target",async()=>{
     const f=fixture();
     const first=await f.migrate();
     const source=paths.get(first.threadId)!;
     fs.appendFileSync(source,[
       {type:"turn_context",payload:{turn_id:"cutoff-a"}},
-      {type:"response_item",payload:{type:"message",role:"assistant",content:[{type:"output_text",text:"SELECTED-ANSWER"}]}},
+      {type:"response_item",payload:{type:"message",role:"user",content:[{type:"input_text",text:"INTERRUPTED-PROMPT"}]}},
+      {type:"event_msg",payload:{type:"turn_aborted",turn_id:"cutoff-a",reason:"interrupted"}},
       {type:"turn_context",payload:{turn_id:"future-b"}},
       {type:"response_item",payload:{type:"message",role:"assistant",content:[{type:"output_text",text:"FUTURE-MUST-NOT-IMPORT"}]}}
     ].map(r=>JSON.stringify(r)).join("\n")+"\n");
@@ -366,8 +367,12 @@ describe("bidirectional runtime history transfer",()=>{
     const child=await f.transfers.migrate(input) as any;
     const text=JSON.stringify(f.service.history(child.threadId));
     const presentation=JSON.stringify(await f.service.readHistory(child.threadId,0,100));
-    expect(presentation).toContain('SELECTED-ANSWER');expect(presentation).not.toContain('FUTURE-MUST-NOT-IMPORT');
-    expect(text).toContain("SELECTED-ANSWER");expect(text).not.toContain("FUTURE-MUST-NOT-IMPORT");
+    expect(presentation).toContain("INTERRUPTED-PROMPT");expect(presentation).not.toContain("FUTURE-MUST-NOT-IMPORT");
+    expect(text).toContain("INTERRUPTED-PROMPT");expect(text).not.toContain("FUTURE-MUST-NOT-IMPORT");
+    expect(f.transfers.status(operationId,"admin",f.project.id,first.threadId)).toMatchObject({
+      phase:"completed",targetThreadId:child.threadId,warnings:child.warnings,historySourceUrl:child.historySourceUrl
+    });
+    expect(f.request.mock.calls.some(([method])=>method==="turn/start")).toBe(false);
     expect(fs.readFileSync(source)).toEqual(before);
     await expect(f.transfers.migrate({...input,sourceTurnId:"future-b"})).rejects.toMatchObject({code:"migration_conflict"});
     await expect(f.transfers.migrate({...input,targetAccountId:"different"})).rejects.toMatchObject({code:"migration_conflict"});

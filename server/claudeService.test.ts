@@ -33,9 +33,12 @@ it('returns a background branch acknowledgement and bounded owned status without
   expect(post.statusCode).toBe(202);expect(post.json().data).toMatchObject({branchPending:true,operationId:operation});expect(begin).toHaveBeenCalledTimes(1);
   const url=`/api/projects/${f.project.id}/threads/${source}/branch-status/${operation}`;
   const pending=await app.inject({method:'GET',url});expect(pending.statusCode).toBe(200);expect(pending.json().data.importedMessages).toBe(128);
-  status.mockReturnValue({phase:'completed',totalMessages:90000,importedMessages:90000,displayItems:90000,updatedAt:2,model:'gpt-6-astra',targetThreadId:source,reasoningEffort:undefined,sourceTurnId:'cutoff',error:undefined,stage:'import'});
+  const historySourceUrl = `/api/projects/${f.project.id}/threads/${source}/migration-source/${operation}`;
+  const warnings = ["工具记录作为历史保留"];
+  status.mockReturnValue({phase:'completed',totalMessages:90000,importedMessages:90000,displayItems:90000,updatedAt:2,model:'gpt-6-astra',targetThreadId:source,reasoningEffort:undefined,sourceTurnId:'cutoff',error:undefined,stage:'import',warnings,historySourceUrl});
   const completed=await app.inject({method:'GET',url});expect(completed.json().data.result.data.thread.id).toBe(source);
   expect(completed.json().data.result.data.thread.turns).toEqual([]);
+  expect(completed.json().data.result.data).toMatchObject({ branchMode: "cross-runtime", warnings, historySourceUrl });
   const unauthorized=await app.inject({method:'GET',url:`/api/projects/${f.project.id}/threads/not-owned/branch-status/${operation}`});expect(unauthorized.statusCode).toBe(403);
  }finally{await app.close();}
 });
