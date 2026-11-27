@@ -4601,7 +4601,8 @@ export function registerRoutes(app: FastifyInstance, bridge: CodexBridge, store:
     if(progress.phase==='completed'&&progress.targetThreadId){
       const response=asRecord(await bridge.request('thread/read',{threadId:progress.targetThreadId,includeTurns:false}));
       result={data:{thread:{...asRecord(response.thread),configuredModel:progress.model,configuredReasoningEffort:progress.reasoningEffort??'medium'},
-        turn:null,sourceThreadId:threadId,sourceTurnId:progress.sourceTurnId,branchMode:'cross-runtime'}};
+        turn:null,sourceThreadId:threadId,sourceTurnId:progress.sourceTurnId,branchMode:'cross-runtime',
+        warnings:progress.warnings,historySourceUrl:progress.historySourceUrl}};
     }
     return {data:{...progress,...(result?{result}:{})}};
   });

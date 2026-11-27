@@ -1,6 +1,6 @@
 import React, {useState} from 'react';
 import {createRoot} from 'react-dom/client';
-import {ConversationTasks} from '../src/ConversationTasks';
+import {ConversationTasks} from '../src/ConversationTasksPanel';
 import '../src/styles.css';
 import '../src/globalDialogs.css';
 import '../src/dialogControlScale.css';

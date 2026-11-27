@@ -1,4 +1,5 @@
 import { claudePendingProfiles } from "../shared/agentRuntime.js";
+import type { ReclaudeUsageStatus } from "../shared/reclaudeUsage.js";
 import { ClaudeStreamAdapter } from "../server/claudeStreamAdapter.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -15,8 +16,8 @@ process.env.CODEX_WEB_PORT = "0";
 // The public repository is flat; the production host keeps frontend/backend
 // separately. Both layouts must run this isolated fixture without live APIs.
 const serverRoot = new URL(fs.existsSync(new URL('../server/db.ts', import.meta.url)) ? '../server/' : '../../backend/server/', import.meta.url);
-const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, auth, { registerHostResourceRoutes }, { registerSessionCommunicationRoutes }, { registerBrowserRoutes }, { sanitizeMcpServerStatus }, { serverConfig }] = await Promise.all(
-  ['db', 'sideChatRoutes', 'socket', 'auth', 'hostResources', 'sessionCommunicationRoutes', 'browserRoutes', 'routes', 'config'].map(name => import(new URL(name + '.js', serverRoot).href))
+const [{ ProjectStore }, { registerSideChatRoutes }, { attachSocketServer }, auth, { registerHostResourceRoutes }, { registerSessionCommunicationRoutes }, { registerBrowserRoutes }, { sanitizeMcpServerStatus }, { serverConfig }, { withClaudeService, getClaudeService }] = await Promise.all(
+  ['db', 'sideChatRoutes', 'socket', 'auth', 'hostResources', 'sessionCommunicationRoutes', 'browserRoutes', 'routes', 'config', 'claudeService'].map(name => import(new URL(name + '.js', serverRoot).href))
 );
 const store = new ProjectStore(path.join(root, "store.sqlite"));
 const project = store.createProject({ name: "侧边绑定验收", rootPath: root, defaultModel: "gpt-6.1-sol", defaultReasoningEffort: "high" });
@@ -30,7 +31,7 @@ for (const [id, name, quote] of [["main-a", "主会话 A", "第一段正文用�
 
 class FixtureBridge extends EventEmitter {
   calls: Array<{ method: string; threadId?: string }> = [];
-  starts: Array<{ threadId: string; text: string }> = [];
+  starts: Array<{ threadId: string; text: string; model?: string }> = [];
   mcpConfigs = new Map<string, Record<string, any>>();
   taskToolOutputs: Array<{ threadId: string; value: any }> = [];
   creationGate: Promise<void> | null = null;
@@ -108,7 +109,7 @@ class FixtureBridge extends EventEmitter {
         if (thread.status === "active") return { turn: { id: thread.turns.at(-1)!.id } };
       }
       const id = randomUUID(), userText = params.input.map((item: any) => item.text ?? "").join("\n");
-      this.starts.push({threadId:thread.id,text:userText});
+      this.starts.push({threadId:thread.id,text:userText,...(process.env.MIGRATION_FIXTURE_TEST === "1" ? { model: params.model } : {})});
       const sideTurnCount = thread.turns.filter(turn => turn.items.some((item: any) => item.type === "userMessage")).length;
       const answer = callback ? `已自动接收协作结果：${callback.result ?? callback.error}` : `侧边回答 ${sideTurnCount + 1}：${userText.split("用户问题：\n").at(-1)}`;
       const turn = { id, status: "running", items: [callback
@@ -140,6 +141,21 @@ class FixtureBridge extends EventEmitter {
   }
 }
 const bridge = new FixtureBridge(), app = Fastify();
+const migrationFixture = process.env.MIGRATION_FIXTURE_TEST === "1";
+const claudeHome = path.join(root, "claude-home");
+const socketBridge = migrationFixture ? withClaudeService(bridge, store, {
+  home: claudeHome, executable: process.execPath, storageDirectory: path.join(claudeHome, "state"),
+  users: { admin: { workspaceRoot: root, orgIds: ["1"] } }
+}) : bridge;
+const fixtureClaude = getClaudeService(socketBridge);
+if (fixtureClaude) {
+  const device = path.join(claudeHome, ".rec", "claude", "accounts", "11");
+  fs.mkdirSync(path.join(device, "config"), { recursive: true });
+  fs.writeFileSync(path.join(device, "device.json"), JSON.stringify({ sk: "fixture-only", org_id: 1, org_name: "ReClaude" }));
+  fs.writeFileSync(path.join(device, "config", ".claude.json"), JSON.stringify({ oauthAccount: { accountUuid: "migration-fixture" } }));
+  // Keep the socket's real runtime/ownership checks and simulate only native requests.
+  fixtureClaude.request = (method: string, params: unknown) => bridge.request(method, params);
+}
 async function callFixtureMcp(config: Record<string, any>, payload: unknown) {
   const expected = `http://127.0.0.1:${(app.server.address() as { port: number }).port}/api/communication/mcp`;
   if (config.url !== expected) throw new Error("MCP must use the isolated fixture server");
@@ -174,7 +190,7 @@ app.post<{ Body: { fail?: boolean; hold?: boolean } }>("/api/__test/network-mode
   if (request.body.hold !== undefined) networkHold = request.body.hold;
   if (!networkHold) { releaseNetwork?.(); releaseNetwork = null; } return { ok: true };
 });
-const wss = attachSocketServer(app.server, bridge as any, store, browserService as any);
+const wss = attachSocketServer(app.server, socketBridge as any, store, browserService as any);
 app.get<{ Params: { id: string; threadId: string } }>("/api/projects/:id/threads/:threadId/mcp-status", async (request, reply) => {
   if (request.params.id !== project.id || !store.userCanAccessThread(request.params.threadId, user(request), project.id)) return reply.code(404).send({ error: "Thread not found." });
   return sanitizeMcpServerStatus(await bridge.request("mcpServerStatus/list", { threadId: request.params.threadId }));
@@ -280,16 +296,70 @@ app.get("/api/__test/state", async () => ({ fixture: "bound-side-chats", project
   calls: bridge.calls, starts:bridge.starts, taskToolOutputs: bridge.taskToolOutputs, questionResponses: bridge.questionResponses, questionOutputs: bridge.questionOutputs, resourceReads, networkProbes, pendingApprovals: bridge.pending, approvalResponses: bridge.approvalResponses, recoveries:store.listTurnRecoveryStates('admin').map(({threadId,error,interruption,activeTurn}:{threadId:string;error:unknown;interruption?:unknown;activeTurn?:unknown})=>({threadId,error,interruption,activeTurn})), sides: ["main-a", "main-b", "main-c"].map(id => store.sideChats.get(id, "admin", project.id)) }));
 app.get("/api/projects", async () => ({ data: [project], projectRoot: root }));
 app.get("/api/users", async () => ({ data: [{ id: "admin", name: "admin" }], defaultUserId: "admin" }));
-app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" }, ...(process.env.RECLAUDE_FIXTURE_TEST === "1" ? claudePendingProfiles() : [])] }));
+app.get("/api/models", async () => ({ data: [{ id: "sol", label: "Sol", model: "gpt-6.1-sol", effort: "high" },
+  ...(process.env.MIGRATION_FIXTURE_TEST === "1" ? [{id:"sol62",label:"GPT 6.2 Sol",model:"gpt-6.2-sol",effort:"high"},{id:"claude-test",label:"Claude",model:"reclaude-sonnet@1",effort:"high",availability:"ready"}] : []),
+  ...(process.env.RECLAUDE_FIXTURE_TEST === "1" ? claudePendingProfiles() : [])] }));
 app.get("/api/pets", async () => ({ pets: [], activePetId: null, visible: false, position: null }));
-app.get("/api/codex/account-pool", async () => ({ data: { strategy: "single-account", accounts: [] } }));
-app.get<{ Params: { id: string } }>("/api/projects/:id/threads", async () => ({ data: ["main-a", "main-b", "main-c"].map(id => threads.get(id)), hiddenThreadIds: [...store.sideChats.threadIds("admin", project.id)] }));
+app.get("/api/codex/account-pool", async () => ({ data: { strategy: "single-account", accounts: process.env.MIGRATION_FIXTURE_TEST === "1" ? [{id:"260831",label:"GPT 0831",kind:"codex-account",health:"ready",selectedForNewThreads:true,assignedThreadCount:0,activeRequests:0,lastError:null,lastCheckedAt:null,
+  quota:{account:{type:"chatgpt",planType:"pro"},rateLimits:null,rateLimitsByLimitId:{},resetCredits:null,usage:null,errors:[],updatedAt:new Date().toISOString()}}] : [] } }));
+app.get<{ Params: { id: string } }>("/api/projects/:id/threads", async () => ({ data: process.env.MIGRATION_FIXTURE_TEST === "1" ? [...threads.values()] : ["main-a", "main-b", "main-c"].map(id => threads.get(id)), hiddenThreadIds: [...store.sideChats.threadIds("admin", project.id)] }));
 app.get<{ Params: { threadId: string } }>("/api/threads/:threadId", async (request, reply) => {
   if (!store.userCanAccessThread(request.params.threadId, user(request), project.id)) return reply.code(403).send({ error: "Thread is not visible for this logged-in user." });
   const thread = threads.get(request.params.threadId)!;
   const answered: string[] = store.answeredQuestionItemIds(thread.id, user(request));
   return { thread: { ...thread, answeredQuestionItemIds: answered, questionAnswers: Object.fromEntries(answered.map(id => [id, store.getQuestionAnswer(thread.id, id, user(request))])) }, history: { totalItems: thread.turns.reduce((count, turn) => count + turn.items.length, 0), returnedItems: thread.turns.reduce((count, turn) => count + turn.items.length, 0), before: 0, hasOlder: false } };
 });
+// Exercise the real App migration flow with isolated storage and simulated
+// native forks. Native history/cutoff preservation is checked by route tests.
+if (fixtureClaude) {
+  const migrations = new Map<string, { sourceThreadId: string; result: unknown }>();
+  app.get("/api/reclaude/usage", async () => ({ data: {
+    thresholdPercent: 99, monitoring: "response-events",
+    accounts: [{ orgId: "1", label: "ReClaude", state: "available", windows: [], message: "", retryAfterSeconds: null }],
+    creations: { limit: 5, windowSeconds: 3600, used: 0, remaining: 5, retryAt: null, retryAfterSeconds: 0 }
+  } satisfies ReclaudeUsageStatus }));
+  app.post<{Body:{threadId:string}}>("/api/__test/interrupted-before-answer", async request => {
+    const thread=threads.get(request.body.threadId)!;
+    const turn={id:randomUUID(),status:"interrupted",items:[{id:randomUUID(),type:"userMessage",text:"中断在回答开始前的最后一轮"}]};
+    thread.turns.push(turn);thread.status="idle";
+    return {turnId:turn.id};
+  });
+  app.post<{Params:{threadId:string;id:string};Body:{turnId:string;model?:string;targetAccountId?:string;reasoningEffort?:string;operationId?:string;background?:boolean}}>("/api/projects/:id/threads/:threadId/branch", async (request,reply) => {
+    if(!store.userCanAccessThread(request.params.threadId,user(request),request.params.id))return reply.code(403).send({error:"No access"});
+    const { model, operationId, background, targetAccountId } = request.body;
+    const crossRuntime = model?.startsWith("reclaude-");
+    if (crossRuntime && (!operationId || !background || targetAccountId)) {
+      return reply.code(400).send({error:"Invalid cross-runtime branch request"});
+    }
+    const result=await bridge.request("thread/fork",{threadId:request.params.threadId,...request.body});
+    const thread=(result as any).thread;
+    Object.assign(thread,{name:"迁移后的测试会话",configuredModel:request.body.model??"gpt-6.1-sol",configuredReasoningEffort:request.body.reasoningEffort??"high"});
+    if (crossRuntime && model) {
+      const binding = fixtureClaude.bindings.resolve("admin", model);
+      fixtureClaude.storage.save({
+        id: thread.id, nativeSessionId: randomUUID(), userId: "admin", projectId: project.id, cwd: root,
+        name: thread.name, model, orgId: binding.orgId, accountKey: binding.accountKey, configRoot: binding.configRoot,
+        initialized: true, archived: false, createdAt: Date.now(), updatedAt: Date.now()
+      });
+    }
+    store.registerThreadOwner({threadId:thread.id,userId:"admin",projectId:project.id,rootPath:root,model:thread.configuredModel,reasoningEffort:thread.configuredReasoningEffort});
+    const outcome = {thread,turn:null,sourceThreadId:request.params.threadId,sourceTurnId:request.body.turnId};
+    if (!crossRuntime || !operationId) return {data:{...outcome,branchMode:"cross-account-native"}};
+    const historySourceUrl = `/api/projects/${request.params.id}/threads/${request.params.threadId}/migration-source/${operationId}`;
+    migrations.set(operationId, { sourceThreadId: request.params.threadId, result: { data: {
+      ...outcome, branchMode: "cross-runtime", historySourceUrl, warnings: ["已保留中断轮次的用户消息"]
+    } } });
+    return reply.code(202).send({ data: { branchPending: true, operationId } });
+  });
+  app.get<{Params:{threadId:string;id:string;operationId:string}}>("/api/projects/:id/threads/:threadId/branch-status/:operationId", async (request, reply) => {
+    const { id, threadId, operationId } = request.params;
+    const migration = migrations.get(operationId);
+    if (!migration || migration.sourceThreadId !== threadId || !store.userCanAccessThread(threadId, user(request), id)) {
+      return reply.code(404).send({ error: "Migration not found" });
+    }
+    return { data: { phase: "completed", totalMessages: 1, importedMessages: 1, updatedAt: Date.now(), result: migration.result } };
+  });
+}
 app.setNotFoundHandler(async (request, reply) => {
   if (request.url.includes("/execution-settings")) return { data: { sandbox: "read-only", approvalPolicy: "never" } };
   if (request.url.includes("/context")) return { data: null };

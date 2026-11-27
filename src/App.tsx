@@ -78,7 +78,7 @@ import { classifyProviderFailure, type ProviderFailureNotice } from "./providerF
 import { finishActiveTurn, pendingTurnStart, rememberTerminalTurn } from "./turnLifecycle";
 import { localMessageBelongsToThread } from "./localMessageScope";
 import { isSuccessfulTransferReceipt, TRANSFER_RECEIPT_HOLD_MS } from "./transferReceipt";
-import { TransferReceipt } from "./TransferReceipt";
+import { TransferReceipt } from "./TransferReceiptCard";
 import "./threadContextMenu.css";
 import "./sideChatDock.css";
 import { downloadBrowserFile, shareBrowserFile } from "./browserFileActions";
@@ -132,6 +132,7 @@ import { RollingToolCount, ToolArrivalList } from "./ToolActivityMotion";
 import { useProviderQuotas, providerRemaining, ProviderQuotaDetails, ProviderFailureSummary } from "./providerQuota";
 import { visibleProviderQuotas } from "./quotaTabs";
 import {BranchTargetDialog,type BranchTarget} from "./BranchTargetDialog";
+import {ThreadMigrationNotice,type MigrationNotice} from "./ThreadMigrationNotice";
 import {profilesByDescendingEffort} from "./effortOrder";
 import { isToolSummaryClick, recordToolDisclosurePointerDown } from "./toolDisclosure";
 import { ToolArrivalRegistry } from "./toolArrivalRegistry";
@@ -145,9 +146,9 @@ import { localizedSkill, skillSection } from "./skillLocalization";
 import { GoalProgress } from "./GoalProgress";
 import { useThreadGoal } from "./threadGoal";
 import { useThreadSchedules } from "./threadSchedules";
-import { ThreadSchedules, threadScheduleSummary } from "./ThreadSchedules";
+import { ThreadSchedules, threadScheduleSummary } from "./ThreadSchedulesPanel";
 import { SubagentToolCard } from "./SubagentActivity";
-import { ConversationTasks } from "./ConversationTasks";
+import { ConversationTasks } from "./ConversationTasksPanel";
 import { conversationTasksEvent } from "./conversationTasks";
 import { isInternalRuntimeUserText } from "./runtimeUserMessages";
 import { observeComposerViewportMetrics } from "./composerViewportMetrics";
@@ -4897,7 +4898,8 @@ export function App() {
   const [branchingThread, setBranchingThread] = useState(false);
   const [branchingTurnKey, setBranchingTurnKey] = useState<string | null>(null);
   const [archiveBranchRetry,setArchiveBranchRetry]=useState<{threadId:string;turnId:string;target?:BranchTarget}|null>(null);
-  const [branchTarget,setBranchTarget]=useState<{threadId:string;projectId:string;turnId:string}|null>(null);
+  const [branchTarget,setBranchTarget]=useState<{threadId:string;projectId:string;turnId:string;purpose?:"migration"}|null>(null);
+  const [migrationNotices,setMigrationNotices]=useState<Record<string,MigrationNotice>>({});
   const branchingThreadRef = useRef(false);
   const [editingLastPrompt, setEditingLastPrompt] = useState(false);
   const editingCommitRef = useRef(false);
@@ -6192,7 +6194,32 @@ export function App() {
     if(selectedThread&&selectedProject)setBranchTarget({threadId:selectedThread.id,projectId:selectedProject.id,turnId:turn.id});
   }
 
-  async function createBranchFromTurn(turn: Pick<Turn,"id">,archiveToolOutputs=false,target:BranchTarget={}) {
+  function dismissMigrationNotice(threadId:string,projectId:string) {
+    const key=`${selectedUserId}:${projectId}:${threadId}`;
+    setMigrationNotices(current=>{if(!current[key])return current;const next={...current};delete next[key];return next;});
+  }
+
+  async function chooseThreadMigration(thread:ThreadSummary) {
+    const projectId=threadProjectIdsRef.current.get(thread.id)??selectedProjectIdRef.current;
+    setThreadContextMenu(null);
+    if(!projectId)return;
+    const viewToken=threadViewTokenRef.current;
+    try {
+      const result=await readThread(thread.id,projectId,{limit:1,fresh:true});
+      if(threadViewTokenRef.current!==viewToken)return;
+      const turn=result.thread.turns.at(-1);
+      if(!turn)throw new Error("此会话尚无可分支轮次，请先发送一条消息。");
+      if(!turn.completedAt&&!["completed","succeeded","failed","interrupted","cancelled","canceled","aborted"].some(status=>normalizedToken(turn.status).includes(status)))throw new Error("请先停止当前轮次，再选择迁移目标。");
+      if(selectedThreadRef.current?.id!==thread.id)await openThread(thread.id,projectId,undefined,{skipCache:true,requireFresh:true});
+      if(selectedThreadRef.current?.id!==thread.id||selectedProjectIdRef.current!==projectId)return;
+      setError("");
+      setBranchTarget({threadId:thread.id,projectId,turnId:turn.id,purpose:"migration"});
+    } catch(caught) {
+      if(threadViewTokenRef.current===viewToken)setError(caught instanceof Error?caught.message:String(caught));
+    }
+  }
+
+  async function createBranchFromTurn(turn: Pick<Turn,"id">,archiveToolOutputs=false,target:BranchTarget={},migration=false) {
     const project = selectedProject;
     const sourceThread = selectedThread;
     if (!sourceThread?.id || !project?.id || branchingThreadRef.current) return false;
@@ -6213,6 +6240,10 @@ export function App() {
         turns: rawThread.turns ?? []
       });
       threadProjectIdsRef.current.set(normalizedThread.id, project.id);
+      if(migration)setMigrationNotices(current=>({...current,[`${selectedUserId}:${project.id}:${normalizedThread.id}`]:{
+        text:"已创建迁移分支，原会话及历史记录保留。",
+        historySourceUrl:response.data.historySourceUrl,warnings:response.data.warnings
+      }}));
       setThreads((current) => {
         const next = current.filter((thread) => thread.id !== normalizedThread.id);
         next.unshift(normalizedThread);
@@ -10519,6 +10550,7 @@ export function App() {
         setError(isStalePromptAck ? `后台会话执行失败：${errorMessage}` : errorMessage);
         return;
       }
+      if(isPromptRequest&&requestContext?.threadId&&requestContext.projectId)dismissMigrationNotice(requestContext.threadId,requestContext.projectId);
       const data = message.data as { thread?: { thread?: ThreadSummary }; turn?: { turn?: { id?: string } }; migratedFromThreadId?: string; autoCompacted?: boolean } | undefined;
       const newThread = data?.thread?.thread;
       const promptThreadId = newThread?.id ?? requestContext?.threadId ?? null;
@@ -10577,7 +10609,10 @@ export function App() {
           setSelectedThread(normalizedThreadWithStoredModel);
           setThreadHistory(null);
           if (data?.migratedFromThreadId) {
-            addLocalMessage("原会话的 Codex 上下文已用尽，继续发送会没有输出。已自动新建续接会话；原记录仍保留，可随时查看或导出。", "Codex Web · 会话迁移");
+            const projectId=requestContext?.projectId??selectedProjectIdRef.current;
+            if(projectId)setMigrationNotices(current=>({...current,[`${selectedUserId}:${projectId}:${newThread.id}`]:{
+              text:"原会话上下文已满，已新建续接会话。原记录保留，可随时查看或导出。"
+            }}));
           }
         }
       }
@@ -12469,9 +12504,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         )}
       />
 
-      {branchTarget?<BranchTargetDialog sourceModel={selectedThread?.configuredModel??selectedModelProfile.model} sourceEffort={selectedThread?.configuredReasoningEffort??selectedModelProfile.effort} pool={accountPool} profiles={modelProfiles} usageStatus={reclaudeUsage} onClose={()=>setBranchTarget(null)} onConfirm={async target=>{
+      {branchTarget?<BranchTargetDialog purpose={branchTarget.purpose} sourceModel={selectedThread?.configuredModel??selectedModelProfile.model} sourceEffort={selectedThread?.configuredReasoningEffort??selectedModelProfile.effort} pool={accountPool} profiles={modelProfiles} usageStatus={reclaudeUsage} onClose={()=>setBranchTarget(null)} onConfirm={async target=>{
         if(selectedThreadRef.current?.id!==branchTarget.threadId||selectedProject?.id!==branchTarget.projectId){setError("源会话已切换，请回到原会话重新选择分支点。");return false;}
-        return createBranchFromTurn({id:branchTarget.turnId},false,target);
+        return createBranchFromTurn({id:branchTarget.turnId},false,target,branchTarget.purpose==="migration");
       }}/>:null}
       {reclaudeAuthTarget ? <ReclaudeAuthorizationDialog key={`reclaude-auth:${selectedUserId}`} orgId={reclaudeAuthTarget.orgId}
         onClose={()=>setReclaudeAuthTarget(null)} onAuthenticated={()=>{void refreshModels();window.dispatchEvent(new Event("reclaude-authenticated"));}}/> : null}
@@ -12479,7 +12514,9 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         name={runtimeMigration.thread.name??runtimeMigration.thread.preview??"会话"} sourceClaude={isReclaudeModel(runtimeMigration.thread.configuredModel??selectedProject?.defaultModel)}
         profiles={modelProfiles} usageStatus={reclaudeUsage} initialModel={runtimeMigration.initialModel} onClose={()=>setRuntimeMigration(null)}
         onComplete={async result=>{const projectId=runtimeMigration.projectId;setRuntimeMigration(null);await refreshThreads(projectId);await openThread(result.threadId,projectId,undefined,{skipCache:true,requireFresh:true});
-          addLocalMessage(`已迁移 ${result.messageCount} 条对话记录，原会话保留。[下载完整源记录](${result.historySourceUrl})\n\n${result.warnings.join("\n")}`,"会话迁移");}}/>:null}
+          setMigrationNotices(current=>({...current,[`${selectedUserId}:${projectId}:${result.threadId}`]:{
+            text:`已迁移 ${result.messageCount} 条对话记录，原会话保留。`,historySourceUrl:result.historySourceUrl,warnings:result.warnings
+          }}));}}/>:null}
 
       {threadContextMenuPresence.present && displayedThreadContextMenu ? createPortal(
         <div
@@ -12502,10 +12539,7 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
             <PencilLine size={15} />
             重命名会话
           </button>
-          {modelProfiles.some(profile=>isReclaudeModel(profile.model)&&modelIsAvailable(profile))||isReclaudeModel(displayedThreadContextMenu.thread.configuredModel)?<button type="button" role="menuitem" onClick={()=>{
-            const projectId=threadProjectIdsRef.current.get(displayedThreadContextMenu.thread.id)??selectedProjectIdRef.current;
-            if(projectId)setRuntimeMigration({thread:displayedThreadContextMenu.thread,projectId});setThreadContextMenu(null);
-          }}><GitBranch size={15}/>迁移会话</button>:null}
+          <button type="button" role="menuitem" onClick={()=>void chooseThreadMigration(displayedThreadContextMenu.thread)}><GitBranch size={15}/>迁移会话</button>
           <button type="button" role="menuitem" onClick={() => void toggleThreadPin(displayedThreadContextMenu.thread)}>
             <Pin size={15} />
             {displayedThreadContextMenu.thread.pinned ? "取消置顶" : "置顶会话"}
@@ -13167,6 +13201,8 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
         )}
 
         <div className="threadNoticeStack">
+        {selectedThread?.id&&selectedProject?.id?<ThreadMigrationNotice notice={migrationNotices[`${selectedUserId}:${selectedProject.id}:${selectedThread.id}`]}
+          onDismiss={()=>dismissMigrationNotice(selectedThread.id,selectedProject.id)}/>:null}
         {error ? (
           <div className="errorBanner" role="alert">
             <span className="errorBannerMessage">{error}</span>
@@ -14079,15 +14115,15 @@ function getRunningTurnIdForThread(thread?: ThreadSummary | null): string | null
                         onFile={(path) => openDiffReview(turnChanges, "本轮文件变更", turn.id, `turn-changes:${turn.id}`, selectedThread?.id, path)}
                       />
                     : null;
-                  const turnCopyAction = turnAgentText
+                  const turnCopyAction = (turnAgentText || turn.id === displayedConversationTurns.at(-1)?.id)
                     && turnHasTerminalStatus
                     && selectedActiveTurnId !== turn.id
                     ? [
                         <div className="v2AgentMessageActions v2TurnCopyAction" key={`${turn.id}-copy-all`} aria-label="本轮回答操作">
-                          <button type="button" title="复制本次回答全部文字" aria-label="复制本次回答全部文字" onClick={() => void copyPlainText(turnAgentText)}>
+                          {turnAgentText ? <button type="button" title="复制本次回答全部文字" aria-label="复制本次回答全部文字" onClick={() => void copyPlainText(turnAgentText)}>
                             <ActionCopy size={15} />
-                          </button>
-                          <button type="button" title={branchingThread ? "正在创建分支" : "选择账号并从此回答分支"} aria-label="选择账号并从此回答分支" aria-busy={branchingTurnKey === `${selectedThread?.id}:${turn.id}`} disabled={branchingThread} onClick={() => {if(selectedThread&&selectedProject)setBranchTarget({threadId:selectedThread.id,projectId:selectedProject.id,turnId:turn.id});}}>
+                          </button> : null}
+                          <button type="button" title={branchingThread ? "正在创建分支" : turnAgentText ? "选择账号并从此回答分支" : "选择账号并从此轮分支"} aria-label={turnAgentText ? "选择账号并从此回答分支" : "选择账号并从此轮分支"} aria-busy={branchingTurnKey === `${selectedThread?.id}:${turn.id}`} disabled={branchingThread} onClick={() => {if(selectedThread&&selectedProject)setBranchTarget({threadId:selectedThread.id,projectId:selectedProject.id,turnId:turn.id});}}>
                             {branchingTurnKey === `${selectedThread?.id}:${turn.id}`
                               ? <span className="branchCreatingSpinner" role="status" aria-label="正在创建分支" />
                               : <ActionBranch size={15} />}

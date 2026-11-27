@@ -42,7 +42,8 @@ export function readHostResources(signal: AbortSignal): Promise<{ data: import("
   return request("/api/system/resources", { signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]) });
 }
 export function checkHostNetwork(signal: AbortSignal): Promise<{ data: import("../shared/hostResources").HostNetworkProbeResult }> {
-  return request("/api/system/network/check", { method: "POST", signal: AbortSignal.any([signal, AbortSignal.timeout(12_000)]) });
+  // Keep a valid media type when a reverse proxy forwards this POST as chunked.
+  return request("/api/system/network/check", { method: "POST", body: JSON.stringify({}), signal: AbortSignal.any([signal, AbortSignal.timeout(12_000)]) });
 }
 export function readCommunication(threadId: string, signal?: AbortSignal): Promise<{ data: import("../shared/sessionCommunication").CommunicationSnapshot }> {
   return request(`/api/threads/${encodeURIComponent(threadId)}/communication`, { signal });
@@ -712,7 +713,7 @@ export function deleteSideChat(side: SideChat): Promise<{ ok: boolean; data: Sid
 }
 
 export interface BranchProgress {phase:string;stage?:'snapshot'|'display'|'import';totalMessages:number;importedMessages:number;displayItems?:number;updatedAt:number;error?:string}
-export interface BranchResponse { data: { thread: ThreadSummary; turn: { turn?: { id?: string } } | null; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null; branchMode: "native" | "cross-account-native" | "legacy-stream-import" | "legacy-tool-archive" | "cross-runtime" } }
+export interface BranchResponse { data: { thread: ThreadSummary; turn: { turn?: { id?: string } } | null; sourceThreadId: string; sourceTurnId: string; targetAccount?: { id: string; label: string } | null; branchMode: "native" | "cross-account-native" | "legacy-stream-import" | "legacy-tool-archive" | "cross-runtime"; warnings?: string[]; historySourceUrl?: string } }
 export async function branchThread(
   projectId: string,
   threadId: string,
